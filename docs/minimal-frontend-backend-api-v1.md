@@ -1,4 +1,4 @@
-# 极简前端后端接口需求（v1）
+# 极简前端后端接口当前合同（v1）
 
 ## 目标
 
@@ -8,7 +8,7 @@
 
 ## 1. 能力声明
 
-现有 `GET /api/capabilities` 增加：
+`GET /api/capabilities` 必须返回：
 
 ```json
 {
@@ -41,11 +41,11 @@
 }
 ```
 
-接口未全部就绪时不要返回 `supported: true`。前端不会回退到旧创建合同。
+`minimal_creation` 的字段、固定值和数组顺序必须与上例精确一致；`version` 必须严格等于整数 `1`。缺失、额外字段、值或顺序不一致都必须 fail closed，不能推断、转换或选择其他创建合同。
 
 ## 2. 创建项目
 
-继续使用 `POST /api/conversations`，编码为 `multipart/form-data`。
+唯一创建入口是 `POST /api/conversations`，编码为 `multipart/form-data`。
 
 | 字段 | 必填 | 含义 |
 | --- | --- | --- |
@@ -54,6 +54,8 @@
 | `client_request_id` | 是 | 创建请求幂等键 |
 | `generation_request` | 是 | 下述 JSON 字符串 |
 | `replacement_image` | 条件必填 | 仅在提供替换说明时上传 |
+
+上表五个字段构成当前客户端创建输入；服务端内部字段不属于公开合同。
 
 `generation_request`：
 
@@ -78,6 +80,8 @@
 }
 ```
 
+`generation_request.version` 必须严格等于整数 `1`；其公开结构由上例中的 `output`、`processing`、`dialogue` 和 `replacement_guidance` 定义。
+
 使用参考图时：
 
 ```json
@@ -95,7 +99,7 @@
 2. `target_language` 去除首尾空白后必须非空，最长 80 个字符。
 3. 三个 `processing` 值固定为 `true`，不能由用户关闭。
 4. `replacement_image` 与 `replacement_guidance` 必须同时存在或同时不存在。
-5. 请求中不接受 `script`、`lines` 或旧台词模式字段。
+5. `generation_request` 不携带客户端台词文本或模型选择。
 
 ## 3. 后端执行语义
 
@@ -125,6 +129,44 @@
 }
 ```
 
+创建响应与 `GET /api/conversations/{id}` 必须返回同一份冻结的 `creation_input`。链接来源使用：
+
+```json
+{
+  "creation_input": {
+    "version": 1,
+    "source": {
+      "mode": "link",
+      "reference_url": "https://media.example/video.mp4"
+    },
+    "replacement_image": null
+  }
+}
+```
+
+上传来源且带参考图时使用：
+
+```json
+{
+  "creation_input": {
+    "version": 1,
+    "source": {
+      "mode": "upload",
+      "filename": "source.mp4",
+      "bytes": 12345678
+    },
+    "replacement_image": {
+      "filename": "product.png",
+      "bytes": 345678,
+      "media_type": "image/png",
+      "preview_url": "/api/conversations/PROJECT_ID/creation-input/replacement-image"
+    }
+  }
+}
+```
+
+`creation_input.version` 必须严格等于整数 `1`；`source.mode` 只能是 `link` 或 `upload`，并携带对应示例中的精确字段。`replacement_image` 未提供时必须为 `null`；提供时必须与冻结输入回执一致。`preview_url` 固定指向当前项目的鉴权只读接口 `GET /api/conversations/{id}/creation-input/replacement-image`，不得接受路径参数、覆盖或重新提交素材。
+
 `GET /api/conversations` 和 `GET /api/conversations/{id}` 都需要返回：
 
 ```json
@@ -140,11 +182,11 @@
 - `status`：`queued | running | succeeded | failed`。
 - `queued=0`，`running=1..99`，最终视频可读取后才允许 `succeeded=100`。
 - 不返回内部阶段或分段进度。
-- 成片可用时 `has_video=true`，并继续使用 `GET /api/conversations/{id}/files/generated.mp4`。
+- 成片可用时 `has_video=true`，成片读取接口固定为 `GET /api/conversations/{id}/files/generated.mp4`。
 
 ## 5. 最小错误合同
 
-错误保持现有 `{"detail":{"code","message","field"}}` 结构。前端需要以下稳定机器码：
+错误结构固定为 `{"detail":{"code","message","field"}}`。前端需要以下稳定机器码：
 
 | HTTP | code | 条件 |
 | --- | --- | --- |

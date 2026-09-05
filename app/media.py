@@ -1,4 +1,4 @@
-"""Deterministic media algorithms migrated from the frozen Master baseline.
+"""Deterministic media algorithms for the H3 video pipeline.
 
 The module intentionally keeps only the media mechanics needed by the research
 pipeline: exact source-frame/scene planning, scene-aware exact-nine sampling,
@@ -1727,15 +1727,6 @@ def materialize_keyframes(
         path.write_bytes(encoded[source_index])
         paths.append(path)
     return paths
-
-
-def exact_nine_keyframes(
-    source: Path,
-    destination: Path,
-    selection: list[dict[str, Any]],
-) -> list[Path]:
-    """Compatibility name; the third argument is an exact selection, not duration."""
-    return materialize_keyframes(source, selection, destination)
 
 
 def localize_dialogue(

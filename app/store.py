@@ -16,7 +16,8 @@ from typing import Any
 PROJECT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PUBLIC_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
-LEGACY_STATUS_ALIASES = {"processing": "running", "done": "succeeded"}
+PROJECT_STATE_SCHEMA = "duet.project-state"
+PROJECT_STATE_VERSION = 1
 IDEMPOTENCY_INDEX_VERSION = 1
 IDEMPOTENCY_INDEX_NAME = ".client-request-index.json"
 
@@ -147,14 +148,25 @@ class ProjectStore:
         *,
         client_request_id: str,
     ) -> str:
-        if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {
+                "version",
+                "client_request_id",
+                "generation_request_sha256",
+                "source",
+                "replacement_image",
+            }
+            or type(receipt.get("version")) is not int
+            or receipt.get("version") != 1
+        ):
             raise IdempotencyIndexUnavailable("project input receipt is missing or invalid")
         if receipt.get("client_request_id") != client_request_id:
             raise IdempotencyIndexUnavailable("project input receipt belongs to another request")
         generation_digest = receipt.get("generation_request_sha256")
         source = receipt.get("source")
         replacement = receipt.get("replacement_image")
-        if not isinstance(source, dict):
+        if not isinstance(source, dict) or set(source) != {"sha256", "bytes"}:
             raise IdempotencyIndexUnavailable("project source receipt is missing")
         source_digest = source.get("sha256")
         source_bytes = source.get("bytes")
@@ -169,7 +181,7 @@ class ProjectStore:
         replacement_digest: str | None
         if replacement is None:
             replacement_digest = None
-        elif isinstance(replacement, dict):
+        elif isinstance(replacement, dict) and set(replacement) == {"sha256", "bytes"}:
             replacement_digest = replacement.get("sha256")
             replacement_bytes = replacement.get("bytes")
             if (
@@ -243,7 +255,7 @@ class ProjectStore:
         if (
             not isinstance(value, dict)
             or set(value) != {"version", "entries"}
-            or isinstance(value.get("version"), bool)
+            or type(value.get("version")) is not int
             or value.get("version") != IDEMPOTENCY_INDEX_VERSION
             or not isinstance(value.get("entries"), dict)
         ):
@@ -394,6 +406,8 @@ class ProjectStore:
 
         if not isinstance(client_request_id, str):
             raise TypeError("client_request_id must be a string")
+        if not client_request_id.strip():
+            raise ValueError("client_request_id must be nonempty")
         if not isinstance(request_digest, str) or SHA256_RE.fullmatch(request_digest) is None:
             raise ValueError("invalid request digest")
         receipt_digest = self._validated_receipt_digest(
@@ -447,31 +461,27 @@ class ProjectStore:
                 raise ValueError("staged replacement image does not match input receipt")
 
         with self._lock:
-            index: dict[str, Any] | None = None
-            key_digest: str | None = None
-            if client_request_id:
-                index = self._read_idempotency_index_unlocked()
-                key_digest = hashlib.sha256(client_request_id.encode("utf-8")).hexdigest()
-                existing = index["entries"].get(key_digest)
-                if existing is not None:
-                    if existing["request_digest"] != request_digest:
-                        raise ClientRequestIdConflict(client_request_id)
-                    project, state = self._read_claimed_project_unlocked(
-                        project_id=existing["project_id"],
-                        client_request_id=client_request_id,
-                        request_digest=request_digest,
-                    )
-                    return existing["project_id"], project, state, False
+            index = self._read_idempotency_index_unlocked()
+            key_digest = hashlib.sha256(client_request_id.encode("utf-8")).hexdigest()
+            existing = index["entries"].get(key_digest)
+            if existing is not None:
+                if existing["request_digest"] != request_digest:
+                    raise ClientRequestIdConflict(client_request_id)
+                project, state = self._read_claimed_project_unlocked(
+                    project_id=existing["project_id"],
+                    client_request_id=client_request_id,
+                    request_digest=request_digest,
+                )
+                return existing["project_id"], project, state, False
 
             project_id = uuid.uuid4().hex
             while self.path(project_id).exists():
                 project_id = uuid.uuid4().hex
-            if index is not None and key_digest is not None:
-                index["entries"][key_digest] = {
-                    "project_id": project_id,
-                    "request_digest": request_digest,
-                }
-                self._write_idempotency_index_unlocked(index)
+            index["entries"][key_digest] = {
+                "project_id": project_id,
+                "request_digest": request_digest,
+            }
+            self._write_idempotency_index_unlocked(index)
 
             project = self.path(project_id)
             project.mkdir(mode=0o700)
@@ -505,6 +515,8 @@ class ProjectStore:
                 else None
             )
             state = {
+                "schema": PROJECT_STATE_SCHEMA,
+                "version": PROJECT_STATE_VERSION,
                 "id": project_id,
                 "title": f"视频改编 {project_id[:8]}",
                 "status": "queued",
@@ -543,6 +555,10 @@ class ProjectStore:
             return project_id, project, state, True
 
     def create(self, effective_request: dict[str, Any], client_request_id: str) -> tuple[str, Path, dict[str, Any]]:
+        if not isinstance(client_request_id, str):
+            raise TypeError("client_request_id must be a string")
+        if not client_request_id.strip():
+            raise ValueError("client_request_id must be nonempty")
         project_id = uuid.uuid4().hex
         project = self.root / project_id
         project.mkdir(mode=0o700)
@@ -553,6 +569,8 @@ class ProjectStore:
             os.chmod(directory, 0o700)
         now = utcnow()
         state = {
+            "schema": PROJECT_STATE_SCHEMA,
+            "version": PROJECT_STATE_VERSION,
             "id": project_id,
             "title": f"视频改编 {project_id[:8]}",
             "status": "queued",
@@ -588,6 +606,12 @@ class ProjectStore:
     def _validate_state(project_id: str, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ProjectStateError("state must be a JSON object")
+        if (
+            value.get("schema") != PROJECT_STATE_SCHEMA
+            or type(value.get("version")) is not int
+            or value.get("version") != PROJECT_STATE_VERSION
+        ):
+            raise ProjectStateError("unsupported project state schema")
         if value.get("id") != project_id:
             raise ProjectStateError("state id does not match its project directory")
         status = value.get("status")
@@ -627,11 +651,12 @@ class ProjectStore:
     @staticmethod
     def _normalized_changes(changes: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(changes)
-        status = normalized.get("status")
-        if status in LEGACY_STATUS_ALIASES:
-            normalized["status"] = LEGACY_STATUS_ALIASES[status]
         progress = normalized.get("project_progress")
-        if isinstance(progress, dict) and progress.get("status") in PUBLIC_STATUSES:
+        if (
+            "status" not in normalized
+            and isinstance(progress, dict)
+            and progress.get("status") in PUBLIC_STATUSES
+        ):
             normalized["status"] = progress["status"]
         return normalized
 
@@ -685,38 +710,6 @@ class ProjectStore:
         rows.sort(key=lambda row: row.get("created_at", ""), reverse=True)
         return rows
 
-    def _failed_recovery_state(self, project_id: str, previous: Any, *, code: str, message: str) -> dict[str, Any]:
-        old = previous if isinstance(previous, dict) else {}
-        now = utcnow()
-        raw_percent = (old.get("project_progress") or {}).get("percent") if isinstance(old.get("project_progress"), dict) else 0
-        percent = raw_percent if isinstance(raw_percent, int) and not isinstance(raw_percent, bool) else 0
-        percent = min(99, max(0, percent))
-        source = self.path(project_id) / "inputs" / "source.mp4"
-        replacement = self.path(project_id) / "inputs" / "replacement-image"
-        has_source = source.is_file()
-        # A corrupt state cannot prove whether the fixed source file came from
-        # an upload or URL.  Preserve no guessed provenance.
-        source_snapshot = {"mode": "link", "reference_url": None}
-        return {
-            "id": project_id,
-            "title": old.get("title") if isinstance(old.get("title"), str) else f"视频改编 {project_id[:8]}",
-            "status": "failed",
-            "created_at": old.get("created_at") if isinstance(old.get("created_at"), str) else now,
-            "updated_at": now,
-            "duration_s": old.get("duration_s") if isinstance(old.get("duration_s"), (int, float)) else 0,
-            "segment_count": old.get("segment_count") if isinstance(old.get("segment_count"), int) else 0,
-            "has_source": has_source,
-            "has_video": False,
-            "effective_request": old.get("effective_request") if isinstance(old.get("effective_request"), dict) else {},
-            "client_request_id": old.get("client_request_id") if isinstance(old.get("client_request_id"), str) else "",
-            "source_path": "inputs/source.mp4" if has_source else None,
-            "replacement_image_path": "inputs/replacement-image" if replacement.is_file() else None,
-            "project_progress": {"status": "failed", "percent": percent, "stage": code},
-            "generation": {"status": "failed", "stage": code, "error": code},
-            "creation_input": {"version": 1, "source": source_snapshot, "replacement_image": None},
-            "error": {"code": code, "message": message},
-        }
-
     def mark_failed(self, project_id: str, *, code: str, message: str, stage: str | None = None) -> dict[str, Any]:
         with self._lock:
             state = self._read_unlocked(project_id)
@@ -744,13 +737,6 @@ class ProjectStore:
                     raw = json.loads(state_path.read_text(encoding="utf-8"))
                     state = self._validate_state(project.name, raw)
                 except (FileNotFoundError, OSError, json.JSONDecodeError, ProjectStateError):
-                    repaired = self._failed_recovery_state(
-                        project.name,
-                        raw,
-                        code="invalid_state",
-                        message="项目状态损坏，已停止自动执行",
-                    )
-                    self.write(project.name, repaired)
                     continue
                 if state["status"] in {"queued", "running"}:
                     self.mark_failed(

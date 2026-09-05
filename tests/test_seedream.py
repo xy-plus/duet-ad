@@ -5,7 +5,9 @@ import json
 import threading
 from pathlib import Path
 
+import cv2
 import httpx
+import numpy as np
 import pytest
 
 from app import seedream
@@ -14,10 +16,14 @@ from app.providers import ProviderFailure, ProviderResult
 from app.seedream import SeedreamClient, SeedreamError
 
 
-_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
-    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
-)
+def _png(width: int, height: int) -> bytes:
+    image = np.zeros((height, width), dtype=np.uint8)
+    encoded_ok, encoded = cv2.imencode(".png", image)
+    assert encoded_ok
+    return encoded.tobytes()
+
+
+_PNG = _png(2048, 2048)
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -64,6 +70,7 @@ def test_seedream_settings_have_closed_defaults_and_environment_mapping(
     monkeypatch.setenv("ACCESS_TOKEN", "test-access")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://seedream-app.test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
     monkeypatch.setenv("ARK_API_KEY", "  ark-key  ")
     monkeypatch.setenv("SEEDREAM_API_BASE", "https://ark.override/api/v3/")
     monkeypatch.setenv("SEEDREAM_MODEL", "seedream-override")
@@ -117,6 +124,7 @@ def test_generate_posts_once_and_persists_only_redacted_receipts(tmp_path: Path)
         body = json.loads(request.content)
         assert body["model"] == "seedream-test-model"
         assert body["prompt"] == "one reference sheet"
+        assert body["size"] == "2048x2048"
         assert body["response_format"] == "b64_json"
         assert body["watermark"] is False
         assert len(body["image"]) == 1
@@ -145,8 +153,11 @@ def test_generate_posts_once_and_persists_only_redacted_receipts(tmp_path: Path)
         (tmp_path / "seedream-receipt.json.response.json").read_text(encoding="utf-8")
     )
     assert receipt["status"] == "succeeded"
+    assert receipt["size"] == "2048x2048"
     assert receipt["request_sha256"] == claim["request_sha256"]
     assert receipt["request_sha256"] == marker["request_sha256"]
+    assert marker["width"] == 2048
+    assert marker["height"] == 2048
     assert (tmp_path / "seedream-receipt.json.result").read_bytes() == _PNG
     serialized = json.dumps(
         {
@@ -561,6 +572,35 @@ def test_untrusted_response_header_values_are_not_persisted(tmp_path: Path) -> N
             200,
             json={"data": [{"b64_json": base64.b64encode(b"not-image").decode("ascii")}]},
         ),
+        httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"b64_json": base64.b64encode(_png(1, 1)).decode("ascii")}
+                ]
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(
+                            _png(2048, 1024)
+                        ).decode("ascii")
+                    }
+                ]
+            },
+        ),
+    ],
+    ids=[
+        "non-json",
+        "zero-images",
+        "multiple-images",
+        "invalid-base64",
+        "not-an-image",
+        "one-by-one-image",
+        "wrong-dimensions-and-aspect-ratio",
     ],
 )
 def test_protocol_error_is_terminal_and_never_reposts(
@@ -778,7 +818,9 @@ def test_result_fsync_before_marker_failure_is_recovered_without_network(
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "succeeded"
 
 
-@pytest.mark.parametrize("damage", ["missing", "invalid", "truncated"])
+@pytest.mark.parametrize(
+    "damage", ["missing", "invalid", "truncated", "wrong_dimensions"]
+)
 def test_submitting_receipt_without_valid_result_stays_unknown_and_never_posts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -811,6 +853,8 @@ def test_submitting_receipt_without_valid_result_stays_unknown_and_never_posts(
         result_path.unlink()
     elif damage == "truncated":
         result_path.write_bytes(_PNG[:-8])
+    elif damage == "wrong_dimensions":
+        result_path.write_bytes(_png(1, 1))
     else:
         result_path.write_bytes(b"not-an-image")
 
@@ -905,6 +949,7 @@ def test_replay_received_rejects_mismatched_claim_without_network(tmp_path: Path
         ("model", "tampered-model"),
         ("prompt_sha256", "0" * 64),
         ("input_sha256", ["0" * 64]),
+        ("size", "1x1"),
         ("request_sha256", "0" * 64),
     ],
 )

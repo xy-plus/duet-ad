@@ -83,9 +83,20 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     html = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
     composer = html.split('<form id="composer"', 1)[1].split("</form>", 1)[0]
-    visible, legacy = composer.split(
-        '<div class="legacy-contract-controls" hidden aria-hidden="true">', 1
-    )
+    visible = composer
+    # 旧兼容控件与旧弹窗已从 DOM 移除，不再允许留在页面上。
+    for legacy_markup in (
+        'class="legacy-contract-controls"',
+        'name="voice-mode"',
+        'name="dialogue-mode"',
+        'id="note-input"',
+        'id="dialogue-review-fields"',
+        'dialogue-review-policy',
+        'id="generation-config"',
+        'id="pp-dialog"',
+        'id="draft-dialog"',
+    ):
+        assert legacy_markup not in html
 
     source_section = visible.split(
         '<section class="setup-section source-section"', 1
@@ -160,15 +171,6 @@ def test_creation_form_defaults_to_link_and_same_source_language():
 
     source_mode = _function_source(source, "sourceMode")
     assert 'return checked ? checked.value : "link"' in source_mode
-
-    # Compatibility-only inputs may remain in the DOM, but never become creation UI.
-    assert 'name="voice-mode"' in legacy
-    assert 'name="dialogue-mode"' in legacy
-    pp_dialog = re.search(r'<dialog\b(?P<attrs>[^>]*)id="pp-dialog"(?P<tail>[^>]*)>', html)
-    assert pp_dialog is not None
-    pp_attrs = pp_dialog.group("attrs") + pp_dialog.group("tail")
-    assert "hidden" in pp_attrs
-    assert 'aria-hidden="true"' in pp_attrs
 
 
 def test_minimal_creation_capability_is_exact_and_fails_closed():
@@ -494,8 +496,6 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
         for name in (
             "renderResults",
             "renderStable",
-            "renderPpDynamic",
-            "renderGenerationDynamic",
         )
     )
     for technical_view in (
@@ -699,7 +699,7 @@ def test_restored_project_configuration_is_view_only_and_releases_file_objects()
 def test_success_response_freezes_configuration_before_followup_requests():
     source = APP_JS.read_text(encoding="utf-8")
     submit = _function_source(source, "handleSend")
-    entry = submit.split("if (!await guardDirtyPrompt())", 1)[0]
+    entry = submit.split("const mode = sourceMode()", 1)[0]
     success = submit.split("const created = await uploadConversation", 1)[1].split(
         "} catch (err)", 1
     )[0]
@@ -977,7 +977,6 @@ def test_initial_detail_failure_clears_selection_and_returns_to_new_project():
         "state.currentId = null",
         "state.detail = null",
         "resetComposerForNewProject()",
-        "resetGenerationConfigDisclosure()",
         "renderList()",
         "renderEmptyHero()",
         'setComposerError("项目加载失败，已回到新建项目：" + err.message)',

@@ -18,6 +18,13 @@ from app.voice_catalog import (
 )
 
 
+_LABEL_POLICY = {
+    "source_truth": "publisher labels only",
+    "personality": "not inferred",
+    "identity": "anonymous corpus speaker",
+}
+
+
 def test_voice_library_assets_are_usable_and_model_lines_are_transportable() -> None:
     library = load_voice_library()
 
@@ -36,7 +43,9 @@ def test_voice_library_assets_are_usable_and_model_lines_are_transportable() -> 
     assert all(voice["file"] in line for voice, line in zip(library.voices, lines))
 
 
-def test_voice_library_does_not_review_catalog_size_or_feature_labels(tmp_path) -> None:
+def test_voice_library_keeps_open_feature_metadata_but_closes_catalog_records(
+    tmp_path,
+) -> None:
     source_library = load_voice_library()
     source_voice = source_library.voices[0]
     source_path = source_library.files[source_voice["voice_id"]]
@@ -49,7 +58,6 @@ def test_voice_library_does_not_review_catalog_size_or_feature_labels(tmp_path) 
         "file": "voice.wav",
         "duration_s": 99.0,
         "source": {"publisher_labels": "passed through without review"},
-        "extra_metadata": "allowed",
     })
     voice["features"] = {
         "age": 12,
@@ -60,8 +68,8 @@ def test_voice_library_does_not_review_catalog_size_or_feature_labels(tmp_path) 
     catalog_path.write_text(json.dumps({
         "schema": VOICE_CATALOG_NAME,
         "version": VOICE_CATALOG_VERSION,
+        "label_policy": _LABEL_POLICY,
         "voices": [voice],
-        "extra_metadata": "allowed",
     }), encoding="utf-8")
 
     library = load_voice_library(catalog_path)
@@ -70,6 +78,26 @@ def test_voice_library_does_not_review_catalog_size_or_feature_labels(tmp_path) 
     assert library.voices[0]["features"]["age"] == 12
     assert library.voices[0]["features"]["personality"] == "confident"
     assert "unspecified - unspecified" in library.model_lines()
+
+    valid_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    for invalid_version in (True, 1.0):
+        invalid_identity = copy.deepcopy(valid_catalog)
+        invalid_identity["version"] = invalid_version
+        catalog_path.write_text(json.dumps(invalid_identity), encoding="utf-8")
+        with pytest.raises(ValueError, match="catalog identity"):
+            load_voice_library(catalog_path)
+
+    invalid_root = copy.deepcopy(valid_catalog)
+    invalid_root["unexpected"] = True
+    catalog_path.write_text(json.dumps(invalid_root), encoding="utf-8")
+    with pytest.raises(ValueError, match="catalog root"):
+        load_voice_library(catalog_path)
+
+    invalid_entry = copy.deepcopy(valid_catalog)
+    invalid_entry["voices"][0]["unexpected"] = True
+    catalog_path.write_text(json.dumps(invalid_entry), encoding="utf-8")
+    with pytest.raises(ValueError, match="entry 1"):
+        load_voice_library(catalog_path)
 
 
 def test_voice_library_keeps_actual_provider_duration_boundary(tmp_path) -> None:
@@ -83,6 +111,7 @@ def test_voice_library_keeps_actual_provider_duration_boundary(tmp_path) -> None
     catalog_path.write_text(json.dumps({
         "schema": VOICE_CATALOG_NAME,
         "version": VOICE_CATALOG_VERSION,
+        "label_policy": _LABEL_POLICY,
         "voices": [{
             "voice_id": "too-short",
             "file": "voice.wav",
@@ -121,3 +150,10 @@ def test_voice_selection_schema_binds_input_and_catalog() -> None:
             input_sha256=input_sha256,
             voice_ids={"voice-a", "voice-b"},
         )
+    for invalid_version in (True, 1.0):
+        with pytest.raises(ValueError, match="not bound"):
+            normalize_voice_selection(
+                {**value, "version": invalid_version},
+                input_sha256=input_sha256,
+                voice_ids={"voice-a", "voice-b"},
+            )

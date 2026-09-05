@@ -18,14 +18,22 @@ from app.object_replace_schema import (
     OBJECT_REPLACE_OUTPUT_VERSION,
 )
 from app.pipeline import (
+    H3_PREPARED_ARTIFACTS_VERSION,
+    PICSART_RECEIPT_VERSION,
     Pipeline,
     PreparedPicsartRequest,
+    REPLACEMENT_SHEET_VERSION,
     SAME_AS_SOURCE_LANGUAGE,
     TRANSLATION_SCHEMA,
 )
 from app.providers import ProviderFailure, ProviderResult
 from app.replacement_sheet import replacement_sheet_spec_sha256
 from app.research_log import ResearchLog
+from app.seedream import (
+    SEEDREAM_OUTPUT_HEIGHT,
+    SEEDREAM_OUTPUT_SIZE,
+    SEEDREAM_OUTPUT_WIDTH,
+)
 from app.store import ProjectStore
 from app.voice_catalog import load_voice_library
 from app.video_maker_schemas import (
@@ -52,6 +60,108 @@ def _settings(path: Path, **changes: Any) -> Settings:
     }
     values.update(changes)
     return Settings(**values)
+
+
+def _effective_request(
+    *,
+    resolution: str = "768p",
+    aspect_ratio: str = "16:9",
+    target_language: str = SAME_AS_SOURCE_LANGUAGE,
+    fusion_agent: str = "deepseek",
+    replacement_instruction: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "output": {
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "fit_mode": "auto",
+        },
+        "processing": {
+            "optimize_image": True,
+            "remove_subtitle": True,
+            "remove_logo": True,
+        },
+        "dialogue": {
+            "mode": "auto_rewrite",
+            "target_language": target_language,
+        },
+        "replacement_guidance": (
+            {
+                "instruction": replacement_instruction,
+                "image_field": "replacement_image",
+            }
+            if replacement_instruction is not None
+            else None
+        ),
+        "fusion": {"agent": fusion_agent},
+    }
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_output",
+        "partial_output",
+        "missing_processing",
+        "disabled_processing",
+        "missing_dialogue",
+        "partial_dialogue",
+        "missing_fusion",
+        "extra_field",
+    ],
+)
+def test_effective_request_requires_the_complete_current_contract(
+    damage: str,
+) -> None:
+    request = _effective_request()
+    assert Pipeline._validated_effective_request(request) is request
+    if damage == "missing_output":
+        request.pop("output")
+    elif damage == "partial_output":
+        request["output"].pop("fit_mode")
+    elif damage == "missing_processing":
+        request.pop("processing")
+    elif damage == "disabled_processing":
+        request["processing"]["optimize_image"] = False
+    elif damage == "missing_dialogue":
+        request.pop("dialogue")
+    elif damage == "partial_dialogue":
+        request["dialogue"].pop("mode")
+    elif damage == "missing_fusion":
+        request.pop("fusion")
+    else:
+        request["unsupported"] = True
+
+    with pytest.raises(ValueError, match="effective request"):
+        Pipeline._validated_effective_request(request)
+
+
+def test_stored_voice_references_reject_noncurrent_asset_path(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "voice-path-version",
+    )
+    library = load_voice_library()
+    voice = library.voices[0]
+    directory = project / "work" / "voice-references"
+    directory.mkdir(parents=True)
+    current_path = directory / "audio-01.wav"
+    current_path.write_bytes(library.files[voice["voice_id"]].read_bytes())
+    state = {
+        "voice_references": [{
+            "audio_reference": "Audio 1",
+            "voice_id": voice["voice_id"],
+            "asset_path": "work/voice-reference.wav",
+            "asset_sha256": voice["sha256"],
+            "features": library.model_line(voice["voice_id"]),
+        }],
+    }
+
+    with pytest.raises(ValueError, match="voice reference"):
+        Pipeline._stored_voice_references(project, state)
 
 
 class _UnusedMediaKit:
@@ -99,7 +209,8 @@ class _FlowSeedream:
         })
         if self.events is not None:
             self.events.append("seedream")
-        destination.write_bytes(_TEST_PNG)
+        result_payload = images[0].read_bytes()
+        destination.write_bytes(result_payload)
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         input_sha256 = [Pipeline._sha256(path) for path in images]
         endpoint = f"{SEEDREAM_API_BASE}/images/generations"
@@ -109,11 +220,12 @@ class _FlowSeedream:
             "model": SEEDREAM_PRO_MODEL,
             "prompt_sha256": prompt_sha256,
             "input_sha256": input_sha256,
+            "size": SEEDREAM_OUTPUT_SIZE,
             "response_format": "b64_json",
             "watermark": False,
         }
         request_sha256 = Pipeline._json_sha256(request_binding)
-        result_sha256 = hashlib.sha256(_TEST_PNG).hexdigest()
+        result_sha256 = hashlib.sha256(result_payload).hexdigest()
         receipt_path.with_name(receipt_path.name + ".post-claim").write_text(
             json.dumps({
                 "version": 1,
@@ -123,7 +235,7 @@ class _FlowSeedream:
             encoding="utf-8",
         )
         receipt_path.with_name(receipt_path.name + ".result").write_bytes(
-            _TEST_PNG,
+            result_payload,
         )
         receipt_path.with_name(receipt_path.name + ".response.json").write_text(
             json.dumps({
@@ -131,9 +243,11 @@ class _FlowSeedream:
                 "kind": "seedream_response",
                 "request_sha256": request_sha256,
                 "result_file": receipt_path.name + ".result",
-                "result_bytes": len(_TEST_PNG),
+                "result_bytes": len(result_payload),
                 "result_sha256": result_sha256,
                 "media_type": "image/png",
+                "width": SEEDREAM_OUTPUT_WIDTH,
+                "height": SEEDREAM_OUTPUT_HEIGHT,
             }),
             encoding="utf-8",
         )
@@ -144,7 +258,7 @@ class _FlowSeedream:
                 "status": "succeeded",
                 "request_sha256": request_sha256,
                 "result_file": receipt_path.name + ".result",
-                "result_bytes": len(_TEST_PNG),
+                "result_bytes": len(result_payload),
                 "result_sha256": result_sha256,
                 "response_marker_file": receipt_path.name + ".response.json",
                 "output_sha256": result_sha256,
@@ -222,10 +336,6 @@ def _materialize_test_replacement_sheet(
     object_replace = dict(state.get("object_replace") or {})
     object_replace.setdefault("version", OBJECT_REPLACE_OUTPUT_VERSION)
     object_replace.setdefault("input_sha256", "a" * 64)
-    object_replace.setdefault(
-        "reference_sheet_prompt",
-        "Render every frozen stable key once in its assigned tile.",
-    )
     pipeline.store.update(
         project_id,
         segment_count=len(frozen_prepared),
@@ -250,7 +360,7 @@ def _failed_replacement_sheet_checkpoint(
     *,
     prepared: bool,
 ) -> tuple[ProjectStore, str, Path, dict[str, Any], _FlowSeedream]:
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(request, "sheet-checkpoint")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
@@ -263,6 +373,7 @@ def _failed_replacement_sheet_checkpoint(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
                 },
             },
         },
@@ -384,6 +495,9 @@ class _FlowDeepSeek:
                         "target_visual_description": (
                             f"replacement appearance for {stable_id}"
                         ),
+                        "appearance_description": (
+                            f"isolated replacement person {stable_id}"
+                        ),
                     },
                     "voice_id": voice_ids[offset],
                 }
@@ -392,9 +506,6 @@ class _FlowDeepSeek:
                     "schema": OBJECT_REPLACE_OUTPUT_NAME,
                     "version": OBJECT_REPLACE_OUTPUT_VERSION,
                     "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
-                    "reference_sheet_prompt": (
-                        "Render every frozen stable key once in its assigned tile."
-                    ),
                     "people": people,
                     "entities": {
                         stable_id: {
@@ -403,6 +514,9 @@ class _FlowDeepSeek:
                                 "source": "generated_variant",
                                 "target_visual_description": (
                                     f"replacement object for {stable_id}"
+                                ),
+                                "appearance_description": (
+                                    f"isolated replacement entity {stable_id}"
                                 ),
                             },
                         }
@@ -415,6 +529,9 @@ class _FlowDeepSeek:
                                 "source": "generated_variant",
                                 "target_visual_description": (
                                     f"replacement layout for {stable_id}"
+                                ),
+                                "appearance_description": (
+                                    f"empty replacement scene {stable_id}"
                                 ),
                             },
                         }
@@ -749,19 +866,10 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {
-        "processing": {
-            "optimize_image": True,
-            "remove_subtitle": True,
-            "remove_logo": True,
-        },
-        "dialogue": {"target_language": "日语"},
-        "replacement_guidance": {
-            "instruction": "把主角替换成用户参考形象",
-            "image_field": "replacement_image",
-        },
-        "output": {"resolution": "768p", "aspect_ratio": "16:9"},
-    }
+    request = _effective_request(
+        target_language="日语",
+        replacement_instruction="把主角替换成用户参考形象",
+    )
     project_id, project, _state = store.create(request, "request-1")
     source = project / "inputs" / "source.mp4"
     source.write_bytes(b"source")
@@ -1065,14 +1173,13 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for tile in replacement_sheet["spec"]["tiles"]
     )
     assert [path.name for path in seedream.calls[0]["images"]] == [
-        "user-reference.png", "canvas.png", "source-evidence.png",
+        "canvas.png", "user-reference.png",
     ]
     assert [
         receipt["path"] for receipt in replacement_sheet["seedream"]["inputs"]
     ] == [
-        "work/global-reference-sheet/user-reference.png",
         "work/global-reference-sheet/canvas.png",
-        "work/global-reference-sheet/source-evidence.png",
+        "work/global-reference-sheet/user-reference.png",
     ]
     expected_image_urls = [
         "https://assets.invalid/global-reference-sheet/user-reference.png",
@@ -1201,7 +1308,9 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "codex-fusion")
+    project_id, project, _state = store.create(
+        _effective_request(fusion_agent="codex"), "codex-fusion",
+    )
     segment_dir = project / "work" / "segments" / "segment-001"
     segment_dir.mkdir(parents=True, exist_ok=True)
     source = segment_dir / "source.mp4"
@@ -1224,6 +1333,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a different visible person",
+                    "appearance_description": "an isolated different visible person",
                 },
                 "voice": {
                     "audio_reference": "Audio 1",
@@ -1245,6 +1355,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a replacement kitchen",
+                    "appearance_description": "an empty replacement kitchen",
                 },
             },
         },
@@ -1325,10 +1436,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
             },
             enhanced_index,
             replacement_sheet,
-            {
-            "fusion": {"agent": "codex"},
-            "replacement_guidance": None,
-        },
+            _effective_request(fusion_agent="codex"),
         ResearchLog(project),
         )
     )
@@ -1361,7 +1469,9 @@ def test_h3_barrier_never_submits_if_any_fusion_preparation_fails(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "h3-barrier")
+    project_id, project, _state = store.create(
+        _effective_request(), "h3-barrier",
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -1409,7 +1519,7 @@ def test_h3_without_user_image_uses_sheet_as_image_1_and_keeps_tile_authority(
     monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     project_id, project, _state = store.create(request, "sheet-only-image")
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -1424,6 +1534,7 @@ def test_h3_without_user_image_uses_sheet_as_image_1_and_keeps_tile_authority(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
                 },
             },
         },
@@ -1474,13 +1585,12 @@ def test_h3_without_user_image_uses_sheet_as_image_1_and_keeps_tile_authority(
         "spec_sha256": replacement_sheet["spec_sha256"],
     }]
     assert [path.name for path in seedream.calls[0]["images"]] == [
-        "canvas.png", "source-evidence.png",
+        "canvas.png",
     ]
     assert [
         receipt["path"] for receipt in replacement_sheet["seedream"]["inputs"]
     ] == [
         "work/global-reference-sheet/canvas.png",
-        "work/global-reference-sheet/source-evidence.png",
     ]
     authority = Pipeline._fusion_authority_block(
         enhanced_element_index,
@@ -1490,6 +1600,27 @@ def test_h3_without_user_image_uses_sheet_as_image_1_and_keeps_tile_authority(
     assert "- person-01 | REPLACE |" in authority
     assert "reference: Image 1, TILE_01 (row 1, column 1)" in authority
 
+    source = segment_dir / "source.mp4"
+    (segment_dir / "h3_prompt.txt").write_text(
+        "frozen prompt", encoding="utf-8",
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [(
+            {
+                "index": 1,
+                "duration_s": 5.0,
+                "join_mode": "hard_cut",
+                "source": source,
+            },
+            "frozen prompt",
+            muted,
+            "a" * 64,
+        )],
+        replacement_sheet=replacement_sheet,
+        request=request,
+    )
     prepared = pipeline._prepare_picsart_segment(
         project_id,
         project,
@@ -1517,7 +1648,7 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
     monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     project_id, project, _state = store.create(request, "unanchored-image")
     replacement = project / "inputs" / "replacement-image"
     replacement.write_bytes(b"replacement")
@@ -1582,6 +1713,28 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
     segment_dir.mkdir(parents=True, exist_ok=True)
     muted = segment_dir / "source-muted.mp4"
     muted.write_bytes(b"muted")
+    source = segment_dir / "source.mp4"
+    (segment_dir / "h3_prompt.txt").write_text(
+        "frozen prompt", encoding="utf-8",
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [(
+            {
+                "index": 1,
+                "duration_s": 5.0,
+                "join_mode": "hard_cut",
+                "source": source,
+            },
+            "frozen prompt",
+            muted,
+            "a" * 64,
+        )],
+        replacement=replacement,
+        replacement_sheet=replacement_sheet,
+        request=request,
+    )
 
     prepared = pipeline._prepare_picsart_segment(
         project_id,
@@ -1601,12 +1754,11 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
     assert registered == [muted]
 
 
-@pytest.mark.parametrize("voice_mode", ["none", "legacy", "multi"])
 def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
-    tmp_path: Path, monkeypatch: Any, voice_mode: str,
+    tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "480p", "aspect_ratio": "9:16"}}
+    request = _effective_request(resolution="480p", aspect_ratio="9:16")
     project_id, project, _state = store.create(request, "resume-only")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
     replacement = project / "inputs" / "replacement-image"
@@ -1658,72 +1810,56 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
             json.dumps(f"frozen prompt {segment['index']}"),
             encoding="utf-8",
         )
-    voice_state: dict[str, Any] = {}
-    if voice_mode == "legacy":
-        library = load_voice_library()
-        voice = library.voices[0]
-        voice_reference = project / "work" / "voice-reference.wav"
-        voice_reference.write_bytes(library.files[voice["voice_id"]].read_bytes())
-        voice_state = {
-            "voice_selection": {
-                "status": "selected",
-                "voice_id": voice["voice_id"],
-                "catalog_sha256": library.digest,
-                "selection_input_sha256": "0" * 64,
-                "asset_path": "work/voice-reference.wav",
-                "asset_sha256": voice["sha256"],
-                "features": dict(voice["features"]),
-                "source": dict(voice["source"]),
-            }
-        }
-    elif voice_mode == "multi":
-        library = load_voice_library()
-        voice_directory = project / "work" / "voice-references"
-        voice_directory.mkdir(parents=True)
-        references: list[dict[str, Any]] = []
-        for slot, voice in enumerate(library.voices[:3], 1):
-            asset_path = f"work/voice-references/audio-{slot:02d}.wav"
-            destination = project / asset_path
-            destination.write_bytes(
-                library.files[voice["voice_id"]].read_bytes(),
-            )
-            references.append({
-                "audio_reference": f"Audio {slot}",
-                "voice_id": voice["voice_id"],
-                "asset_path": asset_path,
-                "asset_sha256": voice["sha256"],
-                "features": library.model_line(voice["voice_id"]),
-            })
-        voice_state = {
-            "voice_references": references,
-            "object_replace": {
-                "input_sha256": "0" * 64,
-                "reference_sheet_prompt": "Render each assigned tile exactly once.",
+    library = load_voice_library()
+    voice_directory = project / "work" / "voice-references"
+    voice_directory.mkdir(parents=True)
+    references: list[dict[str, Any]] = []
+    for slot, voice in enumerate(library.voices[:3], 1):
+        asset_path = f"work/voice-references/audio-{slot:02d}.wav"
+        destination = project / asset_path
+        destination.write_bytes(
+            library.files[voice["voice_id"]].read_bytes(),
+        )
+        references.append({
+            "audio_reference": f"Audio {slot}",
+            "voice_id": voice["voice_id"],
+            "asset_path": asset_path,
+            "asset_sha256": voice["sha256"],
+            "features": library.model_line(voice["voice_id"]),
+        })
+    voice_state = {
+        "voice_references": references,
+        "object_replace": {
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "0" * 64,
+        },
+        "enhanced_element_index": {
+            "people": {
+                f"person-{slot:02d}": {
+                    "source_visual_description": f"source person {slot}",
+                    "occurrences": [
+                        {"segment_index": 1, "frame_orders": [1]},
+                        {"segment_index": 2, "frame_orders": [1]},
+                    ],
+                    "replacement": {
+                        "reason": "automatic",
+                        "source": "generated_variant",
+                        "target_visual_description": (
+                            f"replacement person {slot}"
+                        ),
+                        "appearance_description": (
+                            f"isolated replacement person {slot}"
+                        ),
+                    },
+                    "voice": dict(reference),
+                }
+                for slot, reference in enumerate(references, 1)
             },
-            "enhanced_element_index": {
-                "people": {
-                    f"person-{slot:02d}": {
-                        "source_visual_description": f"source person {slot}",
-                        "occurrences": [
-                            {"segment_index": 1, "frame_orders": [1]},
-                            {"segment_index": 2, "frame_orders": [1]},
-                        ],
-                        "replacement": {
-                            "reason": "automatic",
-                            "source": "generated_variant",
-                            "target_visual_description": (
-                                f"replacement person {slot}"
-                            ),
-                        },
-                        "voice": dict(reference),
-                    }
-                    for slot, reference in enumerate(references, 1)
-                },
-                "entities": {},
-                "scenes": {},
-                "relations": {},
-            },
-        }
+            "entities": {},
+            "scenes": {},
+            "relations": {},
+        },
+    }
     store.update(
         project_id,
         status="failed",
@@ -1733,25 +1869,6 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         segments=segments,
         project_progress={"status": "failed", "percent": 57, "stage": "pipeline_failed"},
         generation={"status": "failed", "stage": "pipeline_failed", "error": "failed"},
-        picsart_submission_receipts={
-            "version": 1,
-            "segments": {
-                "1": [{
-                    "segment_index": 1,
-                    "run_identity": "picsart",
-                    "request_sha256": "a" * 64,
-                    "status": "accepted",
-                    "task_id": "existing-task",
-                }],
-                "2": [{
-                    "segment_index": 2,
-                    "run_identity": "picsart",
-                    "request_sha256": "b" * 64,
-                    "status": "accepted",
-                    "task_id": "failed-task",
-                }],
-            },
-        },
         **voice_state,
     )
     accepted = (
@@ -1813,70 +1930,81 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         picsart=picsart,
         seedream=seedream,
     )
-    if voice_mode == "multi":
-        replacement_sheet, replacement_sheet_path = (
-            _materialize_test_replacement_sheet(
-                pipeline,
-                project_id,
-                project,
-                [dict(segment, analysis_paths=[]) for segment in segments],
-                voice_state["enhanced_element_index"],
-                replacement=replacement,
-            )
-        )
-        assert replacement_sheet_path == (
-            project / "work" / "global-reference-sheet"
-            / "reference-sheet.png"
-        )
-        assert len(seedream.calls) == 1
-        pipeline._freeze_h3_prepared_artifacts(
+    replacement_sheet, replacement_sheet_path = (
+        _materialize_test_replacement_sheet(
+            pipeline,
             project_id,
             project,
-            [
-                (
-                    dict(
-                        segment,
-                        source=(
-                            project / "work" / "segments"
-                            / f"{segment['index']:04d}" / "source.mp4"
-                        ),
-                    ),
-                    f"frozen prompt {segment['index']}",
-                    (
-                        project / "work" / "segments"
-                        / f"{segment['index']:04d}" / "source-muted.mp4"
-                    ),
-                    f"{segment['index']}" * 64,
-                )
-                for segment in segments
-            ],
+            [dict(segment, analysis_paths=[]) for segment in segments],
+            voice_state["enhanced_element_index"],
             replacement=replacement,
-            replacement_sheet=replacement_sheet,
-            request=request,
         )
-        state_with_manifest = store.read(project_id)
-        preparation_sha256 = Pipeline._json_sha256(
-            state_with_manifest["h3_prepared_artifacts"]
-        )
-        bound_ledger = json.loads(json.dumps(
-            state_with_manifest["picsart_submission_receipts"]
-        ))
-        bound_ledger["version"] = 2
-        for records in bound_ledger["segments"].values():
-            for receipt in records:
-                receipt["preparation_sha256"] = preparation_sha256
-        store.update(
-            project_id,
-            picsart_submission_receipts=bound_ledger,
-        )
-        pipeline.seedream = _RejectSeedream()
-        monkeypatch.setattr(
-            media,
-            "provider_reference_png",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("canonical user PNG must not be regenerated")
-            ),
-        )
+    )
+    assert replacement_sheet_path == (
+        project / "work" / "global-reference-sheet"
+        / "reference-sheet.png"
+    )
+    assert len(seedream.calls) == 1
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [
+            (
+                dict(
+                    segment,
+                    source=(
+                        project / "work" / "segments"
+                        / f"{segment['index']:04d}" / "source.mp4"
+                    ),
+                ),
+                f"frozen prompt {segment['index']}",
+                (
+                    project / "work" / "segments"
+                    / f"{segment['index']:04d}" / "source-muted.mp4"
+                ),
+                f"{segment['index']}" * 64,
+            )
+            for segment in segments
+        ],
+        replacement=replacement,
+        replacement_sheet=replacement_sheet,
+        request=request,
+    )
+    preparation_sha256 = Pipeline._json_sha256(
+        store.read(project_id)["h3_prepared_artifacts"]
+    )
+    store.update(
+        project_id,
+        picsart_submission_receipts={
+            "version": PICSART_RECEIPT_VERSION,
+            "segments": {
+                "1": [{
+                    "segment_index": 1,
+                    "run_identity": "picsart",
+                    "request_sha256": "a" * 64,
+                    "preparation_sha256": preparation_sha256,
+                    "status": "accepted",
+                    "task_id": "existing-task",
+                }],
+                "2": [{
+                    "segment_index": 2,
+                    "run_identity": "picsart",
+                    "request_sha256": "b" * 64,
+                    "preparation_sha256": preparation_sha256,
+                    "status": "accepted",
+                    "task_id": "failed-task",
+                }],
+            },
+        },
+    )
+    pipeline.seedream = _RejectSeedream()
+    monkeypatch.setattr(
+        media,
+        "provider_reference_png",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("canonical user PNG must not be regenerated")
+        ),
+    )
 
     pipeline.validate_r2v_resume(project_id)
     reconciled = store.read(project_id)["picsart_submission_receipts"]
@@ -1895,27 +2023,18 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         receipt["status"]
         for receipt in state["picsart_submission_receipts"]["segments"]["2"]
     ] == ["provider_failed", "accepted"]
-    expected_registered = {"source-muted.mp4"}
-    expected_audio_urls: list[str] = []
-    if voice_mode == "legacy":
-        expected_registered.add("provider-reference-resume.png")
-        expected_registered.add("voice-reference.wav")
-        expected_audio_urls = ["https://assets.invalid/voice-reference.wav"]
-    elif voice_mode == "multi":
-        expected_registered.update({
-            "audio-01.wav", "audio-02.wav", "audio-03.wav",
-            "reference-sheet.png",
-        })
-        expected_audio_urls = [
-            f"https://assets.invalid/audio-{slot:02d}.wav"
-            for slot in range(1, 4)
-        ]
-        assert picsart.submits[0]["image_urls"] == [
-            "https://assets.invalid/reference-sheet.png",
-        ]
-        assert len(seedream.calls) == 1
-    else:
-        expected_registered.add("provider-reference-resume.png")
+    expected_registered = {
+        "source-muted.mp4", "audio-01.wav", "audio-02.wav", "audio-03.wav",
+        "reference-sheet.png",
+    }
+    expected_audio_urls = [
+        f"https://assets.invalid/audio-{slot:02d}.wav"
+        for slot in range(1, 4)
+    ]
+    assert picsart.submits[0]["image_urls"] == [
+        "https://assets.invalid/reference-sheet.png",
+    ]
+    assert len(seedream.calls) == 1
     assert {path.name for path in registered} == expected_registered
     assert picsart.submits[0]["audio_urls"] == expected_audio_urls
     assert (project / "output" / "generated.mp4").is_file()
@@ -1933,7 +2052,9 @@ def test_resume_r2v_blocks_an_unknown_submit_receipt(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "unknown-submit")
+    project_id, project, _state = store.create(
+        _effective_request(), "unknown-submit",
+    )
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
     segment = {
         "index": 1,
@@ -2010,235 +2131,51 @@ def test_resume_r2v_blocks_an_unknown_submit_receipt(
         mediakit=object(),
         picsart=picsart,
     )
+    empty_index = {
+        "people": {}, "entities": {}, "scenes": {}, "relations": {},
+    }
+    replacement_sheet, _sheet_path = _materialize_test_replacement_sheet(
+        pipeline,
+        project_id,
+        project,
+        [{**segment, "source": segment_dir / "source.mp4"}],
+        empty_index,
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [(
+            {**segment, "source": segment_dir / "source.mp4"},
+            "frozen",
+            segment_dir / "source-muted.mp4",
+            "a" * 64,
+        )],
+        replacement_sheet=replacement_sheet,
+        request=_effective_request(),
+    )
+    preparation_sha256 = Pipeline._json_sha256(
+        store.read(project_id)["h3_prepared_artifacts"],
+    )
+    store.update(
+        project_id,
+        picsart_submission_receipts={
+            "version": PICSART_RECEIPT_VERSION,
+            "segments": {
+                "1": [{
+                    "segment_index": 1,
+                    "run_identity": "picsart",
+                    "request_sha256": "b" * 64,
+                    "preparation_sha256": preparation_sha256,
+                    "status": "unknown",
+                    "task_id": None,
+                }],
+            },
+        },
+    )
 
     with pytest.raises(ValueError, match="outcome is unknown"):
         pipeline.validate_r2v_resume(project_id)
     assert picsart.submits == []
-
-
-@pytest.mark.parametrize("result", [None, "{broken", json.dumps({})])
-def test_legacy_submit_attempt_without_a_proven_result_is_unknown(
-    tmp_path: Path,
-    result: str | None,
-) -> None:
-    store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create({}, "uncertain-legacy-submit")
-    attempt = (
-        project / "logs" / "picsart-submit"
-        / "segment-0001" / "attempt-1"
-    )
-    attempt.mkdir(parents=True)
-    (attempt / "input.json").write_text("{}", encoding="utf-8")
-    if result is not None:
-        (attempt / "output.json").write_text(result, encoding="utf-8")
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=object(),
-        picsart=_FlowPicsart(),
-    )
-
-    assert pipeline._has_unknown_submit_receipt(
-        project, "segment-0001",
-    ) is True
-
-
-def test_legacy_submit_attempt_with_explicit_rejection_is_retryable(
-    tmp_path: Path,
-) -> None:
-    store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create({}, "rejected-legacy-submit")
-    attempt = (
-        project / "logs" / "picsart-submit"
-        / "segment-0001" / "attempt-1"
-    )
-    attempt.mkdir(parents=True)
-    (attempt / "output.json").write_text(json.dumps({
-        "provider_record": {
-            "outcome": "rejected",
-            "task_id": None,
-            "response": {"status_code": 400},
-        },
-    }), encoding="utf-8")
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=object(),
-        picsart=_FlowPicsart(),
-    )
-
-    assert pipeline._has_unknown_submit_receipt(
-        project, "segment-0001",
-    ) is False
-
-
-def test_legacy_server_error_labeled_rejected_remains_unknown(
-    tmp_path: Path,
-) -> None:
-    store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create({}, "legacy-500")
-    attempt = (
-        project / "logs" / "picsart-submit"
-        / "segment-0001" / "attempt-1"
-    )
-    attempt.mkdir(parents=True)
-    (attempt / "output.json").write_text(json.dumps({
-        "provider_record": {
-            "outcome": "rejected",
-            "task_id": None,
-            "response": {"status_code": 500},
-        },
-    }), encoding="utf-8")
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=object(),
-        picsart=_FlowPicsart(),
-    )
-
-    assert pipeline._has_unknown_submit_receipt(
-        project, "segment-0001",
-    ) is True
-
-
-def test_mixed_ledger_keeps_legacy_accepted_task_for_unlisted_segment(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
-    project_id, project, _state = store.create(request, "mixed-receipts")
-    (project / "inputs" / "source.mp4").write_bytes(b"project-source")
-    segments = []
-    for index in (1, 2):
-        segment = {
-            "index": index,
-            "start_s": float(index - 1) * 5,
-            "end_s": float(index) * 5,
-            "duration_s": 5.0,
-            "dialogue": [],
-            "visual_prompt": f"visual-{index}",
-            "status": "failed",
-        }
-        segments.append(segment)
-        segment_dir = project / "work" / "segments" / f"{index:04d}"
-        segment_dir.mkdir(parents=True, exist_ok=True)
-        (segment_dir / "source.mp4").write_bytes(b"source")
-        (segment_dir / "source-muted.mp4").write_bytes(b"muted")
-        (segment_dir / "h3_prompt.txt").write_text(
-            f"prompt-{index}", encoding="utf-8",
-        )
-        for node, value in (
-            ("mute-reference-video", {}),
-            ("h3-max-r2v-prompt", f"prompt-{index}"),
-        ):
-            evidence = (
-                project / "logs" / node
-                / f"segment-{index:04d}" / "attempt-1"
-            )
-            evidence.mkdir(parents=True)
-            (evidence / "output.json").write_text(
-                json.dumps(value), encoding="utf-8",
-            )
-    accepted = (
-        project / "logs" / "picsart-submit"
-        / "segment-0001" / "attempt-1"
-    )
-    accepted.mkdir(parents=True)
-    (accepted / "output.json").write_text(json.dumps({
-        "value": "legacy-task-1",
-        "provider_record": {
-            "outcome": "accepted", "task_id": "legacy-task-1",
-        },
-    }), encoding="utf-8")
-    store.update(
-        project_id,
-        status="failed",
-        source_path="inputs/source.mp4",
-        segment_count=2,
-        segments=segments,
-        picsart_submission_receipts={
-            "version": 1,
-            "segments": {
-                "2": [{
-                    "segment_index": 2,
-                    "run_identity": "picsart-resume",
-                    "request_sha256": "c" * 64,
-                    "status": "provider_failed",
-                    "task_id": "new-task-2",
-                }],
-            },
-        },
-        project_progress={
-            "status": "failed", "percent": 57, "stage": "pipeline_failed",
-        },
-        generation={
-            "status": "failed", "stage": "pipeline_failed", "error": "failed",
-        },
-    )
-    monkeypatch.setattr(
-        media,
-        "probe",
-        lambda _path: {
-            "duration_s": 5.0,
-            "width": 1280,
-            "height": 720,
-            "has_audio": False,
-        },
-    )
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=object(),
-        picsart=_FlowPicsart(),
-    )
-
-    _project, prepared, _replacement, _sheet, _request, _voices = (
-        pipeline._load_r2v_resume(project_id)
-    )
-
-    assert prepared[0]["resume_task_id"] == "legacy-task-1"
-    assert prepared[1]["resume_task_id"] is None
-
-
-def test_mixed_ledger_legacy_task_failure_needs_no_state_transition(
-    tmp_path: Path,
-) -> None:
-    store = ProjectStore(tmp_path / "projects")
-    project_id, _project, _state = store.create({}, "mixed-task-failure")
-    ledger = {
-        "version": 1,
-        "segments": {
-            "2": [{
-                "segment_index": 2,
-                "run_identity": "picsart-resume",
-                "request_sha256": "c" * 64,
-                "status": "provider_failed",
-                "task_id": "new-task-2",
-            }],
-        },
-    }
-    store.update(project_id, picsart_submission_receipts=ledger)
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=object(),
-        picsart=_FlowPicsart(),
-    )
-
-    pipeline._mark_submission_task_failed(project_id, 1, "legacy-task-1")
-
-    assert store.read(project_id)["picsart_submission_receipts"] == ledger
 
 
 def test_same_language_translation_is_an_explicit_skipped_attempt(
@@ -2249,7 +2186,9 @@ def test_same_language_translation_is_an_explicit_skipped_attempt(
             raise AssertionError("same-language translation must not call DeepSeek")
 
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "request-2")
+    project_id, project, _state = store.create(
+        _effective_request(), "request-2",
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -2304,7 +2243,9 @@ def test_no_audio_skips_audio_analysis_without_creating_fake_media(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "request-no-audio")
+    project_id, project, _state = store.create(
+        _effective_request(), "request-no-audio",
+    )
     source = project / "inputs" / "source.mp4"
     source.write_bytes(b"silent-video")
     pipeline = Pipeline(
@@ -2428,7 +2369,9 @@ def test_nullable_object_replace_plan_is_compiled_without_a_quality_gate(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, _project, _state = store.create({}, "nullable-plan")
+    project_id, _project, _state = store.create(
+        _effective_request(), "nullable-plan",
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -2495,6 +2438,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
                     "target_visual_description": (
                         "a new woman with an angular face and a braided bob"
                     ),
+                    "appearance_description": (
+                        "one isolated woman with an angular face and braided bob"
+                    ),
                 },
             },
             "person-02": {
@@ -2506,6 +2452,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
                     "target_visual_description": (
                         "a different visible forearm with broader proportions, "
                         "warmer skin tone, and a small geometric birthmark"
+                    ),
+                    "appearance_description": (
+                        "one isolated broader forearm with warm skin and a birthmark"
                     ),
                 },
             },
@@ -2519,6 +2468,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
                     "source": "image_1",
                     "target_visual_description": (
                         "the black bear-shaped jewelry case shown in Image 1"
+                    ),
+                    "appearance_description": (
+                        "the isolated black bear-shaped jewelry case from Image 1"
                     ),
                 },
             },
@@ -2544,6 +2496,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
                     "source": "generated_variant",
                     "target_visual_description": (
                         "a bathroom with ribbed oak cabinets and terrazzo walls"
+                    ),
+                    "appearance_description": (
+                        "an empty bathroom with ribbed oak cabinets and terrazzo walls"
                     ),
                 },
             },
@@ -2651,6 +2606,7 @@ def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> Non
                 "replacement": {
                     "source": "generated_variant",
                     "target_visual_description": "one fixed new presenter design",
+                    "appearance_description": "one isolated new presenter design",
                 },
             },
         },
@@ -2661,6 +2617,7 @@ def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> Non
                 "replacement": {
                     "source": "image_1",
                     "target_visual_description": "the bear-shaped cup in Image 1",
+                    "appearance_description": "the isolated bear-shaped cup in Image 1",
                 },
             },
             "entity-02": {
@@ -2669,6 +2626,7 @@ def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> Non
                 "replacement": {
                     "source": "generated_variant",
                     "target_visual_description": "one fixed sculptural brass lamp",
+                    "appearance_description": "one isolated sculptural brass lamp",
                 },
             },
         },
@@ -2682,6 +2640,7 @@ def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> Non
                 "replacement": {
                     "source": "generated_variant",
                     "target_visual_description": "one fixed alternate warm kitchen",
+                    "appearance_description": "one empty alternate warm kitchen",
                 },
             },
         },
@@ -2725,6 +2684,7 @@ def test_fusion_authority_keeps_global_index_element_with_empty_occurrences() ->
                 "replacement": {
                     "source": "generated_variant",
                     "target_visual_description": "one fixed new product design",
+                    "appearance_description": "one isolated new product design",
                 },
             },
         },
@@ -2740,7 +2700,9 @@ def test_node_records_both_failed_attempts_and_process_streams(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create({}, "request-3")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-3",
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -2778,7 +2740,9 @@ def test_pipeline_keeps_raw_failure_in_logs_but_not_public_state(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "request-public-error")
+    project_id, project, _state = store.create(
+        _effective_request(), "request-public-error",
+    )
     source = project / "inputs" / "source.mp4"
     source.write_bytes(b"source")
     store.update(project_id, source_path="inputs/source.mp4", has_source=True)
@@ -2816,7 +2780,9 @@ def test_submit_node_never_retries_without_an_explicit_safe_policy(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create({}, "request-4")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-4",
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -2885,14 +2851,19 @@ def test_pre_picsart_resume_rejects_state_receipt_without_log_evidence(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, _project, _state = store.create({}, "state-only-receipt")
+    project_id, _project, _state = store.create(
+        _effective_request(), "state-only-receipt",
+    )
     store.update(
         project_id,
         status="failed",
         project_progress={
             "status": "failed", "percent": 57, "stage": "pipeline_failed",
         },
-        picsart_submission_receipts={"version": 1, "segments": {}},
+        picsart_submission_receipts={
+            "version": PICSART_RECEIPT_VERSION,
+            "segments": {},
+        },
     )
     pipeline = Pipeline(
         _settings(tmp_path),
@@ -2916,7 +2887,7 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
     failure: str,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     project_id, project, _state = store.create(request, f"preflight-{failure}")
     replacement = project / "inputs" / "replacement-image"
     replacement.write_bytes(b"replacement")
@@ -2936,6 +2907,7 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
                         else "generated_variant"
                     ),
                     "target_visual_description": "a different visible person",
+                    "appearance_description": "an isolated different visible person",
                 },
             },
         },
@@ -2953,8 +2925,8 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
         enhanced_element_index=enhanced_element_index,
         voice_references=[],
         object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": "a" * 64,
-            "reference_sheet_prompt": "Render the bound person in TILE_01.",
         },
     )
     items: list[dict[str, Any]] = []
@@ -2968,6 +2940,7 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
             "start_s": float(index - 1) * 5,
             "end_s": float(index) * 5,
             "duration_s": 5.0,
+            "join_mode": "hard_cut" if index == 1 else "continue",
             "source": source,
             "status": "running",
         })
@@ -3086,7 +3059,9 @@ def test_seedream_failure_happens_before_any_picsart_submit(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "seedream-preflight")
+    project_id, project, _state = store.create(
+        _effective_request(), "seedream-preflight",
+    )
     enhanced_element_index = {
         "people": {
             "person-01": {
@@ -3096,6 +3071,7 @@ def test_seedream_failure_happens_before_any_picsart_submit(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a different visible person",
+                    "appearance_description": "an isolated different visible person",
                 },
             },
         },
@@ -3153,7 +3129,9 @@ def test_stored_sheet_rejects_seedream_receipt_binding_drift(
     value: object,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, f"seedream-drift-{field}")
+    project_id, project, _state = store.create(
+        _effective_request(), f"seedream-drift-{field}",
+    )
     enhanced_element_index = {
         "people": {
             "person-01": {
@@ -3163,6 +3141,7 @@ def test_stored_sheet_rejects_seedream_receipt_binding_drift(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
                 },
             },
         },
@@ -3213,7 +3192,9 @@ def test_stored_sheet_rebuilds_tile_mapping_from_global_index(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "sheet-tile-rebind")
+    project_id, project, _state = store.create(
+        _effective_request(), "sheet-tile-rebind",
+    )
     enhanced_element_index = {
         "people": {
             "person-01": {
@@ -3223,6 +3204,7 @@ def test_stored_sheet_rebuilds_tile_mapping_from_global_index(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "one fixed new person",
+                    "appearance_description": "one isolated fixed new person",
                 },
             },
         },
@@ -3372,7 +3354,7 @@ def test_pre_picsart_resume_reuses_not_needed_sheet_and_keeps_upload_unbound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(request, "no-sheet-checkpoint")
     source = project / "inputs" / "source.mp4"
@@ -3501,7 +3483,7 @@ def test_pre_picsart_resume_submits_only_when_prepared_has_no_attempt_evidence(
     assert len(seedream.calls) == 1
     assert seedream.replay_calls == []
     assert [path.name for path in seedream.calls[0]["images"]] == [
-        "canvas.png", "source-evidence.png",
+        "canvas.png",
     ]
     assert len(downstream) == 1
     assert store.read(project_id)["replacement_sheet"]["status"] == "succeeded"
@@ -3568,7 +3550,10 @@ def test_pre_picsart_resume_rejects_existing_h3_manifest_before_writes(
     store, project_id, project, _sheet, _initial_seedream = (
         _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
     )
-    store.update(project_id, h3_prepared_artifacts={"version": 3})
+    store.update(
+        project_id,
+        h3_prepared_artifacts={"version": H3_PREPARED_ARTIFACTS_VERSION},
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -3587,7 +3572,17 @@ def test_pre_picsart_resume_rejects_existing_h3_manifest_before_writes(
     assert state_path.read_bytes() == state_before
 
 
-def _prepared_submit(project_id: str, project: Path) -> PreparedPicsartRequest:
+def _prepared_submit(
+    store: ProjectStore,
+    project_id: str,
+    project: Path,
+) -> PreparedPicsartRequest:
+    manifest = {
+        "version": H3_PREPARED_ARTIFACTS_VERSION,
+        "bindings": {},
+        "segments": {},
+    }
+    store.update(project_id, h3_prepared_artifacts=manifest)
     muted = project / "work" / "segments" / "0001" / "source-muted.mp4"
     muted.parent.mkdir(parents=True, exist_ok=True)
     muted.write_bytes(b"muted")
@@ -3620,7 +3615,7 @@ def _prepared_submit(project_id: str, project: Path) -> PreparedPicsartRequest:
         aspect_ratio="16:9",
         target_duration_s=5.0,
         request_sha256=Pipeline._json_sha256(payload),
-        preparation_sha256=None,
+        preparation_sha256=Pipeline._json_sha256(manifest),
     )
 
 
@@ -3628,7 +3623,9 @@ def test_submit_receipt_is_accepted_without_research_log_evidence(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "accepted-state-receipt")
+    project_id, project, _state = store.create(
+        _effective_request(), "accepted-state-receipt",
+    )
 
     class AcceptedPicsart:
         def submit(self, **_kwargs: Any) -> ProviderResult[str]:
@@ -3645,7 +3642,7 @@ def test_submit_receipt_is_accepted_without_research_log_evidence(
         mediakit=object(),
         picsart=AcceptedPicsart(),
     )
-    prepared = _prepared_submit(project_id, project)
+    prepared = _prepared_submit(store, project_id, project)
     pipeline._begin_submission_batch([prepared])
 
     result = pipeline._submit_prepared_picsart(prepared)
@@ -3660,11 +3657,15 @@ def test_submit_receipt_is_accepted_without_research_log_evidence(
 
 
 def test_picsart_receipt_v2_rejects_manifest_drift_before_task_reuse() -> None:
-    manifest = {"version": 3, "bindings": {}, "segments": {}}
+    manifest = {
+        "version": H3_PREPARED_ARTIFACTS_VERSION,
+        "bindings": {},
+        "segments": {},
+    }
     state = {
         "h3_prepared_artifacts": manifest,
         "picsart_submission_receipts": {
-            "version": 2,
+            "version": PICSART_RECEIPT_VERSION,
             "segments": {
                 "1": [{
                     "segment_index": 1,
@@ -3680,7 +3681,7 @@ def test_picsart_receipt_v2_rejects_manifest_drift_before_task_reuse() -> None:
     assert Pipeline._state_submission_task(state, 1) == (True, "paid-task")
 
     state["h3_prepared_artifacts"] = {
-        "version": 3,
+        "version": H3_PREPARED_ARTIFACTS_VERSION,
         "bindings": {"changed": True},
         "segments": {},
     }
@@ -3688,10 +3689,12 @@ def test_picsart_receipt_v2_rejects_manifest_drift_before_task_reuse() -> None:
         Pipeline._state_submission_task(state, 1)
 
 
-def test_h3_v3_rejects_legacy_picsart_receipt_ledger() -> None:
+def test_picsart_receipt_unsupported_version_is_rejected() -> None:
     state = {
         "h3_prepared_artifacts": {
-            "version": 3, "bindings": {}, "segments": {},
+            "version": H3_PREPARED_ARTIFACTS_VERSION,
+            "bindings": {},
+            "segments": {},
         },
         "picsart_submission_receipts": {
             "version": 1,
@@ -3707,7 +3710,7 @@ def test_h3_v3_rejects_legacy_picsart_receipt_ledger() -> None:
         },
     }
 
-    with pytest.raises(ValueError, match="requires Picsart receipt v2"):
+    with pytest.raises(ValueError, match="receipt ledger is invalid"):
         Pipeline._state_submission_task(state, 1)
 
 
@@ -3716,7 +3719,9 @@ def test_submit_response_then_accepted_state_write_failure_becomes_unknown(
     monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "accepted-write-crash")
+    project_id, project, _state = store.create(
+        _effective_request(), "accepted-write-crash",
+    )
     calls = 0
 
     class AcceptedPicsart:
@@ -3736,7 +3741,7 @@ def test_submit_response_then_accepted_state_write_failure_becomes_unknown(
         mediakit=object(),
         picsart=AcceptedPicsart(),
     )
-    prepared = _prepared_submit(project_id, project)
+    prepared = _prepared_submit(store, project_id, project)
     pipeline._begin_submission_batch([prepared])
     original_update = store.update
     failed_accepted_write = False
@@ -3837,7 +3842,9 @@ def test_resume_invalid_segment_structure_fails_before_any_submit(
     segments: list[dict[str, Any]],
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "invalid-resume-segments")
+    project_id, project, _state = store.create(
+        _effective_request(), "invalid-resume-segments",
+    )
     (project / "inputs" / "source.mp4").write_bytes(b"source")
     store.update(
         project_id,
@@ -3868,25 +3875,26 @@ def test_resume_invalid_segment_structure_fails_before_any_submit(
 
 
 @pytest.mark.parametrize(
-    ("manifest_version", "object_replace_version", "has_sheet"),
-    [(2, 2, False), (3, 1, True)],
+    "manifest_version",
+    [1, 2, 3, H3_PREPARED_ARTIFACTS_VERSION + 1],
 )
-def test_h3_manifest_rejects_object_replace_version_mismatch(
+def test_h3_manifest_unsupported_version_is_rejected(
     tmp_path: Path,
     manifest_version: int,
-    object_replace_version: int,
-    has_sheet: bool,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create({}, "version-mismatch")
+    _project_id, project, _state = store.create(
+        _effective_request(), "version-mismatch",
+    )
     enhanced_index = {
         "people": {}, "entities": {}, "scenes": {}, "relations": {},
     }
     object_replace = {
-        "version": object_replace_version,
+        "version": OBJECT_REPLACE_OUTPUT_VERSION,
         "input_sha256": "a" * 64,
     }
-    replacement_sheet = {"version": 1} if has_sheet else None
+    replacement_sheet = {"version": REPLACEMENT_SHEET_VERSION}
+    effective_request = _effective_request()
     bindings = {
         "enhanced_element_index_sha256": Pipeline._json_sha256(
             enhanced_index,
@@ -3894,17 +3902,18 @@ def test_h3_manifest_rejects_object_replace_version_mismatch(
         "voice_references_sha256": Pipeline._json_sha256([]),
         "object_replace_input_sha256": object_replace["input_sha256"],
         "replacement_image": None,
-        "output_request_sha256": Pipeline._json_sha256({}),
+        "output_request_sha256": Pipeline._json_sha256(
+            effective_request["output"]
+        ),
     }
-    if has_sheet:
-        bindings["replacement_sheet_sha256"] = Pipeline._json_sha256(
-            replacement_sheet,
-        )
+    bindings["replacement_sheet_sha256"] = Pipeline._json_sha256(
+        replacement_sheet,
+    )
     state = {
         "enhanced_element_index": enhanced_index,
         "voice_references": [],
         "object_replace": object_replace,
-        "effective_request": {},
+        "effective_request": effective_request,
         "replacement_sheet": replacement_sheet,
         "h3_prepared_artifacts": {
             "version": manifest_version,
@@ -3913,15 +3922,15 @@ def test_h3_manifest_rejects_object_replace_version_mismatch(
         },
     }
 
-    with pytest.raises(ValueError, match="Object Replace version"):
+    with pytest.raises(ValueError, match="manifest is invalid"):
         Pipeline._validated_h3_prepared_artifacts(project, state, [])
 
 
-def test_freeze_h3_v3_rejects_object_replace_v1(
+def test_freeze_h3_rejects_unsupported_object_replace_version(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     project_id, project, _state = store.create(request, "freeze-version")
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -3937,7 +3946,10 @@ def test_freeze_h3_v3_rejects_object_replace_v1(
         project_id,
         enhanced_element_index=enhanced_index,
         voice_references=[],
-        object_replace={"version": 1, "input_sha256": "a" * 64},
+        object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "a" * 64,
+        },
     )
     pipeline = Pipeline(
         _settings(tmp_path),
@@ -3957,12 +3969,20 @@ def test_freeze_h3_v3_rejects_object_replace_v1(
         )
     )
     assert replacement_sheet_path is None
+    store.update(
+        project_id,
+        object_replace={"version": 2, "input_sha256": "a" * 64},
+    )
 
-    with pytest.raises(ValueError, match="requires Object Replace v2"):
+    with pytest.raises(ValueError, match="requires Object Replace"):
         pipeline._freeze_h3_prepared_artifacts(
             project_id,
             project,
-            [({"index": 1, "source": source}, "prompt", muted, "b" * 64)],
+            [({
+                "index": 1,
+                "join_mode": "hard_cut",
+                "source": source,
+            }, "prompt", muted, "b" * 64)],
             replacement_sheet=replacement_sheet,
             request=request,
         )
@@ -3974,7 +3994,7 @@ def test_h3_manifest_rejects_new_voice_mapping_with_old_prompt_binding(
     monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     project_id, project, _state = store.create(request, "voice-binding")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
     segment_dir = project / "work" / "segments" / "0001"
@@ -3990,6 +4010,7 @@ def test_h3_manifest_rejects_new_voice_mapping_with_old_prompt_binding(
         "start_s": 0.0,
         "end_s": 5.0,
         "duration_s": 5.0,
+        "join_mode": "hard_cut",
         "dialogue": [],
         "visual_prompt": "visual",
         "status": "failed",
@@ -4084,7 +4105,7 @@ def test_h3_manifest_rejects_new_voice_mapping_with_old_prompt_binding(
 def test_h3_manifest_rejects_a_changed_replacement_image(
     tmp_path: Path,
 ) -> None:
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(request, "replacement-binding")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
@@ -4167,7 +4188,7 @@ def test_resume_rejects_frozen_replacement_sheet_drift_without_provider_calls(
     monkeypatch: Any,
     drift_target: str,
 ) -> None:
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(request, "sheet-drift")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
@@ -4207,6 +4228,7 @@ def test_resume_rejects_frozen_replacement_sheet_drift_without_provider_calls(
                         else "generated_variant"
                     ),
                     "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
                 },
             },
         },
@@ -4228,20 +4250,8 @@ def test_resume_rejects_frozen_replacement_sheet_drift_without_provider_calls(
         enhanced_element_index=enhanced_element_index,
         voice_references=[],
         object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": "a" * 64,
-            "reference_sheet_prompt": "Render TILE_01 once.",
-        },
-        picsart_submission_receipts={
-            "version": 1,
-            "segments": {
-                "1": [{
-                    "segment_index": 1,
-                    "run_identity": "picsart",
-                    "request_sha256": "b" * 64,
-                    "status": "provider_failed",
-                    "task_id": "failed-task",
-                }],
-            },
         },
         project_progress={
             "status": "failed", "percent": 57, "stage": "pipeline_failed",
@@ -4302,6 +4312,25 @@ def test_resume_rejects_frozen_replacement_sheet_drift_without_provider_calls(
         replacement_sheet=replacement_sheet,
         request=request,
     )
+    preparation_sha256 = Pipeline._json_sha256(
+        store.read(project_id)["h3_prepared_artifacts"]
+    )
+    store.update(
+        project_id,
+        picsart_submission_receipts={
+            "version": PICSART_RECEIPT_VERSION,
+            "segments": {
+                "1": [{
+                    "segment_index": 1,
+                    "run_identity": "picsart",
+                    "request_sha256": "b" * 64,
+                    "preparation_sha256": preparation_sha256,
+                    "status": "provider_failed",
+                    "task_id": "failed-task",
+                }],
+            },
+        },
+    )
     if drift_target == "sheet_bytes":
         replacement_sheet_path.write_bytes(
             replacement_sheet_path.read_bytes() + b"drift"
@@ -4341,11 +4370,13 @@ def test_resume_rejects_frozen_replacement_sheet_drift_without_provider_calls(
     assert registered == []
 
 
-def test_new_object_replace_state_cannot_use_legacy_manifest_fallback(
+def test_current_state_requires_h3_manifest(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create({}, "new-state-no-manifest")
+    project_id, project, _state = store.create(
+        _effective_request(), "new-state-no-manifest",
+    )
     (project / "inputs" / "source.mp4").write_bytes(b"source")
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -4357,8 +4388,15 @@ def test_new_object_replace_state_cannot_use_legacy_manifest_fallback(
         status="failed",
         source_path="inputs/source.mp4",
         segment_count=1,
-        segments=[{"index": 1, "duration_s": 5.0}],
-        object_replace={"input_sha256": "a" * 64},
+        segments=[{
+            "index": 1,
+            "duration_s": 5.0,
+            "join_mode": "hard_cut",
+        }],
+        object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "a" * 64,
+        },
         enhanced_element_index={
             "people": {}, "entities": {}, "scenes": {}, "relations": {},
         },
@@ -4376,17 +4414,17 @@ def test_new_object_replace_state_cannot_use_legacy_manifest_fallback(
         picsart=object(),
     )
 
-    with pytest.raises(ValueError, match="missing its artifact manifest"):
+    with pytest.raises(ValueError, match="missing the current H3 preparation"):
         pipeline.validate_r2v_resume(project_id)
 
 
-def _frozen_v3_after_global_preflight_failure(
+def _frozen_current_after_global_preflight_failure(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> tuple[ProjectStore, str, Path, list[dict[str, Any]], _FlowSeedream]:
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
+    request = _effective_request()
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create(request, "v3-preflight-failure")
+    project_id, project, _state = store.create(request, "current-preflight-failure")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
     enhanced_element_index = {
         "people": {
@@ -4400,6 +4438,7 @@ def _frozen_v3_after_global_preflight_failure(
                     "reason": "automatic",
                     "source": "generated_variant",
                     "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
                 },
             },
         },
@@ -4490,7 +4529,9 @@ def _frozen_v3_after_global_preflight_failure(
         )
 
     frozen_state = store.read(project_id)
-    assert frozen_state["h3_prepared_artifacts"]["version"] == 3
+    assert frozen_state["h3_prepared_artifacts"]["version"] == (
+        H3_PREPARED_ARTIFACTS_VERSION
+    )
     assert "picsart_submission_receipts" not in frozen_state
     assert register_calls
     assert not any(
@@ -4538,12 +4579,12 @@ def _install_resume_output_media(monkeypatch: Any) -> None:
     monkeypatch.setattr(media, "concat", concat)
 
 
-def test_v3_manifest_without_submission_evidence_can_resume_first_batch(
+def test_current_manifest_without_submission_evidence_can_resume_first_batch(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
     store, project_id, project, _items, initial_seedream = (
-        _frozen_v3_after_global_preflight_failure(tmp_path, monkeypatch)
+        _frozen_current_after_global_preflight_failure(tmp_path, monkeypatch)
     )
     _install_resume_output_media(monkeypatch)
     registered: list[Path] = []
@@ -4629,13 +4670,13 @@ def test_v3_manifest_without_submission_evidence_can_resume_first_batch(
 
 
 @pytest.mark.parametrize("damage", ["submit_directory", "partial_ledger"])
-def test_v3_first_submit_resume_rejects_any_ambiguous_submission_evidence(
+def test_current_first_submit_resume_rejects_ambiguous_submission_evidence(
     tmp_path: Path,
     monkeypatch: Any,
     damage: str,
 ) -> None:
     store, project_id, project, _items, _seedream = (
-        _frozen_v3_after_global_preflight_failure(tmp_path, monkeypatch)
+        _frozen_current_after_global_preflight_failure(tmp_path, monkeypatch)
     )
     if damage == "submit_directory":
         (project / "logs" / "picsart-resume-submit").mkdir(parents=True)
@@ -4644,7 +4685,7 @@ def test_v3_first_submit_resume_rejects_any_ambiguous_submission_evidence(
         store.update(
             project_id,
             picsart_submission_receipts={
-                "version": 2,
+                "version": PICSART_RECEIPT_VERSION,
                 "segments": {
                     "1": [{
                         "segment_index": 1,
@@ -4692,261 +4733,3 @@ def test_v3_first_submit_resume_rejects_any_ambiguous_submission_evidence(
 
     assert registered == []
     assert provider_calls == []
-
-
-def _legacy_v2_resume_project(
-    tmp_path: Path,
-    *,
-    has_upload: bool,
-    has_index_replacement: bool,
-    receipt_status: str,
-) -> tuple[ProjectStore, str, Path]:
-    request = {"output": {"resolution": "768p", "aspect_ratio": "16:9"}}
-    store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create(request, "legacy-v2-resume")
-    (project / "inputs" / "source.mp4").write_bytes(b"project-source")
-    replacement = project / "inputs" / "replacement-image"
-    if has_upload:
-        replacement.write_bytes(b"user-replacement")
-    segment_dir = project / "work" / "segments" / "0001"
-    segment_dir.mkdir(parents=True, exist_ok=True)
-    source = segment_dir / "source.mp4"
-    muted = segment_dir / "source-muted.mp4"
-    prompt = segment_dir / "h3_prompt.txt"
-    source.write_bytes(b"segment-source")
-    muted.write_bytes(b"segment-muted")
-    prompt.write_text("legacy frozen prompt", encoding="utf-8")
-    segment = {
-        "index": 1,
-        "start_s": 0.0,
-        "end_s": 5.0,
-        "duration_s": 5.0,
-        "join_mode": "hard_cut",
-        "visual_prompt": "legacy visual",
-        "dialogue": [],
-        "status": "failed",
-    }
-    enhanced_index = {
-        "people": {
-            "person-01": {
-                **(
-                    {
-                        "replacement": {
-                            "reason": "automatic",
-                            "source": "generated_variant",
-                            "target_visual_description": "a different person",
-                        },
-                    }
-                    if has_index_replacement
-                    else {"replacement": None}
-                ),
-            },
-        },
-        "entities": {},
-        "scenes": {},
-        "relations": {},
-    }
-    object_replace = {"version": 1, "input_sha256": "a" * 64}
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        codex=object(),
-        deepseek=object(),
-        mediakit=object(),
-        picsart=object(),
-        seedream=object(),
-    )
-    replacement_receipt = (
-        pipeline._project_artifact_receipt(
-            project, replacement, "inputs/replacement-image",
-        )
-        if has_upload
-        else None
-    )
-    manifest = {
-        "version": 2,
-        "bindings": {
-            "enhanced_element_index_sha256": Pipeline._json_sha256(
-                enhanced_index,
-            ),
-            "voice_references_sha256": Pipeline._json_sha256([]),
-            "object_replace_input_sha256": object_replace["input_sha256"],
-            "replacement_image": replacement_receipt,
-            "output_request_sha256": Pipeline._json_sha256(request["output"]),
-        },
-        "segments": {
-            "1": {
-                "segment_index": 1,
-                "source_video": pipeline._project_artifact_receipt(
-                    project, source, "work/segments/0001/source.mp4",
-                ),
-                "muted_video": pipeline._project_artifact_receipt(
-                    project, muted, "work/segments/0001/source-muted.mp4",
-                ),
-                "prompt": pipeline._project_artifact_receipt(
-                    project, prompt, "work/segments/0001/h3_prompt.txt",
-                ),
-                "fusion_input_sha256": "b" * 64,
-                "segment_metadata_sha256": Pipeline._json_sha256({
-                    "index": 1,
-                    "start_s": 0.0,
-                    "end_s": 5.0,
-                    "duration_s": 5.0,
-                    "join_mode": "hard_cut",
-                }),
-            },
-        },
-    }
-    task_id = (
-        "legacy-task"
-        if receipt_status == "accepted"
-        else "failed-task" if receipt_status == "provider_failed" else None
-    )
-    store.update(
-        project_id,
-        status="failed",
-        source_path="inputs/source.mp4",
-        **(
-            {"replacement_image_path": "inputs/replacement-image"}
-            if has_upload
-            else {}
-        ),
-        segment_count=1,
-        segments=[segment],
-        enhanced_element_index=enhanced_index,
-        voice_references=[],
-        object_replace=object_replace,
-        h3_prepared_artifacts=manifest,
-        picsart_submission_receipts={
-            "version": 1,
-            "segments": {
-                "1": [{
-                    "segment_index": 1,
-                    "run_identity": "picsart",
-                    "request_sha256": "c" * 64,
-                    "status": receipt_status,
-                    "task_id": task_id,
-                }],
-            },
-        },
-        project_progress={
-            "status": "failed", "percent": 57, "stage": "pipeline_failed",
-        },
-        generation={
-            "status": "failed", "stage": "pipeline_failed", "error": "failed",
-        },
-    )
-    return store, project_id, project
-
-
-@pytest.mark.parametrize(
-    ("has_upload", "has_index_replacement", "receipt_status"),
-    [
-        (True, False, "provider_failed"),
-        (True, False, "rejected"),
-        (False, True, "provider_failed"),
-        (False, True, "rejected"),
-    ],
-)
-def test_legacy_v2_replacement_state_cannot_create_a_new_paid_task(
-    tmp_path: Path,
-    monkeypatch: Any,
-    has_upload: bool,
-    has_index_replacement: bool,
-    receipt_status: str,
-) -> None:
-    store, project_id, _project = _legacy_v2_resume_project(
-        tmp_path,
-        has_upload=has_upload,
-        has_index_replacement=has_index_replacement,
-        receipt_status=receipt_status,
-    )
-    _install_resume_output_media(monkeypatch)
-    registered: list[Path] = []
-    picsart = _FlowPicsart()
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, path: (
-            registered.append(path) or "https://assets.invalid/value"
-        ),
-        codex=object(),
-        deepseek=object(),
-        mediakit=object(),
-        picsart=picsart,
-        seedream=object(),
-    )
-
-    with pytest.raises(ValueError, match="create a new H3 v3 project"):
-        pipeline.resume_r2v(project_id)
-
-    assert registered == []
-    assert picsart.submits == []
-    assert picsart.poll_counts == {}
-
-
-def test_legacy_v2_replacement_state_with_accepted_task_only_polls(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    store, project_id, project = _legacy_v2_resume_project(
-        tmp_path,
-        has_upload=True,
-        has_index_replacement=True,
-        receipt_status="accepted",
-    )
-    _install_resume_output_media(monkeypatch)
-    picsart = _FlowPicsart()
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda *_args: (_ for _ in ()).throw(
-            AssertionError("accepted legacy task must not register assets")
-        ),
-        codex=object(),
-        deepseek=object(),
-        mediakit=object(),
-        picsart=picsart,
-        seedream=object(),
-    )
-
-    pipeline.validate_r2v_resume(project_id)
-    pipeline.resume_r2v(project_id)
-
-    assert picsart.submits == []
-    assert picsart.poll_counts == {"legacy-task": 1}
-    assert (project / "output" / "generated.mp4").is_file()
-    assert not (project / "logs" / "picsart-resume-submit").exists()
-
-
-def test_legacy_v2_without_any_replacement_can_retry_a_new_paid_task(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    store, project_id, _project = _legacy_v2_resume_project(
-        tmp_path,
-        has_upload=False,
-        has_index_replacement=False,
-        receipt_status="rejected",
-    )
-    _install_resume_output_media(monkeypatch)
-    registered: list[Path] = []
-    picsart = _FlowPicsart()
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, path: (
-            registered.append(path) or f"https://assets.invalid/{path.name}"
-        ),
-        codex=object(),
-        deepseek=object(),
-        mediakit=object(),
-        picsart=picsart,
-        seedream=object(),
-    )
-
-    pipeline.resume_r2v(project_id)
-
-    assert len(picsart.submits) == 1
-    assert [path.name for path in registered] == ["source-muted.mp4"]

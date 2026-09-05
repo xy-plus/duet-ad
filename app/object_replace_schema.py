@@ -11,13 +11,17 @@ from app.fusion_schema import canonical_input
 
 
 OBJECT_REPLACE_OUTPUT_NAME = "duet.object-replace-output"
-OBJECT_REPLACE_OUTPUT_VERSION = 2
+OBJECT_REPLACE_OUTPUT_VERSION = 3
 MAX_REFERENCE_AUDIO = 3
 
 _ELEMENT_CATEGORIES = ("people", "entities", "scenes")
 _INDEX_KEYS = {*_ELEMENT_CATEGORIES, "relations"}
 _PATCH_KEYS = {"matches_user_request", "replacement"}
-_REPLACEMENT_KEYS = {"source", "target_visual_description"}
+_REPLACEMENT_KEYS = {
+    "source",
+    "target_visual_description",
+    "appearance_description",
+}
 _REPLACEMENT_SOURCES = {"image_1", "generated_variant"}
 
 
@@ -99,24 +103,27 @@ def _catalog_ids(voice_ids: Collection[str]) -> tuple[str, ...]:
 
 def _replacement_schema(
     *,
-    has_user_image: bool,
+    allow_user_image_binding: bool,
     voice_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     replacement_sources = (
-        _REPLACEMENT_SOURCES if has_user_image else {"generated_variant"}
+        _REPLACEMENT_SOURCES
+        if allow_user_image_binding
+        else {"generated_variant"}
     )
     properties: dict[str, dict[str, Any]] = {
         "source": {"type": "string", "enum": sorted(replacement_sources)},
         "target_visual_description": {"type": "string"},
+        "appearance_description": {"type": "string"},
     }
     replacement = _closed_object(properties)
     patch_properties: dict[str, dict[str, Any]] = {
         "matches_user_request": (
             {"type": "boolean"}
-            if has_user_image
+            if allow_user_image_binding
             else {"type": "boolean", "enum": [False]}
         ),
-        "replacement": {"anyOf": [replacement, {"type": "null"}]},
+        "replacement": replacement,
     }
     if voice_ids is not None:
         patch_properties["voice_id"] = {
@@ -126,7 +133,7 @@ def _replacement_schema(
             ],
         }
     patch_schema = _closed_object(patch_properties)
-    if has_user_image:
+    if allow_user_image_binding:
         image_patch_properties = copy.deepcopy(patch_properties)
         image_patch_properties["matches_user_request"] = {
             "type": "boolean",
@@ -142,9 +149,9 @@ def _replacement_schema(
             "type": "boolean",
             "enum": [False],
         }
-        generated_patch_properties["replacement"]["anyOf"][0]["properties"][
-            "source"
-        ]["enum"] = ["generated_variant"]
+        generated_patch_properties["replacement"]["properties"]["source"][
+            "enum"
+        ] = ["generated_variant"]
         patch_schema["anyOf"] = [
             _closed_object(image_patch_properties),
             _closed_object(generated_patch_properties),
@@ -167,14 +174,19 @@ def object_replace_schema(
         raise ValueError("object-replace replacement set is invalid")
     catalog_ids = _catalog_ids(voice_ids)
     input_sha256 = hashlib.sha256(canonical_input(payload)).hexdigest()
-    has_user_image = payload.get("has_user_image") is True
+    user_instruction = payload.get("user_replacement_instruction")
+    allow_user_image_binding = (
+        payload.get("has_user_image") is True
+        and isinstance(user_instruction, str)
+        and bool(user_instruction.strip())
+    )
 
     category_schemas: dict[str, dict[str, Any]] = {}
     for category in _ELEMENT_CATEGORIES:
         properties: dict[str, dict[str, Any]] = {}
         for stable_id in element_ids[category]:
             patch_schema = _replacement_schema(
-                has_user_image=has_user_image,
+                allow_user_image_binding=allow_user_image_binding,
                 voice_ids=catalog_ids if category == "people" else None,
             )
             properties[stable_id] = patch_schema
@@ -184,7 +196,6 @@ def object_replace_schema(
         "schema": {"type": "string", "enum": [OBJECT_REPLACE_OUTPUT_NAME]},
         "version": {"type": "integer", "enum": [OBJECT_REPLACE_OUTPUT_VERSION]},
         "input_sha256": {"type": "string", "enum": [input_sha256]},
-        "reference_sheet_prompt": {"type": "string"},
         **category_schemas,
     }
     return _closed_object(properties), input_sha256
@@ -192,9 +203,7 @@ def object_replace_schema(
 
 def _normalize_replacement(
     value: object,
-) -> dict[str, str] | None:
-    if value is None:
-        return None
+) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != _REPLACEMENT_KEYS:
         raise ValueError("object-replace replacement is invalid")
     source = value["source"]
@@ -203,9 +212,16 @@ def _normalize_replacement(
     description = value["target_visual_description"]
     if not isinstance(description, str):
         raise ValueError("object-replace target description is invalid")
+    appearance_description = value["appearance_description"]
+    if not isinstance(appearance_description, str):
+        raise ValueError("object-replace appearance description is invalid")
+    appearance_description = appearance_description.strip()
+    if not appearance_description:
+        raise ValueError("object-replace appearance description is empty")
     return {
         "source": source,
         "target_visual_description": description,
+        "appearance_description": appearance_description,
     }
 
 
@@ -225,25 +241,18 @@ def normalize_object_replace(
         "schema",
         "version",
         "input_sha256",
-        "reference_sheet_prompt",
         *_ELEMENT_CATEGORIES,
     }
     if not isinstance(value, dict) or set(value) != expected_top_level:
         raise ValueError("object-replace output is invalid")
     if (
         value["schema"] != OBJECT_REPLACE_OUTPUT_NAME
-        or isinstance(value["version"], bool)
+        or type(value["version"]) is not int
         or value["version"] != OBJECT_REPLACE_OUTPUT_VERSION
         or value["input_sha256"] != input_sha256
     ):
         raise ValueError("object-replace output is not bound to its input")
-    reference_sheet_prompt = value["reference_sheet_prompt"]
-    if not isinstance(reference_sheet_prompt, str):
-        raise ValueError("object-replace reference sheet prompt is invalid")
-
-    normalized: dict[str, Any] = {
-        "reference_sheet_prompt": reference_sheet_prompt,
-    }
+    normalized: dict[str, Any] = {}
     image_1_locations: list[tuple[str, str]] = []
     selected_voice_ids: set[str] = set()
     for category in _ELEMENT_CATEGORIES:
@@ -265,16 +274,15 @@ def normalize_object_replace(
             if not isinstance(matches_user_request, bool):
                 raise ValueError("object-replace match flag is invalid")
             replacement = _normalize_replacement(patch["replacement"])
-            uses_image_1 = (
-                replacement is not None and replacement["source"] == "image_1"
-            )
+            uses_image_1 = replacement["source"] == "image_1"
+            if matches_user_request != uses_image_1:
+                raise ValueError(
+                    "object-replace match flag conflicts with replacement source"
+                )
             if uses_image_1:
                 image_1_locations.append((category, stable_id))
             normalized_patch: dict[str, Any] = {
-                # The media binding is authoritative.  Reconcile the model's
-                # redundant flag instead of turning a usable output into a
-                # semantic quality gate.
-                "matches_user_request": uses_image_1,
+                "matches_user_request": matches_user_request,
                 "replacement": replacement,
             }
             if category == "people":
@@ -294,17 +302,10 @@ def normalize_object_replace(
                     selected_voice_ids.add(normalized_voice_id)
                 normalized_patch["voice_id"] = normalized_voice_id
             normalized[category][stable_id] = normalized_patch
-    if not has_user_image or len(image_1_locations) != 1:
-        # An absent or ambiguous user-image binding cannot safely be guessed.
-        # Keep every replacement usable as a generated variant instead of
-        # blocking the project or arbitrarily assigning the user image.
-        for category, stable_id in image_1_locations:
-            normalized_patch = normalized[category][stable_id]
-            normalized_patch["replacement"] = {
-                **normalized_patch["replacement"],
-                "source": "generated_variant",
-            }
-            normalized_patch["matches_user_request"] = False
+    requires_image_1 = has_user_image and bool(user_instruction.strip())
+    expected_image_1_count = 1 if requires_image_1 else 0
+    if len(image_1_locations) != expected_image_1_count:
+        raise ValueError("object-replace user-image binding count is invalid")
     return normalized
 
 
@@ -316,10 +317,7 @@ def merge_object_replace_index(
     """Merge a normalized patch without exposing source facts to model edits."""
     element_ids = _element_ids(original)
     patch_keys = set(patch) if isinstance(patch, dict) else set()
-    if patch_keys not in (
-        set(_ELEMENT_CATEGORIES),
-        {*_ELEMENT_CATEGORIES, "reference_sheet_prompt"},
-    ):
+    if patch_keys != set(_ELEMENT_CATEGORIES):
         raise ValueError("object-replace patch root is invalid")
     if not isinstance(voice_metadata_by_id, Mapping):
         raise ValueError("object-replace voice metadata is invalid")
@@ -343,20 +341,15 @@ def merge_object_replace_index(
             matches_user_request = item["matches_user_request"]
             if not isinstance(matches_user_request, bool):
                 raise ValueError("object-replace match flag is invalid")
-            replacement = item["replacement"]
-            if replacement is None:
-                merged[category][stable_id]["replacement"] = None
-            else:
-                normalized_replacement = _normalize_replacement(replacement)
-                assert normalized_replacement is not None
-                merged[category][stable_id]["replacement"] = {
-                    "reason": (
-                        "user_requested"
-                        if matches_user_request
-                        else "automatic"
-                    ),
-                    **normalized_replacement,
-                }
+            normalized_replacement = _normalize_replacement(
+                item["replacement"],
+            )
+            merged[category][stable_id]["replacement"] = {
+                "reason": (
+                    "user_requested" if matches_user_request else "automatic"
+                ),
+                **normalized_replacement,
+            }
             if category == "people":
                 voice_id = item["voice_id"]
                 if (

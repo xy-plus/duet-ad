@@ -25,6 +25,9 @@ _SAFE_PROVIDER_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SAFE_CONTENT_TYPE_RE = re.compile(r"^[a-z0-9.+-]{1,64}/[a-z0-9.+-]{1,64}$")
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SEEDREAM_OUTPUT_SIZE = "2048x2048"
+SEEDREAM_OUTPUT_WIDTH = 2048
+SEEDREAM_OUTPUT_HEIGHT = 2048
 _SAFE_REJECT_STATUS_CODES = frozenset(
     code for code in range(400, 500) if code not in {408, 409, 425, 429}
 )
@@ -151,6 +154,12 @@ def _validated_image_media_type(payload: bytes) -> str:
     decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if decoded is None or decoded.size < 1:
         raise ValueError("image result cannot be fully decoded")
+    height, width = decoded.shape[:2]
+    if (width, height) != (SEEDREAM_OUTPUT_WIDTH, SEEDREAM_OUTPUT_HEIGHT):
+        raise ValueError(
+            "image result dimensions must be "
+            f"{SEEDREAM_OUTPUT_WIDTH}x{SEEDREAM_OUTPUT_HEIGHT}"
+        )
     return media_type
 
 
@@ -225,7 +234,8 @@ def _decode_response(response: httpx.Response) -> tuple[bytes, str]:
     except (binascii.Error, TypeError, ValueError):
         raise SeedreamError(
             "provider_protocol_error",
-            "Seedream response does not contain one valid base64 image",
+            "Seedream response must contain exactly one complete "
+            f"{SEEDREAM_OUTPUT_SIZE} base64 image",
         ) from None
     return raw, media_type
 
@@ -300,11 +310,13 @@ class SeedreamClient:
         request_sha256: str,
     ) -> None:
         if (
-            value.get("version") != 1
+            type(value.get("version")) is not int
+            or value.get("version") != 1
             or value.get("request_sha256") != request_sha256
             or value.get("model") != request_binding["model"]
             or value.get("prompt_sha256") != request_binding["prompt_sha256"]
             or value.get("input_sha256") != request_binding["input_sha256"]
+            or value.get("size") != request_binding["size"]
         ):
             raise ValueError("Seedream durable receipt does not match the request")
 
@@ -316,9 +328,11 @@ class SeedreamClient:
         model = receipt.get("model")
         prompt_sha256 = receipt.get("prompt_sha256")
         input_sha256 = receipt.get("input_sha256")
+        size = receipt.get("size")
         request_sha256 = receipt.get("request_sha256")
         if (
-            receipt.get("version") != 1
+            type(receipt.get("version")) is not int
+            or receipt.get("version") != 1
             or receipt.get("provider") != "ark_seedream"
             or not isinstance(endpoint, str)
             or not endpoint.startswith("https://")
@@ -333,6 +347,7 @@ class SeedreamClient:
                 not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
                 for value in input_sha256
             )
+            or size != SEEDREAM_OUTPUT_SIZE
             or not isinstance(request_sha256, str)
             or _SHA256_RE.fullmatch(request_sha256) is None
         ):
@@ -343,6 +358,7 @@ class SeedreamClient:
             "model": model,
             "prompt_sha256": prompt_sha256,
             "input_sha256": input_sha256,
+            "size": size,
             "response_format": "b64_json",
             "watermark": False,
         }
@@ -356,6 +372,7 @@ class SeedreamClient:
                 "model": model,
                 "prompt_sha256": prompt_sha256,
                 "input_sha256": list(input_sha256),
+                "size": size,
                 "response_format": "b64_json",
                 "watermark": False,
             },
@@ -367,7 +384,8 @@ class SeedreamClient:
     def _validate_claim(claim_path: Path, request_sha256: str) -> None:
         claim = _read_json(claim_path)
         if (
-            claim.get("version") != 1
+            type(claim.get("version")) is not int
+            or claim.get("version") != 1
             or claim.get("kind") != "seedream_paid_post"
             or claim.get("request_sha256") != request_sha256
         ):
@@ -382,12 +400,15 @@ class SeedreamClient:
     ) -> tuple[bytes, dict[str, Any]]:
         marker = _read_json(marker_path)
         if (
-            marker.get("version") != 1
+            type(marker.get("version")) is not int
+            or marker.get("version") != 1
             or marker.get("kind") != "seedream_response"
             or marker.get("request_sha256") != request_sha256
             or marker.get("result_file") != result_path.name
             or not isinstance(marker.get("result_sha256"), str)
             or not isinstance(marker.get("result_bytes"), int)
+            or marker.get("width") != SEEDREAM_OUTPUT_WIDTH
+            or marker.get("height") != SEEDREAM_OUTPUT_HEIGHT
         ):
             raise ValueError("Seedream response marker is invalid")
         try:
@@ -491,6 +512,8 @@ class SeedreamClient:
                     "bytes": marker["result_bytes"],
                     "sha256": marker["result_sha256"],
                     "media_type": marker["media_type"],
+                    "width": marker["width"],
+                    "height": marker["height"],
                 }
             },
         }
@@ -626,6 +649,8 @@ class SeedreamClient:
                     "result_bytes": len(raw_result),
                     "result_sha256": result_sha256,
                     "media_type": media_type,
+                    "width": SEEDREAM_OUTPUT_WIDTH,
+                    "height": SEEDREAM_OUTPUT_HEIGHT,
                     "received_at_unix_ns": time.time_ns(),
                     "recovered_from": "durable_raw_result",
                 }
@@ -731,6 +756,7 @@ class SeedreamClient:
             "model": self.settings.seedream_model,
             "prompt_sha256": prompt_sha256,
             "input_sha256": input_sha256,
+            "size": SEEDREAM_OUTPUT_SIZE,
             "response_format": "b64_json",
             "watermark": False,
         }
@@ -746,6 +772,7 @@ class SeedreamClient:
                 "model": self.settings.seedream_model,
                 "prompt_sha256": prompt_sha256,
                 "input_receipts": input_receipts,
+                "size": SEEDREAM_OUTPUT_SIZE,
                 "response_format": "b64_json",
                 "watermark": False,
             },
@@ -759,10 +786,12 @@ class SeedreamClient:
             "model": self.settings.seedream_model,
             "prompt_sha256": prompt_sha256,
             "input_sha256": input_sha256,
+            "size": SEEDREAM_OUTPUT_SIZE,
         }
         payload: dict[str, Any] = {
             "model": self.settings.seedream_model,
             "prompt": prompt,
+            "size": SEEDREAM_OUTPUT_SIZE,
             "response_format": "b64_json",
             "watermark": False,
         }
@@ -917,7 +946,8 @@ class SeedreamClient:
             try:
                 existing_claim = _read_json(claim_path)
                 if (
-                    existing_claim.get("version") != 1
+                    type(existing_claim.get("version")) is not int
+                    or existing_claim.get("version") != 1
                     or existing_claim.get("kind") != "seedream_paid_post"
                     or existing_claim.get("request_sha256") != request_sha256
                 ):
@@ -1111,6 +1141,8 @@ class SeedreamClient:
             "result_bytes": len(raw_result),
             "result_sha256": result_sha256,
             "media_type": media_type,
+            "width": SEEDREAM_OUTPUT_WIDTH,
+            "height": SEEDREAM_OUTPUT_HEIGHT,
             "received_at_unix_ns": time.time_ns(),
         }
         try:
@@ -1153,6 +1185,8 @@ class SeedreamClient:
                             "bytes": len(raw_result),
                             "sha256": result_sha256,
                             "media_type": media_type,
+                            "width": SEEDREAM_OUTPUT_WIDTH,
+                            "height": SEEDREAM_OUTPUT_HEIGHT,
                         }
                     },
                 },
@@ -1172,6 +1206,8 @@ class SeedreamClient:
                     "bytes": len(raw_result),
                     "sha256": result_sha256,
                     "media_type": media_type,
+                    "width": SEEDREAM_OUTPUT_WIDTH,
+                    "height": SEEDREAM_OUTPUT_HEIGHT,
                 }
             },
         }

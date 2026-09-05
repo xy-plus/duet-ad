@@ -87,11 +87,25 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
     if (
         not isinstance(raw, dict)
-        or not {"schema", "version", "voices"}.issubset(raw)
+        or set(raw) != {"schema", "version", "label_policy", "voices"}
     ):
         raise ValueError("voice catalog root is invalid")
-    if raw["schema"] != VOICE_CATALOG_NAME or raw["version"] != VOICE_CATALOG_VERSION:
+    if (
+        raw["schema"] != VOICE_CATALOG_NAME
+        or type(raw["version"]) is not int
+        or raw["version"] != VOICE_CATALOG_VERSION
+    ):
         raise ValueError("voice catalog identity is invalid")
+    label_policy = raw["label_policy"]
+    if (
+        not isinstance(label_policy, dict)
+        or set(label_policy) != {"source_truth", "personality", "identity"}
+        or any(
+            not isinstance(value, str) or not value or value != value.strip()
+            for value in label_policy.values()
+        )
+    ):
+        raise ValueError("voice catalog label policy is invalid")
     voices = raw["voices"]
     if not isinstance(voices, list) or not voices:
         raise ValueError("voice catalog must contain at least one asset")
@@ -104,7 +118,7 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
             "voice_id", "file", "sha256", "duration_s", "media_type",
             "source", "features",
         }
-        if not isinstance(value, dict) or not required_keys.issubset(value):
+        if not isinstance(value, dict) or set(value) != required_keys:
             raise ValueError(f"voice catalog entry {index} is invalid")
         voice_id = _non_empty_string(value["voice_id"], "voice_id")
         if voice_id in ids:
@@ -183,6 +197,7 @@ def normalize_voice_selection(
         raise ValueError("voice selection output is invalid")
     if (
         value["schema"] != VOICE_SELECTION_OUTPUT_NAME
+        or type(value["version"]) is not int
         or value["version"] != VOICE_SELECTION_OUTPUT_VERSION
         or value["input_sha256"] != input_sha256
         or value["voice_id"] not in voice_ids

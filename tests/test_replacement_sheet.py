@@ -11,87 +11,64 @@ import pytest
 
 from app.replacement_sheet import (
     REPLACEMENT_SHEET_HEIGHT,
+    REPLACEMENT_SHEET_SPEC_VERSION,
     REPLACEMENT_SHEET_WIDTH,
     build_replacement_sheet_spec,
     finalize_replacement_sheet,
     materialize_replacement_sheet_inputs,
     replacement_sheet_spec_sha256,
+    validate_replacement_sheet_spec,
 )
 
 
-def _write_png(path: Path, color: tuple[int, int, int]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image = np.full((72, 128, 3), color, dtype=np.uint8)
-    encoded, payload = cv2.imencode(".png", image)
-    assert encoded
-    path.write_bytes(payload.tobytes())
-    return path
-
-
 def _replacement(
-    target: str,
+    appearance: str,
     *,
     source: str = "generated_variant",
+    target: str = "TARGET_ACTION_RELATION_SENTINEL",
     occurrences: object = None,
 ) -> dict[str, object]:
     return {
-        "source_visual_description": f"source for {target}",
-        "occurrences": [] if occurrences is None else occurrences,
+        "source_visual_description": "SOURCE_VISUAL_SENTINEL",
+        "occurrences": (
+            ["OCCURRENCE_SENTINEL"] if occurrences is None else occurrences
+        ),
         "replacement": {
             "source": source,
             "target_visual_description": target,
+            "appearance_description": appearance,
         },
     }
 
 
-def test_spec_is_globally_ordered_without_guessing_missing_occurrences(
-    tmp_path: Path,
-) -> None:
+def test_v2_spec_is_globally_ordered_and_appearance_only(tmp_path: Path) -> None:
     project = tmp_path / "project"
-    first = _write_png(project / "work/segments/0001/analysis-01.png", (10, 20, 30))
-    second = _write_png(project / "work/segments/0002/analysis-01.png", (40, 50, 60))
-    third = _write_png(project / "work/segments/0002/analysis-02.png", (70, 80, 90))
-    prepared = [
-        {"index": 2, "analysis_paths": [second, third]},
-        {"index": 1, "analysis_paths": [first]},
-    ]
+    project.mkdir()
     enhanced = {
         "people": {
-            "person-10": _replacement(
-                "new tenth person",
-                occurrences=[{"segment_index": 999, "frame_orders": [1]}],
-            ),
+            "person-10": _replacement("silver braided bob and oval face"),
             "person-03": {"replacement": None},
             "person-02": _replacement(
-                "new second person",
+                "warm brown freckled forearm with a narrow scar",
                 source="image_1",
-                occurrences=[{"segment_index": 2, "frame_orders": [2]}],
             ),
         },
         "entities": {
-            "entity-01": _replacement(
-                "new object",
-                occurrences=[{"segment_index": 2, "frame_orders": [1]}],
-            ),
+            "entity-01": _replacement("matte green ceramic grooming tool"),
         },
         "scenes": {
-            "scene-01": _replacement(
-                "new room",
-                occurrences=[{"segment_index": "bad", "frame_orders": [1]}],
-            ),
+            "scene-01": _replacement("sunlit oak walk-in wardrobe"),
         },
         "relations": {
-            "relation-01": {
-                "replacement": {
-                    "source": "generated_variant",
-                    "target_visual_description": "must not get a tile",
-                }
+            "RELATION_SENTINEL": {
+                "description": "person holds entity beside another entity"
             }
         },
     }
 
-    spec = build_replacement_sheet_spec(project, enhanced, prepared)
+    spec = build_replacement_sheet_spec(enhanced)
 
+    assert spec["version"] == REPLACEMENT_SHEET_SPEC_VERSION == 2
     assert [tile["stable_key"] for tile in spec["tiles"]] == [
         "person-02",
         "person-10",
@@ -99,21 +76,33 @@ def test_spec_is_globally_ordered_without_guessing_missing_occurrences(
         "scene-01",
     ]
     assert [tile["tile_id"] for tile in spec["tiles"]] == [
-        "TILE_01", "TILE_02", "TILE_03", "TILE_04",
+        "TILE_01",
+        "TILE_02",
+        "TILE_03",
+        "TILE_04",
     ]
     assert [(tile["row"], tile["column"]) for tile in spec["tiles"]] == [
-        (1, 1), (1, 2), (2, 1), (2, 2),
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
     ]
     assert (spec["columns"], spec["rows"]) == (2, 2)
-    assert spec["tiles"][0]["source"] == "image_1"
-    assert spec["tiles"][0]["source_frame_receipt"]["path"] == (
-        "work/segments/0002/analysis-02.png"
-    )
-    assert spec["tiles"][1]["source_frame_receipt"] is None
-    assert spec["tiles"][2]["source_frame_receipt"]["path"] == (
-        "work/segments/0002/analysis-01.png"
-    )
-    assert spec["tiles"][3]["source_frame_receipt"] is None
+    assert spec["tiles"][0] == {
+        "tile_id": "TILE_01",
+        "category": "people",
+        "stable_key": "person-02",
+        "row": 1,
+        "column": 1,
+        "source": "image_1",
+        "appearance_description": (
+            "warm brown freckled forearm with a narrow scar"
+        ),
+    }
+    assert all("target" not in tile for tile in spec["tiles"])
+    assert all("target_visual_description" not in tile for tile in spec["tiles"])
+    assert all("source_frame_receipt" not in tile for tile in spec["tiles"])
+    assert all("occurrences" not in tile for tile in spec["tiles"])
     assert spec["spec_sha256"] == replacement_sheet_spec_sha256(spec)
     canonical_index = json.dumps(
         enhanced,
@@ -124,117 +113,95 @@ def test_spec_is_globally_ordered_without_guessing_missing_occurrences(
     assert spec["enhanced_element_index_sha256"] == hashlib.sha256(
         canonical_index
     ).hexdigest()
+    assert validate_replacement_sheet_spec(spec, allow_empty=False) == spec["tiles"]
 
 
-def test_spec_with_no_replacement_is_empty_and_does_not_require_frames(
-    tmp_path: Path,
-) -> None:
+def test_spec_with_no_replacement_is_empty(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
+
     spec = build_replacement_sheet_spec(
-        project,
         {
             "people": {"person-01": {"replacement": None}},
             "entities": {},
             "scenes": {},
             "relations": {},
         },
-        [],
     )
 
     assert spec["tiles"] == []
     assert spec["columns"] == 0
     assert spec["rows"] == 0
     assert spec["spec_sha256"] == replacement_sheet_spec_sha256(spec)
+    assert validate_replacement_sheet_spec(spec, allow_empty=True) == []
 
 
-def test_missing_analysis_frames_do_not_become_a_quality_gate(
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"source": "generated_variant", "appearance_description": ""},
+        {"source": "generated_variant", "appearance_description": "   "},
+        {"source": "generated_variant"},
+        {"source": "unknown", "appearance_description": "new design"},
+    ],
+)
+def test_spec_rejects_invalid_appearance_contract(
+    tmp_path: Path,
+    replacement: dict[str, object],
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    enhanced = {
+        "people": {"person-01": {"replacement": replacement}},
+        "entities": {},
+        "scenes": {},
+        "relations": {},
+    }
+
+    with pytest.raises(ValueError, match="replacement sheet"):
+        build_replacement_sheet_spec(enhanced)
+
+
+def test_materialize_writes_only_bound_layout_prompt_and_spec(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    spec = build_replacement_sheet_spec(
-        project,
-        {
-            "people": {
-                "person-01": _replacement(
-                    "new person",
-                    occurrences=[{"segment_index": 1, "frame_orders": [9]}],
-                ),
-            },
-            "entities": {},
-            "scenes": {},
-            "relations": {},
-        },
-        [{"index": 1, "analysis_paths": [project / "missing.png"]}],
-    )
-
-    assert len(spec["tiles"]) == 1
-    assert spec["tiles"][0]["source_frame_receipt"] is None
-
-
-def test_materialize_writes_one_bound_layout_and_evidence_sheet_atomically(
-    tmp_path: Path,
-) -> None:
-    project = tmp_path / "project"
-    frame = _write_png(
-        project / "work/segments/0001/analysis-01.png",
-        (12, 80, 170),
-    )
     enhanced = {
         "people": {
-            "person-01": _replacement(
-                "a distinctly different lead with a silver braided bob",
-                occurrences=[{"segment_index": 1, "frame_orders": [1]}],
-            ),
+            "person-01": _replacement("silver braided bob and angular face"),
         },
         "entities": {
-            "entity-01": _replacement(
-                "a matte green ceramic device",
-                source="image_1",
-                occurrences=[{"segment_index": 1, "frame_orders": [1]}],
-            ),
+            "entity-01": _replacement("matte green ceramic grooming tool"),
         },
         "scenes": {
-            "scene-01": _replacement(
-                "a different sunlit studio instance",
-                occurrences=[{"segment_index": 1, "frame_orders": [1]}],
-            ),
+            "scene-01": _replacement("empty sunlit oak walk-in wardrobe"),
         },
-        "relations": {},
+        "relations": {
+            "RELATION_PROMPT_LEAK_SENTINEL": {
+                "description": "hand grips tool while brushing animal"
+            }
+        },
     }
-    spec = build_replacement_sheet_spec(
-        project,
-        enhanced,
-        [{"index": 1, "analysis_paths": [frame]}],
-    )
+    spec = build_replacement_sheet_spec(enhanced)
     directory = project / "work/replacement-sheet"
 
-    first = materialize_replacement_sheet_inputs(
-        project,
-        directory,
-        spec,
-        "Base object-replace design direction.",
-    )
+    first = materialize_replacement_sheet_inputs(directory, spec)
     first_bytes = {
         name: (directory / name).read_bytes()
-        for name in ("canvas.png", "source-evidence.png", "prompt.txt", "spec.json")
+        for name in ("canvas.png", "prompt.txt", "spec.json")
     }
-    second = materialize_replacement_sheet_inputs(
-        project,
-        directory,
-        spec,
-        "Base object-replace design direction.",
-    )
+    second = materialize_replacement_sheet_inputs(directory, spec)
 
-    assert first["spec_sha256"] == spec["spec_sha256"]
+    assert first == {
+        "spec": spec,
+        "spec_sha256": spec["spec_sha256"],
+        "prompt": first["prompt"],
+        "canvas_path": directory / "canvas.png",
+    }
     assert first["prompt"] == second["prompt"]
-    assert first["canvas_path"] == directory / "canvas.png"
-    assert first["source_evidence_path"] == directory / "source-evidence.png"
+    assert not (directory / "source-evidence.png").exists()
     assert (directory / "prompt.txt").read_text(encoding="utf-8") == first["prompt"]
-    assert hashlib.sha256((directory / "prompt.txt").read_bytes()).hexdigest() == (
-        hashlib.sha256(first["prompt"].encode("utf-8")).hexdigest()
-    )
     for name, payload in first_bytes.items():
         assert (directory / name).read_bytes() == payload
         assert stat.S_IMODE((directory / name).stat().st_mode) == 0o600
@@ -243,117 +210,137 @@ def test_materialize_writes_one_bound_layout_and_evidence_sheet_atomically(
     assert json.loads((directory / "spec.json").read_text()) == spec
 
     canvas = cv2.imread(str(directory / "canvas.png"))
-    evidence = cv2.imread(str(directory / "source-evidence.png"))
     assert canvas.shape[:2] == (
         REPLACEMENT_SHEET_HEIGHT,
         REPLACEMENT_SHEET_WIDTH,
     )
-    assert evidence.shape == canvas.shape
-    assert not np.array_equal(canvas, evidence)
-    prompt = (directory / "prompt.txt").read_text(encoding="utf-8")
-    assert prompt.startswith("Base object-replace design direction.")
+    prompt = first["prompt"]
     assert f"frozen global-index binding is {spec['spec_sha256']}" in prompt
     assert "Input Image 1 is the blank 2048x2048" in prompt
-    assert "Input Image 2 is source-frame evidence" in prompt
-    assert "No user-reference image is supplied" in prompt
-    assert "Input Image 3" not in prompt
-    assert "TILE_01 | row=1 | column=1 | category=people" in prompt
-    assert 'stable_key="entity-01" | SOURCE="image_1"' in prompt
+    assert "Input Image 2" not in prompt
+    assert "source-frame evidence" not in prompt
+    assert "silver braided bob and angular face" in prompt
+    assert "matte green ceramic grooming tool" in prompt
+    assert "empty sunlit oak walk-in wardrobe" in prompt
+    assert "TARGET_ACTION_RELATION_SENTINEL" not in prompt
+    assert "RELATION_PROMPT_LEAK_SENTINEL" not in prompt
+    assert "SOURCE_VISUAL_SENTINEL" not in prompt
+    assert "OCCURRENCE_SENTINEL" not in prompt
+    assert "MISSING_FRAME_SENTINEL" not in prompt
 
 
-def test_materialize_numbers_user_image_before_canvas_and_evidence(
+def test_prompt_enforces_per_category_cell_isolation(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    spec = build_replacement_sheet_spec(
+        {
+            "people": {
+                "person-01": _replacement("freckled left forearm with a scar"),
+            },
+            "entities": {
+                "entity-01": _replacement("red-brown dog with a white chest"),
+            },
+            "scenes": {
+                "scene-01": _replacement("board-formed concrete studio"),
+            },
+            "relations": {},
+        },
+    )
+
+    prompt = materialize_replacement_sheet_inputs(
+        project / "work/replacement-sheet",
+        spec,
+    )["prompt"]
+
+    assert "appearance atlas, not a reenacted video frame" in prompt
+    assert "each listed stable key exactly once" in prompt
+    assert "Only that cell's stable key may appear in it" in prompt
+    assert "PEOPLE tiles: show exactly one replacement person" in prompt
+    assert "Show no props, held objects" in prompt
+    assert "ENTITIES tiles: show exactly one isolated replacement object or animal" in prompt
+    assert "Show no person, hand, other entity" in prompt
+    assert "SCENES tiles: show one empty, unoccupied replacement environment" in prompt
+    assert "show no indexed person, animal, movable entity" in prompt
+    assert "APPEARANCE=\"freckled left forearm with a scar\"" in prompt
+    assert "APPEARANCE=\"red-brown dog with a white chest\"" in prompt
+    assert "APPEARANCE=\"board-formed concrete studio\"" in prompt
+
+
+def test_materialize_uses_canvas_first_and_scopes_user_image(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     spec = build_replacement_sheet_spec(
-        project,
         {
             "people": {},
             "entities": {
                 "entity-01": _replacement(
-                    "the exact replacement product design",
+                    "exact wooden paddle brush design",
                     source="image_1",
                 ),
+                "entity-02": _replacement("matte steel comb"),
             },
             "scenes": {},
             "relations": {},
         },
-        [],
     )
 
     result = materialize_replacement_sheet_inputs(
-        project,
         project / "work/replacement-sheet",
         spec,
-        "Use the object-replace design without changing its stable key.",
         user_image_present=True,
     )
 
     prompt = result["prompt"]
-    image_1 = prompt.index("Input Image 1 is the user-reference image")
-    image_2 = prompt.index("Input Image 2 is the blank 2048x2048")
-    image_3 = prompt.index("Input Image 3 is source-frame evidence")
-    assert image_1 < image_2 < image_3
-    assert "only a tile whose SOURCE is exactly image_1" in prompt
-    assert "No user-reference image is supplied" not in prompt
+    image_1 = prompt.index("Input Image 1 is the blank 2048x2048")
+    image_2 = prompt.index("Input Image 2 is the user-reference image")
+    assert image_1 < image_2
+    assert "SOURCE=image_1 maps only to this Seedream Input Image 2" in prompt
+    assert "SOURCE=generated_variant must ignore it completely" in prompt
+    assert "Input Image 3" not in prompt
+    assert "source-frame evidence" not in prompt
     assert (
         'TILE_01 | row=1 | column=1 | category=entities | '
-        'stable_key="entity-01" | SOURCE="image_1"'
+        'stable_key="entity-01" | SOURCE="image_1" | '
+        'APPEARANCE="exact wooden paddle brush design"'
     ) in prompt
 
 
-def test_materialize_rejects_drifted_bound_source_evidence(
-    tmp_path: Path,
-) -> None:
-    project = tmp_path / "project"
-    frame = _write_png(
-        project / "work/segments/0001/analysis-01.png",
-        (12, 80, 170),
-    )
-    spec = build_replacement_sheet_spec(
-        project,
-        {
-            "people": {},
-            "entities": {
-                "entity-01": _replacement(
-                    "a matte green ceramic device",
-                    occurrences=[{"segment_index": 1, "frame_orders": [1]}],
-                ),
-            },
-            "scenes": {},
-            "relations": {},
-        },
-        [{"index": 1, "analysis_paths": [frame]}],
-    )
-    _write_png(frame, (170, 80, 12))
-
-    with pytest.raises(ValueError, match="source-frame receipt does not match"):
-        materialize_replacement_sheet_inputs(
-            project,
-            project / "work/replacement-sheet",
-            spec,
-            "Use the frozen target.",
-        )
-
-
-def test_materialize_skips_empty_spec_for_caller_control(
+def test_materialize_rejects_missing_user_image_for_bound_tile(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     spec = build_replacement_sheet_spec(
-        project,
-        {"people": {}, "entities": {}, "scenes": {}, "relations": {}},
-        [],
+        {
+            "people": {},
+            "entities": {
+                "entity-01": _replacement("wooden brush", source="image_1"),
+            },
+            "scenes": {},
+            "relations": {},
+        },
+    )
+
+    with pytest.raises(ValueError, match="user-reference image is missing"):
+        materialize_replacement_sheet_inputs(
+            project / "work/replacement-sheet",
+            spec,
+        )
+
+
+def test_materialize_skips_empty_spec_for_caller_control(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    spec = build_replacement_sheet_spec(
+        {"people": {}, "entities": {}, "scenes": {}, "relations": {}}
     )
 
     with pytest.raises(ValueError, match="no replacement tiles"):
         materialize_replacement_sheet_inputs(
-            project,
             project / "work/replacement-sheet",
             spec,
-            "unused",
         )
 
 
@@ -370,7 +357,7 @@ def test_spec_never_truncates_large_replacement_sets(tmp_path: Path) -> None:
         "relations": {},
     }
 
-    spec = build_replacement_sheet_spec(project, enhanced, [])
+    spec = build_replacement_sheet_spec(enhanced)
 
     assert len(spec["tiles"]) == 257
     assert spec["tiles"][0]["tile_id"] == "TILE_01"
@@ -385,14 +372,12 @@ def test_finalize_normalizes_to_one_2048_png_and_restores_labels(
     project = tmp_path / "project"
     project.mkdir()
     spec = build_replacement_sheet_spec(
-        project,
         {
             "people": {"person-01": _replacement("new person")},
             "entities": {"entity-01": _replacement("new entity")},
             "scenes": {},
             "relations": {},
         },
-        [],
     )
     provider_image = np.full((180, 320, 3), (31, 63, 127), dtype=np.uint8)
     encoded, payload = cv2.imencode(".jpg", provider_image)
@@ -421,25 +406,52 @@ def test_finalize_normalizes_to_one_2048_png_and_restores_labels(
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
 
-def test_materialize_rejects_a_mutated_binding_spec(tmp_path: Path) -> None:
+def test_rejects_unsupported_or_non_closed_v2_binding(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     spec = build_replacement_sheet_spec(
-        project,
         {
             "people": {"person-01": _replacement("new person")},
             "entities": {},
             "scenes": {},
             "relations": {},
         },
-        [],
     )
-    spec["tiles"][0]["stable_key"] = "person-99"
+    unsupported = dict(spec)
+    unsupported["version"] = 1
+    unsupported["spec_sha256"] = replacement_sheet_spec_sha256(unsupported)
+    with pytest.raises(ValueError, match="spec binding is invalid"):
+        validate_replacement_sheet_spec(unsupported, allow_empty=False)
 
+    for invalid_version in (True, 2.0):
+        invalid_type = dict(spec)
+        invalid_type["version"] = invalid_version
+        invalid_type["spec_sha256"] = replacement_sheet_spec_sha256(invalid_type)
+        with pytest.raises(ValueError, match="spec binding is invalid"):
+            validate_replacement_sheet_spec(invalid_type, allow_empty=False)
+
+    extra_field = dict(spec)
+    extra_field["source_evidence_path"] = "old-source-evidence.png"
+    extra_field["spec_sha256"] = replacement_sheet_spec_sha256(extra_field)
+    with pytest.raises(ValueError, match="spec binding is invalid"):
+        validate_replacement_sheet_spec(extra_field, allow_empty=False)
+
+    uppercase_digest = dict(spec)
+    uppercase_digest["enhanced_element_index_sha256"] = "A" * 64
+    uppercase_digest["spec_sha256"] = replacement_sheet_spec_sha256(
+        uppercase_digest
+    )
+    with pytest.raises(ValueError, match="spec binding is invalid"):
+        validate_replacement_sheet_spec(uppercase_digest, allow_empty=False)
+
+    uppercase_spec_digest = dict(spec)
+    uppercase_spec_digest["spec_sha256"] = spec["spec_sha256"].upper()
+    with pytest.raises(ValueError, match="spec binding is invalid"):
+        validate_replacement_sheet_spec(uppercase_spec_digest, allow_empty=False)
+
+    spec["tiles"][0]["stable_key"] = "person-99"
     with pytest.raises(ValueError, match="spec binding is invalid"):
         materialize_replacement_sheet_inputs(
-            project,
             project / "work/replacement-sheet",
             spec,
-            "base",
         )

@@ -444,7 +444,7 @@ def test_codex_structured_uses_acct2_sol_low_and_output_schema(
         lambda value: value + "\ntokens used\n1,234\n",
     ],
 )
-def test_codex_structured_transport_compatibility(wrapper) -> None:
+def test_codex_structured_transport_wrappers(wrapper) -> None:
     body = json.dumps({"prompt": "ok"})
     assert providers._parse_codex_object(wrapper(body).encode("utf-8")) == {
         "prompt": "ok",

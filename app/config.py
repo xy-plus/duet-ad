@@ -164,6 +164,9 @@ def get_settings() -> Settings:
     access_token = os.environ.get("ACCESS_TOKEN", "").strip()
     if not access_token:
         raise RuntimeError("ACCESS_TOKEN must be set to a non-empty value")
+    deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not deepseek_api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY must be set to a non-empty value")
     return Settings(
         access_token=access_token,
         data_dir=Path(os.environ.get("DATA_DIR", str(ROOT / "data"))).resolve(),
@@ -178,14 +181,7 @@ def get_settings() -> Settings:
             "SEEDREAM_MODEL", SEEDREAM_PRO_MODEL
         ).strip(),
         seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "300")),
-        # duet-ad1 stores its DeepSeek credential as ANTHROPIC_AUTH_TOKEN in
-        # the protected credential file.  Accept the canonical name first,
-        # then the source deployment's name so the independent app can reuse
-        # that file without copying the secret into a second location.
-        deepseek_api_key=(
-            os.environ.get("DEEPSEEK_API_KEY", "").strip()
-            or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-        ),
+        deepseek_api_key=deepseek_api_key,
         deepseek_api_base=os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com").rstrip("/"),
         deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp"),
         fusion_agent=os.environ.get("FUSION_AGENT", "deepseek").strip().lower(),

@@ -25,8 +25,9 @@ def _run_contract(expression: str):
         pytest.skip("node is unavailable")
     script = (
         "const contract = require(process.argv[1]);"
-        f"const result = ({expression});"
+        f"Promise.resolve(({expression})).then((result) => {{"
         "process.stdout.write(JSON.stringify(result));"
+        "});"
     )
     completed = subprocess.run(
         [node, "-e", script, str(APP_JS)],
@@ -37,33 +38,162 @@ def _run_contract(expression: str):
     return json.loads(completed.stdout)
 
 
-def test_visible_creation_contract_defaults_to_link_and_hides_pipeline_copy():
-    html = INDEX_HTML.read_text(encoding="utf-8")
-    source = APP_JS.read_text(encoding="utf-8")
-    composer = html.split('<form id="composer"', 1)[1].split("</form>", 1)[0]
-    visible = composer.split(
-        '<div class="legacy-contract-controls" hidden aria-hidden="true">', 1
-    )[0]
+def _function_source(source, name):
+    marker = f"function {name}("
+    assert marker in source
+    return marker + source.split(marker, 1)[1].split("\nfunction ", 1)[0]
 
-    assert 'name="source-mode" value="link" checked' in visible
-    assert 'name="source-mode" value="upload">' in visible
-    assert '<h2 id="dialogue-title">改编台词</h2>' in visible
-    assert "系统自动识别并改编台词" in visible
-    assert "script-input" not in html
-    assert "script-input" not in source
-    assert 'id="translation-toggle"' not in visible
-    assert 'id="lang-input"' in visible
-    assert 'name="voice-mode"' not in visible
-    assert 'name="dialogue-mode"' not in visible
-    assert "target_language" not in visible
-    for technical_copy in (
-        "H3",
-        "Context IR",
-        "超过 10 秒会拆分为单次不超过 10 秒的视频生成子任务",
-        "十秒分段",
+
+def test_removed_legacy_endpoints_and_contracts_have_no_frontend_references():
+    source = APP_JS.read_text(encoding="utf-8")
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    for removed_endpoint in (
+        '"/submit"',
+        '"/prompt"',
+        "/postprocess",
+        "/dialogue-review/commit",
+        "/image-optimization-prompt",
     ):
-        assert technical_copy not in visible
-    assert "minimax" not in visible.lower()
+        assert removed_endpoint not in source
+    for removed_contract in (
+        "resume_required",
+        "buildResumePayload",
+        "buildSubmitPayload",
+        "generationAction",
+        "generationRetryContract",
+        "canOperate",
+        "longVideoContract",
+        "fitProfile",
+        "requestGenerationSubmit",
+        "normalizeGenerationConfigCapability",
+        "normalizeDialogueReviewCapability",
+        "dialogueReviewPolicy",
+        "loadGenerationConfigCapability",
+        "resetGenerationConfigDisclosure",
+        "guardDirtyPrompt",
+        'dyn: ""',
+    ):
+        assert removed_contract not in source
+    assert 'class="legacy-contract-controls"' not in html
+    assert 'id="pp-dialog"' not in html
+    assert 'id="draft-dialog"' not in html
+    # 新续跑入口是详情页唯一的项目级恢复手段
+    assert '"/resume-picsart"' in source
+    assert '"/resume-pre-picsart"' in source
+
+
+def test_resume_posts_confirm_true_json_to_picsart_first():
+    result = _run_contract(
+        "(async()=>{const calls=[];"
+        "const request=async(path,options)=>{calls.push({path,method:options.method,"
+        "contentType:options.headers['Content-Type'],body:JSON.parse(options.body)});"
+        "return {status:'queued'};};"
+        "const state=await contract.resumeFailedProject('proj 1',request);"
+        "return {calls,state}})()"
+    )
+    assert result == {
+        "calls": [{
+            "path": "/api/conversations/proj%201/resume-picsart",
+            "method": "POST",
+            "contentType": "application/json",
+            "body": {"confirm": True},
+        }],
+        "state": {"status": "queued"},
+    }
+
+
+def test_resume_falls_back_to_pre_picsart_only_when_picsart_not_ready():
+    result = _run_contract(
+        "(async()=>{const calls=[];const bodies=[];"
+        "const request=async(path,options)=>{calls.push(path);bodies.push(JSON.parse(options.body));"
+        "if(path.endsWith('/resume-picsart')){"
+        "const e=new Error('项目缺少可复用的 Picsart 前置产物');e.code='picsart_resume_not_ready';throw e;}"
+        "return {status:'queued'};};"
+        "const state=await contract.resumeFailedProject('p1',request);"
+        "return {calls,bodies,state}})()"
+    )
+    assert result["calls"] == [
+        "/api/conversations/p1/resume-picsart",
+        "/api/conversations/p1/resume-pre-picsart",
+    ]
+    assert result["bodies"] == [{"confirm": True}, {"confirm": True}]
+    assert result["state"] == {"status": "queued"}
+
+
+def test_resume_does_not_fall_back_when_project_is_not_failed():
+    result = _run_contract(
+        "(async()=>{const calls=[];"
+        "const request=async(path)=>{calls.push(path);"
+        "const e=new Error('只有失败项目可以续跑 Picsart');e.code='project_not_failed';throw e;};"
+        "try{await contract.resumeFailedProject('p1',request);return {calls,error:null}}"
+        "catch(e){return {calls,error:{code:e.code,message:e.message}}}})()"
+    )
+    assert result == {
+        "calls": ["/api/conversations/p1/resume-picsart"],
+        "error": {"code": "project_not_failed", "message": "只有失败项目可以续跑 Picsart"},
+    }
+
+
+def test_resume_surfaces_backend_detail_when_both_entry_points_are_not_ready():
+    result = _run_contract(
+        "(async()=>{const calls=[];"
+        "const request=async(path)=>{calls.push(path);"
+        "const e=path.endsWith('/resume-picsart')"
+        "?Object.assign(new Error('项目缺少可复用的 Picsart 前置产物'),{code:'picsart_resume_not_ready'})"
+        ":Object.assign(new Error('项目缺少可安全复用的前置产物，或已存在 Picsart 提交痕迹'),"
+        "{code:'pre_picsart_resume_not_ready'});throw e;};"
+        "try{await contract.resumeFailedProject('p1',request);return {calls,error:null}}"
+        "catch(e){return {calls,error:{code:e.code,message:e.message}}}})()"
+    )
+    assert result == {
+        "calls": [
+            "/api/conversations/p1/resume-picsart",
+            "/api/conversations/p1/resume-pre-picsart",
+        ],
+        "error": {
+            "code": "pre_picsart_resume_not_ready",
+            "message": "项目缺少可安全复用的前置产物，或已存在 Picsart 提交痕迹",
+        },
+    }
+
+
+def test_failed_projects_get_a_confirmed_resume_action_in_the_fail_card():
+    source = APP_JS.read_text(encoding="utf-8")
+    render_fail = _function_source(source, "renderFail")
+    assert 'detail.status === "failed"' in render_fail
+    assert '"续跑生成"' in render_fail
+    assert "window.confirm(" in render_fail
+    assert "resumeFailedProject(detail.id)" in render_fail
+    assert "loadDetail(detail.id, true)" in render_fail
+    assert "showActionError(err, errorBox, [resume])" in render_fail
+    assert "handleAuthError(err)" in render_fail
+    # 续跑成功后不重发 POST，只刷新详情并交给现有轮询
+    assert render_fail.count("resumeFailedProject(") == 1
+
+
+def test_api_error_parser_reads_only_the_detail_envelope():
+    result = _run_contract(
+        "(()=>({"
+        "detailObject:(()=>{const e=contract.apiErrorFromPayload("
+        "{detail:{code:'queue_full',message:'当前队列已满'}},'fallback');"
+        "return {code:e.code,message:e.message}})(),"
+        "detailString:(()=>{const e=contract.apiErrorFromPayload({detail:'出错了'},'fallback');"
+        "return {code:e.code,message:e.message}})(),"
+        "legacyErrorKey:(()=>{const e=contract.apiErrorFromPayload("
+        "{error:{code:'x',message:'y'}},'fallback');return {code:e.code,message:e.message}})(),"
+        "legacyMessageKey:(()=>{const e=contract.apiErrorFromPayload({message:'y'},'fallback');"
+        "return {code:e.code,message:e.message}})(),"
+        "empty:(()=>{const e=contract.apiErrorFromPayload(null,'fallback');"
+        "return {code:e.code,message:e.message}})()"
+        "}))()"
+    )
+    assert result == {
+        "detailObject": {"code": "queue_full", "message": "当前队列已满"},
+        "detailString": {"code": "", "message": "出错了"},
+        "legacyErrorKey": {"code": "", "message": "fallback"},
+        "legacyMessageKey": {"code": "", "message": "fallback"},
+        "empty": {"code": "", "message": "fallback"},
+    }
 
 
 def test_duration_limit_error_is_structured_and_shown_as_popup():
@@ -95,239 +225,3 @@ def test_stale_page_error_shows_refresh_instruction():
         "message": "页面版本已更新，请刷新页面后重试。",
         "code": "client_refresh_required",
     }
-
-
-def test_context_ir_is_read_only_server_state_without_new_endpoint():
-    source = _web_source().lower()
-    assert "context ir" in source
-    assert "context_ir" in source
-    assert "/context-ir" not in source
-    assert "服务器未公开逐段计数" in source
-
-
-def test_submit_and_detail_state_are_part_of_static_contract():
-    source = APP_JS.read_text(encoding="utf-8")
-    for token in (
-        '"/submit"',
-        "client_request_id",
-        "dialogue_mode",
-        "fit_mode",
-        "fit_required",
-        "submission_unknown",
-        "resume_required",
-        "receipt_version",
-        "read_only",
-        "duration_s",
-        "aspect_ratio",
-        "resolution",
-        "fit_profiles",
-    ):
-        assert token in source
-    assert "提交结果未知，禁止重复提交" in source
-    assert "源提示词将直接提交生成" in source
-
-
-def test_read_only_gate_fails_closed_for_legacy_details():
-    result = _run_contract(
-        "["
-        "contract.canOperate({read_only:false, submit_enabled:true}),"
-        "contract.canOperate({read_only:true, submit_enabled:true}),"
-        "contract.canOperate({submit_enabled:true}),"
-        "contract.canOperate({read_only:false, submit_enabled:false})"
-        "]"
-    )
-    assert result == [True, False, False, False]
-
-
-def test_hidden_direct_h3_fields_do_not_rebuild_the_minimal_view():
-    result = _run_contract(
-        "(() => {"
-        "const base={status:'done',read_only:false,submit_enabled:true,fit_required:false,duration_s:10,"
-        "receipt_version:1,fit_mode:'none',dialogue:[],"
-        "generation:{status:null,error:null,attempt:0,client_request_id:null,stage:'h3'},"
-        "keyframes:[],segments:[]};"
-        "const original=contract.detailSignature(base);"
-        "const variants=["
-        "{...base,read_only:true},{...base,dialogue:[{start_s:0,end_s:1,text:'x'}]},"
-        "{...base,receipt_version:2},{...base,fit_mode:'pad'},"
-        "{...base,generation:{status:'running',error:null,attempt:1,client_request_id:'request-a',stage:'h3'}},"
-        "{...base,source_prompt:'edited',source_prompt_sha256:'b'.repeat(64)}];"
-        "return variants.map(value => {const next=contract.detailSignature(value);"
-        "return next.stable !== original.stable || next.generation !== original.generation;});"
-        "})()"
-    )
-    assert result == [False, False, False, False, False, False]
-
-
-def test_resume_builder_reuses_persisted_h3_attempt_exactly():
-    payload = _run_contract(
-        "contract.buildResumePayload({generation:{status:'resume_required',client_request_id:'request-old'},"
-        "dialogue:{mode:'edit',lines:[{text:'x',start_s:0,end_s:1}]},fit_mode:'pad',"
-        "aspect_ratio:'9:16',resolution:'768p'})"
-    )
-    assert payload == {
-        "confirm": True,
-        "client_request_id": "request-old",
-        "dialogue_mode": "edit",
-        "fit_mode": "pad",
-        "aspect_ratio": "9:16",
-        "resolution": "768p",
-        "lines": [{"text": "x", "start_s": 0, "end_s": 1}],
-    }
-
-
-def test_generation_actions_never_retry_unknown_or_active_statuses():
-    result = _run_contract(
-        "['failed','resume_required','submission_unknown','queued','running','succeeded',null]"
-        ".map(contract.generationAction)"
-    )
-    assert result == ["retry", "resume", "none", "none", "none", "none", "new"]
-
-
-def test_failed_stitch_has_distinct_non_paid_retry_action():
-    result = _run_contract(
-        "[contract.generationAction('failed','h3'),"
-        "contract.generationAction('failed','stitch'),"
-        "contract.generationAction('submission_unknown','stitch')]"
-    )
-    assert result == ["retry", "retry_stitch", "none"]
-
-
-def test_resume_ui_is_locked_and_explicit_about_cost():
-    source = APP_JS.read_text(encoding="utf-8")
-    assert "继续既有生成任务" in source
-    assert "继续原任务（0 新增付费）" in source
-    assert "buildResumePayload(detail)" in source
-
-
-def test_submission_unknown_branch_has_no_action_button():
-    source = APP_JS.read_text(encoding="utf-8")
-    branch = source.split('if (generation.status === "submission_unknown")', 1)[1]
-    branch = branch.split("if (!canOperate(detail))", 1)[0]
-    assert "generation-submit" not in branch
-    assert "禁止重复提交" in branch
-
-
-def test_pure_submit_builder_omits_lines_for_auto_and_none():
-    result = _run_contract(
-        "["
-        "contract.buildSubmitPayload({clientRequestId:'request-1',dialogueMode:'auto',fitRequired:false,aspectRatio:'16:9',resolution:'480p'}),"
-        "contract.buildSubmitPayload({clientRequestId:'request-2',dialogueMode:'none',fitRequired:false,aspectRatio:'9:16',resolution:'768p'})"
-        "]"
-    )
-    assert result == [
-        {"confirm": True, "client_request_id": "request-1", "dialogue_mode": "auto", "fit_mode": "none", "aspect_ratio": "16:9", "resolution": "480p"},
-        {"confirm": True, "client_request_id": "request-2", "dialogue_mode": "none", "fit_mode": "none", "aspect_ratio": "9:16", "resolution": "768p"},
-    ]
-
-
-def test_pure_submit_builder_parses_custom_lines():
-    result = _run_contract(
-        "contract.buildSubmitPayload({clientRequestId:'request-3',dialogueMode:'custom',"
-        "linesText:'0 - 1.5 | first\\n1.5 - 3 | second',fitRequired:true,fitMode:'crop',"
-        "aspectRatio:'9:16',resolution:'768p'})"
-    )
-    assert result == {
-        "confirm": True,
-        "client_request_id": "request-3",
-        "dialogue_mode": "custom",
-        "fit_mode": "crop",
-        "aspect_ratio": "9:16",
-        "resolution": "768p",
-        "lines": [
-            {"start_s": 0, "end_s": 1.5, "text": "first"},
-            {"start_s": 1.5, "end_s": 3, "text": "second"},
-        ],
-    }
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "contract.buildSubmitPayload({clientRequestId:'request-1',dialogueMode:'custom',linesText:'',fitRequired:false})",
-        "contract.buildSubmitPayload({clientRequestId:'request-2',dialogueMode:'auto',fitRequired:true,fitMode:'none'})",
-    ],
-)
-def test_pure_submit_builder_rejects_incomplete_attempts(expression):
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is unavailable")
-    script = (
-        "const contract=require(process.argv[1]);"
-        f"try{{{expression};process.exit(1)}}catch(error){{process.stdout.write(error.message)}}"
-    )
-    completed = subprocess.run(
-        [node, "-e", script, str(APP_JS)], capture_output=True, text=True
-    )
-    assert completed.returncode == 0
-    assert completed.stdout
-
-
-def test_generation_options_select_server_defaults_and_switch_fit_profile():
-    result = _run_contract(
-        "(()=>{const detail={aspect_ratio:'16:9',resolution:'480p',fit_profiles:{"
-        "'16:9':{fit_required:false,default_fit_mode:'none'},"
-        "'9:16':{fit_required:true,default_fit_mode:'crop'}}};"
-        "return [contract.generationParameterDraft(detail),"
-        "contract.fitProfile(detail,'9:16')];})()"
-    )
-    assert result == [
-        {"aspectRatio": "16:9", "resolution": "480p", "fitMode": "none"},
-        {"fit_required": True, "default_fit_mode": "crop"},
-    ]
-
-
-def test_generation_draft_discards_touched_values_after_remote_freeze():
-    result = _run_contract(
-        "(()=>{const initial={id:'cross-tab-cid',aspect_ratio:'9:16',resolution:'768p',"
-        "fit_mode:'crop',fit_profiles:{"
-        "'16:9':{fit_required:false,default_fit_mode:'none'},"
-        "'9:16':{fit_required:true,default_fit_mode:'crop'}},"
-        "dialogue:{mode:'auto',lines:[],auto_lines:[]},receipt_version:1,generation:null};"
-        "const draft=contract.generationDraft(initial);"
-        "Object.assign(draft,{aspectRatio:'9:16',resolution:'768p',fitMode:'pad',"
-        "dialogueMode:'custom',customLinesText:'0 - 1 | local',parameterTouched:true});"
-        "const frozen={...initial,aspect_ratio:'16:9',resolution:'480p',fit_mode:'none',"
-        "dialogue:{mode:'auto',lines:[],auto_lines:[]},"
-        "generation:{status:'failed',attempt:1,client_request_id:'remote-request'}};"
-        "const synced=contract.generationDraft(frozen);"
-        "return {aspectRatio:synced.aspectRatio,resolution:synced.resolution,"
-        "fitMode:synced.fitMode,dialogueMode:synced.dialogueMode,"
-        "parameterTouched:synced.parameterTouched};})()"
-    )
-    assert result == {
-        "aspectRatio": "16:9",
-        "resolution": "480p",
-        "fitMode": "none",
-        "dialogueMode": "auto",
-        "parameterTouched": False,
-    }
-    source = _web_source()
-    assert 'card.querySelectorAll("input, textarea")' in source
-    assert "重试将使用上次服务端冻结的生成参数" in source
-
-
-def test_success_snapshot_uses_only_server_frozen_generation_values():
-    result = _run_contract(
-        "contract.generationParameterSnapshot({aspect_ratio:'16:9',resolution:'768p',"
-        "fit_mode:'crop',duration_s:20.25,segment_count:3,"
-        "dialogue:{mode:'auto'},generation:{status:'succeeded'}})"
-    )
-    assert result == {
-        "aspect_ratio": "16:9",
-        "resolution": "768p",
-        "dialogue_mode": "auto",
-        "fit_mode": "crop",
-        "duration_s": 20.25,
-        "segment_count": 3,
-        "fast_mode": False,
-    }
-
-
-def test_parameter_controls_and_success_summary_are_rendered_together():
-    source = _web_source()
-    assert "画幅" in source
-    assert "清晰度" in source
-    assert "生成参数" in source
-    assert "实际总时长" in source
-    assert "长视频分段数" in source

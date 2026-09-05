@@ -58,7 +58,7 @@ def normalize_fusion_prompt(
         raise ValueError("fusion prompt output is invalid")
     if (
         value["schema"] != FUSION_OUTPUT_NAME
-        or isinstance(value["version"], bool)
+        or type(value["version"]) is not int
         or value["version"] != FUSION_OUTPUT_VERSION
         or value["input_sha256"] != input_sha256
         or isinstance(value["segment_index"], bool)

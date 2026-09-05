@@ -29,6 +29,7 @@ from app.replacement_sheet import (
     finalize_replacement_sheet,
     materialize_replacement_sheet_inputs,
     replacement_sheet_spec_sha256,
+    validate_replacement_sheet_spec,
 )
 from app.providers import (
     CodexClient,
@@ -38,7 +39,13 @@ from app.providers import (
     ProviderFailure,
     ProviderResult,
 )
-from app.seedream import SeedreamClient, _validated_image_media_type
+from app.seedream import (
+    SEEDREAM_OUTPUT_HEIGHT,
+    SEEDREAM_OUTPUT_SIZE,
+    SEEDREAM_OUTPUT_WIDTH,
+    SeedreamClient,
+    _validated_image_media_type,
+)
 from app.research_log import ResearchLog
 from app.store import ProjectStore
 from app.voice_catalog import VoiceLibrary, load_voice_library
@@ -74,11 +81,9 @@ TRANSLATION_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-PICSART_RECEIPT_LEGACY_VERSION = 1
 PICSART_RECEIPT_VERSION = 2
-H3_PREPARED_ARTIFACTS_VERSION = 3
-H3_PREPARED_ARTIFACTS_LEGACY_VERSION = 2
-REPLACEMENT_SHEET_VERSION = 2
+H3_PREPARED_ARTIFACTS_VERSION = 4
+REPLACEMENT_SHEET_VERSION = 3
 PICSART_PROMPT_MAX_CHARS = 50_000
 PICSART_REFERENCE_MIN_DURATION_S = 2
 PICSART_REFERENCE_MAX_DURATION_S = 15
@@ -347,7 +352,9 @@ class Pipeline:
         log = ResearchLog(project)
         state = self.store.read(project_id)
         source, replacement = self._stored_input_paths(project, state)
-        request = state.get("effective_request") or {}
+        request = self._validated_effective_request(
+            state.get("effective_request")
+        )
         try:
             self._progress(project_id, 2, "probe")
             info = self._node(
@@ -414,6 +421,7 @@ class Pipeline:
                 [],
                 lambda: media.plan_segments(scenes, duration_s, spoken_lines),
             )
+            self._validated_join_modes(segments)
             selections: dict[int, list[dict[str, Any]]] = {}
             for segment in segments:
                 index = int(segment["index"])
@@ -489,16 +497,81 @@ class Pipeline:
                 },
             )
 
+    @staticmethod
+    def _validated_effective_request(value: object) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {
+            "version", "output", "processing", "dialogue",
+            "replacement_guidance", "fusion",
+        }:
+            raise ValueError("stored effective request is invalid")
+        output = value.get("output")
+        processing = value.get("processing")
+        dialogue = value.get("dialogue")
+        guidance = value.get("replacement_guidance")
+        fusion = value.get("fusion")
+        if (
+            type(value.get("version")) is not int
+            or value["version"] != 1
+            or not isinstance(output, dict)
+            or set(output) != {"aspect_ratio", "resolution", "fit_mode"}
+            or output.get("aspect_ratio") not in {"16:9", "9:16"}
+            or output.get("resolution") not in {"480p", "768p"}
+            or output.get("fit_mode") != "auto"
+            or not isinstance(processing, dict)
+            or set(processing) != {
+                "optimize_image", "remove_subtitle", "remove_logo",
+            }
+            or any(processing[key] is not True for key in processing)
+            or not isinstance(dialogue, dict)
+            or set(dialogue) != {"mode", "target_language"}
+            or dialogue.get("mode") != "auto_rewrite"
+            or not isinstance(dialogue.get("target_language"), str)
+            or not dialogue["target_language"]
+            or dialogue["target_language"].strip()
+            != dialogue["target_language"]
+            or not isinstance(fusion, dict)
+            or set(fusion) != {"agent"}
+            or fusion.get("agent") not in {"codex", "deepseek"}
+        ):
+            raise ValueError("stored effective request is invalid")
+        if guidance is not None and (
+            not isinstance(guidance, dict)
+            or set(guidance) != {"instruction", "image_field"}
+            or guidance.get("image_field") != "replacement_image"
+            or not isinstance(guidance.get("instruction"), str)
+            or not guidance["instruction"]
+            or guidance["instruction"].strip() != guidance["instruction"]
+        ):
+            raise ValueError("stored effective request is invalid")
+        return value
+
+    @staticmethod
+    def _validated_join_modes(items: list[dict[str, Any]]) -> list[str]:
+        if not items:
+            raise ValueError("segment list is empty")
+        modes: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("segment metadata is invalid")
+            mode = item.get("join_mode")
+            if mode not in {"hard_cut", "continue"}:
+                raise ValueError("segment join mode is invalid")
+            modes.append(mode)
+        if modes[0] != "hard_cut":
+            raise ValueError("first segment must use a hard cut")
+        return modes
+
     def _fusion_client_for_request(
         self, request: dict[str, Any],
     ) -> tuple[str, CodexClient | DeepSeekClient]:
-        configured_fusion = request.get("fusion")
-        # Legacy projects without a frozen internal choice used DeepSeek.
-        agent = (
-            configured_fusion.get("agent")
-            if isinstance(configured_fusion, dict)
-            else "deepseek"
-        )
+        request = self._validated_effective_request(request)
+        configured_fusion = request["fusion"]
+        if (
+            not isinstance(configured_fusion, dict)
+            or set(configured_fusion) != {"agent"}
+        ):
+            raise ValueError("frozen fusion configuration is invalid")
+        agent = configured_fusion.get("agent")
         if agent == "codex":
             return agent, self.codex
         if agent == "deepseek":
@@ -506,56 +579,48 @@ class Pipeline:
         raise ValueError("frozen fusion agent is invalid")
 
     @staticmethod
-    def _stored_voice_reference(
-        project: Path, state: dict[str, Any],
-    ) -> tuple[dict[str, Any] | None, Path | None]:
-        selection = state.get("voice_selection")
-        if selection is None:
-            # Backward compatibility for projects created before voice selection.
-            return None, None
-        if not isinstance(selection, dict):
-            raise TypeError("stored voice selection is invalid")
-        status = selection.get("status")
-        if status == "not_needed":
-            return selection, None
-        if status != "selected":
-            raise ValueError("stored voice selection status is invalid")
-        if selection.get("asset_path") != "work/voice-reference.wav":
-            raise ValueError("stored voice reference path is invalid")
-        expected_sha256 = selection.get("asset_sha256")
-        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
-            raise ValueError("stored voice reference checksum is invalid")
-        voice_reference = (project / "work" / "voice-reference.wav").resolve(strict=True)
-        project_root = project.resolve(strict=True)
-        if project_root not in voice_reference.parents or not voice_reference.is_file():
-            raise ValueError("stored voice reference is outside the project")
-        if Pipeline._sha256(voice_reference) != expected_sha256:
-            raise ValueError("stored voice reference checksum does not match")
-        return selection, voice_reference
-
-    @staticmethod
     def _stored_voice_references(
         project: Path, state: dict[str, Any],
     ) -> list[Path]:
-        """Load the frozen Audio 1..N list, with legacy Audio 1 fallback."""
-        if "voice_references" not in state:
-            _selection, legacy = Pipeline._stored_voice_reference(project, state)
-            return [legacy] if legacy is not None else []
-
-        references = state["voice_references"]
+        """Load the frozen Audio 1..N list."""
+        references = state.get("voice_references")
         if not isinstance(references, list) or len(references) > MAX_REFERENCE_AUDIO:
             raise ValueError("stored voice references are invalid")
         project_root = project.resolve(strict=True)
         paths: list[Path] = []
         for slot, reference in enumerate(references, 1):
-            if not isinstance(reference, dict):
-                raise ValueError("stored voice reference is invalid")
             expected_path = f"work/voice-references/audio-{slot:02d}.wav"
+            if (
+                not isinstance(reference, dict)
+                or set(reference) != {
+                    "audio_reference", "voice_id", "asset_path",
+                    "asset_sha256", "features",
+                }
+                or reference.get("audio_reference") != f"Audio {slot}"
+                or reference.get("asset_path") != expected_path
+                or not isinstance(reference.get("voice_id"), str)
+                or not reference["voice_id"]
+                or not isinstance(reference.get("features"), str)
+                or not reference["features"]
+            ):
+                raise ValueError("stored voice reference is invalid")
             expected_sha256 = reference.get("asset_sha256")
-            if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+            if (
+                not isinstance(expected_sha256, str)
+                or len(expected_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_sha256
+                )
+            ):
                 raise ValueError("stored voice reference checksum is invalid")
-            resolved = (project / expected_path).resolve(strict=True)
-            if project_root not in resolved.parents or not resolved.is_file():
+            candidate = project / expected_path
+            resolved = candidate.resolve(strict=True)
+            if (
+                project_root not in resolved.parents
+                or candidate.is_symlink()
+                or not resolved.is_file()
+            ):
                 raise ValueError("stored voice reference is outside the project")
             if Pipeline._sha256(resolved) != expected_sha256:
                 raise ValueError("stored voice reference checksum does not match")
@@ -659,14 +724,12 @@ class Pipeline:
         request: dict[str, Any],
         log: ResearchLog,
     ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[Path]]:
-        user_instruction = str(
-            ((request.get("replacement_guidance") or {}).get("instruction"))
-            or ""
-        ).strip()
-        target_language = str(
-            ((request.get("dialogue") or {}).get("target_language"))
-            or SAME_AS_SOURCE_LANGUAGE
-        ).strip()
+        request = self._validated_effective_request(request)
+        guidance = request["replacement_guidance"]
+        user_instruction = (
+            guidance["instruction"] if guidance is not None else ""
+        )
+        target_language = request["dialogue"]["target_language"]
         voice_ids = [voice["voice_id"] for voice in self.voice_library.voices]
         planning_context = object_replace_planning_context(element_index)
         payload = {
@@ -706,9 +769,6 @@ class Pipeline:
             )
             materialized["references"] = references
             materialized["paths"] = paths
-            materialized["reference_sheet_prompt"] = patch[
-                "reference_sheet_prompt"
-            ]
             return merge_object_replace_index(
                 element_index, patch, metadata_by_id,
             )
@@ -741,9 +801,6 @@ class Pipeline:
             "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": input_sha256,
             "voice_catalog_sha256": self.voice_library.digest,
-            "reference_sheet_prompt": materialized.get(
-                "reference_sheet_prompt", ""
-            ),
         }
         return enhanced_index, metadata, references, paths
 
@@ -799,16 +856,21 @@ class Pipeline:
     ) -> tuple[dict[str, Any], Path | None]:
         """Render the one project-wide appearance sheet from the frozen index."""
 
-        spec = build_replacement_sheet_spec(
-            project,
-            enhanced_element_index,
-            prepared,
-        )
+        if object_replace.get("version") != OBJECT_REPLACE_OUTPUT_VERSION:
+            raise ValueError(
+                "replacement sheet requires the current Object Replace output"
+            )
+        spec = build_replacement_sheet_spec(enhanced_element_index)
         user_image_present = (
             replacement is not None
             and self._enhanced_index_uses_user_image(enhanced_element_index)
         )
         existing = self.store.read(project_id).get("replacement_sheet")
+        if (
+            isinstance(existing, dict)
+            and existing.get("version") != REPLACEMENT_SHEET_VERSION
+        ):
+            raise ValueError("stored replacement sheet version is unsupported")
         if isinstance(existing, dict) and existing.get("status") in {
             "not_needed", "succeeded",
         }:
@@ -831,6 +893,12 @@ class Pipeline:
         image_reference = "Image 2" if user_image_present else "Image 1"
         h3_reference_images: list[dict[str, Any]] = []
         state = self.store.read(project_id)
+        voice_references = state.get("voice_references")
+        effective_request = self._validated_effective_request(
+            state.get("effective_request")
+        )
+        if not isinstance(voice_references, list):
+            raise ValueError("stored voice references are invalid")
         base_bundle: dict[str, Any] = {
             "version": REPLACEMENT_SHEET_VERSION,
             "status": "not_needed" if not spec["tiles"] else "prepared",
@@ -844,8 +912,8 @@ class Pipeline:
                 prepared,
                 enhanced_element_index,
                 object_replace,
-                state.get("voice_references") or [],
-                state.get("effective_request") or {},
+                voice_references,
+                effective_request,
                 replacement,
             ),
             "seedream": None,
@@ -862,23 +930,17 @@ class Pipeline:
             "project",
             {
                 "spec": spec,
-                "base_prompt": object_replace.get("reference_sheet_prompt", ""),
             },
             [],
             lambda: materialize_replacement_sheet_inputs(
-                project,
                 directory,
                 spec,
-                object_replace.get("reference_sheet_prompt", ""),
                 user_image_present=user_image_present,
             ),
-            output_media=lambda value: [
-                value["canvas_path"], value["source_evidence_path"],
-            ],
+            output_media=lambda value: [value["canvas_path"]],
         )
         prompt = inputs["prompt"]
         canvas = inputs["canvas_path"]
-        source_evidence = inputs["source_evidence_path"]
         prompt_path = directory / "prompt.txt"
         spec_path = directory / "spec.json"
         if user_image_present and user_reference is None:
@@ -905,9 +967,8 @@ class Pipeline:
                 **canonical_receipt,
             })
         seedream_inputs = [
-            *([canonical_replacement] if canonical_replacement is not None else []),
             canvas,
-            source_evidence,
+            *([canonical_replacement] if canonical_replacement is not None else []),
         ]
         input_receipts = [
             self._project_artifact_receipt(
@@ -940,6 +1001,7 @@ class Pipeline:
                 "input_sha256": [
                     receipt["sha256"] for receipt in input_receipts
                 ],
+                "size": SEEDREAM_OUTPUT_SIZE,
                 "response_format": "b64_json",
                 "watermark": False,
             }),
@@ -1133,9 +1195,16 @@ class Pipeline:
         effective_request: dict[str, Any],
         replacement: Path | None,
     ) -> dict[str, Any]:
+        effective_request = cls._validated_effective_request(
+            effective_request
+        )
         segment_bindings: list[dict[str, Any]] = []
         source_receipts: list[dict[str, Any]] = []
-        for item in sorted(prepared, key=lambda value: int(value["index"])):
+        sorted_prepared = sorted(
+            prepared, key=lambda value: int(value["index"])
+        )
+        cls._validated_join_modes(sorted_prepared)
+        for item in sorted_prepared:
             index = int(item["index"])
             source = item.get("source")
             if not isinstance(source, Path):
@@ -1148,7 +1217,7 @@ class Pipeline:
                 "end_s": item.get("end_s"),
                 "duration_s": item.get("duration_s"),
                 "chain_id": item.get("chain_id"),
-                "join_mode": item.get("join_mode"),
+                "join_mode": item["join_mode"],
                 "visual_prompt": item.get("visual_prompt"),
                 "dialogue": item.get("dialogue", []),
             })
@@ -1214,9 +1283,11 @@ class Pipeline:
         request: dict[str, Any] | None = None,
     ) -> None:
         segments: dict[str, dict[str, Any]] = {}
-        for item, final_prompt, muted, fusion_input_sha256 in sorted(
+        sorted_h3_inputs = sorted(
             h3_inputs, key=lambda value: int(value[0]["index"]),
-        ):
+        )
+        self._validated_join_modes([value[0] for value in sorted_h3_inputs])
+        for item, final_prompt, muted, fusion_input_sha256 in sorted_h3_inputs:
             index = int(item["index"])
             if str(final_prompt).strip() != final_prompt:
                 raise ValueError("prepared H3 prompt is not canonical")
@@ -1238,7 +1309,7 @@ class Pipeline:
                     "start_s": item.get("start_s"),
                     "end_s": item.get("end_s"),
                     "duration_s": item.get("duration_s"),
-                    "join_mode": item.get("join_mode", "hard_cut"),
+                    "join_mode": item["join_mode"],
                 }),
             }
         state = self.store.read(project_id)
@@ -1261,7 +1332,13 @@ class Pipeline:
             raise ValueError("H3 preparation binding state is invalid")
         if object_replace.get("version") != OBJECT_REPLACE_OUTPUT_VERSION:
             raise ValueError(
-                "H3 preparation v3 requires Object Replace v2"
+                f"H3 preparation v{H3_PREPARED_ARTIFACTS_VERSION} requires "
+                f"Object Replace v{OBJECT_REPLACE_OUTPUT_VERSION}"
+            )
+        if frozen_replacement_sheet.get("version") != REPLACEMENT_SHEET_VERSION:
+            raise ValueError(
+                f"H3 preparation v{H3_PREPARED_ARTIFACTS_VERSION} requires "
+                f"replacement sheet v{REPLACEMENT_SHEET_VERSION}"
             )
         if state.get("replacement_sheet") != frozen_replacement_sheet:
             raise ValueError(
@@ -1277,14 +1354,14 @@ class Pipeline:
             if replacement is not None
             else None
         )
-        effective_request = request if isinstance(request, dict) else (
-            state.get("effective_request") or {}
+        effective_request = self._validated_effective_request(
+            state.get("effective_request")
         )
-        output_request = (
-            effective_request.get("output") or {}
-            if isinstance(effective_request, dict)
-            else {}
-        )
+        if request is not None and request != effective_request:
+            raise ValueError(
+                "H3 preparation request is not the stored effective request"
+            )
+        output_request = effective_request["output"]
         self.store.update(
             project_id,
             h3_prepared_artifacts={
@@ -1389,14 +1466,12 @@ class Pipeline:
         request: dict[str, Any],
         log: ResearchLog,
     ) -> None:
+        request = self._validated_effective_request(request)
         visual_prompts = "\n\n".join(
             f"Segment {item['index']}: {item['visual_prompt']}"
             for item in prepared
         )
-        target_language = str(
-            ((request.get("dialogue") or {}).get("target_language"))
-            or SAME_AS_SOURCE_LANGUAGE
-        ).strip()
+        target_language = request["dialogue"]["target_language"]
         self._progress(project_id, 43, "translation")
         translated_lines = self._node(
             log,
@@ -1587,6 +1662,7 @@ class Pipeline:
         )
 
         final = project / "output" / "generated.mp4"
+        join_modes = self._validated_join_modes(prepared)
         self._progress(
             project_id,
             95,
@@ -1600,9 +1676,7 @@ class Pipeline:
             {
                 "segments": outputs,
                 "target_durations": [item["duration_s"] for item in prepared],
-                "join_modes": [
-                    item.get("join_mode", "hard_cut") for item in prepared
-                ],
+                "join_modes": join_modes,
                 "output": final,
             },
             outputs,
@@ -1610,9 +1684,7 @@ class Pipeline:
                 outputs,
                 final,
                 target_durations=[item["duration_s"] for item in prepared],
-                join_modes=[
-                    item.get("join_mode", "hard_cut") for item in prepared
-                ],
+                join_modes=join_modes,
             ),
             lambda _value: [final],
         )
@@ -1672,11 +1744,11 @@ class Pipeline:
                 or float(duration) * 24 < 1
             ):
                 raise ValueError("stored segment metadata is invalid")
-            join_mode = raw.get("join_mode", "hard_cut")
+            join_mode = raw.get("join_mode")
             if join_mode not in {"hard_cut", "continue"}:
                 raise ValueError("stored segment join mode is invalid")
             indices.append(index)
-            segments.append({**raw, "join_mode": join_mode})
+            segments.append(dict(raw))
         if sorted(indices) != list(range(1, segment_count + 1)):
             raise ValueError(
                 "stored segment indices must be unique and contiguous"
@@ -1701,6 +1773,9 @@ class Pipeline:
     ]:
         project = self.store.path(project_id)
         state = self.store.read(project_id)
+        effective_request = self._validated_effective_request(
+            state.get("effective_request")
+        )
         status = state.get("status")
         stage = (state.get("project_progress") or {}).get("stage")
         if status != "failed" and not (
@@ -1767,7 +1842,7 @@ class Pipeline:
                 project,
                 source,
                 replacement,
-                state.get("effective_request") or {},
+                effective_request,
                 prepared_segments,
                 {},
                 [],
@@ -1814,7 +1889,7 @@ class Pipeline:
             project,
             source,
             replacement,
-            state.get("effective_request") or {},
+            effective_request,
             segments,
             selections,
             [dict(line) for line in spoken_lines],
@@ -1982,10 +2057,7 @@ class Pipeline:
             not isinstance(raw, dict)
             or set(raw) != {"version", "segments"}
             or isinstance(version, bool)
-            or version not in {
-                PICSART_RECEIPT_LEGACY_VERSION,
-                PICSART_RECEIPT_VERSION,
-            }
+            or version != PICSART_RECEIPT_VERSION
             or not isinstance(raw.get("segments"), dict)
         ):
             raise ValueError("stored Picsart receipt ledger is invalid")
@@ -1995,17 +2067,11 @@ class Pipeline:
             if isinstance(prepared_manifest, dict)
             else None
         )
-        preparation_sha256: str | None = None
-        if version == PICSART_RECEIPT_VERSION:
-            if prepared_version != H3_PREPARED_ARTIFACTS_VERSION:
-                raise ValueError(
-                    "Picsart receipt v2 requires an H3 preparation v3 manifest"
-                )
-            preparation_sha256 = cls._json_sha256(prepared_manifest)
-        elif prepared_version == H3_PREPARED_ARTIFACTS_VERSION:
+        if prepared_version != H3_PREPARED_ARTIFACTS_VERSION:
             raise ValueError(
-                "H3 preparation v3 requires Picsart receipt v2"
+                "Picsart receipt v2 requires the current H3 preparation manifest"
             )
+        preparation_sha256 = cls._json_sha256(prepared_manifest)
         normalized: dict[str, list[dict[str, Any]]] = {}
         allowed_statuses = {
             "submission_started", "accepted", "unknown", "rejected",
@@ -2026,10 +2092,8 @@ class Pipeline:
             for offset, receipt in enumerate(records):
                 expected_receipt_keys = {
                     "segment_index", "run_identity", "request_sha256",
-                    "status", "task_id",
+                    "preparation_sha256", "status", "task_id",
                 }
-                if version == PICSART_RECEIPT_VERSION:
-                    expected_receipt_keys.add("preparation_sha256")
                 if (
                     not isinstance(receipt, dict)
                     or set(receipt) != expected_receipt_keys
@@ -2062,11 +2126,8 @@ class Pipeline:
                         offset < len(records) - 1
                         and status not in {"rejected", "provider_failed"}
                     )
-                    or (
-                        version == PICSART_RECEIPT_VERSION
-                        and receipt.get("preparation_sha256")
-                        != preparation_sha256
-                    )
+                    or receipt.get("preparation_sha256")
+                    != preparation_sha256
                 ):
                     raise ValueError("stored Picsart receipt fields are invalid")
                 seen_runs.add(run_identity)
@@ -2092,16 +2153,12 @@ class Pipeline:
             manifest_version = (
                 manifest.get("version") if isinstance(manifest, dict) else None
             )
-            ledger_version = (
-                PICSART_RECEIPT_VERSION
-                if manifest_version == H3_PREPARED_ARTIFACTS_VERSION
-                else PICSART_RECEIPT_LEGACY_VERSION
-            )
-            preparation_sha256 = (
-                self._json_sha256(manifest)
-                if ledger_version == PICSART_RECEIPT_VERSION
-                else None
-            )
+            if manifest_version != H3_PREPARED_ARTIFACTS_VERSION:
+                raise ValueError(
+                    "Picsart submission requires the current H3 preparation manifest"
+                )
+            ledger_version = PICSART_RECEIPT_VERSION
+            preparation_sha256 = self._json_sha256(manifest)
             if any(
                 prepared.preparation_sha256 != preparation_sha256
                 for prepared in pending
@@ -2138,8 +2195,7 @@ class Pipeline:
                     "status": "submission_started",
                     "task_id": None,
                 }
-                if preparation_sha256 is not None:
-                    receipt["preparation_sha256"] = preparation_sha256
+                receipt["preparation_sha256"] = preparation_sha256
                 records.append(receipt)
             self.store.update(
                 project_id,
@@ -2200,14 +2256,10 @@ class Pipeline:
             state = self.store.read(project_id)
             ledger = self._validated_submission_receipts(state)
             if ledger is None:
-                return
+                raise ValueError("Picsart submission receipt ledger is missing")
             records = ledger["segments"].get(str(segment_index)) or []
-            # A ledger may first appear when a different segment is resumed
-            # from a mixed legacy/new project. This segment's accepted task
-            # can still be owned solely by the legacy research log, so there
-            # is no state receipt to transition here.
             if not records:
-                return
+                raise ValueError("accepted Picsart task receipt is missing")
             matches = [
                 receipt for receipt in records
                 if receipt["status"] == "accepted"
@@ -2232,10 +2284,7 @@ class Pipeline:
             return False, None
         records = ledger["segments"].get(str(segment_index)) or []
         if not records:
-            # A ledger can first appear during a mixed legacy resume where a
-            # different segment needed a new POST.  Absence for this segment
-            # does not erase its older accepted-task evidence.
-            return False, None
+            raise ValueError("Picsart segment receipt is missing")
         receipt = records[-1]
         if receipt["status"] in {"submission_started", "unknown"}:
             raise ValueError(
@@ -2311,103 +2360,6 @@ class Pipeline:
                 ):
                     terminal_task_ids.add(task_id)
         return terminal_task_ids
-
-    def _active_resume_task(
-        self, project: Path, scope: str,
-    ) -> str | None:
-        terminal_task_ids = self._terminal_resume_task_ids(project, scope)
-
-        for prefix in self._picsart_receipt_prefixes(project):
-            submit_root = project / "logs" / f"{prefix}-submit" / scope
-            outputs = sorted(
-                submit_root.glob("attempt-*/output.json"), reverse=True,
-            )
-            for output in outputs:
-                try:
-                    logged = json.loads(output.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                record = logged.get("provider_record") if isinstance(logged, dict) else None
-                task_id = record.get("task_id") if isinstance(record, dict) else None
-                if not isinstance(task_id, str) or not task_id:
-                    continue
-                if task_id not in terminal_task_ids:
-                    return task_id
-        return None
-
-    def _has_retryable_submit_evidence(
-        self, project: Path, scope: str,
-    ) -> bool:
-        terminal_task_ids = self._terminal_resume_task_ids(project, scope)
-        for prefix in self._picsart_receipt_prefixes(project):
-            submit_root = project / "logs" / f"{prefix}-submit" / scope
-            for output in submit_root.glob("attempt-*/output.json"):
-                try:
-                    logged = json.loads(output.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                record = (
-                    logged.get("provider_record")
-                    if isinstance(logged, dict)
-                    else None
-                )
-                if not isinstance(record, dict):
-                    continue
-                task_id = record.get("task_id")
-                if isinstance(task_id, str) and task_id in terminal_task_ids:
-                    return True
-                response = record.get("response")
-                status_code = (
-                    response.get("status_code")
-                    if isinstance(response, dict)
-                    else None
-                )
-                if (
-                    record.get("outcome") == "rejected"
-                    and status_code in PicsartClient.SAFE_REJECT_STATUS_CODES
-                ):
-                    return True
-        return False
-
-    def _has_unknown_submit_receipt(
-        self, project: Path, scope: str,
-    ) -> bool:
-        for prefix in self._picsart_receipt_prefixes(project):
-            submit_root = project / "logs" / f"{prefix}-submit" / scope
-            for attempt in submit_root.glob("attempt-*"):
-                if not attempt.is_dir():
-                    continue
-                output = attempt / "output.json"
-                try:
-                    logged = json.loads(output.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    # Input evidence is written before the paid POST. A
-                    # missing or corrupt result cannot prove rejection.
-                    return True
-                record = (
-                    logged.get("provider_record")
-                    if isinstance(logged, dict)
-                    else None
-                )
-                if not isinstance(record, dict):
-                    return True
-                task_id = record.get("task_id")
-                if isinstance(task_id, str) and task_id.strip():
-                    continue
-                # Explicit rejection is the only no-task-id result that
-                # makes another paid POST safe.
-                response = record.get("response")
-                status_code = (
-                    response.get("status_code")
-                    if isinstance(response, dict)
-                    else None
-                )
-                if (
-                    record.get("outcome") != "rejected"
-                    or status_code not in PicsartClient.SAFE_REJECT_STATUS_CODES
-                ):
-                    return True
-        return False
 
     def _completed_resume_output(
         self, project: Path, segment_dir: Path, scope: str,
@@ -2494,10 +2446,7 @@ class Pipeline:
             not isinstance(raw, dict)
             or set(raw) != {"version", "bindings", "segments"}
             or isinstance(version, bool)
-            or version not in {
-                H3_PREPARED_ARTIFACTS_LEGACY_VERSION,
-                H3_PREPARED_ARTIFACTS_VERSION,
-            }
+            or version != H3_PREPARED_ARTIFACTS_VERSION
             or not isinstance(raw.get("bindings"), dict)
             or not isinstance(raw.get("segments"), dict)
         ):
@@ -2508,19 +2457,16 @@ class Pipeline:
             "object_replace_input_sha256", "replacement_image",
             "output_request_sha256",
         }
-        if version == H3_PREPARED_ARTIFACTS_VERSION:
-            expected_binding_keys.add("replacement_sheet_sha256")
+        expected_binding_keys.add("replacement_sheet_sha256")
         if set(bindings) != expected_binding_keys:
             raise ValueError("stored H3 preparation bindings are invalid")
         enhanced_index = state.get("enhanced_element_index")
         voice_references = state.get("voice_references")
         object_replace = state.get("object_replace")
-        effective_request = state.get("effective_request") or {}
-        output_request = (
-            effective_request.get("output") or {}
-            if isinstance(effective_request, dict)
-            else {}
+        effective_request = cls._validated_effective_request(
+            state.get("effective_request")
         )
+        output_request = effective_request["output"]
         if (
             not isinstance(enhanced_index, dict)
             or not isinstance(voice_references, list)
@@ -2535,12 +2481,7 @@ class Pipeline:
             != cls._json_sha256(output_request)
         ):
             raise ValueError("stored H3 preparation bindings do not match")
-        expected_object_replace_version = (
-            1
-            if version == H3_PREPARED_ARTIFACTS_LEGACY_VERSION
-            else OBJECT_REPLACE_OUTPUT_VERSION
-        )
-        if object_replace.get("version") != expected_object_replace_version:
+        if object_replace.get("version") != OBJECT_REPLACE_OUTPUT_VERSION:
             raise ValueError(
                 "stored H3 preparation Object Replace version does not match"
             )
@@ -2553,12 +2494,7 @@ class Pipeline:
                 project, replacement_receipt, "inputs/replacement-image",
             )
         replacement_sheet = state.get("replacement_sheet")
-        if version == H3_PREPARED_ARTIFACTS_LEGACY_VERSION:
-            if replacement_sheet is not None:
-                raise ValueError(
-                    "legacy H3 preparation cannot bind a replacement sheet"
-                )
-        elif (
+        if (
             not isinstance(replacement_sheet, dict)
             or bindings.get("replacement_sheet_sha256")
             != cls._json_sha256(replacement_sheet)
@@ -2566,8 +2502,11 @@ class Pipeline:
             raise ValueError(
                 "stored H3 preparation replacement sheet binding does not match"
             )
-        else:
-            cls._validated_stored_replacement_sheet(project, state)
+        if replacement_sheet.get("version") != REPLACEMENT_SHEET_VERSION:
+            raise ValueError(
+                "stored H3 preparation replacement sheet version does not match"
+            )
+        cls._validated_stored_replacement_sheet(project, state)
         expected_keys = {str(item["index"]) for item in segments}
         if set(raw["segments"]) != expected_keys:
             raise ValueError("stored H3 preparation segments do not match")
@@ -2587,7 +2526,7 @@ class Pipeline:
                 "start_s": item.get("start_s"),
                 "end_s": item.get("end_s"),
                 "duration_s": item.get("duration_s"),
-                "join_mode": item.get("join_mode", "hard_cut"),
+                "join_mode": item["join_mode"],
             })
             if (
                 entry.get("segment_index") != index
@@ -2648,14 +2587,20 @@ class Pipeline:
                 )
             )
             or not isinstance(raw.get("spec"), dict)
-            or raw.get("spec_sha256")
-            != raw["spec"].get("spec_sha256")
+            or not isinstance(state.get("enhanced_element_index"), dict)
+            or not isinstance(raw.get("h3_reference_images"), list)
+        ):
+            raise ValueError("stored replacement sheet state is invalid")
+        try:
+            validate_replacement_sheet_spec(raw["spec"], allow_empty=True)
+        except ValueError as exc:
+            raise ValueError("stored replacement sheet state is invalid") from exc
+        if (
+            raw.get("spec_sha256") != raw["spec"].get("spec_sha256")
             or raw.get("spec_sha256")
             != replacement_sheet_spec_sha256(raw["spec"])
-            or not isinstance(state.get("enhanced_element_index"), dict)
             or raw["spec"].get("enhanced_element_index_sha256")
-            != cls._json_sha256(state.get("enhanced_element_index"))
-            or not isinstance(raw.get("h3_reference_images"), list)
+            != cls._json_sha256(state["enhanced_element_index"])
         ):
             raise ValueError("stored replacement sheet state is invalid")
 
@@ -2675,11 +2620,13 @@ class Pipeline:
         ]
         object_replace = state.get("object_replace")
         voice_references = state.get("voice_references")
-        effective_request = state.get("effective_request") or {}
+        effective_request = cls._validated_effective_request(
+            state.get("effective_request")
+        )
         if (
             not isinstance(object_replace, dict)
+            or object_replace.get("version") != OBJECT_REPLACE_OUTPUT_VERSION
             or not isinstance(voice_references, list)
-            or not isinstance(effective_request, dict)
         ):
             raise ValueError("stored replacement sheet upstream state is invalid")
         replacement = (
@@ -2702,32 +2649,9 @@ class Pipeline:
             )
 
         expected_spec = build_replacement_sheet_spec(
-            project,
             state["enhanced_element_index"],
-            [],
         )
-        stable_tile_fields = (
-            "tile_id", "category", "stable_key", "row", "column",
-            "source", "target",
-        )
-        expected_tiles = expected_spec["tiles"]
-        actual_tiles = raw["spec"].get("tiles")
-        if (
-            raw["spec"].get("columns") != expected_spec["columns"]
-            or raw["spec"].get("rows") != expected_spec["rows"]
-            or not isinstance(actual_tiles, list)
-            or len(actual_tiles) != len(expected_tiles)
-            or any(
-                {
-                    key: actual.get(key) for key in stable_tile_fields
-                } != {
-                    key: expected.get(key) for key in stable_tile_fields
-                }
-                for actual, expected in zip(actual_tiles, expected_tiles)
-                if isinstance(actual, dict) and isinstance(expected, dict)
-            )
-            or any(not isinstance(tile, dict) for tile in actual_tiles)
-        ):
+        if raw["spec"] != expected_spec:
             raise ValueError(
                 "stored replacement sheet tiles do not match the global index"
             )
@@ -2819,13 +2743,12 @@ class Pipeline:
         if persisted_spec != raw["spec"]:
             raise ValueError("stored replacement sheet spec does not match")
         allowed_inputs = [
+            "work/global-reference-sheet/canvas.png",
             *(
                 ["work/global-reference-sheet/user-reference.png"]
                 if raw["user_image_present"]
                 else []
             ),
-            "work/global-reference-sheet/canvas.png",
-            "work/global-reference-sheet/source-evidence.png",
         ]
         if len(seedream["inputs"]) != len(allowed_inputs):
             raise ValueError("stored Seedream input order is invalid")
@@ -2844,6 +2767,7 @@ class Pipeline:
             "model": seedream["model"],
             "prompt_sha256": prompt_sha256,
             "input_sha256": input_sha256,
+            "size": SEEDREAM_OUTPUT_SIZE,
             "response_format": "b64_json",
             "watermark": False,
         }
@@ -2881,7 +2805,13 @@ class Pipeline:
             "work/global-reference-sheet/reference-sheet.png",
         )
         output_bytes = output_path.read_bytes()
-        if not output_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        try:
+            output_media_type = _validated_image_media_type(output_bytes)
+        except ValueError as exc:
+            raise ValueError(
+                "stored replacement sheet is not a valid 2048x2048 image"
+            ) from exc
+        if output_media_type != "image/png":
             raise ValueError("stored replacement sheet is not PNG")
         expected_references.append({
             "image_reference": expected_image_reference,
@@ -2921,6 +2851,7 @@ class Pipeline:
             or seedream_receipt.get("model") != seedream["model"]
             or seedream_receipt.get("prompt_sha256") != prompt_sha256
             or seedream_receipt.get("input_sha256") != input_sha256
+            or seedream_receipt.get("size") != SEEDREAM_OUTPUT_SIZE
             or receipt_request_sha256 != request_sha256
         ):
             raise ValueError(
@@ -2992,6 +2923,7 @@ class Pipeline:
             or receipt.get("prompt_sha256")
             != seedream.get("prompt", {}).get("sha256")
             or receipt.get("input_sha256") != input_sha256
+            or receipt.get("size") != SEEDREAM_OUTPUT_SIZE
             or receipt.get("request_sha256")
             != seedream.get("request_sha256")
             or receipt.get("status")
@@ -3048,6 +2980,8 @@ class Pipeline:
                 or marker.get("result_bytes") != len(result)
                 or marker.get("result_sha256") != result_sha256
                 or marker.get("media_type") != media_type
+                or marker.get("width") != SEEDREAM_OUTPUT_WIDTH
+                or marker.get("height") != SEEDREAM_OUTPUT_HEIGHT
             ):
                 raise ValueError("stored Seedream response marker is invalid")
         elif receipt.get("status") != "submitting":
@@ -3076,6 +3010,9 @@ class Pipeline:
     ]:
         project = self.store.path(project_id)
         state = self.store.read(project_id)
+        effective_request = self._validated_effective_request(
+            state.get("effective_request")
+        )
         status = state.get("status")
         stage = (state.get("project_progress") or {}).get("stage")
         if status != "failed" and not (
@@ -3089,15 +3026,9 @@ class Pipeline:
         manifest = self._validated_h3_prepared_artifacts(
             project, state, raw_segments,
         )
-        if manifest is None and any(
-            key in state
-            for key in (
-                "object_replace", "enhanced_element_index", "voice_references",
-                "replacement_sheet",
-            )
-        ):
+        if manifest is None:
             raise ValueError(
-                "new H3 preparation state is missing its artifact manifest"
+                "project is missing the current H3 preparation manifest"
             )
         replacement_sheet = self._validated_stored_replacement_sheet(
             project, state,
@@ -3109,31 +3040,32 @@ class Pipeline:
             if isinstance(state.get("h3_prepared_artifacts"), dict)
             else None
         )
-        v3_first_submit_resume = False
-        if manifest_version == H3_PREPARED_ARTIFACTS_VERSION:
-            expected_receipt_segments = {
-                str(item["index"]) for item in raw_segments
-            }
-            if state_receipts is None:
-                has_submit_directory = any(
-                    path.is_dir()
-                    for path in (project / "logs").glob("picsart*-submit")
-                )
-                if has_submit_directory:
-                    raise ValueError(
-                        "H3 preparation v3 has Picsart submission evidence "
-                        "without its receipt ledger"
-                    )
-                # The v3 manifest is frozen before global Picsart preflight.
-                # A preflight failure therefore legitimately leaves neither
-                # a ledger nor a submit directory.  This is the only state in
-                # which Picsart resume may perform the first paid submission.
-                v3_first_submit_resume = True
-            elif set(state_receipts["segments"]) != expected_receipt_segments:
+        if manifest_version != H3_PREPARED_ARTIFACTS_VERSION:
+            raise ValueError("stored H3 preparation manifest is invalid")
+        current_first_submit_resume = False
+        expected_receipt_segments = {
+            str(item["index"]) for item in raw_segments
+        }
+        if state_receipts is None:
+            has_submit_directory = any(
+                path.is_dir()
+                for path in (project / "logs").glob("picsart*-submit")
+            )
+            if has_submit_directory:
                 raise ValueError(
-                    "H3 preparation v3 requires a complete Picsart receipt ledger; "
-                    "reconcile it before any paid submit"
+                    f"H3 preparation v{H3_PREPARED_ARTIFACTS_VERSION} has "
+                    "Picsart submission evidence without its receipt ledger"
                 )
+            # The current manifest is frozen before global Picsart preflight.
+            # A preflight failure therefore legitimately leaves neither a
+            # ledger nor a submit directory. This is the only state in which
+            # Picsart resume may perform the first paid submission.
+            current_first_submit_resume = True
+        elif set(state_receipts["segments"]) != expected_receipt_segments:
+            raise ValueError(
+                f"H3 preparation v{H3_PREPARED_ARTIFACTS_VERSION} requires a "
+                "complete Picsart receipt ledger; reconcile it before any paid submit"
+            )
         if state_receipts is not None and not set(
             state_receipts["segments"]
         ).issubset({str(item["index"]) for item in raw_segments}):
@@ -3156,28 +3088,6 @@ class Pipeline:
                     raise ValueError(
                         f"reusable segment artifact is empty: {required.name}"
                     )
-            if manifest is None:
-                self._project_artifact_receipt(
-                    project,
-                    source,
-                    f"work/segments/{index:04d}/source.mp4",
-                )
-                self._project_artifact_receipt(
-                    project,
-                    muted,
-                    f"work/segments/{index:04d}/source-muted.mp4",
-                )
-                self._project_artifact_receipt(
-                    project,
-                    prompt_path,
-                    f"work/segments/{index:04d}/h3_prompt.txt",
-                )
-                self._completed_node_value(
-                    project, "mute-reference-video", self._segment_scope(index),
-                )
-                self._completed_node_value(
-                    project, "h3-max-r2v-prompt", self._segment_scope(index),
-                )
             self._validate_reference_video(muted)
             final_prompt = prompt_path.read_text(encoding="utf-8").strip()
             if not final_prompt:
@@ -3205,50 +3115,8 @@ class Pipeline:
                     project_id, index, resume_task_id,
                 )
                 resume_task_id = None
-            if not has_state_receipt:
-                resume_task_id = self._active_resume_task(
-                    project, scope,
-                )
-                if (
-                    resume_task_id is None
-                    and self._has_unknown_submit_receipt(
-                        project, scope,
-                    )
-                ):
-                    raise ValueError(
-                        "Picsart submission outcome is unknown; reconcile it before resume"
-                    )
-                if (
-                    resume_task_id is None
-                    and resume_output is None
-                    and not v3_first_submit_resume
-                    and not self._has_retryable_submit_evidence(
-                        project, scope,
-                    )
-                ):
-                    raise ValueError(
-                        "Picsart submission outcome is unproven; use preparation resume "
-                        "or reconcile it before a new paid submit"
-                    )
-            requires_new_submit = (
-                resume_output is None and resume_task_id is None
-            )
-            if (
-                manifest_version == H3_PREPARED_ARTIFACTS_LEGACY_VERSION
-                and requires_new_submit
-                and (
-                    replacement is not None
-                    or self._enhanced_index_has_replacement(
-                        state.get("enhanced_element_index")
-                        if isinstance(state.get("enhanced_element_index"), dict)
-                        else {}
-                    )
-                )
-            ):
-                raise ValueError(
-                    "legacy H3 preparation with replacement state cannot make "
-                    "a new Picsart submission; create a new H3 v3 project"
-                )
+            elif not has_state_receipt and not current_first_submit_resume:
+                raise ValueError("Picsart segment receipt is missing")
             item.update({
                 "source": source,
                 "resume_muted": muted,
@@ -3264,7 +3132,7 @@ class Pipeline:
             prepared,
             replacement,
             replacement_sheet,
-            state.get("effective_request") or {},
+            effective_request,
             voice_references,
         )
 
@@ -3349,6 +3217,7 @@ class Pipeline:
                 ]
 
             final = project / "output" / "generated.mp4"
+            join_modes = self._validated_join_modes(prepared)
             self._progress(
                 project_id,
                 95,
@@ -3362,9 +3231,7 @@ class Pipeline:
                 {
                     "segments": outputs,
                     "target_durations": [item["duration_s"] for item in prepared],
-                    "join_modes": [
-                        item.get("join_mode", "hard_cut") for item in prepared
-                    ],
+                    "join_modes": join_modes,
                     "output": final,
                 },
                 outputs,
@@ -3372,9 +3239,7 @@ class Pipeline:
                     outputs,
                     final,
                     target_durations=[item["duration_s"] for item in prepared],
-                    join_modes=[
-                        item.get("join_mode", "hard_cut") for item in prepared
-                    ],
+                    join_modes=join_modes,
                 ),
                 lambda _value: [final],
             )
@@ -3634,16 +3499,17 @@ class Pipeline:
                 encoding="utf-8",
             )
 
-        processing = request.get("processing") or {}
+        request = self._validated_effective_request(request)
+        processing = request["processing"]
         generation_config = self._generation_config(request)
         stages: list[str] = []
-        if processing.get("remove_subtitle"):
+        if processing["remove_subtitle"]:
             stages.append("full_screen_text_erase")
-        if processing.get("remove_logo"):
+        if processing["remove_logo"]:
             stages.append("full_screen_icon_erase")
         use_mediakit = (
             self.settings.enable_mediakit
-            and processing.get("optimize_image", True)
+            and processing["optimize_image"]
             and bool(stages)
         )
         authoritative_frames = list(frames)
@@ -4227,13 +4093,10 @@ class Pipeline:
         resolved_voice_references: list[Path] = []
         for slot, path in enumerate(voice_references, 1):
             resolved = path.resolve(strict=True)
-            valid_paths = {
-                (project / "work" / "voice-reference.wav").resolve(),
-                (
-                    project / "work" / "voice-references"
-                    / f"audio-{slot:02d}.wav"
-                ).resolve(),
-            }
+            valid_paths = {(
+                project / "work" / "voice-references"
+                / f"audio-{slot:02d}.wav"
+            ).resolve()}
             if (
                 project_root not in resolved.parents
                 or resolved not in valid_paths
@@ -4251,11 +4114,10 @@ class Pipeline:
             or existing_task_id != existing_task_id.strip()
         ):
             raise ValueError("stored Picsart task id is invalid")
-        output_request = request.get("output") or {}
-        if not isinstance(output_request, dict):
-            raise ValueError("stored Picsart output request is invalid")
-        resolution = output_request.get("resolution", "768p")
-        aspect_ratio = output_request.get("aspect_ratio", "adaptive")
+        request = self._validated_effective_request(request)
+        output_request = request["output"]
+        resolution = output_request["resolution"]
+        aspect_ratio = output_request["aspect_ratio"]
         if not isinstance(resolution, str) or resolution not in PICSART_RESOLUTIONS:
             raise ValueError("Picsart resolution is unsupported")
         if (
@@ -4287,83 +4149,43 @@ class Pipeline:
         )
         if prepared_manifest_version == H3_PREPARED_ARTIFACTS_VERSION:
             preparation_sha256 = self._json_sha256(prepared_manifest)
-        elif prepared_manifest_version in {
-            None, H3_PREPARED_ARTIFACTS_LEGACY_VERSION,
-        }:
-            preparation_sha256 = None
         else:
             raise ValueError("stored H3 preparation manifest is invalid")
         if existing_task_id is None:
             stored_state = binding_state
             stored_sheet = stored_state.get("replacement_sheet")
-            if stored_sheet is not None:
-                if not isinstance(stored_sheet, dict):
-                    raise ValueError("stored replacement sheet state is invalid")
-                validated_sheet = self._validated_stored_replacement_sheet(
-                    project, stored_state,
-                )
-                supplied_sheet = (
-                    replacement_sheet.resolve(strict=True)
-                    if replacement_sheet is not None
-                    else None
-                )
-                if (
-                    supplied_sheet != validated_sheet
-                    or stored_sheet["user_image_present"]
-                    != (
-                        replacement is not None
-                        and self._enhanced_index_uses_user_image(
-                            stored_state.get("enhanced_element_index")
-                            if isinstance(
-                                stored_state.get("enhanced_element_index"),
-                                dict,
-                            )
-                            else {}
+            if not isinstance(stored_sheet, dict):
+                raise ValueError("stored replacement sheet state is invalid")
+            validated_sheet = self._validated_stored_replacement_sheet(
+                project, stored_state,
+            )
+            supplied_sheet = (
+                replacement_sheet.resolve(strict=True)
+                if replacement_sheet is not None
+                else None
+            )
+            if (
+                supplied_sheet != validated_sheet
+                or stored_sheet["user_image_present"]
+                != (
+                    replacement is not None
+                    and self._enhanced_index_uses_user_image(
+                        stored_state.get("enhanced_element_index")
+                        if isinstance(
+                            stored_state.get("enhanced_element_index"),
+                            dict,
                         )
+                        else {}
                     )
-                ):
-                    raise ValueError(
-                        "prepared Picsart image binding does not match"
-                    )
-                provider_images.extend(
-                    (project / reference["path"]).resolve(strict=True)
-                    for reference in stored_sheet["h3_reference_images"]
                 )
-            elif replacement_sheet is not None:
+            ):
                 raise ValueError(
-                    "legacy H3 preparation cannot use a replacement sheet"
+                    "prepared Picsart image binding does not match"
                 )
-            elif replacement is not None:
-                canonical_replacement = project / "inputs" / "replacement-image"
-                resolved_replacement = replacement.resolve(strict=True)
-                if (
-                    resolved_replacement
-                    != canonical_replacement.resolve(strict=True)
-                    or project_root not in resolved_replacement.parents
-                    or replacement.is_symlink()
-                ):
-                    raise ValueError("replacement image path is invalid")
-                provider_replacement = (
-                    segment_dir / f"provider-reference{artifact_suffix}.png"
-                )
-                self._node(
-                    log,
-                    f"{node_prefix}-reference-image",
-                    scope,
-                    {"source": replacement, "output": provider_replacement},
-                    [replacement],
-                    lambda: media.provider_reference_png(
-                        replacement, provider_replacement,
-                    ),
-                    lambda _value: [provider_replacement],
-                )
-                provider_bytes = provider_replacement.read_bytes()
-                if (
-                    not provider_bytes.startswith(b"\x89PNG\r\n\x1a\n")
-                    or len(provider_bytes) < 9
-                ):
-                    raise ValueError("prepared provider reference is not PNG")
-                provider_images.append(provider_replacement.resolve(strict=True))
+            provider_images.extend(
+                (project / reference["path"]).resolve(strict=True)
+                for reference in stored_sheet["h3_reference_images"]
+            )
             if len(provider_images) != len(set(provider_images)):
                 raise ValueError("prepared Picsart image files must be unique")
             video_url = self._validated_provider_asset_url(
@@ -4570,16 +4392,17 @@ class Pipeline:
             raise
 
     def _generation_config(self, request: dict[str, Any]) -> dict[str, bool]:
-        processing = request.get("processing") or {}
+        request = self._validated_effective_request(request)
+        processing = request["processing"]
         enabled = self.settings.enable_mediakit and bool(
-            processing.get("optimize_image", True)
+            processing["optimize_image"]
         )
         return {
             "remove_subtitle": enabled and bool(
-                processing.get("remove_subtitle")
+                processing["remove_subtitle"]
             ),
             "remove_watermark": enabled and bool(
-                processing.get("remove_logo")
+                processing["remove_logo"]
             ),
         }
 
@@ -4638,7 +4461,7 @@ class Pipeline:
             "end_s": item["end_s"],
             "duration_s": item["duration_s"],
             "chain_id": item.get("chain_id"),
-            "join_mode": item.get("join_mode"),
+            "join_mode": item["join_mode"],
             "status": item.get("status", "running"),
             "visual_prompt": item.get("visual_prompt"),
             "final_prompt": item.get("final_prompt"),

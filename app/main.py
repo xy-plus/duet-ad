@@ -40,10 +40,20 @@ from app.store import (
 LOGGER = logging.getLogger(__name__)
 MIB = 1024 * 1024
 REPLACEMENT_MAX_BYTES = 10 * MIB
+CLIENT_REQUEST_ID_MAX_CHARS = 64
+TARGET_LANGUAGE_MAX_CHARS = 80
+REPLACEMENT_INSTRUCTION_MAX_CHARS = 1000
 UPLOAD_CHUNK_BYTES = MIB
 CREATION_REQUEST_OVERHEAD_BYTES = 4 * MIB
 PROVIDER_ASSET_TTL_S = 24 * 60 * 60
 REPLACEMENT_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+CREATION_FORM_FIELDS = frozenset({
+    "file",
+    "reference_url",
+    "client_request_id",
+    "generation_request",
+    "replacement_image",
+})
 PROVIDER_ASSET_SUFFIXES = {
     "video/mp4": ".mp4",
     "image/jpeg": ".jpg",
@@ -72,7 +82,7 @@ CAPABILITY = {
             "supported": True,
             "accept": ["image/jpeg", "image/png", "image/webp"],
             "max_bytes": REPLACEMENT_MAX_BYTES,
-            "max_instruction_chars": 1000,
+            "max_instruction_chars": REPLACEMENT_INSTRUCTION_MAX_CHARS,
         },
     }
 }
@@ -175,19 +185,142 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _utf16_code_units(value: str) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _normalize_client_request_id(value: object) -> str:
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not normalized or len(normalized) > CLIENT_REQUEST_ID_MAX_CHARS:
+        raise _error(
+            400,
+            "invalid_client_request_id",
+            f"client_request_id 必须是 1 至 {CLIENT_REQUEST_ID_MAX_CHARS} 个字符",
+        )
+    return normalized
+
+
+async def _validate_creation_form(request: Request) -> None:
+    counts: dict[str, int] = {}
+    for field, _value in (await request.form()).multi_items():
+        if field not in CREATION_FORM_FIELDS:
+            raise _error(422, "invalid_creation_form", f"不支持的创建字段: {field}")
+        counts[field] = counts.get(field, 0) + 1
+        if counts[field] > 1:
+            raise _error(422, "invalid_creation_form", f"创建字段不能重复: {field}")
+
+
 def _parse_generation_request(
-    raw: str, internal_fusion_agent: str = "deepseek",
+    raw: str | None,
+    internal_fusion_agent: str,
 ) -> dict[str, Any]:
     try:
-        value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        raise _error(400, "invalid_generation_request", "generation_request 必须是 JSON 对象") from None
-    if not isinstance(value, dict):
-        raise _error(400, "invalid_generation_request", "generation_request 必须是 JSON 对象")
-    # The Fusion implementation is an internal deployment choice.  Never let
-    # a client-supplied field select a provider; freeze the server choice into
-    # the project so retries and resume remain deterministic.
-    return {**value, "fusion": {"agent": internal_fusion_agent}}
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise _error(
+            422,
+            "invalid_generation_request",
+            "generation_request 必须是唯一 v1 JSON 对象",
+        ) from None
+    if not isinstance(value, dict) or set(value) != {
+        "version", "output", "processing", "dialogue", "replacement_guidance",
+    }:
+        raise _error(
+            422,
+            "invalid_generation_request",
+            "generation_request 必须是唯一 v1 JSON 对象",
+        )
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise _error(422, "invalid_generation_request", "generation_request.version 必须为 1")
+
+    output = value["output"]
+    if (
+        not isinstance(output, dict)
+        or set(output) != {"aspect_ratio", "resolution", "fit_mode"}
+        or output.get("aspect_ratio") not in {"16:9", "9:16"}
+        or output.get("resolution") not in {"480p", "768p"}
+        or output.get("fit_mode") != "auto"
+    ):
+        raise _error(422, "invalid_generation_request", "generation_request.output 无效")
+
+    processing = value["processing"]
+    if (
+        not isinstance(processing, dict)
+        or set(processing) != {
+            "optimize_image", "remove_subtitle", "remove_logo",
+        }
+        or any(processing[key] is not True for key in processing)
+    ):
+        raise _error(422, "invalid_generation_request", "generation_request.processing 无效")
+
+    dialogue = value["dialogue"]
+    if (
+        not isinstance(dialogue, dict)
+        or set(dialogue) != {"mode", "target_language"}
+        or dialogue.get("mode") != "auto_rewrite"
+    ):
+        raise _error(422, "invalid_generation_request", "generation_request.dialogue 无效")
+    target_language = dialogue.get("target_language")
+    if not isinstance(target_language, str) or not target_language.strip():
+        raise _error(422, "target_language_required", "target_language 不能为空")
+    target_language = target_language.strip()
+    if _utf16_code_units(target_language) > TARGET_LANGUAGE_MAX_CHARS:
+        raise _error(422, "invalid_generation_request", "target_language 过长")
+
+    guidance = value["replacement_guidance"]
+    normalized_guidance = None
+    if guidance is not None:
+        if (
+            not isinstance(guidance, dict)
+            or set(guidance) != {"instruction", "image_field"}
+            or guidance.get("image_field") != "replacement_image"
+        ):
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "replacement_guidance 无效",
+            )
+        instruction = guidance.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "replacement_guidance.instruction 不能为空",
+            )
+        instruction = instruction.strip()
+        if _utf16_code_units(instruction) > REPLACEMENT_INSTRUCTION_MAX_CHARS:
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "replacement_guidance.instruction 过长",
+            )
+        normalized_guidance = {
+            "instruction": instruction,
+            "image_field": "replacement_image",
+        }
+
+    # Fusion is injected only after the complete public request has passed the
+    # closed v1 validator; clients cannot select or shadow the internal agent.
+    return {
+        "version": 1,
+        "output": dict(output),
+        "processing": dict(processing),
+        "dialogue": {
+            "mode": "auto_rewrite",
+            "target_language": target_language,
+        },
+        "replacement_guidance": normalized_guidance,
+        "fusion": {"agent": internal_fusion_agent},
+    }
 
 
 def _capability() -> dict[str, Any]:
@@ -382,16 +515,30 @@ def create_app(
         response: Response,
         file: UploadFile | None = File(default=None),
         reference_url: str | None = Form(default=None),
-        client_request_id: str = Form(default=""),
-        generation_request: str = Form(default="{}"),
+        client_request_id: str | None = Form(default=None),
+        generation_request: str | None = Form(default=None),
         replacement_image: UploadFile | None = File(default=None),
     ):
+        await _validate_creation_form(request)
+        normalized_client_request_id = _normalize_client_request_id(client_request_id)
         effective_request = _parse_generation_request(
-            generation_request, configured.fusion_agent,
+            generation_request,
+            configured.fusion_agent,
         )
         normalized_reference_url = reference_url.strip() if isinstance(reference_url, str) else ""
-        if file is None and not normalized_reference_url:
-            raise _error(400, "source_missing", "没有提供视频")
+        if (file is not None) == bool(normalized_reference_url):
+            raise _error(
+                400,
+                "source_exactly_one_required",
+                "file 与 reference_url 必须且只能提供一个",
+            )
+        has_replacement_guidance = effective_request["replacement_guidance"] is not None
+        if (replacement_image is not None) != has_replacement_guidance:
+            raise _error(
+                422,
+                "replacement_pair_required",
+                "replacement_image 与 replacement_guidance 必须同时提供",
+            )
 
         source_limit = configured.max_upload_mb * MIB
         if file is not None:
@@ -459,7 +606,7 @@ def create_app(
                 generation_request_sha256 = canonical_json_sha256(effective_request)
                 input_receipt = {
                     "version": 1,
-                    "client_request_id": client_request_id,
+                    "client_request_id": normalized_client_request_id,
                     "generation_request_sha256": generation_request_sha256,
                     "source": {
                         "sha256": source_sha256,
@@ -478,7 +625,7 @@ def create_app(
                 )
                 project_id, project, state, created = app.state.store.create_from_staging(
                     effective_request,
-                    client_request_id,
+                    normalized_client_request_id,
                     request_digest=request_digest,
                     input_receipt=input_receipt,
                     source_snapshot=source_snapshot,
@@ -524,7 +671,7 @@ def create_app(
             "headers": dict(request.headers),
             "generation_request_raw": generation_request,
             "generation_request": effective_request,
-            "client_request_id": client_request_id,
+            "client_request_id": normalized_client_request_id,
             "reference_url": reference_url,
             "file": {"filename": file.filename, "headers": dict(file.headers)} if file else None,
             "replacement_image": {"filename": replacement_image.filename, "headers": dict(replacement_image.headers)} if replacement_image else None,

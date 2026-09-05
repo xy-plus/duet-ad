@@ -188,25 +188,6 @@
             <p id="replacement-hint" class="field-hint">参考图与替换说明需要一起提供</p>
           </section>
 
-          <div class="legacy-contract-controls" hidden aria-hidden="true">
-            <input id="note-input" type="text">
-            <input type="radio" name="voice-mode" value="rewrite" checked>
-            <input type="radio" name="dialogue-mode" value="auto" checked>
-            <fieldset id="dialogue-review-fields" disabled>
-              <input type="radio" name="dialogue-review-policy" value="auto_continue" checked>
-            </fieldset>
-            <span id="dialogue-review-policy-status"></span>
-            <details id="generation-config">
-              <span id="generation-config-summary-text"></span>
-              <fieldset id="generation-config-fields" disabled>
-                <input id="generation-optimize-image" type="checkbox" checked>
-                <input id="generation-remove-subtitle" type="checkbox" checked>
-                <input id="generation-remove-watermark" type="checkbox" checked>
-              </fieldset>
-              <span id="generation-config-status"></span>
-            </details>
-          </div>
-
           <p id="creation-service-status" class="creation-service-status" aria-live="polite">正在连接生成服务…</p>
           <button type="submit" id="send-btn" class="btn btn-primary create-video-button" disabled>开始生成</button>
           <div id="upload-progress" class="upload-progress" hidden>
@@ -222,45 +203,6 @@
   <input type="file" id="file-input" accept="video/*" hidden>
   <input type="file" id="replacement-image-input" accept="image/jpeg,image/png,image/webp" hidden>
 </div>
-
-<dialog id="pp-dialog" class="pp-dialog" aria-labelledby="pp-title" hidden aria-hidden="true">
-  <form id="pp-form" class="pp-form" novalidate>
-    <h2 id="pp-title" class="pp-title">后处理关键帧</h2>
-    <p class="pp-sub">勾选处理项（至少一项）。确认后才会提交素材处理；取消不会提交。</p>
-    <p id="pp-lock-hint" class="pp-lock-hint" hidden>已运行过后处理，选项已锁定为上次选择</p>
-    <div class="pp-opts" role="group" aria-label="后处理选项">
-      <label class="pp-opt">
-        <input type="checkbox" name="opt" value="remove_subtitle" checked>
-        <span>移除文字/字幕</span>
-      </label>
-      <label class="pp-opt">
-        <input type="checkbox" name="opt" value="remove_brand" checked>
-        <span>移除常见 Logo/图标</span>
-      </label>
-      <label class="pp-opt">
-        <input type="checkbox" name="opt" value="optimize_image">
-        <span>优化图片质量</span>
-      </label>
-    </div>
-    <p id="pp-error" class="form-error" role="alert" hidden></p>
-    <div class="pp-actions">
-      <button type="button" id="pp-cancel" class="btn btn-ghost">取消</button>
-      <button type="submit" id="pp-confirm" class="btn btn-primary" disabled>开始素材处理</button>
-    </div>
-  </form>
-</dialog>
-
-<dialog id="draft-dialog" class="pp-dialog" aria-labelledby="draft-title">
-  <div class="pp-form">
-    <h2 id="draft-title" class="pp-title">图片优化提示词尚未保存</h2>
-    <p class="pp-sub">请选择保存修改、丢弃修改，或取消当前操作继续编辑。</p>
-    <div class="pp-actions draft-actions">
-      <button type="button" id="draft-cancel" class="btn btn-ghost">取消</button>
-      <button type="button" id="draft-discard" class="btn">丢弃</button>
-      <button type="button" id="draft-save" class="btn btn-primary">保存</button>
-    </div>
-  </div>
-</dialog>
 
 <script src="app.js"></script>
 </body>

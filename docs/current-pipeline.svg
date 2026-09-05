@@ -49,21 +49,21 @@
 
   <!-- Phase 3 -->
   <text x="800" y="165" class="t h">3  Object Replace 与 Seedream</text>
-  <rect x="798" y="188" width="296" height="132" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="220" class="t n">Object Replace v2</text><text x="818" y="248" class="t s">确定性 replacement_set</text><text x="818" y="273" class="t s">全部人物 / 实体 / 场景 stable key</text><text x="818" y="298" class="t s">增强索引 · 人物音色 · 图版提示词</text>
+  <rect x="798" y="188" width="296" height="132" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="220" class="t n">Object Replace v3</text><text x="818" y="248" class="t s">确定性 replacement_set</text><text x="818" y="273" class="t s">全部人物 / 实体 / 场景 stable key</text><text x="818" y="298" class="t s">外观 / 交互语义分离 · 人物音色</text>
   <path d="M946 320V346" class="inner"/>
-  <rect x="798" y="346" width="296" height="97" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="378" class="t n">后端确定性映射</text><text x="818" y="407" class="t m">stable key → TILE_XX</text><text x="818" y="431" class="t s">人物 → 实体 → 场景；关系不占格</text>
+  <rect x="798" y="346" width="296" height="97" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="378" class="t n">后端确定性映射</text><text x="818" y="407" class="t m">stable key → TILE_XX</text><text x="818" y="431" class="t s">sheet bundle v3 · spec v2</text>
   <path d="M946 443V469" class="inner"/>
-  <rect x="798" y="469" width="296" height="220" rx="14" fill="#211d48" stroke="#aa92f3"/><text x="818" y="501" class="t n">Seedream · 每项目仅 1 次</text><text x="818" y="527" class="t s">空白格 + 源帧证据 + 可选用户图</text>
-  <g transform="translate(826 550)"><rect width="240" height="108" rx="8" fill="#f2f0e8" stroke="#e4cf87" stroke-width="2"/><rect x="7" y="7" width="110" height="44" fill="#b9d4e5"/><rect x="123" y="7" width="110" height="44" fill="#d2b8df"/><rect x="7" y="57" width="110" height="44" fill="#d9bf91"/><rect x="123" y="57" width="110" height="44" fill="#abcbb1"/><text x="15" y="34" class="t m" fill="#173044">TILE_01</text><text x="131" y="34" class="t m" fill="#35223d">TILE_02</text><text x="15" y="84" class="t m" fill="#3d2e19">TILE_03</text><text x="131" y="84" class="t m" fill="#213c27">TILE_04</text></g>
+  <rect x="798" y="469" width="296" height="220" rx="14" fill="#211d48" stroke="#aa92f3"/><text x="818" y="501" class="t n">Seedream · 每项目仅 1 次</text><text x="818" y="527" class="t s">Image 1 空白布局 · Image 2 可选用户图</text>
+  <g transform="translate(826 550)"><rect width="240" height="108" rx="8" fill="#f2f0e8" stroke="#e4cf87" stroke-width="2"/><rect x="7" y="7" width="110" height="44" fill="#b9d4e5"/><rect x="123" y="7" width="110" height="44" fill="#d2b8df"/><rect x="7" y="57" width="110" height="44" fill="#d9bf91"/><rect x="123" y="57" width="110" height="44" fill="#abcbb1"/><text x="15" y="34" class="t m" fill="#173044">TILE_01</text><text x="131" y="34" class="t m" fill="#35223d">TILE_02</text><text x="15" y="84" class="t m" fill="#3d2e19">TILE_03</text><text x="131" y="84" class="t m" fill="#213c27">TILE_04</text></g><text x="818" y="681" class="t s">单体分格 · 场景空置 · 无源帧证据</text>
   <rect x="798" y="713" width="296" height="67" rx="12" fill="#392f70" stroke="#b09cf4"/><text x="818" y="741" class="t n">单张 2048×2048 新形象图版</text><text x="818" y="766" class="t s">固定标签、行列、文件 SHA</text>
 
   <!-- Phase 4 -->
   <text x="1168" y="165" class="t h">4  Fusion 与 H3</text>
-  <rect x="1166" y="188" width="296" height="112" rx="12" class="card"/><text x="1186" y="220" class="t n">逐段 Fusion</text><text x="1186" y="249" class="t m">stable key → TILE_XX → Image N</text><text x="1186" y="276" class="t s">同一图版 / 同一顺序 / 跨段复用</text>
+  <rect x="1166" y="188" width="296" height="112" rx="12" class="card"/><text x="1186" y="220" class="t n">逐段 Fusion</text><text x="1186" y="249" class="t m">stable key → TILE_XX → Image N</text><text x="1186" y="276" class="t s">图版取外观 · 增强索引取动作/关系</text>
   <path d="M1314 300V326" class="inner"/>
   <rect x="1166" y="326" width="296" height="178" rx="12" class="card"/><text x="1186" y="358" class="t n">H3 有序媒体输入</text><text x="1186" y="388" class="t s">Video 1：静音源片段</text><text x="1186" y="418" class="t s">有绑定：Image 1 用户图</text><text x="1270" y="444" class="t s">Image 2 图版</text><text x="1186" y="471" class="t s">无绑定：Image 1 图版</text><text x="1186" y="496" class="t s">Audio 1..N：冻结音色</text>
   <path d="M1314 504V530" class="inner"/>
-  <rect x="1166" y="530" width="296" height="105" rx="12" fill="#102f4b" stroke="#48d8ff" stroke-width="2"/><text x="1186" y="563" class="t n">H3 v3 manifest</text><text x="1186" y="591" class="t s">prompt / 媒体顺序 / 路径 / SHA</text><text x="1186" y="617" class="t s">全段预检后才越过付费边界</text>
+  <rect x="1166" y="530" width="296" height="105" rx="12" fill="#102f4b" stroke="#48d8ff" stroke-width="2"/><text x="1186" y="563" class="t n">H3 manifest v4</text><text x="1186" y="591" class="t s">prompt / 媒体顺序 / 路径 / SHA</text><text x="1186" y="617" class="t s">全段预检后才越过付费边界</text>
   <path d="M1314 635V661" class="inner"/>
   <rect x="1166" y="661" width="296" height="119" rx="12" fill="#173957" stroke="#55bee8"/><text x="1186" y="694" class="t n">Picsart H3 Max R2V</text><text x="1186" y="722" class="t s">逐段独立 task，共享图版锚点</text><text x="1186" y="750" class="t m">Segment 1 · 2 · ... · N</text>
 
@@ -84,6 +84,6 @@
   <rect x="66" y="902" width="330" height="108" rx="12" class="warn"/><text x="86" y="935" class="t n">Seedream receipt</text><text x="86" y="965" class="t s">POST 前 claim；每项目至多一次</text><text x="86" y="992" class="t s">unknown 禁止自动重投</text>
   <rect x="416" y="902" width="330" height="108" rx="12" class="warn"/><text x="436" y="935" class="t n">Picsart ledger</text><text x="436" y="965" class="t s">先完整 submission_started，再 POST</text><text x="436" y="992" class="t s">已有 task_id：只 poll / download</text>
   <rect x="766" y="902" width="350" height="108" rx="12" class="card"/><text x="786" y="935" class="t n">resume-pre-picsart</text><text x="786" y="965" class="t s">复用或本地 replay 图版 checkpoint</text><text x="786" y="992" class="t s">checkpoint 后不重跑全局索引 / OR</text>
-  <rect x="1136" y="902" width="350" height="108" rx="12" class="card"/><text x="1156" y="935" class="t n">resume-picsart</text><text x="1156" y="965" class="t s">只复用冻结 v3 素材与提示词</text><text x="1156" y="992" class="t s">零提交 checkpoint 可安全首提</text>
-  <rect x="1506" y="902" width="348" height="108" rx="12" class="warn"/><text x="1526" y="935" class="t n">Fail Closed</text><text x="1526" y="965" class="t s">哈希 / 顺序 / 回执不一致即停止</text><text x="1526" y="992" class="t s">旧 v2 不得绕过 TILE 新提交</text>
+  <rect x="1136" y="902" width="350" height="108" rx="12" class="card"/><text x="1156" y="935" class="t n">resume-picsart</text><text x="1156" y="965" class="t s">只复用冻结 manifest v4 素材与提示词</text><text x="1156" y="992" class="t s">零提交 checkpoint 可安全首提</text>
+  <rect x="1506" y="902" width="348" height="108" rx="12" class="warn"/><text x="1526" y="935" class="t n">Fail Closed</text><text x="1526" y="965" class="t s">哈希 / 顺序 / 回执不一致即停止</text><text x="1526" y="992" class="t s">所有版本字段必须严格等值</text>
 </svg>

@@ -17,7 +17,12 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings, get_settings
 from app.main import UploadTooLarge, _write_upload, create_app
-from app.store import ProjectStore
+from app.store import (
+    ProjectStateError,
+    ProjectStore,
+    canonical_json_sha256,
+    creation_request_digest,
+)
 
 
 AUTH = {"Authorization": "Bearer test-secret"}
@@ -26,8 +31,11 @@ GENERATION_REQUEST = {
     "output": {"aspect_ratio": "16:9", "resolution": "480p", "fit_mode": "auto"},
     "processing": {"optimize_image": True, "remove_subtitle": True, "remove_logo": True},
     "dialogue": {"mode": "auto_rewrite", "target_language": "日语"},
-    "fusion": {"agent": "codex"},
-    "replacement_guidance": {"instruction": "替换产品", "image_field": "replacement_image"},
+    "replacement_guidance": None,
+}
+REPLACEMENT_GUIDANCE = {
+    "instruction": "替换产品",
+    "image_field": "replacement_image",
 }
 
 
@@ -42,7 +50,7 @@ class SuccessfulPipeline:
         os.chmod(output, 0o600)
         self.store.update(
             project_id,
-            status="done",
+            status="succeeded",
             has_video=True,
             output_path="output/generated.mp4",
             project_progress={"status": "succeeded", "percent": 100, "stage": "completed"},
@@ -134,9 +142,13 @@ def successful_factory(_settings: Settings, store: ProjectStore, _register_asset
     return SuccessfulPipeline(store)
 
 
-def create_payload(**overrides):
+def create_payload(*, replacement_guidance=None, **overrides):
+    generation_request = {
+        **GENERATION_REQUEST,
+        "replacement_guidance": replacement_guidance,
+    }
     data = {
-        "generation_request": json.dumps(GENERATION_REQUEST, ensure_ascii=False),
+        "generation_request": json.dumps(generation_request, ensure_ascii=False),
         "client_request_id": "request-1",
     }
     data.update(overrides)
@@ -162,6 +174,21 @@ def test_default_and_blank_access_tokens_are_rejected(monkeypatch: pytest.Monkey
         get_settings()
 
 
+def test_get_settings_requires_the_canonical_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("ACCESS_TOKEN", "test-access")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://studio.example")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "old-key-must-not-be-used")
+
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY"):
+        get_settings()
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "  canonical-deepseek-key  ")
+    assert get_settings().deepseek_api_key == "canonical-deepseek-key"
+
+
 @pytest.mark.parametrize(
     "base",
     ["", "http://public.example", "https://127.0.0.1:8000", "https://user@public.example"],
@@ -176,12 +203,18 @@ def test_fusion_agent_configuration_is_closed() -> None:
         access_token="test-secret",
         public_base_url="https://studio.example",
     ).fusion_agent == "deepseek"
-    with pytest.raises(ValueError, match="FUSION_AGENT"):
-        Settings(
-            access_token="test-secret",
-            public_base_url="https://studio.example",
-            fusion_agent="other",
-        )
+    assert Settings(
+        access_token="test-secret",
+        public_base_url="https://studio.example",
+        fusion_agent="codex",
+    ).fusion_agent == "codex"
+    for unsupported_agent in ("gpt", "other"):
+        with pytest.raises(ValueError, match="FUSION_AGENT"):
+            Settings(
+                access_token="test-secret",
+                public_base_url="https://studio.example",
+                fusion_agent=unsupported_agent,
+            )
 
 
 def test_fusion_is_internal_and_client_cannot_select_it(tmp_path: Path) -> None:
@@ -199,7 +232,7 @@ def test_fusion_is_internal_and_client_cannot_select_it(tmp_path: Path) -> None:
         response = client.post(
             "/api/conversations",
             headers=AUTH,
-            data={"generation_request": "{}", "client_request_id": "fusion-default"},
+            data=create_payload(client_request_id="fusion-default"),
             files={"file": ("source.mp4", b"source", "video/mp4")},
         )
         assert response.status_code == 201
@@ -207,20 +240,24 @@ def test_fusion_is_internal_and_client_cannot_select_it(tmp_path: Path) -> None:
             "agent": "deepseek",
         }
 
-        for index, client_fusion in enumerate((None, {}, {"agent": "codex"}, {"agent": "other"})):
-            ignored = client.post(
+        for index, client_fusion in enumerate(
+            (None, {}, {"agent": "codex"}, {"agent": "other"})
+        ):
+            rejected = client.post(
                 "/api/conversations",
                 headers=AUTH,
                 data={
-                    "generation_request": json.dumps({"fusion": client_fusion}),
+                    "generation_request": json.dumps({
+                        **GENERATION_REQUEST,
+                        "fusion": client_fusion,
+                    }),
                     "client_request_id": f"fusion-client-value-{index}",
                 },
                 files={"file": ("source.mp4", b"source", "video/mp4")},
             )
-            assert ignored.status_code == 201
-            assert ignored.json()["effective_request"]["fusion"] == {
-                "agent": "deepseek",
-            }
+            assert rejected.status_code == 422
+            assert rejected.json()["detail"]["code"] == "invalid_generation_request"
+        assert len(client.get("/api/conversations", headers=AUTH).json()) == 1
 
 
 def test_creation_request_rejects_oversized_declared_body_before_parsing(tmp_path: Path):
@@ -349,7 +386,7 @@ def test_create_uses_exact_recovery_shape_fixed_paths_and_four_public_statuses(t
         response = client.post(
             "/api/conversations",
             headers=AUTH,
-            data=create_payload(),
+            data=create_payload(replacement_guidance=REPLACEMENT_GUIDANCE),
             files={
                 "file": ("../../nested\\clip.mp4", b"source-video", "video/mp4"),
                 "replacement_image": ("../images\\product.png", b"replacement", "image/png"),
@@ -404,12 +441,19 @@ def test_create_client_request_id_replays_same_project_without_rewriting_or_reru
         ),
     )
     pipeline = app.state.pipeline
+    request_with_replacement = {
+        **GENERATION_REQUEST,
+        "replacement_guidance": REPLACEMENT_GUIDANCE,
+    }
     with TestClient(app) as client:
         try:
             first = client.post(
                 "/api/conversations",
                 headers=AUTH,
-                data=create_payload(client_request_id="durable-request-1"),
+                data=create_payload(
+                    client_request_id="durable-request-1",
+                    replacement_guidance=REPLACEMENT_GUIDANCE,
+                ),
                 files={
                     "file": ("source.mp4", b"source-video", "video/mp4"),
                     "replacement_image": (
@@ -435,7 +479,7 @@ def test_create_client_request_id_replays_same_project_without_rewriting_or_reru
                 data=create_payload(
                     client_request_id="durable-request-1",
                     generation_request=json.dumps(
-                        GENERATION_REQUEST,
+                        request_with_replacement,
                         ensure_ascii=False,
                         sort_keys=True,
                         indent=2,
@@ -489,12 +533,19 @@ def test_create_client_request_id_conflicts_on_any_bound_input_change(tmp_path: 
         ),
     )
     pipeline = app.state.pipeline
+    request_with_replacement = {
+        **GENERATION_REQUEST,
+        "replacement_guidance": REPLACEMENT_GUIDANCE,
+    }
     with TestClient(app) as client:
         try:
             first = client.post(
                 "/api/conversations",
                 headers=AUTH,
-                data=create_payload(client_request_id="durable-conflict-1"),
+                data=create_payload(
+                    client_request_id="durable-conflict-1",
+                    replacement_guidance=REPLACEMENT_GUIDANCE,
+                ),
                 files={
                     "file": ("source.mp4", b"source-a", "video/mp4"),
                     "replacement_image": ("product.png", b"image-a", "image/png"),
@@ -504,7 +555,7 @@ def test_create_client_request_id_conflicts_on_any_bound_input_change(tmp_path: 
             assert pipeline.started.wait(timeout=2)
 
             changed_request = {
-                **GENERATION_REQUEST,
+                **request_with_replacement,
                 "output": {
                     **GENERATION_REQUEST["output"],
                     "resolution": "768p",
@@ -512,7 +563,10 @@ def test_create_client_request_id_conflicts_on_any_bound_input_change(tmp_path: 
             }
             conflicts = [
                 (
-                    create_payload(client_request_id="durable-conflict-1"),
+                    create_payload(
+                        client_request_id="durable-conflict-1",
+                        replacement_guidance=REPLACEMENT_GUIDANCE,
+                    ),
                     {
                         "file": ("source.mp4", b"source-b", "video/mp4"),
                         "replacement_image": (
@@ -537,7 +591,10 @@ def test_create_client_request_id_conflicts_on_any_bound_input_change(tmp_path: 
                     },
                 ),
                 (
-                    create_payload(client_request_id="durable-conflict-1"),
+                    create_payload(
+                        client_request_id="durable-conflict-1",
+                        replacement_guidance=REPLACEMENT_GUIDANCE,
+                    ),
                     {
                         "file": ("source.mp4", b"source-a", "video/mp4"),
                         "replacement_image": (
@@ -566,21 +623,100 @@ def test_create_client_request_id_conflicts_on_any_bound_input_change(tmp_path: 
         wait_for_status(client, first.json()["id"], "succeeded")
 
 
-def test_blank_client_request_id_always_creates_a_new_project(tmp_path: Path):
+@pytest.mark.parametrize("client_request_id", [None, "", "   ", "x" * 65])
+def test_client_request_id_is_required_nonempty_and_bounded(
+    tmp_path: Path,
+    client_request_id: str | None,
+):
     app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
     with TestClient(app) as client:
-        responses = [
-            client.post(
-                "/api/conversations",
-                headers=AUTH,
-                data=create_payload(client_request_id=""),
-                files={"file": ("source.mp4", b"same-source", "video/mp4")},
-            )
-            for _ in range(2)
-        ]
-        assert [item.status_code for item in responses] == [201, 201]
-        assert responses[0].json()["id"] != responses[1].json()["id"]
-        assert len(client.get("/api/conversations", headers=AUTH).json()) == 2
+        data = create_payload()
+        if client_request_id is None:
+            data.pop("client_request_id")
+        else:
+            data["client_request_id"] = client_request_id
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=data,
+            files={"file": ("source.mp4", b"same-source", "video/mp4")},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "invalid_client_request_id"
+        assert client.get("/api/conversations", headers=AUTH).json() == []
+
+
+def test_client_request_id_is_trimmed_before_idempotency_lookup(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="  trimmed-request  "),
+            files={"file": ("source.mp4", b"same-source", "video/mp4")},
+        )
+        assert first.status_code == 201
+        project_id = first.json()["id"]
+        wait_for_status(client, project_id, "succeeded")
+
+        replay = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="trimmed-request"),
+            files={"file": ("source.mp4", b"same-source", "video/mp4")},
+        )
+        assert replay.status_code == 200
+        assert replay.json()["id"] == project_id
+        assert replay.json()["client_request_id"] == "trimmed-request"
+        assert len(client.get("/api/conversations", headers=AUTH).json()) == 1
+
+
+@pytest.mark.parametrize("client_request_id", ["", "   "])
+def test_store_create_from_staging_rejects_blank_client_request_id(
+    tmp_path: Path,
+    client_request_id: str,
+):
+    store = ProjectStore(tmp_path / "projects", acquire_process_lock=False)
+    staging = store.root / ".create-staging-test"
+    staging.mkdir()
+    staged_source = staging / "source.mp4"
+    staged_source.write_bytes(b"source")
+    effective_request = {
+        **GENERATION_REQUEST,
+        "fusion": {"agent": "deepseek"},
+    }
+    generation_digest = canonical_json_sha256(effective_request)
+    source_digest = hashlib.sha256(b"source").hexdigest()
+    input_receipt = {
+        "version": 1,
+        "client_request_id": client_request_id,
+        "generation_request_sha256": generation_digest,
+        "source": {"sha256": source_digest, "bytes": len(b"source")},
+        "replacement_image": None,
+    }
+
+    with pytest.raises(ValueError, match="client_request_id must be nonempty"):
+        store.create_from_staging(
+            effective_request,
+            client_request_id,
+            request_digest=creation_request_digest(
+                generation_digest,
+                source_digest,
+                None,
+            ),
+            input_receipt=input_receipt,
+            source_snapshot={
+                "mode": "upload",
+                "filename": "source.mp4",
+                "bytes": len(b"source"),
+            },
+            staged_source=staged_source,
+            replacement_snapshot=None,
+            staged_replacement=None,
+        )
+
+    assert store.list() == []
+    assert not store.idempotency_index_path.exists()
 
 
 def test_client_request_id_replay_survives_app_restart(tmp_path: Path):
@@ -672,25 +808,193 @@ def test_client_request_id_index_damage_fails_closed_without_new_project(
         assert list(second_app.state.store.root.glob(".create-staging-*")) == []
 
 
-def test_generation_request_and_missing_source_errors_are_stable_and_create_nothing(tmp_path: Path):
+def test_generation_request_accepts_only_the_closed_v1_shape(tmp_path: Path):
     app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
     with TestClient(app) as client:
-        for raw in ("{", "[]", "null", '"text"'):
+        invalid_requests = [
+            None,
+            "{",
+            "[]",
+            "null",
+            '"text"',
+            json.dumps({}),
+            json.dumps({key: value for key, value in GENERATION_REQUEST.items() if key != "dialogue"}),
+            json.dumps({**GENERATION_REQUEST, "extra": True}),
+            json.dumps({**GENERATION_REQUEST, "version": True}),
+            json.dumps({**GENERATION_REQUEST, "version": 2}),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "output": {"aspect_ratio": "16:9", "resolution": "480p"},
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "output": {
+                    **GENERATION_REQUEST["output"],
+                    "extra": True,
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "processing": {
+                    "optimize_image": 1,
+                    "remove_subtitle": True,
+                    "remove_logo": True,
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "processing": {
+                    "optimize_image": False,
+                    "remove_subtitle": True,
+                    "remove_logo": True,
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "processing": {
+                    **GENERATION_REQUEST["processing"],
+                    "extra": False,
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {"mode": "manual", "target_language": "日语"},
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "replacement_guidance": {
+                    "instruction": "替换产品",
+                    "image_field": "image",
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "replacement_guidance": {
+                    "instruction": "   ",
+                    "image_field": "replacement_image",
+                },
+            }),
+            '{"version":1,"version":1,"output":{},"processing":{},"dialogue":{},"replacement_guidance":null}',
+        ]
+        for index, raw in enumerate(invalid_requests):
+            data = create_payload(client_request_id=f"invalid-generation-{index}")
+            if raw is None:
+                data.pop("generation_request")
+            else:
+                data["generation_request"] = raw
             response = client.post(
                 "/api/conversations",
                 headers=AUTH,
-                data={"generation_request": raw},
+                data=data,
                 files={"file": ("source.mp4", b"x", "video/mp4")},
             )
-            assert response.status_code == 400
+            assert response.status_code == 422
             assert response.json()["detail"]["code"] == "invalid_generation_request"
-        missing = client.post(
+
+        blank_language = client.post(
             "/api/conversations",
             headers=AUTH,
-            data={"generation_request": "{}"},
+            data=create_payload(
+                client_request_id="blank-target-language",
+                generation_request=json.dumps({
+                    **GENERATION_REQUEST,
+                    "dialogue": {
+                        "mode": "auto_rewrite",
+                        "target_language": "   ",
+                    },
+                }),
+            ),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
         )
-        assert missing.status_code == 400
-        assert missing.json()["detail"] == {"code": "source_missing", "message": "没有提供视频"}
+        assert blank_language.status_code == 422
+        assert blank_language.json()["detail"]["code"] == "target_language_required"
+        assert client.get("/api/conversations", headers=AUTH).json() == []
+
+
+def test_creation_multipart_surface_rejects_extra_and_duplicate_fields(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        extra = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data={
+                **create_payload(client_request_id="extra-multipart-field"),
+                "unexpected": "value",
+            },
+            files={"file": ("source.mp4", b"source", "video/mp4")},
+        )
+        assert extra.status_code == 422
+        assert extra.json()["detail"]["code"] == "invalid_creation_form"
+
+        duplicate = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            files=[
+                ("file", ("source.mp4", b"source", "video/mp4")),
+                ("client_request_id", (None, "duplicate-one")),
+                ("client_request_id", (None, "duplicate-two")),
+                (
+                    "generation_request",
+                    (None, json.dumps(GENERATION_REQUEST, ensure_ascii=False)),
+                ),
+            ],
+        )
+        assert duplicate.status_code == 422
+        assert duplicate.json()["detail"]["code"] == "invalid_creation_form"
+        assert client.get("/api/conversations", headers=AUTH).json() == []
+        assert list(app.state.store.root.glob(".create-staging-*")) == []
+
+
+def test_source_and_replacement_inputs_must_match_the_v1_contract(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        missing_source = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="missing-source"),
+        )
+        assert missing_source.status_code == 400
+        assert missing_source.json()["detail"]["code"] == "source_exactly_one_required"
+
+        duplicate_source = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="duplicate-source",
+                reference_url="https://media.example/source.mp4",
+            ),
+            files={"file": ("source.mp4", b"source", "video/mp4")},
+        )
+        assert duplicate_source.status_code == 400
+        assert duplicate_source.json()["detail"]["code"] == "source_exactly_one_required"
+
+        missing_replacement_image = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="missing-replacement-image",
+                replacement_guidance=REPLACEMENT_GUIDANCE,
+            ),
+            files={"file": ("source.mp4", b"source", "video/mp4")},
+        )
+        assert missing_replacement_image.status_code == 422
+        assert missing_replacement_image.json()["detail"]["code"] == (
+            "replacement_pair_required"
+        )
+
+        missing_replacement_guidance = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="missing-replacement-guidance"),
+            files={
+                "file": ("source.mp4", b"source", "video/mp4"),
+                "replacement_image": ("product.png", b"image", "image/png"),
+            },
+        )
+        assert missing_replacement_guidance.status_code == 422
+        assert missing_replacement_guidance.json()["detail"]["code"] == (
+            "replacement_pair_required"
+        )
         assert client.get("/api/conversations", headers=AUTH).json() == []
 
 
@@ -709,7 +1013,7 @@ def test_source_and_replacement_limits_reject_before_project_creation(tmp_path: 
         replacement = client.post(
             "/api/conversations",
             headers=AUTH,
-            data=create_payload(),
+            data=create_payload(replacement_guidance=REPLACEMENT_GUIDANCE),
             files={
                 "file": ("source.mp4", b"x", "video/mp4"),
                 "replacement_image": ("large.png", b"y" * (10 * 1024 * 1024 + 1), "image/png"),
@@ -861,7 +1165,7 @@ def test_provider_asset_preserves_replacement_image_media_type(tmp_path: Path):
         created = client.post(
             "/api/conversations",
             headers=AUTH,
-            data=create_payload(),
+            data=create_payload(replacement_guidance=REPLACEMENT_GUIDANCE),
             files={
                 "file": ("source.mp4", b"source", "video/mp4"),
                 "replacement_image": ("product.png", b"replacement", "image/png"),
@@ -900,6 +1204,60 @@ def test_unhandled_background_failure_is_persisted_as_failed(tmp_path: Path):
         assert "background exploded" not in json.dumps(failed)
 
 
+@pytest.mark.parametrize(
+    ("unsupported_status", "project_progress"),
+    [
+        (
+            "processing",
+            {"status": "running", "percent": 1, "stage": "running"},
+        ),
+        (
+            "done",
+            {"status": "succeeded", "percent": 100, "stage": "completed"},
+        ),
+    ],
+)
+def test_store_rejects_unsupported_status_values_without_normalizing(
+    tmp_path: Path,
+    unsupported_status: str,
+    project_progress: dict,
+):
+    store = ProjectStore(tmp_path / "projects", acquire_process_lock=False)
+    project_id, _project, _state = store.create({}, "unsupported-status-test")
+
+    with pytest.raises(ProjectStateError, match="invalid top-level project status"):
+        store.update(
+            project_id,
+            status=unsupported_status,
+            project_progress=project_progress,
+        )
+
+    assert store.read(project_id)["status"] == "queued"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda state: state.pop("schema"),
+        lambda state: state.pop("version"),
+        lambda state: state.update({"version": 0}),
+        lambda state: state.update({"version": True}),
+        lambda state: state.update({"version": 1.0}),
+    ],
+)
+def test_store_rejects_unsupported_project_state_contract(
+    tmp_path: Path,
+    mutate,
+):
+    store = ProjectStore(tmp_path / "projects", acquire_process_lock=False)
+    project_id, project, state = store.create({}, "unsupported-state-contract")
+    mutate(state)
+    (project / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(ProjectStateError, match="unsupported project state schema"):
+        store.read(project_id)
+
+
 def test_store_lock_permissions_and_restart_scan_fail_safe(tmp_path: Path):
     locked_root = tmp_path / "locked-projects"
     first = ProjectStore(locked_root)
@@ -914,24 +1272,33 @@ def test_store_lock_permissions_and_restart_scan_fail_safe(tmp_path: Path):
     reopened.close()
 
     store = ProjectStore(tmp_path / "recovery-projects", acquire_process_lock=False)
-    malformed_id, malformed_dir, _ = store.create({}, "")
-    wrong_id, wrong_dir, wrong_state = store.create({}, "")
-    percent_id, percent_dir, percent_state = store.create({}, "")
-    active_id, _active_dir, _ = store.create({}, "")
+    malformed_id, malformed_dir, _ = store.create({}, "malformed-state")
+    wrong_id, wrong_dir, wrong_state = store.create({}, "wrong-id-state")
+    percent_id, percent_dir, percent_state = store.create({}, "bad-percent-state")
+    unsupported_id, unsupported_dir, unsupported_state = store.create(
+        {}, "unsupported-state"
+    )
+    active_id, _active_dir, _ = store.create({}, "active-state")
     (malformed_dir / "state.json").write_text("{", encoding="utf-8")
     wrong_state["id"] = "0" * 32
     (wrong_dir / "state.json").write_text(json.dumps(wrong_state), encoding="utf-8")
     percent_state["project_progress"]["percent"] = 999
     (percent_dir / "state.json").write_text(json.dumps(percent_state), encoding="utf-8")
+    unsupported_state["version"] = 0
+    (unsupported_dir / "state.json").write_text(
+        json.dumps(unsupported_state), encoding="utf-8"
+    )
+    frozen_invalid_states = {
+        project_id: (store.path(project_id) / "state.json").read_bytes()
+        for project_id in (malformed_id, wrong_id, percent_id, unsupported_id)
+    }
 
     store.fail_incomplete_after_restart()
 
-    for project_id in (malformed_id, wrong_id, percent_id):
-        repaired = store.read(project_id)
-        assert repaired["id"] == project_id
-        assert repaired["status"] == "failed"
-        assert repaired["error"]["code"] == "invalid_state"
-        assert os.stat(store.path(project_id) / "state.json").st_mode & 0o777 == 0o600
+    for project_id, frozen_payload in frozen_invalid_states.items():
+        assert (store.path(project_id) / "state.json").read_bytes() == frozen_payload
+        with pytest.raises(ProjectStateError):
+            store.read(project_id)
     restarted = store.read(active_id)
     assert restarted["status"] == "failed"
     assert restarted["error"]["code"] == "process_restarted"
