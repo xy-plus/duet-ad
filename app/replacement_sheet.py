@@ -381,10 +381,13 @@ def _build_seedream_prompt(
             "foreground object, animal, body part, or scene may leak into it."
         ),
         (
-            "PEOPLE tiles: show exactly one replacement person, or exactly the "
-            "named visible body portion when only a partial person is indexed, "
-            "against a plain neutral background. Show no props, held objects, "
-            "other subjects, interactions, or environment."
+            "PEOPLE tiles: show exactly one replacement person as a "
+            "head-and-shoulders face close-up portrait: front-facing, "
+            "neutral expression, the face filling most of the cell, against "
+            "a plain neutral background, so the new facial identity is "
+            "unmistakable. When only a partial person is indexed, show "
+            "exactly the named visible body portion instead. Show no props, "
+            "held objects, other subjects, interactions, or environment."
         ),
         (
             "ENTITIES tiles: show exactly one isolated replacement object or "

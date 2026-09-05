@@ -14,7 +14,7 @@ description: 根据原片段描述、Object Replace 增强后的全局对象索�
 `authoritative_constraints` 是后端从增强索引和图版 spec 机械编译的本段替换、`stable key -> TILE_XX -> Image N`、关系和 `person -> Audio N` 权威块，后端会在你的 `prompt` 尾部原样附加。你必须以它规划主体提示；主体中不得出现稳定 ID、TILE、Image N、Audio N 或 BEGIN/END 块，不得另写对象、图片或音色映射，也不得输出与它冲突的要求。后端只校验输出结构和输入绑定，不会二次判断你是否完成这些语义要求；完整表达替换、音色和连续性是本节点自身职责。
 
 1. 对当前片段出现且 `replacement` 非 null 的每个 stable key，让动作、遮挡和连续性适配已冻结的新设计；模型主体只写自然的画面和动作衔接，不写 stable key。源对象、目标对象及其图版 tile 由输出尾部的权威块逐项明确。
-2. 指示 H3 从权威块指定的图版 tile 取得该 stable key 的新形象，并替换 Video 1 中对应的旧形象；不得从整张图版任选相似对象，不得跨 tile 借用外观。即使 `replacement.source="image_1"`，也以该 stable key 在新形象图版中的最终 tile 为下游外观权威，而不是把原始用户图直接套给其他对象。
+2. 指示 H3 从权威块指定的图版 tile 取得该 stable key 的新形象，并替换 Video 1 中对应的旧形象；不得从整张图版任选相似对象，不得跨 tile 借用外观。即使 `replacement.source="image_1"`，也以该 stable key 在新形象图版中的最终 tile 为下游外观权威，而不是把原始用户图直接套给其他对象。人物 tile 是头肩面部特写：它是人脸身份的唯一权威，必须明确要求 H3 把 Video 1 中人物的脸换成该 tile 的脸（脸型、五官、肤色、发型），不能只换衣服或配饰；人物的服装与全身外观以权威块的文字描述为准。
 3. `replacement=null` 的实体保持原样，不得把它加入替换清单。人物和场景按索引中的非空 replacement 完整执行，不得遗漏。
 4. 对当前片段出现的每个人物，读取其 `voice.audio_reference` 和 `voice.features`；人物到 Audio N 的精确约束由权威块给出。不得交换 Audio 序号，不得把一个人物的音色套给另一个人物。
 5. 保持原片段动作、因果、速度、机位、构图、镜头运动、焦段、光线和转场，并遵守逐帧 `relations`，尤其是 `replace_together=true` 的接口、尺度和功能配合。对 `replacement` 非 null 的记录，只服从 `authoritative_constraints` 编译出的安全不变量，不得用 raw `preserve` 恢复源身份或外观；raw `preserve` 只直接用于 `replacement=null` 的 KEEP 项。
