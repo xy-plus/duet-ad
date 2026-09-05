@@ -3982,11 +3982,29 @@ class Pipeline:
                     ],
                 ),
             )
+            processing = self._validated_effective_request(request)["processing"]
+            overlay_targets = []
+            if processing["remove_subtitle"]:
+                overlay_targets.append(
+                    "burned-in subtitles, captions, and on-screen text"
+                )
+            if processing["remove_logo"]:
+                overlay_targets.append("watermarks and logos")
+            overlay_block = ""
+            if overlay_targets:
+                overlay_block = (
+                    "\n\nOverlay removal: Video 1 may contain "
+                    + " and ".join(overlay_targets)
+                    + ". Remove all of them from the generated video and "
+                    "reconstruct the occluded background naturally. Do not "
+                    "reproduce, translate, or re-render any source on-screen "
+                    "text, watermark, or logo."
+                )
             dialogue = "\n".join(
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
                 for line in item["dialogue"]
             )
-            final_prompt = prompt + (
+            final_prompt = prompt + overlay_block + (
                 "\n\nDialogue requirements: Speak the following lines naturally in "
                 "the target language. Do not speak the original-language dialogue. "
                 "Do not render captions or subtitles. Finish every line within the "

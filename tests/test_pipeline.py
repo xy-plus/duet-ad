@@ -1463,6 +1463,10 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert "Audio 1" in prompt
     assert "reference: Image 1, TILE_01" in prompt
     assert "[0.000-1.000s] 你好" in prompt
+    assert "Overlay removal:" in prompt
+    assert "burned-in subtitles, captions, and on-screen text" in prompt
+    assert "watermarks and logos" in prompt
+    assert prompt.index("Overlay removal:") < prompt.index("[0.000-1.000s] 你好")
 
 
 def test_h3_barrier_never_submits_if_any_fusion_preparation_fails(

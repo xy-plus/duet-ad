@@ -116,7 +116,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 
 新增 `skills/h3-max-r2v-prompt/SKILL.md` 每段执行一次。Fusion 的业务事实源包括本段 `visual_prompt`、完整 `enhanced_element_index`、本段本地化后的翻译台词，以及后端冻结的 `h3_reference_images`/`replacement_sheet` 元数据；不再单独传入用户说明或独立音色选择。Skill 负责读取索引中的 replacement/voice，并指示 H3 从权威 `stable key -> TILE_XX -> 实际 Image N` 对应格取得新形象、替换 Video 1 中的源形象；后端仅根据实际存在的字段 best-effort 生成 `authoritative_constraints`，不把它当成质量门禁。增强索引继续保存 raw `preserve`，但 `REPLACE` 项只编译动作、功能、尺度、接触、相对位置、运动连续性、人物明确属性及场景色调/构图/机位/光线等类别安全不变量；可能冲突的源脸、服装款式、物体外观和场景陈设不会带入，raw `preserve` 只直接用于 `KEEP`。
 
-内部 Codex 和 DeepSeek Fusion 共用动态 closed JSON Schema：固定 `schema/version`，并把 `input_sha256/segment_index` 绑定到本次输入，模型填写字符串 `prompt`。本地只校验这套结构和绑定，不扫描正文里的 stable key、TILE、`Image N`、`Audio N` 或替换覆盖率。后端把能从增强索引和图版 spec 得到的对象/图片映射、目标语言台词和时间窗机械附加；缺少可选语义时继续出片。关系任一端被替换时，权威约束只保留通用交互类型、接触、相对位置和运动连续性，不带入指向源对象外观的 predicate/preserve；两端都未替换时保留原关系描述。Codex 路径仍保留独立 `/tmp` stage、bwrap 遮蔽 checkout、只读输入、剔除秘密环境变量、agent shell 断网、进程组硬超时和唯一有界输出的隔离边界。
+内部 Codex 和 DeepSeek Fusion 共用动态 closed JSON Schema：固定 `schema/version`，并把 `input_sha256/segment_index` 绑定到本次输入，模型填写字符串 `prompt`。本地只校验这套结构和绑定，不扫描正文里的 stable key、TILE、`Image N`、`Audio N` 或替换覆盖率。后端把能从增强索引和图版 spec 得到的对象/图片映射、目标语言台词和时间窗机械附加，并按请求的 remove_subtitle/remove_logo 默认注入 Overlay removal 块（要求成片不保留源视频的字幕、文字、水印和 Logo；注意 MediaKit 擦除只作用于分析关键帧，不改变送给 H3 的静音 Video 1）；缺少可选语义时继续出片。关系任一端被替换时，权威约束只保留通用交互类型、接触、相对位置和运动连续性，不带入指向源对象外观的 predicate/preserve；两端都未替换时保留原关系描述。Codex 路径仍保留独立 `/tmp` stage、bwrap 遮蔽 checkout、只读输入、剔除秘密环境变量、agent shell 断网、进程组硬超时和唯一有界输出的隔离边界。
 
 随后通过 Picsart Advanced workflow `minimax/h3-max/reference-to-video` 提交最终提示词及 H3 参考素材：
 
