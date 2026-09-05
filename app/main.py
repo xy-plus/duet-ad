@@ -290,6 +290,9 @@ def create_app(
                 if declared_type in REPLACEMENT_MEDIA_TYPES:
                     media_type = declared_type
         now = time.time()
+        size_bytes = owned_path.stat().st_size
+        with owned_path.open("rb") as stream:
+            asset_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
         asset_id = secrets.token_urlsafe(18)
         asset_name = asset_id + PROVIDER_ASSET_SUFFIXES.get(media_type or "", "")
         token = secrets.token_urlsafe(32)
@@ -305,6 +308,8 @@ def create_app(
                 "asset_id": asset_name,
                 "token": token,
                 "path": owned_path,
+                "size_bytes": size_bytes,
+                "sha256": asset_sha256,
                 "media_type": media_type or "application/octet-stream",
                 "expires_at": now + PROVIDER_ASSET_TTL_S,
             }
@@ -681,6 +686,15 @@ def create_app(
             path = app.state.store.resolve_project_file(project_id, record["path"])
         except (FileNotFoundError, OSError):
             raise HTTPException(404) from None
+        try:
+            if path.stat().st_size != record["size_bytes"]:
+                raise HTTPException(404)
+            with path.open("rb") as stream:
+                current_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        except OSError:
+            raise HTTPException(404) from None
+        if not hmac.compare_digest(current_sha256, record["sha256"]):
+            raise HTTPException(404)
         return FileResponse(path, media_type=record["media_type"])
 
     web = Path(__file__).resolve().parents[1] / "web"

@@ -617,7 +617,8 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
                 "https://assets.test/source.mp4"
             ]
             assert params["reference_image_urls"] == [
-                "https://assets.test/reference.png"
+                "https://assets.test/user-reference.png",
+                "https://assets.test/replacement-sheet.png",
             ]
             assert params["reference_audio_urls"] == [
                 "https://assets.test/voice.wav"
@@ -646,7 +647,10 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
     submitted = client.submit(
         prompt="replace subject",
         video_url="https://assets.test/source.mp4",
-        image_url="https://assets.test/reference.png",
+        image_urls=[
+            "https://assets.test/user-reference.png",
+            "https://assets.test/replacement-sheet.png",
+        ],
         audio_urls=["https://assets.test/voice.wav"],
         duration=5,
         resolution="768p",
@@ -664,7 +668,10 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
     ]
 
 
-def test_picsart_advanced_request_omits_empty_optional_inputs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("image_urls", [None, []])
+def test_picsart_advanced_request_omits_empty_optional_inputs(
+    tmp_path: Path, image_urls: list[str] | None
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body == {
@@ -683,7 +690,7 @@ def test_picsart_advanced_request_omits_empty_optional_inputs(tmp_path: Path) ->
     result = client.submit(
         prompt="prompt",
         video_url="https://assets.test/source.mp4",
-        image_url=None,
+        image_urls=image_urls,
         audio_urls=[],
         duration=5,
         resolution="480p",
@@ -691,6 +698,50 @@ def test_picsart_advanced_request_omits_empty_optional_inputs(tmp_path: Path) ->
     )
 
     assert result.value == "task-no-image"
+
+
+@pytest.mark.parametrize(
+    ("image_urls", "message"),
+    [
+        (
+            [f"https://assets.test/{index}.png" for index in range(10)],
+            "at most 9",
+        ),
+        (
+            [
+                "https://assets.test/repeated.png",
+                "https://assets.test/repeated.png",
+            ],
+            "duplicates",
+        ),
+        ([""], "non-empty strings"),
+        ([" https://assets.test/reference.png"], "trimmed"),
+        ([42], "non-empty strings"),
+        (("https://assets.test/reference.png",), "list or None"),
+    ],
+)
+def test_picsart_submit_rejects_invalid_image_urls_before_network(
+    tmp_path: Path, image_urls: object, message: str
+) -> None:
+    network_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        return httpx.Response(200, json={"response": {"id": "unexpected"}})
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match=message):
+        client.submit(
+            prompt="prompt",
+            video_url="https://assets.test/source.mp4",
+            image_urls=image_urls,  # type: ignore[arg-type]
+            duration=5,
+            resolution="768p",
+            aspect_ratio="16:9",
+        )
+
+    assert network_calls == 0
 
 
 def test_picsart_submit_preserves_three_audio_urls_in_order(tmp_path: Path) -> None:
@@ -712,7 +763,7 @@ def test_picsart_submit_preserves_three_audio_urls_in_order(tmp_path: Path) -> N
     ).submit(
         prompt="prompt",
         video_url="https://assets.test/source.mp4",
-        image_url=None,
+        image_urls=None,
         audio_urls=audio_urls,
         duration=5,
         resolution="768p",
@@ -760,7 +811,7 @@ def test_picsart_submit_rejects_invalid_audio_urls_before_network(
         client.submit(
             prompt="prompt",
             video_url="https://assets.test/source.mp4",
-            image_url=None,
+            image_urls=None,
             audio_urls=audio_urls,
             duration=5,
             resolution="768p",
@@ -805,7 +856,7 @@ def test_picsart_submit_failure_outcome_is_explicit(
         client.submit(
             prompt="prompt",
             video_url="https://assets.test/source.mp4",
-            image_url=None,
+            image_urls=None,
             duration=5,
             resolution="768p",
             aspect_ratio="16:9",

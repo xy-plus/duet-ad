@@ -938,12 +938,29 @@ class PicsartClient:
         *,
         prompt: str,
         video_url: str,
-        image_url: str | None,
+        image_urls: list[str] | None,
         audio_urls: list[str] | None = None,
         duration: int,
         resolution: str,
         aspect_ratio: str,
     ) -> ProviderResult[str]:
+        if image_urls is not None:
+            if not isinstance(image_urls, list):
+                raise ValueError("Picsart image_urls must be a list or None")
+            if len(image_urls) > 9:
+                raise ValueError("Picsart image_urls supports at most 9 URLs")
+            if any(
+                not isinstance(url, str)
+                or not url
+                or url != url.strip()
+                for url in image_urls
+            ):
+                raise ValueError(
+                    "Picsart image_urls must contain trimmed non-empty strings"
+                )
+            if len(image_urls) != len(set(image_urls)):
+                raise ValueError("Picsart image_urls must not contain duplicates")
+
         if audio_urls is not None:
             if not isinstance(audio_urls, list):
                 raise ValueError("Picsart audio_urls must be a list or None")
@@ -969,8 +986,8 @@ class PicsartClient:
             "aspect_ratio": aspect_ratio,
             "prompt_expansion_mode": "quality",
         }
-        if image_url:
-            params["reference_image_urls"] = [image_url]
+        if image_urls:
+            params["reference_image_urls"] = image_urls
         if audio_urls:
             params["reference_audio_urls"] = audio_urls
         body = {"params": params}

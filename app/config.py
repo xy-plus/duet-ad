@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FUSION_AGENTS = frozenset({"codex", "deepseek"})
+SEEDREAM_PRO_MODEL = "doubao-seedream-5-0-pro-260628"
+SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -18,6 +23,10 @@ class Settings:
     public_base_url: str = ""
     picsart_api_key: str = ""
     picsart_api_base: str = "https://api.picsart.com"
+    seedream_api_key: str = field(default="", repr=False)
+    seedream_api_base: str = SEEDREAM_API_BASE
+    seedream_model: str = SEEDREAM_PRO_MODEL
+    seedream_timeout_s: float = 300.0
     deepseek_api_key: str = ""
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash-vision-exp"
@@ -44,6 +53,59 @@ class Settings:
             raise ValueError("ACCESS_TOKEN must be a non-empty value")
         if token != self.access_token:
             object.__setattr__(self, "access_token", token)
+        seedream_key = (
+            self.seedream_api_key.strip()
+            if isinstance(self.seedream_api_key, str)
+            else ""
+        )
+        if seedream_key and (
+            not seedream_key.isascii()
+            or any(not 0x21 <= ord(character) <= 0x7E for character in seedream_key)
+        ):
+            raise ValueError("ARK_API_KEY must be header-safe ASCII")
+        object.__setattr__(self, "seedream_api_key", seedream_key)
+        seedream_base = (
+            self.seedream_api_base.strip().rstrip("/")
+            if isinstance(self.seedream_api_base, str)
+            else ""
+        )
+        if (
+            not seedream_base.isascii()
+            or any(not 0x21 <= ord(character) <= 0x7E for character in seedream_base)
+        ):
+            raise ValueError("SEEDREAM_API_BASE must be an HTTPS base URL")
+        try:
+            seedream_url = urlsplit(seedream_base)
+            seedream_port = seedream_url.port
+        except ValueError as exc:
+            raise ValueError("SEEDREAM_API_BASE must be an HTTPS base URL") from exc
+        if (
+            seedream_url.scheme != "https"
+            or not seedream_url.netloc
+            or not seedream_url.hostname
+            or seedream_url.username is not None
+            or seedream_url.password is not None
+            or seedream_url.query
+            or seedream_url.fragment
+            or seedream_port is not None and not 1 <= seedream_port <= 65535
+        ):
+            raise ValueError("SEEDREAM_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "seedream_api_base", seedream_base)
+        seedream_model = (
+            self.seedream_model.strip()
+            if isinstance(self.seedream_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(seedream_model):
+            raise ValueError("SEEDREAM_MODEL must be a valid model identifier")
+        object.__setattr__(self, "seedream_model", seedream_model)
+        if (
+            isinstance(self.seedream_timeout_s, bool)
+            or not isinstance(self.seedream_timeout_s, (int, float))
+            or not math.isfinite(float(self.seedream_timeout_s))
+            or self.seedream_timeout_s <= 0
+        ):
+            raise ValueError("SEEDREAM_TIMEOUT_S must be a positive finite number")
         base = self.public_base_url.strip() if isinstance(self.public_base_url, str) else ""
         try:
             parsed = urlsplit(base)
@@ -108,6 +170,14 @@ def get_settings() -> Settings:
         public_base_url=os.environ.get("PUBLIC_BASE_URL", ""),
         picsart_api_key=os.environ.get("PICSART_API_KEY", ""),
         picsart_api_base=os.environ.get("PICSART_API_BASE", "https://api.picsart.com").rstrip("/"),
+        seedream_api_key=os.environ.get("ARK_API_KEY", "").strip(),
+        seedream_api_base=os.environ.get(
+            "SEEDREAM_API_BASE", SEEDREAM_API_BASE
+        ).strip(),
+        seedream_model=os.environ.get(
+            "SEEDREAM_MODEL", SEEDREAM_PRO_MODEL
+        ).strip(),
+        seedream_timeout_s=float(os.environ.get("SEEDREAM_TIMEOUT_S", "300")),
         # duet-ad1 stores its DeepSeek credential as ANTHROPIC_AUTH_TOKEN in
         # the protected credential file.  Accept the canonical name first,
         # then the source deployment's name so the independent app can reuse

@@ -1059,6 +1059,7 @@ function projectPhaseLabel(detail) {
     return "AI 正在生成视频";
   }
   if (["video-maker", "video-maker-resume", "translation", "video-maker-project-index", "object-replace",
+    "seedream-reference-sheet",
     "context_ir", "context_ir_native"].includes(stage)) {
     return "AI 正在思考创意";
   }

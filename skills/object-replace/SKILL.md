@@ -1,11 +1,11 @@
 ---
 name: object-replace
-description: 基于 video-maker 的稳定全局索引、全部分段视频描述、用户替换要求和 Image 1，规划项目级元素替换，并从固定音色目录为每个人物选择 voice_id。用于在逐段 Fusion 前冻结唯一的替换与人物音色权威，不生成最终视频提示词。
+description: 基于 video-maker 的稳定全局索引、全部分段视频描述、用户替换要求和 Image 1，规划项目级元素替换、人物音色与一张全项目合并新形象图的 Seedream 基础提示词。用于在逐段 Fusion 前冻结唯一的替换与人物音色权威，不生成最终视频提示词。
 ---
 
 # Object Replace
 
-只规划替换和人物音色，不重写原视频事实、稳定 ID、occurrences 或 relations。输出格式以本次注入的 JSON Schema 为唯一权威；逐字回填固定的 `schema`、`version` 和 `input_sha256`，覆盖 Schema 列出的每个稳定 ID，不增删字段，不输出 Markdown。
+只规划替换、人物音色和合并新形象图的项目级基础提示，不重写原视频事实、稳定 ID、occurrences 或 relations。输出格式以本次注入的 JSON Schema 为唯一权威；逐字回填固定的 `schema`、`version` 和 `input_sha256`，覆盖 Schema 列出的每个稳定 ID，不增删字段，不输出 Markdown。
 
 后端只检查输出能否按 Schema 结构、输入绑定和稳定 ID 机械传给下游，不会二次判断替换是否充分、对象是否匹配或音色是否最优；完成下列语义要求是本节点自身职责。
 
@@ -20,6 +20,14 @@ description: 基于 video-maker 的稳定全局索引、全部分段视频描述
 5. `entities` 中所有可见实体都必须替换，包括用户指定元素及其联动组件。保持功能、动作接口、尺度、接触和相对关系，同时明确改变材质、颜色、品种、轮廓、结构或造型中的一个或多个主要维度；只添加附件、只改关联物或只做近邻色相变化不算替换。
 6. 同一个 stable key 在不同图片、不同分段和所有 occurrence 中必须逐字复用同一套新设计。联动元素的设计必须兼容，但仍各自输出自己的 replacement；`replace_together` 不会把 Image 1 或 `matches_user_request` 自动传播给无关元素。
 7. `target_visual_description` 先简短写清完整的新目标，再点明相对源素材的可观察差异；描述必须可直接供 Fusion 使用。保持动作、姿态、位置、尺度、接触、遮挡、前后关系、角色功能和跨段连续性，不得保留与新身份、新款式、新材质、新造型或新场景实例冲突的源外观。
+
+## 合并新形象图
+
+1. `reference_sheet_prompt` 只是供 Seedream 生成一张全项目合并新形象图的项目级基础提示词，不是 Fusion 或 H3 的最终提示词。
+2. 基础提示词必须描述 `people`、`entities` 和 `scenes` 中所有实际非空 `replacement`，逐个写出完整 stable key 与对应的 `target_visual_description`；不得增加索引外元素，也不得合并、改名或重复 stable key。
+3. 全局索引是唯一锚点。同一 stable key 在 `reference_sheet_prompt`、所有分段和后续 Fusion 中必须复用同一套新设计，不得在生图提示中另行改造或补猜。
+4. 该字段只描述新形象内容，不决定、声明或重排 TILE、网格、槽位、图片顺序或 Image N。后端必须根据冻结的全局索引机械分配这些定位信息，本节点不得覆盖。
+5. Image 1 只约束 `replacement.source=image_1` 的对应 stable key。其他 stable key 的新形象不得继承 Image 1 的身份、外观、背景、风格或无关元素。
 
 ## 人物音色
 

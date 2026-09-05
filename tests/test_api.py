@@ -841,6 +841,9 @@ def test_provider_asset_signature_binds_project_asset_id_token_and_real_path(tmp
         assert client.get(
             f"/internal/provider-assets/{second['id']}/{asset_id}?token={token}"
         ).status_code == 404
+        source.write_bytes(b"other")
+        assert len(b"other") == len(b"first")
+        assert client.get(f"{signed.path}?{signed.query}").status_code == 404
 
         outside = tmp_path / "outside.mp4"
         outside.write_bytes(b"outside")

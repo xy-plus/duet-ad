@@ -131,6 +131,12 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "不得把参考图背景或无关对象扩散到其他 stable key",
         "其他必换 key 仍各自使用 `generated_variant`",
         "不把这条语义职责变成质量门禁",
+        "`reference_sheet_prompt`",
+        "一张全项目合并新形象图",
+        "所有实际非空 `replacement`",
+        "全局索引是唯一锚点",
+        "不决定、声明或重排 TILE",
+        "其他 stable key 的新形象不得继承 Image 1",
     ):
         assert rule in skill
     for obsolete_or_specific_rule in (
@@ -158,15 +164,29 @@ def _output(
     element_index: dict[str, Any],
     digest: str,
 ) -> dict[str, Any]:
+    image_1_key = next(
+        (
+            stable_id
+            for category in ("people", "entities", "scenes")
+            for stable_id in element_index[category]
+        ),
+        None,
+    )
     return {
         "schema": OBJECT_REPLACE_OUTPUT_NAME,
         "version": OBJECT_REPLACE_OUTPUT_VERSION,
         "input_sha256": digest,
+        "reference_sheet_prompt": "one project reference sheet",
         "people": {
             stable_id: {
-                "matches_user_request": False,
+                "matches_user_request": stable_id == image_1_key,
                 "replacement": _replacement(
-                    "generated_variant", f"new appearance for {stable_id}",
+                    (
+                        "image_1"
+                        if stable_id == image_1_key
+                        else "generated_variant"
+                    ),
+                    f"new appearance for {stable_id}",
                 ),
                 "voice_id": VOICE_IDS[index % len(VOICE_IDS)],
             }
@@ -174,18 +194,28 @@ def _output(
         },
         "entities": {
             stable_id: {
-                "matches_user_request": False,
+                "matches_user_request": stable_id == image_1_key,
                 "replacement": _replacement(
-                    "generated_variant", f"new appearance for {stable_id}",
+                    (
+                        "image_1"
+                        if stable_id == image_1_key
+                        else "generated_variant"
+                    ),
+                    f"new appearance for {stable_id}",
                 ),
             }
             for stable_id in element_index["entities"]
         },
         "scenes": {
             stable_id: {
-                "matches_user_request": False,
+                "matches_user_request": stable_id == image_1_key,
                 "replacement": _replacement(
-                    "generated_variant", f"new layout for {stable_id}",
+                    (
+                        "image_1"
+                        if stable_id == image_1_key
+                        else "generated_variant"
+                    ),
+                    f"new layout for {stable_id}",
                 ),
             }
             for stable_id in element_index["scenes"]
@@ -201,7 +231,7 @@ def _normalize(
     voice_ids: list[str] = VOICE_IDS,
     has_user_image: bool = True,
     instruction: str = "replace the held product",
-) -> dict[str, dict[str, dict[str, Any]]]:
+) -> dict[str, Any]:
     return normalize_object_replace(
         value,
         input_sha256=digest,
@@ -220,9 +250,17 @@ def test_schema_is_closed_bound_and_all_quality_choices_are_nullable() -> None:
     assert digest == hashlib.sha256(canonical_input(payload)).hexdigest()
     assert schema["additionalProperties"] is False
     assert schema["required"] == [
-        "schema", "version", "input_sha256", "people", "entities", "scenes",
+        "schema",
+        "version",
+        "input_sha256",
+        "reference_sheet_prompt",
+        "people",
+        "entities",
+        "scenes",
     ]
+    assert OBJECT_REPLACE_OUTPUT_VERSION == 2
     assert schema["properties"]["input_sha256"]["enum"] == [digest]
+    assert schema["properties"]["reference_sheet_prompt"] == {"type": "string"}
     assert "relations" not in schema["properties"]
 
     for category in ("people", "entities", "scenes"):
@@ -246,6 +284,41 @@ def test_schema_is_closed_bound_and_all_quality_choices_are_nullable() -> None:
                     {"type": "string", "enum": VOICE_IDS},
                     {"type": "null"},
                 ]
+
+            image_branch, generated_branch = patch_schema["anyOf"]
+            assert image_branch["additionalProperties"] is False
+            assert image_branch["properties"]["matches_user_request"][
+                "enum"
+            ] == [True]
+            assert image_branch["properties"]["replacement"]["properties"][
+                "source"
+            ]["enum"] == ["image_1"]
+            assert generated_branch["additionalProperties"] is False
+            assert generated_branch["properties"]["matches_user_request"][
+                "enum"
+            ] == [False]
+            assert generated_branch["properties"]["replacement"]["anyOf"][0][
+                "properties"
+            ]["source"]["enum"] == ["generated_variant"]
+
+
+def test_schema_removes_image_1_when_there_is_no_user_image() -> None:
+    element_index = _index()
+    payload = _payload(element_index)
+    payload["has_user_image"] = False
+    payload["user_replacement_image"] = None
+
+    schema, _digest = object_replace_schema(payload, VOICE_IDS)
+
+    for category in ("people", "entities", "scenes"):
+        for patch_schema in schema["properties"][category]["properties"].values():
+            assert "anyOf" not in patch_schema
+            assert patch_schema["properties"]["matches_user_request"][
+                "enum"
+            ] == [False]
+            assert patch_schema["properties"]["replacement"]["anyOf"][0][
+                "properties"
+            ]["source"]["enum"] == ["generated_variant"]
 
 
 @pytest.mark.parametrize(
@@ -298,17 +371,17 @@ def test_normalizer_allows_semantically_imperfect_but_consumable_output() -> Non
     value = _output(element_index, digest)
 
     value["people"]["person-01"] = {
-        "matches_user_request": True,
+        "matches_user_request": False,
         "replacement": None,
         "voice_id": None,
     }
     value["people"]["person-02"] = {
         "matches_user_request": False,
-        "replacement": _replacement("image_1", "person-02"),
+        "replacement": _replacement("generated_variant", "person-02"),
         "voice_id": None,
     }
     value["entities"]["entity-01"] = {
-        "matches_user_request": True,
+        "matches_user_request": False,
         "replacement": _replacement("generated_variant", ""),
     }
     value["entities"]["entity-02"]["replacement"] = None
@@ -327,8 +400,23 @@ def test_normalizer_allows_semantically_imperfect_but_consumable_output() -> Non
     )
 
     assert normalized == {
-        category: value[category] for category in ("people", "entities", "scenes")
+        "reference_sheet_prompt": value["reference_sheet_prompt"],
+        **{
+            category: value[category]
+            for category in ("people", "entities", "scenes")
+        },
     }
+
+
+def test_normalizer_keeps_empty_reference_sheet_prompt_without_quality_gate() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["reference_sheet_prompt"] = ""
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["reference_sheet_prompt"] == ""
 
 
 def test_normalizer_does_not_limit_description_length_or_compare_source() -> None:
@@ -336,10 +424,10 @@ def test_normalizer_does_not_limit_description_length_or_compare_source() -> Non
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
     value["people"]["person-01"]["replacement"] = _replacement(
-        "generated_variant", "person-01",
+        "image_1", "person-01",
     )
     value["scenes"]["scene-01"]["replacement"] = _replacement(
-        "image_1", "x" * 10_000,
+        "generated_variant", "x" * 10_000,
     )
 
     normalized = _normalize(value, digest=digest, element_index=element_index)
@@ -351,12 +439,139 @@ def test_normalizer_does_not_limit_description_length_or_compare_source() -> Non
     ) == 10_000
 
 
+def test_normalizer_downgrades_image_1_without_a_user_image() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+
+    normalized = _normalize(
+        value,
+        digest=digest,
+        element_index=element_index,
+        has_user_image=False,
+    )
+
+    assert normalized["people"]["person-01"]["replacement"]["source"] == (
+        "generated_variant"
+    )
+    assert normalized["people"]["person-01"]["matches_user_request"] is False
+
+
+def test_normalizer_allows_zero_image_1_bindings_with_a_user_image() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["people"]["person-01"]["replacement"] = None
+    value["people"]["person-01"]["matches_user_request"] = False
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["replacement"] is None
+    assert all(
+        patch["replacement"] is None
+        or patch["replacement"]["source"] != "image_1"
+        for category in ("people", "entities", "scenes")
+        for patch in normalized[category].values()
+    )
+
+
+def test_normalizer_downgrades_every_ambiguous_image_1_binding() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"]["entity-01"] = {
+        "matches_user_request": True,
+        "replacement": _replacement("image_1", "entity-01"),
+    }
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["replacement"]["source"] == (
+        "generated_variant"
+    )
+    assert normalized["people"]["person-01"]["matches_user_request"] is False
+    assert normalized["entities"]["entity-01"]["replacement"]["source"] == (
+        "generated_variant"
+    )
+    assert normalized["entities"]["entity-01"]["matches_user_request"] is False
+
+
+def test_normalizer_derives_true_match_from_image_1_binding() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["people"]["person-01"]["matches_user_request"] = False
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["matches_user_request"] is True
+
+
+@pytest.mark.parametrize("replacement", [None, _replacement("generated_variant", "x")])
+def test_normalizer_clears_true_match_without_image_1(
+    replacement: dict[str, str] | None,
+) -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["people"]["person-01"]["replacement"] = replacement
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["matches_user_request"] is False
+
+
+def test_normalizer_clears_match_flag_without_a_user_image() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["people"]["person-01"] = {
+        "matches_user_request": True,
+        "replacement": _replacement("generated_variant", "person-01"),
+        "voice_id": None,
+    }
+
+    normalized = _normalize(
+        value,
+        digest=digest,
+        element_index=element_index,
+        has_user_image=False,
+    )
+
+    assert normalized["people"]["person-01"]["matches_user_request"] is False
+
+
+def test_normalizer_accepts_exactly_one_matching_image_1_binding() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    replacements = [
+        patch["replacement"]
+        for category in ("people", "entities", "scenes")
+        for patch in normalized[category].values()
+        if patch["replacement"] is not None
+    ]
+    assert [
+        replacement["source"] for replacement in replacements
+    ].count("image_1") == 1
+    assert all(
+        replacement["source"] == "generated_variant"
+        for replacement in replacements
+        if replacement["source"] != "image_1"
+    )
+    assert normalized["people"]["person-01"]["matches_user_request"] is True
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
         lambda value: value.update({"input_sha256": "0" * 64}),
         lambda value: value.update({"version": True}),
         lambda value: value.update({"extra": True}),
+        lambda value: value.update({"reference_sheet_prompt": 1}),
         lambda value: value["people"].pop("person-02"),
         lambda value: value["entities"].update({"entity-99": {}}),
         lambda value: value["scenes"]["scene-01"].update({"extra": True}),
@@ -426,12 +641,12 @@ def test_merge_safely_copies_without_semantic_review() -> None:
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
     value["people"]["person-01"] = {
-        "matches_user_request": True,
+        "matches_user_request": False,
         "replacement": None,
         "voice_id": None,
     }
     value["entities"]["entity-01"] = {
-        "matches_user_request": False,
+        "matches_user_request": True,
         "replacement": _replacement("image_1", ""),
     }
     normalized = _normalize(value, digest=digest, element_index=element_index)
@@ -448,13 +663,14 @@ def test_merge_safely_copies_without_semantic_review() -> None:
     assert normalized == patch_snapshot
     assert voice_metadata == metadata_snapshot
     assert merged is not element_index
+    assert "reference_sheet_prompt" not in merged
     assert merged["relations"] == element_index["relations"]
     assert merged["people"]["person-01"]["replacement"] is None
     assert merged["people"]["person-01"]["voice"] is None
     assert merged["people"]["person-02"]["voice"] == voice_metadata["voice-b"]
     assert merged["people"]["person-02"]["voice"] is not voice_metadata["voice-b"]
     assert merged["entities"]["entity-01"]["replacement"] == {
-        "reason": "automatic",
+        "reason": "user_requested",
         "source": "image_1",
         "target_visual_description": "",
     }
