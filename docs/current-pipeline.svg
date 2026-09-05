@@ -51,7 +51,7 @@
   <text x="800" y="165" class="t h">3  Object Replace 与 Seedream</text>
   <rect x="798" y="188" width="296" height="132" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="220" class="t n">Object Replace v3</text><text x="818" y="248" class="t s">确定性 replacement_set</text><text x="818" y="273" class="t s">全部人物 / 实体 / 场景 stable key</text><text x="818" y="298" class="t s">外观 / 交互语义分离 · 人物音色</text>
   <path d="M946 320V346" class="inner"/>
-  <rect x="798" y="346" width="296" height="97" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="378" class="t n">后端确定性映射</text><text x="818" y="407" class="t m">stable key → TILE_XX</text><text x="818" y="431" class="t s">sheet bundle v3 · spec v2</text>
+  <rect x="798" y="346" width="296" height="97" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="378" class="t n">后端确定性映射</text><text x="818" y="407" class="t m">stable key → TILE_XX</text><text x="818" y="431" class="t s">sheet bundle v4 · spec v2</text>
   <path d="M946 443V469" class="inner"/>
   <rect x="798" y="469" width="296" height="220" rx="14" fill="#211d48" stroke="#aa92f3"/><text x="818" y="501" class="t n">Seedream · 每项目仅 1 次</text><text x="818" y="527" class="t s">Image 1 空白布局 · Image 2 可选用户图</text>
   <g transform="translate(826 550)"><rect width="240" height="108" rx="8" fill="#f2f0e8" stroke="#e4cf87" stroke-width="2"/><rect x="7" y="7" width="110" height="44" fill="#b9d4e5"/><rect x="123" y="7" width="110" height="44" fill="#d2b8df"/><rect x="7" y="57" width="110" height="44" fill="#d9bf91"/><rect x="123" y="57" width="110" height="44" fill="#abcbb1"/><text x="15" y="34" class="t m" fill="#173044">TILE_01</text><text x="131" y="34" class="t m" fill="#35223d">TILE_02</text><text x="15" y="84" class="t m" fill="#3d2e19">TILE_03</text><text x="131" y="84" class="t m" fill="#213c27">TILE_04</text></g><text x="818" y="681" class="t s">人物面部特写 · 单体分格 · 场景空置</text>
@@ -61,7 +61,7 @@
   <text x="1168" y="165" class="t h">4  Fusion 与 H3</text>
   <rect x="1166" y="188" width="296" height="112" rx="12" class="card"/><text x="1186" y="220" class="t n">逐段 Fusion</text><text x="1186" y="249" class="t m">stable key → TILE_XX → Image N</text><text x="1186" y="276" class="t s">图版取外观 · 增强索引取动作/关系</text>
   <path d="M1314 300V326" class="inner"/>
-  <rect x="1166" y="326" width="296" height="178" rx="12" class="card"/><text x="1186" y="358" class="t n">H3 有序媒体输入</text><text x="1186" y="388" class="t s">Video 1：静音源片段</text><text x="1186" y="418" class="t s">有绑定：Image 1 用户图</text><text x="1270" y="444" class="t s">Image 2 图版</text><text x="1186" y="471" class="t s">无绑定：Image 1 图版</text><text x="1186" y="496" class="t s">Audio 1..N：冻结音色</text>
+  <rect x="1166" y="326" width="296" height="178" rx="12" class="card"/><text x="1186" y="358" class="t n">H3 有序媒体输入</text><text x="1186" y="388" class="t s">Video 1：静音源片段</text><text x="1186" y="418" class="t s">Image 1 图版（固定主参考）</text><text x="1186" y="444" class="t s">有绑定：Image 2 用户图</text><text x="1186" y="471" class="t s">提示词首行强制换脸</text><text x="1186" y="496" class="t s">Audio 1..N：冻结音色</text>
   <path d="M1314 504V530" class="inner"/>
   <rect x="1166" y="530" width="296" height="105" rx="12" fill="#102f4b" stroke="#48d8ff" stroke-width="2"/><text x="1186" y="563" class="t n">H3 manifest v4</text><text x="1186" y="591" class="t s">prompt / 媒体顺序 / 路径 / SHA</text><text x="1186" y="617" class="t s">全段预检后才越过付费边界</text>
   <path d="M1314 635V661" class="inner"/>

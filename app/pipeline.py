@@ -83,7 +83,7 @@ TRANSLATION_SCHEMA: dict[str, Any] = {
 
 PICSART_RECEIPT_VERSION = 2
 H3_PREPARED_ARTIFACTS_VERSION = 4
-REPLACEMENT_SHEET_VERSION = 3
+REPLACEMENT_SHEET_VERSION = 4
 PICSART_PROMPT_MAX_CHARS = 50_000
 PICSART_REFERENCE_MIN_DURATION_S = 2
 PICSART_REFERENCE_MAX_DURATION_S = 15
@@ -890,7 +890,10 @@ class Pipeline:
             raise ValueError(
                 "prepared replacement sheet requires receipt-safe replay"
             )
-        image_reference = "Image 2" if user_image_present else "Image 1"
+        # The replacement sheet is always H3 Image 1 so the identity anchor
+        # carries the primary reference weight; the user image, when present,
+        # follows as Image 2.
+        image_reference = "Image 1"
         h3_reference_images: list[dict[str, Any]] = []
         state = self.store.read(project_id)
         voice_references = state.get("voice_references")
@@ -962,7 +965,7 @@ class Pipeline:
                 "work/global-reference-sheet/user-reference.png",
             )
             h3_reference_images.append({
-                "image_reference": "Image 1",
+                "image_reference": "Image 2",
                 "role": "user_replacement",
                 **canonical_receipt,
             })
@@ -1093,13 +1096,13 @@ class Pipeline:
             ),
         }
         completed_bundle["h3_reference_images"] = [
-            *prepared_bundle["h3_reference_images"],
             {
                 "image_reference": prepared_bundle["h3_image_reference"],
                 "role": "global_replacement_sheet",
                 **completed_bundle["output"],
                 "spec_sha256": spec["spec_sha256"],
             },
+            *prepared_bundle["h3_reference_images"],
         ]
         self.store.update(project_id, replacement_sheet=completed_bundle)
         return completed_bundle, final_path
@@ -2691,14 +2694,13 @@ class Pipeline:
             ):
                 raise ValueError("stored user reference is not PNG")
             expected_references.append({
-                "image_reference": "Image 1",
+                "image_reference": "Image 2",
                 "role": "user_replacement",
                 **canonical_receipt,
             })
 
-        expected_image_reference = (
-            "Image 2" if raw["user_image_present"] else "Image 1"
-        )
+        # The sheet is always H3 Image 1; the user image follows as Image 2.
+        expected_image_reference = "Image 1"
         if raw.get("h3_image_reference") != expected_image_reference:
             raise ValueError("stored H3 image reference order is invalid")
 
@@ -2813,7 +2815,7 @@ class Pipeline:
             ) from exc
         if output_media_type != "image/png":
             raise ValueError("stored replacement sheet is not PNG")
-        expected_references.append({
+        expected_references.insert(0, {
             "image_reference": expected_image_reference,
             "role": "global_replacement_sheet",
             **output,
@@ -3764,6 +3766,12 @@ class Pipeline:
                 "its bound tile; never borrow another tile or the source Video 1 "
                 "appearance. The same tile is authoritative in every segment."
             )
+            if replacement_sheet.get("user_image_present") is True:
+                lines.append(
+                    "The user reference image is Image 2. It already shaped its "
+                    "bound tile during sheet creation and adds no further "
+                    "constraint; never copy from Image 2 directly."
+                )
         replaced_ids: set[str] = set()
         for category in ("people", "entities", "scenes"):
             records = element_index.get(category)
@@ -3809,8 +3817,9 @@ class Pipeline:
                             and replacement_sheet.get("user_image_present") is True
                         ):
                             reference_text += (
-                                "; this tile was designed from the user Image 1, "
-                                "but the tile is the final appearance authority"
+                                "; this tile was designed from the user image "
+                                "Image 2, but the tile is the final appearance "
+                                "authority"
                             )
                     else:
                         reference_text = (
@@ -3983,6 +3992,29 @@ class Pipeline:
                 ),
             )
             processing = self._validated_effective_request(request)["processing"]
+            face_block = ""
+            sheet_reference = replacement_sheet.get("h3_image_reference")
+            people = element_index.get("people")
+            if (
+                isinstance(sheet_reference, str)
+                and sheet_reference.strip()
+                and isinstance(people, dict)
+                and any(
+                    isinstance(record, dict)
+                    and isinstance(record.get("replacement"), dict)
+                    and self._appears_in_segment(record, index)
+                    for record in people.values()
+                )
+            ):
+                face_block = (
+                    "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
+                    "EVERYTHING ELSE. Every person in Video 1 must appear with "
+                    f"the face from their tile in {sheet_reference}: face "
+                    "shape, eyes, nose, mouth, skin tone, and hairstyle all "
+                    "come from that tile, never from Video 1. Keeping the "
+                    "source face is a failure, even if everything else is "
+                    "correct.\n\n"
+                )
             overlay_targets = []
             if processing["remove_subtitle"]:
                 overlay_targets.append(
@@ -4004,7 +4036,7 @@ class Pipeline:
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
                 for line in item["dialogue"]
             )
-            final_prompt = prompt + overlay_block + (
+            final_prompt = face_block + prompt + overlay_block + (
                 "\n\nDialogue requirements: Speak the following lines naturally in "
                 "the target language. Do not speak the original-language dialogue. "
                 "Do not render captions or subtitles. Finish every line within the "

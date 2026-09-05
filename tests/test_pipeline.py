@@ -1139,7 +1139,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert state["object_replace"]["version"] == OBJECT_REPLACE_OUTPUT_VERSION
     replacement_sheet = state["replacement_sheet"]
     assert replacement_sheet["status"] == "succeeded"
-    assert replacement_sheet["h3_image_reference"] == "Image 2"
+    assert replacement_sheet["h3_image_reference"] == "Image 1"
     canonical_receipt = Pipeline._project_artifact_receipt(
         project,
         canonical_reference,
@@ -1148,14 +1148,14 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert replacement_sheet["h3_reference_images"] == [
         {
             "image_reference": "Image 1",
-            "role": "user_replacement",
-            **canonical_receipt,
-        },
-        {
-            "image_reference": "Image 2",
             "role": "global_replacement_sheet",
             **replacement_sheet["output"],
             "spec_sha256": replacement_sheet["spec_sha256"],
+        },
+        {
+            "image_reference": "Image 2",
+            "role": "user_replacement",
+            **canonical_receipt,
         },
     ]
     assert [
@@ -1182,8 +1182,8 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         "work/global-reference-sheet/user-reference.png",
     ]
     expected_image_urls = [
-        "https://assets.invalid/global-reference-sheet/user-reference.png",
         "https://assets.invalid/global-reference-sheet/reference-sheet.png",
+        "https://assets.invalid/global-reference-sheet/user-reference.png",
     ]
     assert all(
         call["image_urls"] == expected_image_urls for call in picsart.submits
@@ -1277,7 +1277,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
                 tile for tile in replacement_sheet["spec"]["tiles"]
                 if tile["stable_key"] == stable_id
             )
-            assert f"reference: Image 2, {tile['tile_id']} " in authority_line
+            assert f"reference: Image 1, {tile['tile_id']} " in authority_line
 
     translation_output = json.loads(
         (project / "logs" / "deepseek-translation" / "project" / "attempt-1" / "output.json").read_text(encoding="utf-8")
@@ -1442,7 +1442,8 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     )
 
     assert result_item["index"] == 1
-    assert result_prompt.startswith("Preserve the source motion")
+    assert result_prompt.startswith("FACE REPLACEMENT IS MANDATORY")
+    assert "Preserve the source motion" in result_prompt
     assert result_muted == segment_dir / "source-muted.mp4"
     assert len(fusion_input_sha256) == 64
     assert len(calls) == 1
@@ -1459,7 +1460,11 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert calls[0]["schema"]["additionalProperties"] is False
     assert calls[0]["images"] == []
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
-    assert prompt.startswith("Preserve the source motion")
+    assert prompt.startswith("FACE REPLACEMENT IS MANDATORY")
+    assert "Preserve the source motion" in prompt
+    assert prompt.index("FACE REPLACEMENT IS MANDATORY") < prompt.index(
+        "Preserve the source motion"
+    )
     assert "Audio 1" in prompt
     assert "reference: Image 1, TILE_01" in prompt
     assert "[0.000-1.000s] 你好" in prompt

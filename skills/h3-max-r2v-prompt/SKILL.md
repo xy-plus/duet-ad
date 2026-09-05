@@ -9,7 +9,7 @@ description: 根据原片段描述、Object Replace 增强后的全局对象索�
 
 冻结的 `global_element_index` 是本项目唯一对象身份、替换与人物音色锚点。不得重新识别、重命名、合并或拆分 stable key，不得重新决定替换目标，不得要求读取用户替换说明，也不得根据常识新增替换。逐项读取当前 segment 的 occurrences、replacement、voice、preserve 和 relations。
 
-`replacement_sheet` 是按同一冻结索引生成的项目级单张新形象图版；`h3_reference_images` 给出 H3 图片的有序角色。后端生成的 `stable key -> TILE_XX -> 实际 Image N` 映射是唯一图片引用权威：存在唯一有效用户图绑定时 `Image 1` 是用户图、图版是 `Image 2`；没有该绑定时不发送原始用户图，图版是 `Image 1`。用户图只约束增强索引中与其对应的那个 stable key，不得把用户图外观扩散给其他 stable key；所有替换对象最终都使用各自在图版中的 tile。同一项目的每个 segment 必须沿用同一张图版和同一套映射，不得重新编号或自行推断图片顺序。
+`replacement_sheet` 是按同一冻结索引生成的项目级单张新形象图版；`h3_reference_images` 给出 H3 图片的有序角色。后端生成的 `stable key -> TILE_XX -> 实际 Image N` 映射是唯一图片引用权威：图版固定为 `Image 1`（身份锚点占主参考位），存在唯一有效用户图绑定时用户图是 `Image 2`；没有该绑定时不发送原始用户图，图版仍是 `Image 1`。用户图只约束增强索引中与其对应的那个 stable key，不得把用户图外观扩散给其他 stable key；所有替换对象最终都使用各自在图版中的 tile。同一项目的每个 segment 必须沿用同一张图版和同一套映射，不得重新编号或自行推断图片顺序。
 
 `authoritative_constraints` 是后端从增强索引和图版 spec 机械编译的本段替换、`stable key -> TILE_XX -> Image N`、关系和 `person -> Audio N` 权威块，后端会在你的 `prompt` 尾部原样附加。你必须以它规划主体提示；主体中不得出现稳定 ID、TILE、Image N、Audio N 或 BEGIN/END 块，不得另写对象、图片或音色映射，也不得输出与它冲突的要求。后端只校验输出结构和输入绑定，不会二次判断你是否完成这些语义要求；完整表达替换、音色和连续性是本节点自身职责。
 

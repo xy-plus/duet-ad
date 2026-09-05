@@ -28,7 +28,7 @@
   -> 后端从 raw 索引生成全 stable-key replacement_set 和去除条目级 preserve/replaceable 的规划视图
   -> 一次项目级 DeepSeek Object Replace v3：规划视图 + replacement_set + 全部视觉提示 + 用户图/说明 + 当前音色目录；输出分离外观/交互语义的 patch 和 voice
   -> 后端机械合并增强索引；按可用 voice_id 生成全项目 Audio 1..N（N <= 3）
-  -> 后端按冻结 stable key 确定性生成图版 bundle v3 / spec v2 和 TILE_XX；Seedream 以 Image 1 空白布局、可选 Image 2 用户图生成一张隔离图版
+  -> 后端按冻结 stable key 确定性生成图版 bundle v4 / spec v2 和 TILE_XX；Seedream 以 Image 1 空白布局、可选 Image 2 用户图生成一张隔离图版
   -> 第一屏障：所有段并行完成 Fusion、best-effort 约束编译、最终提示词和静音 Video 1
   -> 第二屏障：所有段完成有序图片、音频和 Video 1 的素材注册及 H3 参数预检
   -> 各段并行 H3：Video 1 + 同一组有序 Images + 全项目同序 Audio 1..N -> 裁回源时长
@@ -43,7 +43,7 @@ Object Replace 调用前，后端从 raw stable index 确定性生成 `replaceme
 
 Object Replace Skill 要求 `replacement_set` 中每个人物、实体和场景都生成非空替换。同一 stable key 跨图片、分段和 occurrence 使用同一套新设计；Object Replace 调用中的 Image 1 只约束用户文字唯一语义对应的一个既有 stable key，其他 key 仍使用 `generated_variant`。`appearance_description` 不能出现动作、接触、相对位置、场景归属或其他 stable key；人物格画该人物的头肩面部特写（索引只见到身体局部时只画该局部），实体格只画该实体，场景格只画空置环境。人物保持明确的类型、性别、种族、年龄段、整体风格和服装主色，但更换身份，使人脸或可见身体产生差异；只露出身体局部时，统一改变局部形态、比例、肤色、纹理或标记，不为具体部位写特例；服装保持颜色和风格但改变款式。场景保持类型、用途、布局、色调、构图、机位、镜头运动、焦段和光线，但改成同类不同实例。实体保持功能、动作接口和尺度，但改变材质、颜色、品种、轮廓、结构或造型；动作、接触与相对关系只进入 `target_visual_description`。增强索引仍保存 raw `preserve`；对 `REPLACE`，Fusion 不带入与新设计冲突的源外观。上述是模型生成职责：Schema/normalizer 仍允许 nullable，后端不以是否完成替换作为失败、拦截或重试条件。
 
-新形象图版是 bundle v3、spec v2 下的项目级单张 2048×2048 PNG。后端只从 `appearance_description` 确定性编译隔离式图版提示词：每格恰好一个 stable key，人物、实体互不带入其他对象，场景必须为空置环境。Seedream 每项目只调用一次，输入固定为 `Image 1=后端空白布局`，存在唯一有效用户图绑定时再加入 `Image 2=规范化用户图`；不再生成或发送源帧证据。用户图只可影响 `source=image_1` 对应的一个 tile，不约束其他 tile。这里的 Seedream 编号不沿用到 H3：存在该绑定时，H3 仍为 `Image 1=用户图`、`Image 2=新形象图版`；没有绑定时不扩散原始用户图，图版单独作为 H3 `Image 1`。每个 segment 都使用同一张图版、同一顺序和同一 `stable key -> TILE_XX -> Image N` 映射；Fusion 只消费这套后端映射，不自行识别或重编号图版对象。
+新形象图版是 bundle v4、spec v2 下的项目级单张 2048×2048 PNG。后端只从 `appearance_description` 确定性编译隔离式图版提示词：每格恰好一个 stable key，人物、实体互不带入其他对象，场景必须为空置环境。Seedream 每项目只调用一次，输入固定为 `Image 1=后端空白布局`，存在唯一有效用户图绑定时再加入 `Image 2=规范化用户图`；不再生成或发送源帧证据。用户图只可影响 `source=image_1` 对应的一个 tile，不约束其他 tile。这里的 Seedream 编号不沿用到 H3：H3 侧新形象图版固定为 `Image 1`（身份锚点占主参考位），存在该绑定时用户图为 `Image 2`；没有绑定时不扩散原始用户图，图版单独作为 H3 `Image 1`。每个 segment 都使用同一张图版、同一顺序和同一 `stable key -> TILE_XX -> Image N` 映射；Fusion 只消费这套后端映射，不自行识别或重编号图版对象。
 
 音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。当前随仓库提供 30 条 2–5 秒单声道 PCM WAV；运行时只要求目录中存在可用条目，不把“恰好 30 条”设为门禁，也不复审年龄、性格等标签是否与声音主观相符。Object Replace 每条只接收一行 `voice_id - file - language - gender - 短特征`。Skill 仍负责为人物选择合适音色；后端只消费可用选择，并按稳定人物顺序保留最先出现的最多 3 个不同 `voice_id`，后续新增音色稳定降级为 `null`，再机械映射为 `Audio 1..N`。Picsart 的每个 segment 接收同一份、同一顺序的 0–3 条参考音频。
 
@@ -86,9 +86,9 @@ python3 /home/xy/duet-ad1-h3-max-r2v/run.py
   logs/
 ```
 
-`work/element_index.json` 与 `state.element_index` 保存 video-maker 原始结果；`work/enhanced_element_index.json` 与 `state.enhanced_element_index` 保存后端机械合并的 replacement/voice patch。`state.object_replace.version=3` 保存输入哈希和目录哈希；`state.replacement_sheet.version=3` 保存 `spec.version=2`、Seedream 提交回执及最终单图回执；`state.voice_references` 按 `Audio 1..N` 顺序冻结实际可用的文件路径与哈希。`state.h3_prepared_artifacts.version=4` 把各段 prompt/源片段/静音片段哈希绑定到增强索引、图版状态、音色列表、Object Replace 输入、可选用户图、输出配置，以及每段的起止时间、时长和 join mode。所有版本字段都必须严格等于当前合同值，任何缺失或不等立即失败，不能转换或混用。它用于保证恢复时复用的是同一批技术输入，不判断替换质量。`state.picsart_submission_receipts` 是付费提交恢复的权威账本；签名 URL 不持久化。
+`work/element_index.json` 与 `state.element_index` 保存 video-maker 原始结果；`work/enhanced_element_index.json` 与 `state.enhanced_element_index` 保存后端机械合并的 replacement/voice patch。`state.object_replace.version=3` 保存输入哈希和目录哈希；`state.replacement_sheet.version=4` 保存 `spec.version=2`、Seedream 提交回执及最终单图回执；`state.voice_references` 按 `Audio 1..N` 顺序冻结实际可用的文件路径与哈希。`state.h3_prepared_artifacts.version=4` 把各段 prompt/源片段/静音片段哈希绑定到增强索引、图版状态、音色列表、Object Replace 输入、可选用户图、输出配置，以及每段的起止时间、时长和 join mode。所有版本字段都必须严格等于当前合同值，任何缺失或不等立即失败，不能转换或混用。它用于保证恢复时复用的是同一批技术输入，不判断替换质量。`state.picsart_submission_receipts` 是付费提交恢复的权威账本；签名 URL 不持久化。
 
-重启时遗留的 `queued/running` 项目会失败为 `process_restarted`，不做自动断点恢复。`resume-pre-picsart` 只接受没有任何 Picsart submit 痕迹的项目：失败发生在图版 checkpoint 之前时，可复用前置媒体后重新进入免费上游；已冻结 `prepared/succeeded/not_needed` checkpoint 时，先在任何写入前验证 Object Replace v3、sheet bundle v3/spec v2、全局索引、segments、文件和请求绑定，再只恢复或复用原图版，不重跑翻译、原始索引或 Object Replace。已有 Seedream 付费证据只允许本地 replay，结果未知时停止，不能盲目再 POST。`resume-picsart` 只复用 H3 manifest v4 冻结的 `h3_prompt.txt`、静音 Video 1、有序图片（包括同一张冻结图版）和参考音频，不重跑 Object Replace、Seedream 或 Fusion；恢复时所有版本字段必须严格等值，并校验文件、哈希、路径和请求绑定等技术一致性。通用文件接口只暴露源视频和最终视频，不能读取状态、日志或中间文件。
+重启时遗留的 `queued/running` 项目会失败为 `process_restarted`，不做自动断点恢复。`resume-pre-picsart` 只接受没有任何 Picsart submit 痕迹的项目：失败发生在图版 checkpoint 之前时，可复用前置媒体后重新进入免费上游；已冻结 `prepared/succeeded/not_needed` checkpoint 时，先在任何写入前验证 Object Replace v3、sheet bundle v4/spec v2、全局索引、segments、文件和请求绑定，再只恢复或复用原图版，不重跑翻译、原始索引或 Object Replace。已有 Seedream 付费证据只允许本地 replay，结果未知时停止，不能盲目再 POST。`resume-picsart` 只复用 H3 manifest v4 冻结的 `h3_prompt.txt`、静音 Video 1、有序图片（包括同一张冻结图版）和参考音频，不重跑 Object Replace、Seedream 或 Fusion；恢复时所有版本字段必须严格等值，并校验文件、哈希、路径和请求绑定等技术一致性。通用文件接口只暴露源视频和最终视频，不能读取状态、日志或中间文件。
 
 ## 验证
 
@@ -102,4 +102,4 @@ python3 -m pytest /home/xy/duet-ad1-h3-max-r2v/tests -q
 
 非空 `client_request_id` 会持久绑定规范化请求、源视频内容和可选替换图内容。首次创建返回 `201`；相同 ID 与相同输入的重放返回原项目 `200`，不会重写输入或再次启动流水线；相同 ID 绑定不同输入时返回 `409`。索引损坏或无法证明绑定关系时以 `503` 停止创建，避免产生第二个可能付费的项目。
 
-Object Replace v3、sheet bundle v3/spec v2 与 H3 manifest v4 的最终离线结果以本工作树合并后的实际测试为准；当前改造尚未部署，也尚未执行真实付费 E2E。
+Object Replace v3、sheet bundle v4/spec v2 与 H3 manifest v4 已通过离线全量测试，并先后用狗（860d0800）、项链（9ee796d7 / 387f0e0a）和小熊（de0832f4 / 7df907e2）项目完成真实付费 E2E：物体替换与 overlay 去除已达标，换脸在人物格头肩特写 + 图版固定 Image 1 + 强制换脸前置块后仍按段波动。

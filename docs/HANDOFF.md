@@ -8,7 +8,7 @@
 - 本工作树使用项目级 DeepSeek Object Replace v3 和项目级 Seedream 单张新形象图版；原始索引、增强索引、`stable key -> TILE_XX -> 实际 Image N` 映射、人物音色和 H3 有序媒体分层冻结。全局 stable index 是这些层共同且唯一的身份锚点。
 - 逐段 Fusion 仍由后端 `FUSION_AGENT` 选择 `codex` 或 `deepseek`，缺省为 `deepseek`；前端和公开 capability/request 不暴露该选择，客户端夹带的 `fusion` 会被服务端配置覆盖并在创建时冻结。Object Replace 始终使用 DeepSeek，不受 `FUSION_AGENT` 影响。
 - DeepSeek 代码路径显式开启 thinking，不发送供应商级输出 token 上限；video-maker 两阶段、项目级翻译、Object Replace 和 DeepSeek Fusion 均使用 Responses API 原生 `text.format=json_schema`。本地只处理 closed 结构与输入绑定，不做模型语义二次校验。
-- Object Replace v3、sheet bundle v3/spec v2 与 H3 manifest v4 的最终离线结果以本工作树合并完成后的实际测试为准；当前改造尚未部署，也尚未创建真实付费 E2E。
+- Object Replace v3、sheet bundle v4/spec v2 与 H3 manifest v4 的最终离线结果以本工作树合并完成后的实际测试为准；当前改造尚未部署，也尚未创建真实付费 E2E。
 
 ## 已实现链路
 
@@ -26,7 +26,7 @@
   -> 后端从 raw 索引生成全 stable-key replacement_set 和去除条目级 preserve/replaceable 的规划视图
   -> 一次项目级 DeepSeek Object Replace v3：规划视图 + replacement_set + 全部视觉提示 + 用户图/说明 + 当前音色目录；输出分离外观/交互语义的 patch 和 voice
   -> 后端机械合并 enhanced 索引，按可用 voice_id 生成同序 Audio 1..N（N <= 3）
-  -> 后端从 frozen enhanced index 生成 sheet bundle v3/spec v2：stable key -> TILE_XX
+  -> 后端从 frozen enhanced index 生成 sheet bundle v4/spec v2：stable key -> TILE_XX
   -> Seedream 每项目一次，以 Image 1 空白布局 + 可选 Image 2 用户图生成一张隔离的新形象图版
   -> 公共输入屏障
   -> 第一屏障：所有段并行完成 Fusion、最终提示词和静音 Video 1
@@ -112,7 +112,7 @@ Object Replace v3 不回吐完整索引，只通过动态 closed JSON Schema 输
 
 patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable replacement 和人物 voice，原样保留 stable ID、原始描述、occurrences、preserve 与 relations，并写入 `work/enhanced_element_index.json` 与 `state.enhanced_element_index`。后端按稳定人物顺序保留最先出现的最多 3 个不同可用 `voice_id`；第四个及后续新音色稳定降级为 `null`，不会阻断项目。保留项依次分配 `Audio 1..N` 并复制为 `work/voice-references/audio-01.wav` 至 `audio-03.wav`。运行时只校验音频文件与 Picsart 输入可用性，不复审年龄、性格等标签。
 
-增强索引是新形象图版唯一身份锚点。后端只为实际非空 replacement 确定性生成一个项目级 sheet bundle v3/spec v2，冻结每个 tile 的 stable key、类别、行列和 `appearance_description`，并机械编译完整图版提示词；Seedream 不得重新识别、合并、重命名或排序对象。每个人物格画该人物的头肩面部特写（索引只见到身体局部时只画该局部），每个实体格只画该实体，每个场景格只画无人物、动物和可移动实体的空置环境，不能重演源视频关系。Seedream 每项目调用一次，输入固定为 `Image 1=2048×2048 空白布局`，存在绑定时追加 `Image 2=规范化用户图`；不再生成或发送源帧证据。用户图只可影响 `source=image_1` 对应的 stable key，后端把这个 Object Replace/H3 用户图角色确定性映射到 Seedream Image 2，不扩散到其他 tile。输出仍只做解码、尺寸归一、标签复写及文件/哈希绑定；不增加替换覆盖或画面效果的本地质量门禁。
+增强索引是新形象图版唯一身份锚点。后端只为实际非空 replacement 确定性生成一个项目级 sheet bundle v4/spec v2，冻结每个 tile 的 stable key、类别、行列和 `appearance_description`，并机械编译完整图版提示词；Seedream 不得重新识别、合并、重命名或排序对象。每个人物格画该人物的头肩面部特写（索引只见到身体局部时只画该局部），每个实体格只画该实体，每个场景格只画无人物、动物和可移动实体的空置环境，不能重演源视频关系。Seedream 每项目调用一次，输入固定为 `Image 1=2048×2048 空白布局`，存在绑定时追加 `Image 2=规范化用户图`；不再生成或发送源帧证据。用户图只可影响 `source=image_1` 对应的 stable key，后端把这个 Object Replace/H3 用户图角色确定性映射到 Seedream Image 2，不扩散到其他 tile。输出仍只做解码、尺寸归一、标签复写及文件/哈希绑定；不增加替换覆盖或画面效果的本地质量门禁。
 
 新增 `skills/h3-max-r2v-prompt/SKILL.md` 每段执行一次。Fusion 的业务事实源包括本段 `visual_prompt`、完整 `enhanced_element_index`、本段本地化后的翻译台词，以及后端冻结的 `h3_reference_images`/`replacement_sheet` 元数据；不再单独传入用户说明或独立音色选择。Skill 负责读取索引中的 replacement/voice，并指示 H3 从权威 `stable key -> TILE_XX -> 实际 Image N` 对应格取得新形象、替换 Video 1 中的源形象；后端仅根据实际存在的字段 best-effort 生成 `authoritative_constraints`，不把它当成质量门禁。增强索引继续保存 raw `preserve`，但 `REPLACE` 项只编译动作、功能、尺度、接触、相对位置、运动连续性、人物明确属性及场景色调/构图/机位/光线等类别安全不变量；可能冲突的源脸、服装款式、物体外观和场景陈设不会带入，raw `preserve` 只直接用于 `KEEP`。
 
@@ -122,7 +122,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 
 - `prompt_expansion_mode`: `quality`
 - `reference_video_urls`: 当前静音片段 Video 1 的临时签名公网 URL
-- `reference_image_urls`: 每段相同的有序图片 URL；存在唯一有效用户图绑定时 `[用户图, 新形象图版]`，对应 `Image 1/2`；没有该绑定时不扩散原始用户图，仅发送 `[新形象图版]`，图版对应 `Image 1`
+- `reference_image_urls`: 每段相同的有序图片 URL；新形象图版固定为 `Image 1`（身份锚点占主参考位），存在唯一有效用户图绑定时追加用户图，对应 `Image 2`；没有该绑定时不扩散原始用户图，仅发送 `[新形象图版]`
 - `reference_audio_urls`: 冻结的 0–3 条音频，按 `Audio 1..N` 原序写入；空列表时省略字段
 - `duration`: `max(5, ceil(原片段秒数))`
 - `resolution`: 前端 `480p`/`768p` 映射为供应商 Advanced API 的 `480P`/`768P`
@@ -138,7 +138,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - 通用文件 API 只允许源视频与成功态最终视频；状态、日志和中间文件不能下载。
 - 供应商素材 token 与项目、asset 和真实项目内路径绑定；归一化替换图以 `.png` 和 `image/png` 提供，并支持 `GET/HEAD`。
 - `work/element_index.json`/`state.element_index` 是 raw index；`work/enhanced_element_index.json`/`state.enhanced_element_index` 是机械合并后的下游权威，两层不互相覆盖。
-- `state.object_replace.version=3` 冻结输入哈希和目录哈希；`state.replacement_sheet.version=3` 冻结 `spec.version=2`、Seedream 输入/提交/输出回执、最终图版文件回执及 H3 图片角色；`state.voice_references` 是与 `work/voice-references/audio-XX.wav` 一一对应的有序列表，包括 `audio_reference`、`voice_id`、项目内路径、文件哈希和目录特征行。
+- `state.object_replace.version=3` 冻结输入哈希和目录哈希；`state.replacement_sheet.version=4` 冻结 `spec.version=2`、Seedream 输入/提交/输出回执、最终图版文件回执及 H3 图片角色；`state.voice_references` 是与 `work/voice-references/audio-XX.wav` 一一对应的有序列表，包括 `audio_reference`、`voice_id`、项目内路径、文件哈希和目录特征行。
 - `state.h3_prepared_artifacts.version=4` 逐段冻结 source、muted、prompt 的路径/大小/哈希、Fusion 输入哈希与 segment metadata 哈希；metadata 覆盖 index、start/end、duration 和 join mode。bindings 同时绑定 enhanced index、replacement sheet、voice references、Object Replace 输入、可选用户图及 output request。Object Replace、sheet bundle、spec 和 H3 manifest 的版本字段都必须严格等于当前合同值；缺失或不等立即失败，不能转换、推断或混用。
 - `state.picsart_submission_receipts` 是付费恢复权威：按 segment/run 保存 request 哈希、`submission_started/accepted/unknown/rejected/provider_failed` 和 task ID。研究日志可以丢失，但不能改变是否允许再次 POST 的判定。
 - 状态文件原子写入；项目与日志目录为 `0700`，文件为 `0600`。
@@ -165,7 +165,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - Object Replace v3 每项目只设一个公共节点，不随 segment 重复；后端从 raw index 确定性生成包含全部排序 stable key 的 `replacement_set`，模型只收到移除三类记录顶层 `preserve/replaceable` 的规划视图，relations 不变；nullable replacement/voice 可直接流向增强索引，非空 replacement 的 `appearance_description` 与 `target_visual_description` 分别只流向图版和 Fusion/H3。
 - project-index 收到逐段 `visual_prompt` 防漏清单，但仍以九帧像素为唯一视觉事实；动态 Schema 只接受本次请求中的精确正整数段号，拒绝 `0`、未知段号和重新编号。
 - raw index 不变，enhanced index 由后端机械合并；人物共用可用 `voice_id` 时共用同一 `Audio N`，第四个不同音色稳定降级而不阻断。
-- sheet bundle v3/spec v2 只从 frozen enhanced index 生成，确定性绑定全部实际非空 replacement 的 stable key/TILE/行列；Seedream 每项目只生成一张图版，仅接收 canvas Image 1 和可选用户 Image 2，不生成/发送源帧证据，人物、实体与空置场景严格分格描述。H3 有用户图和无用户图两种图片顺序都保持冻结且跨段一致。
+- sheet bundle v4/spec v2 只从 frozen enhanced index 生成，确定性绑定全部实际非空 replacement 的 stable key/TILE/行列；Seedream 每项目只生成一张图版，仅接收 canvas Image 1 和可选用户 Image 2，不生成/发送源帧证据，人物、实体与空置场景严格分格描述。H3 图片顺序固定为图版 Image 1、可选用户图 Image 2，保持冻结且跨段一致。
 - 每段 Fusion 收到视觉提示、enhanced index、本段翻译台词和后端冻结的图片角色/TILE 映射；原始用户说明、图片二进制和独立音色字段不能泄漏进 Fusion。
 - `REPLACE` 权威约束不带入冲突的源脸、服装款式、物体外观或场景陈设；关系任一端被替换时也不带入指向源对象外观的 predicate/preserve，只保留通用交互、接触、相对位置和运动连续性。`KEEP` 项及两端均未替换的关系仍保留各自 raw 描述。
 - Seedream 的 pre-POST receipt 会阻止 `submission_unknown` 自动重投；图版后处理不以视觉效果阻断项目。
