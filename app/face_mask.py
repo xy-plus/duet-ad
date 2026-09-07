@@ -1,11 +1,11 @@
-"""Deterministic YuNet mosaic face masking for the H3 reference video.
+"""Deterministic YuNet gray-block face masking for the H3 reference video.
 
-H3 keeps the source face when it can see it; pixelating every detected face
+H3 keeps the source face when it can see it; covering every detected face
 in the muted reference video forces H3 to take the identity from the sheet
 tile. The detector runs on CPU via cv2.FaceDetectorYN and the local YuNet
 ONNX model; the output stays a pure video stream at the source fps/resolution.
-A mosaic (not a solid block) keeps texture variance so the masked region does
-not read as an inpainting marker.
+The mask is a solid gray block (not a mosaic): every facial feature must be
+completely erased, with no texture or color leaking through.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ MODEL_PATH = (
 )
 SCORE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.3
-PAD_RATIO = 0.15  # expand each side of the face box by 15% of its width/height
-MOSAIC_BLOCKS = 12  # pixel blocks across the masked box width
+PAD_RATIO = 0.25  # expand each side of the face box by 25% of its width/height
+GRAY_FILL = (128, 128, 128)  # solid neutral gray (BGR) filling the face box
 
 
 class FaceMaskError(RuntimeError):
@@ -56,17 +56,10 @@ def _face_boxes(
     return boxes
 
 
-def _apply_mosaic(frame: np.ndarray, box: tuple[int, int, int, int]) -> None:
-    """Pixelate the box in place: downscale to coarse blocks, upscale nearest."""
+def _apply_gray_block(frame: np.ndarray, box: tuple[int, int, int, int]) -> None:
+    """Fill the box in place with a solid gray that hides every feature."""
     x0, y0, x1, y1 = box
-    region = frame[y0:y1, x0:x1]
-    block = max(1, (x1 - x0) // MOSAIC_BLOCKS)
-    small_w = max(1, (x1 - x0) // block)
-    small_h = max(1, (y1 - y0) // block)
-    small = cv2.resize(region, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-    frame[y0:y1, x0:x1] = cv2.resize(
-        small, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST
-    )
+    frame[y0:y1, x0:x1] = GRAY_FILL
 
 
 def mask_faces(
@@ -75,7 +68,7 @@ def mask_faces(
     *,
     detector: Any | None = None,
 ) -> dict[str, Any]:
-    """Pixelate every detected face, keeping fps/resolution."""
+    """Cover every detected face with a gray block, keeping fps/resolution."""
     if not isinstance(source, Path) or not source.is_file():
         raise FaceMaskError("face mask source video is invalid")
     capture = cv2.VideoCapture(str(source))
@@ -133,7 +126,7 @@ def mask_faces(
             if boxes:
                 stats["frames_with_face"] += 1
             for x0, y0, x1, y1 in boxes:
-                _apply_mosaic(frame, (x0, y0, x1, y1))
+                _apply_gray_block(frame, (x0, y0, x1, y1))
             writer.write(frame)
         capture.release()
         writer.release()

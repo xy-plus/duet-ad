@@ -52,9 +52,11 @@ def normalize_fusion_prompt(
     segment_index: int,
     authoritative_constraints: str = "",
 ) -> str:
-    if not isinstance(value, dict) or set(value) != {
+    # Extra top-level keys are tolerated and dropped, mirroring the other
+    # structured contracts; the frozen keys below carry the binding.
+    if not isinstance(value, dict) or not {
         "schema", "version", "input_sha256", "segment_index", "prompt",
-    }:
+    } <= set(value):
         raise ValueError("fusion prompt output is invalid")
     if (
         value["schema"] != FUSION_OUTPUT_NAME

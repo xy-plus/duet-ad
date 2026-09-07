@@ -306,6 +306,171 @@ def test_deepseek_structured_invalid_output_text_keeps_raw_exchange(
     assert caught.value.record["response"]["body"] == payload
 
 
+def _deepseek_text_payload(text: str) -> dict[str, Any]:
+    return {
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        ],
+    }
+
+
+def test_deepseek_structured_repairs_invalid_json_in_the_same_conversation(
+    tmp_path: Path,
+) -> None:
+    responses = [
+        _deepseek_text_payload("{not-json"),
+        _deepseek_text_payload('{"prompt":"fixed"}'),
+    ]
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=responses[len(requests) - 1])
+
+    result = DeepSeekClient(
+        _settings(tmp_path), httpx.MockTransport(handler),
+    ).complete_structured("skill", {}, {"type": "object"})
+
+    assert result.value == {"prompt": "fixed"}
+    assert len(requests) == 2
+    followup = requests[1]["input"]
+    assert [message["role"] for message in followup] == [
+        "user", "assistant", "user",
+    ]
+    assert followup[1]["content"] == [
+        {"type": "output_text", "text": "{not-json"}
+    ]
+    repair_text = followup[2]["content"][0]["text"]
+    assert repair_text.startswith(
+        "Your previous output failed JSON validation:"
+    )
+    assert "no markdown, no commentary" in repair_text
+    assert len(result.record["json_repairs"]) == 1
+    repair = result.record["json_repairs"][0]
+    assert repair["repair"] == 1
+    assert repair["error"]["type"] == "JSONDecodeError"
+    assert repair["exchange"]["response"]["body"] == responses[0]
+
+
+def test_deepseek_structured_repairs_validator_rejection(tmp_path: Path) -> None:
+    responses = [
+        _deepseek_text_payload('{"prompt":123}'),
+        _deepseek_text_payload('{"prompt":"fixed"}'),
+    ]
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=responses[len(requests) - 1])
+
+    def validator(value: dict[str, Any]) -> None:
+        if not isinstance(value.get("prompt"), str):
+            raise ValueError("visual prompt output is invalid")
+
+    result = DeepSeekClient(
+        _settings(tmp_path), httpx.MockTransport(handler),
+    ).complete_structured(
+        "skill", {}, {"type": "object"}, validator=validator,
+    )
+
+    assert result.value == {"prompt": "fixed"}
+    assert len(requests) == 2
+    repair_text = requests[1]["input"][2]["content"][0]["text"]
+    assert "visual prompt output is invalid" in repair_text
+    assert result.record["json_repairs"][0]["error"] == {
+        "type": "ValueError",
+        "message": "visual prompt output is invalid",
+    }
+
+
+def test_deepseek_structured_repair_exhaustion_raises_with_all_evidence(
+    tmp_path: Path,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=_deepseek_text_payload("{not-json"))
+
+    client = DeepSeekClient(
+        _settings(tmp_path), httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        client.complete_structured("skill", {}, {"type": "object"})
+
+    assert isinstance(caught.value.cause, json.JSONDecodeError)
+    assert len(requests) == providers.JSON_REPAIR_MAX_ATTEMPTS + 1
+    repairs = caught.value.record["json_repairs"]
+    assert [entry["repair"] for entry in repairs] == [1, 2, 3]
+    assert all(
+        entry["error"]["type"] == "JSONDecodeError" for entry in repairs
+    )
+    # The conversation grows by one bad answer + one correction per repair.
+    assert len(requests[-1]["input"]) == 1 + 2 * providers.JSON_REPAIR_MAX_ATTEMPTS
+
+
+def test_deepseek_structured_accepts_raw_control_characters_in_strings(
+    tmp_path: Path,
+) -> None:
+    # A literal newline inside a string value breaks strict json.loads but is
+    # accepted by the strict=False fallback without entering the repair loop.
+    text = '{"prompt":"第一行\n第二行"}'
+    assert json.loads(text, strict=False)["prompt"] == "第一行\n第二行"
+    client = DeepSeekClient(
+        _settings(tmp_path),
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, json=_deepseek_text_payload(text))
+        ),
+    )
+
+    result = client.complete_structured("skill", {}, {"type": "object"})
+
+    assert result.value == {"prompt": "第一行\n第二行"}
+    assert "json_repairs" not in result.record
+
+
+def test_codex_structured_applies_the_validator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 987654
+
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_text('{"prompt":"ok"}', encoding="utf-8")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+    monkeypatch.setattr(providers.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(
+        providers, "_terminate_process_group", lambda _process: None,
+    )
+
+    def validator(value: dict[str, Any]) -> None:
+        raise ValueError("fusion prompt output is invalid")
+
+    with pytest.raises(ProviderFailure) as caught:
+        CodexClient(_settings(tmp_path)).complete_structured(
+            "skill", {}, {"type": "object"}, validator=validator,
+        )
+
+    assert isinstance(caught.value.cause, ValueError)
+    assert str(caught.value.cause) == "fusion prompt output is invalid"
+    assert caught.value.record["response"]["body"] == {"prompt": "ok"}
+
+
 def test_codex_structured_uses_acct2_sol_low_and_output_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

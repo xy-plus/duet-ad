@@ -110,10 +110,15 @@ def project_index_schema(segment_indices: Sequence[int]) -> dict[str, Any]:
 
 
 def normalize_visual_prompt(value: object) -> str:
-    """Return only model-owned prose from the structured transport object."""
-    if not isinstance(value, dict) or set(value) != {"prompt"}:
+    """Return only model-owned prose from the structured transport object.
+
+    Extra keys (models sometimes emit stray fields such as
+    ``is_project_index``) are tolerated and dropped instead of killing the
+    output; only the ``prompt`` string is load-bearing.
+    """
+    if not isinstance(value, dict):
         raise ValueError("visual prompt output is invalid")
-    prompt = value["prompt"]
+    prompt = value.get("prompt")
     if not isinstance(prompt, str):
         raise ValueError("visual prompt output is invalid")
     return prompt

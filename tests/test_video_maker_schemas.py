@@ -114,6 +114,24 @@ def test_visual_prompt_normalizer_does_not_grade_empty_prose() -> None:
     assert normalize_visual_prompt({"prompt": ""}) == ""
 
 
+def test_visual_prompt_normalizer_tolerates_extra_keys() -> None:
+    # Models occasionally emit stray fields (e.g. is_project_index) next to
+    # the contracted prompt; they are dropped instead of killing the output.
+    assert (
+        normalize_visual_prompt({"prompt": "画面", "is_project_index": False})
+        == "画面"
+    )
+
+
+def test_visual_prompt_normalizer_requires_a_prompt_string() -> None:
+    with pytest.raises(ValueError, match="visual prompt output is invalid"):
+        normalize_visual_prompt({"is_project_index": False})
+    with pytest.raises(ValueError, match="visual prompt output is invalid"):
+        normalize_visual_prompt({"prompt": 3})
+    with pytest.raises(ValueError, match="visual prompt output is invalid"):
+        normalize_visual_prompt(["prompt"])
+
+
 def test_project_index_normalizer_accepts_empty_collections() -> None:
     assert normalize_project_index({
         "people": [],

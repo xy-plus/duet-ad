@@ -108,6 +108,28 @@ DIALOGUE_GENERATION_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
+def _validate_translation_shape(value: dict[str, Any]) -> None:
+    """Transport-shape gate for the JSON repair loop; content stays lenient."""
+    lines = value.get("lines")
+    if not isinstance(lines, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("text"), str)
+        for item in lines
+    ):
+        raise ValueError("translation output is invalid")
+
+
+def _validate_dialogue_generation_shape(value: dict[str, Any]) -> None:
+    """Transport-shape gate for the JSON repair loop; content stays lenient."""
+    lines = value.get("lines")
+    if not isinstance(lines, list) or any(
+        not isinstance(item, dict)
+        or type(item.get("segment_index")) is not int
+        or not isinstance(item.get("text"), str)
+        for item in lines
+    ):
+        raise ValueError("dialogue generation output is invalid")
+
 PICSART_RECEIPT_VERSION = 2
 H3_PREPARED_ARTIFACTS_VERSION = 6
 REPLACEMENT_SHEET_VERSION = 4
@@ -263,9 +285,11 @@ class Pipeline:
         off exponentially from one minute (capped at thirty minutes). Nodes
         with an explicit ``retry_if`` keep their own gate (paid submissions
         with receipt semantics). Transport evidence is kept per attempt.
+        Resumed nodes continue from the highest existing attempt number so
+        the failed attempts' evidence is never overwritten.
         """
         last_error: Exception | None = None
-        attempt = 0
+        attempt = log.next_attempt(node, scope) - 1
         moderation_fingerprint: str | None = None
         moderation_streak = 0
         while True:
@@ -1009,6 +1033,15 @@ class Pipeline:
                 payload,
                 output_schema,
                 [user_reference] if user_reference is not None else [],
+                validator=lambda value: normalize_object_replace(
+                    value,
+                    input_sha256=input_sha256,
+                    element_index=element_index,
+                    voice_ids=voice_ids,
+                    has_user_image=user_reference is not None,
+                    user_instruction=user_instruction,
+                    dialogue_line_count=len(translated_lines),
+                ),
             ),
             transform=normalize_and_merge,
             output_media=lambda _value: list(materialized.get("paths") or []),
@@ -2031,6 +2064,7 @@ class Pipeline:
                 index_request,
                 index_schema,
                 index_images,
+                validator=normalize_project_index,
             ),
             transform=normalize_project_index,
         )
@@ -4007,7 +4041,16 @@ class Pipeline:
     @staticmethod
     def _completed_node_value(project: Path, node: str, scope: str) -> Any:
         attempts = project / "logs" / node / scope
-        for directory in sorted(attempts.glob("attempt-*"), reverse=True):
+        numbered = [
+            directory
+            for directory in attempts.glob("attempt-*")
+            if directory.name.rsplit("-", 1)[-1].isdigit()
+        ]
+        numbered.sort(
+            key=lambda directory: int(directory.name.rsplit("-", 1)[-1]),
+            reverse=True,
+        )
+        for directory in numbered:
             output = directory / "output.json"
             if not output.is_file() or (directory / "error.json").exists():
                 continue
@@ -4202,6 +4245,7 @@ class Pipeline:
                     visual_payload,
                     VISUAL_PROMPT_SCHEMA,
                     analysis_frames,
+                    validator=normalize_visual_prompt,
                 ),
                 transform=normalize_visual_prompt,
             )
@@ -4245,6 +4289,7 @@ class Pipeline:
             instruction,
             {"lines": lines, "video_prompts": visual_prompts},
             TRANSLATION_SCHEMA,
+            validator=_validate_translation_shape,
         )
 
     @staticmethod
@@ -4315,6 +4360,7 @@ class Pipeline:
             instruction,
             self._dialogue_generation_payload(brief, target_language, prepared),
             DIALOGUE_GENERATION_SCHEMA,
+            validator=_validate_dialogue_generation_shape,
         )
 
     @staticmethod
@@ -4684,6 +4730,14 @@ class Pipeline:
                     fusion_payload,
                     fusion_schema,
                     [],
+                    validator=lambda value: normalize_fusion_prompt(
+                        value,
+                        input_sha256=fusion_input_sha256,
+                        segment_index=index,
+                        authoritative_constraints=fusion_payload[
+                            "authoritative_constraints"
+                        ],
+                    ),
                 ),
                 transform=lambda value: normalize_fusion_prompt(
                     value,

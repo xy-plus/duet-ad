@@ -279,7 +279,9 @@ def normalize_object_replace(
         *_ELEMENT_CATEGORIES,
         "dialogue_voices",
     }
-    if not isinstance(value, dict) or set(value) != expected_top_level:
+    # Extra top-level keys are tolerated and dropped; only the frozen
+    # contract keys below carry meaning.
+    if not isinstance(value, dict) or not expected_top_level <= set(value):
         raise ValueError("object-replace output is invalid")
     if (
         value["schema"] != OBJECT_REPLACE_OUTPUT_NAME

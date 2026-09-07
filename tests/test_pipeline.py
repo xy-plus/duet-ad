@@ -31,6 +31,8 @@ from app.pipeline import (
     REPLACEMENT_SHEET_VERSION,
     SAME_AS_SOURCE_LANGUAGE,
     TRANSLATION_SCHEMA,
+    _validate_dialogue_generation_shape,
+    _validate_translation_shape,
 )
 from app.providers import CodexProcessError, ProviderFailure, ProviderResult
 from app.replacement_sheet import (
@@ -521,6 +523,7 @@ class _FlowDeepSeek:
         payload: Any,
         schema: dict[str, Any],
         images: list[Path] | None = None,
+        validator: Any = None,
     ) -> ProviderResult[dict[str, Any]]:
         with self.lock:
             self.structured_calls.append({
@@ -1549,6 +1552,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
             payload: dict[str, Any],
             schema: dict[str, Any],
             images: list[Path],
+            validator: Any = None,
         ) -> ProviderResult[dict[str, Any]]:
             calls.append({
                 "instruction": instruction,
@@ -2447,12 +2451,14 @@ class _RecordingDeepSeek:
         payload: Any,
         schema: dict[str, Any],
         images: list[Path] | None = None,
+        validator: Any = None,
     ) -> ProviderResult[dict[str, Any]]:
         self.calls.append({
             "instruction": instruction,
             "payload": payload,
             "schema": schema,
             "images": list(images or []),
+            "validator": validator,
         })
         return ProviderResult(
             self.value,
@@ -2520,6 +2526,7 @@ def test_dialogue_generation_node_carries_brief_and_segment_context(
     }
     assert "# dialogue-writer" in call["instruction"]
     assert "台词语言为中文" in call["instruction"]
+    assert call["validator"] is _validate_dialogue_generation_shape
     # 段内多条按字数比例切分：第一句 6 字、第二句 3 字，共 9 字切 5 秒。
     assert generated == [
         {"start_s": 0.0, "end_s": pytest.approx(5.0 * 6 / 9), "text": "第一句台词呀"},
@@ -5250,6 +5257,7 @@ def _prepare_h3_mask_fixture(
             _payload: dict[str, Any],
             schema: dict[str, Any],
             _images: list[Path],
+            validator: Any = None,
         ) -> ProviderResult[dict[str, Any]]:
             return ProviderResult({
                 "schema": FUSION_OUTPUT_NAME,
@@ -6623,3 +6631,66 @@ def test_seedream_submission_unknown_reposts_the_frozen_prompt(
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "seedream_submission_regenerated" in trace
     assert '"reason": "submission_unknown"' in trace
+
+
+def test_node_attempt_numbering_continues_past_failed_evidence(
+    tmp_path: Path,
+) -> None:
+    """A resumed node must not overwrite a failed attempt's raw evidence."""
+    store = ProjectStore(tmp_path / "projects")
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    project = tmp_path / "project"
+    log = ResearchLog(project)
+    failed = log.attempt_dir("some-node", "project", 1)
+    log.write_json(failed / "input.json", {"original": "failed-input"})
+    log.error(failed / "error.json", RuntimeError("original failure"))
+
+    result = pipeline._node(
+        log, "some-node", "project", {"fresh": 1}, [], lambda: {"ok": True},
+    )
+
+    assert result == {"ok": True}
+    # The failed attempt keeps its original input and error untouched.
+    assert json.loads((failed / "input.json").read_text(encoding="utf-8")) == {
+        "original": "failed-input"
+    }
+    assert (failed / "error.json").is_file()
+    continued = project / "logs" / "some-node" / "project" / "attempt-2"
+    assert json.loads(
+        (continued / "input.json").read_text(encoding="utf-8")
+    ) == {"fresh": 1}
+    assert json.loads(
+        (continued / "output.json").read_text(encoding="utf-8")
+    ) == {"ok": True}
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"attempt": 2' in trace
+
+
+def test_translation_and_dialogue_shape_validators() -> None:
+    _validate_translation_shape({"lines": []})
+    _validate_translation_shape({"lines": [{"text": "你好"}]})
+    with pytest.raises(ValueError, match="translation output is invalid"):
+        _validate_translation_shape({})
+    with pytest.raises(ValueError, match="translation output is invalid"):
+        _validate_translation_shape({"lines": [{"text": 3}]})
+
+    _validate_dialogue_generation_shape(
+        {"lines": [{"segment_index": 1, "text": "口播"}]}
+    )
+    with pytest.raises(
+        ValueError, match="dialogue generation output is invalid",
+    ):
+        _validate_dialogue_generation_shape(
+            {"lines": [{"segment_index": "1", "text": "口播"}]}
+        )
+    with pytest.raises(
+        ValueError, match="dialogue generation output is invalid",
+    ):
+        _validate_dialogue_generation_shape({"lines": [{"segment_index": 1}]})

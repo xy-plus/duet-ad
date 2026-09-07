@@ -107,3 +107,32 @@ def test_constructor_directory_failure_does_not_block(
     log = ResearchLog(tmp_path / "project")
     assert log.root == tmp_path / "project" / "logs"
     assert "research log failure: logs are read-only" in capsys.readouterr().err
+
+
+def test_next_attempt_continues_past_existing_evidence(tmp_path: Path) -> None:
+    log = ResearchLog(tmp_path / "project")
+    assert log.next_attempt("node", "segment-0001") == 1
+
+    log.attempt_dir("node", "segment-0001", 1)
+    log.attempt_dir("node", "segment-0001", 2)
+    assert log.next_attempt("node", "segment-0001") == 3
+    # A different scope starts at 1 again.
+    assert log.next_attempt("node", "segment-0002") == 1
+
+
+def test_next_attempt_uses_the_numeric_maximum(tmp_path: Path) -> None:
+    log = ResearchLog(tmp_path / "project")
+    log.attempt_dir("node", "project", 2)
+    log.attempt_dir("node", "project", 10)
+
+    assert log.next_attempt("node", "project") == 11
+
+
+def test_next_attempt_ignores_non_attempt_entries(tmp_path: Path) -> None:
+    log = ResearchLog(tmp_path / "project")
+    log.attempt_dir("node", "project", 3)
+    stray = log.root / "node" / "project" / "attempt-final"
+    stray.mkdir(parents=True)
+    (log.root / "node" / "project" / "notes.txt").write_text("x")
+
+    assert log.next_attempt("node", "project") == 4

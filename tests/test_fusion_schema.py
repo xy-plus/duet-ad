@@ -29,7 +29,7 @@ def test_fusion_schema_binds_input_and_normalizes_prompt() -> None:
     }, input_sha256=digest, segment_index=2) == "replace all people and scenes"
 
 
-def test_fusion_normalizer_rejects_unbound_or_extra_output() -> None:
+def test_fusion_normalizer_rejects_unbound_output() -> None:
     payload = {"segment_index": 1}
     _schema, digest = fusion_prompt_schema(payload)
     base = {
@@ -47,10 +47,28 @@ def test_fusion_normalizer_rejects_unbound_or_extra_output() -> None:
         )
     with pytest.raises(ValueError):
         normalize_fusion_prompt(
-            {**base, "extra": True},
+            {key: item for key, item in base.items() if key != "prompt"},
             input_sha256=digest,
             segment_index=1,
         )
+
+
+def test_fusion_normalizer_tolerates_extra_top_level_keys() -> None:
+    payload = {"segment_index": 1}
+    _schema, digest = fusion_prompt_schema(payload)
+    prompt = normalize_fusion_prompt(
+        {
+            "schema": FUSION_OUTPUT_NAME,
+            "version": 1,
+            "input_sha256": digest,
+            "segment_index": 1,
+            "prompt": "valid",
+            "confidence": 0.9,
+        },
+        input_sha256=digest,
+        segment_index=1,
+    )
+    assert prompt == "valid"
 
 
 def test_fusion_normalizer_does_not_grade_prompt_semantics() -> None:
