@@ -155,7 +155,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - 每次允许的 submit 在 POST 前先原子冻结 `submission_started` 回执；拿到 `taskId` 后立即写 accepted。无 task ID 的未知结果禁止 resume 重提；只有 submit 自身明确被拒绝，或已有 task 的业务状态明确为 `FAILED`，才允许后续再次 POST。poll 的网络错误或 HTTP 4xx/5xx 都不证明 task 已失败。
 - 一旦取得 `taskId`，poll 和 download 的失败只重试自身，不能返回 submit。
 - MediaKit 调用使用进程级 `MEDIAKIT_CONCURRENCY` 信号量；可配置为 `1` 以序列化多项目/多分段请求。
-- `POST /api/conversations/{id}/resume-pre-picsart` 只接受从未出现 Picsart submit 痕迹的失败项目。没有图版 checkpoint 时，它复用原切段、4 fps manifest、exact-9、MediaKit 帧、分析副本和逐段 video-maker，再重建免费上游；存在 checkpoint 时先在零写入边界验证冻结上游与图版绑定，`prepared` 只首次提交或本地 replay 同一 Seedream receipt，`succeeded/not_needed` 直接复用，均不重跑翻译、raw index 或 Object Replace。未知/损坏的付费证据停止恢复，不能盲目再 POST。
+- `POST /api/conversations/{id}/resume-pre-picsart` 只接受从未出现 Picsart submit 痕迹的失败项目。没有图版 checkpoint 时，它复用原切段、4 fps manifest、exact-9、MediaKit 帧、分析副本和逐段 video-maker，再重建免费上游；存在 checkpoint 时先在零写入边界验证冻结上游与图版绑定，`prepared` 只首次提交或本地 replay 同一 Seedream receipt，`succeeded/not_needed` 直接复用，均不重跑翻译、raw index 或 Object Replace。未知/损坏的付费证据停止恢复，不能盲目再 POST。兜底逻辑上线前冻结的 voice_references 为空但有待合成台词的旧项目，续跑装载后自动从音色库物化默认音色为 Audio 1 并重算图版 upstream_bindings（voice_reference_default_fallback 事件，reason 带 resume: 前缀）。
 - `POST /api/conversations/{id}/resume-picsart` 只复用 H3 manifest v4 冻结的静音 Video 1、R2V 提示词、同一张图版、相同顺序的有序图片和有序音频。它不重跑 raw/enhanced 索引、Object Replace、Seedream 或 Fusion；严格检查版本、路径、哈希、媒体和请求绑定，不把图版画面或 voice 与 enhanced index 做语义交叉复审。已有且未明确失败的 task ID 只继续 poll；只有供应商业务结果明确为 `FAILED`，或 submit 自身明确被拒绝且未产生 task ID，才允许重新 submit。
 - 不因生成质量、替换效果或媒体观感增加重试。
 - 明确决策（2026-09-07）：不做段级产出验收 + 自动重跑。H3 单段产出存在随机波动（场景替换、字幕复现都有随机性，已由受控实验证明与 prompt/素材无关），但我们的目标是通过输入侧控制让一次就跑过——凡是不想让 H3 保留的信息，在参考视频进 H3 之前从像素层面抹掉（人脸灰块打码、MediaKit 视频字幕擦除），而不是生成后再验收补救。
