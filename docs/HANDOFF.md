@@ -25,7 +25,7 @@
   -> 一次 video-maker 项目级 raw 全局对象索引：九帧为事实源，逐段 visual_prompt 仅作防漏清单
   -> 后端从 raw 索引生成全 stable-key replacement_set 和去除条目级 preserve/replaceable 的规划视图
   -> 一次项目级 DeepSeek Object Replace v4：规划视图 + replacement_set + 全部视觉提示 + 用户图/说明 + 当前音色目录；输出分离外观/交互语义的 patch、voice 和逐行 dialogue_voices 台词归属
-  -> 后端机械合并 enhanced 索引，按可用 voice_id 生成同序 Audio 1..N（N <= 3）
+  -> 后端机械合并 enhanced 索引，按可用 voice_id 生成同序 Audio 1..N（N <= 3）；有台词但无人分配到音色时从音色库兜底一条默认音色（优先目标语言，否则目录第一条）作 Audio 1，记 voice_reference_default_fallback 事件和 state.object_replace.voice_reference_fallback
   -> 逐行 AutoDL indextts2-v1 台词 TTS（归属人物音色，null 回退 Audio 1），拼整条音轨并切每段 dialogue-track.wav；失败即 fail-closed
   -> 后端从 frozen enhanced index 生成 sheet bundle v4/spec v2：stable key -> TILE_XX
   -> Seedream 每项目一次，以 Image 1 空白布局 + 可选 Image 2 用户图生成一张隔离的新形象图版

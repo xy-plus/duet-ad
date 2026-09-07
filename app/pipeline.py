@@ -820,7 +820,8 @@ class Pipeline:
         self,
         project: Path,
         patch: dict[str, dict[str, dict[str, Any]]],
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[Path]]:
+        fallback_voice_id: str | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[Path], bool]:
         selected_ids: list[str] = []
         people = patch.get("people")
         records = people.values() if isinstance(people, dict) else ()
@@ -833,6 +834,10 @@ class Pipeline:
                 and len(selected_ids) < MAX_REFERENCE_AUDIO
             ):
                 selected_ids.append(voice_id)
+        fallback_used = False
+        if not selected_ids and fallback_voice_id is not None:
+            selected_ids.append(fallback_voice_id)
+            fallback_used = True
 
         directory = project / "work" / "voice-references"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -867,7 +872,7 @@ class Pipeline:
             metadata_by_id[voice_id] = metadata
             references.append(metadata)
             paths.append(destination)
-        return metadata_by_id, references, paths
+        return metadata_by_id, references, paths, fallback_used
 
     def _materialize_canonical_user_reference(
         self,
@@ -942,6 +947,14 @@ class Pipeline:
             "voice_catalog_lines": self.voice_library.model_lines(),
         }
         output_schema, input_sha256 = object_replace_schema(payload, voice_ids)
+        # Dialogue lines need a TTS voice even when the model deliberately
+        # leaves every person voiceless (e.g. only hands on camera); pick a
+        # deterministic catalog fallback instead of failing later.
+        fallback_voice_id = (
+            self.voice_library.default_voice(target_language)["voice_id"]
+            if translated_lines
+            else None
+        )
         materialized: dict[str, Any] = {}
 
         def normalize_and_merge(value: object) -> dict[str, Any]:
@@ -954,11 +967,14 @@ class Pipeline:
                 user_instruction=user_instruction,
                 dialogue_line_count=len(translated_lines),
             )
-            metadata_by_id, references, paths = self._materialize_voice_references(
-                project, patch,
+            (
+                metadata_by_id, references, paths, fallback_used,
+            ) = self._materialize_voice_references(
+                project, patch, fallback_voice_id=fallback_voice_id,
             )
             materialized["references"] = references
             materialized["paths"] = paths
+            materialized["fallback_used"] = fallback_used
             return merge_object_replace_index(
                 element_index, patch, metadata_by_id,
             )
@@ -996,10 +1012,29 @@ class Pipeline:
         )
         references = list(materialized.get("references") or [])
         paths = list(materialized.get("paths") or [])
+        fallback_used = bool(materialized.get("fallback_used"))
+        if fallback_used:
+            log.event(
+                "voice_reference_default_fallback",
+                voice_id=fallback_voice_id,
+                reason=(
+                    "dialogue requires TTS but no person was assigned a voice"
+                ),
+            )
         metadata = {
             "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": input_sha256,
             "voice_catalog_sha256": self.voice_library.digest,
+            "voice_reference_fallback": (
+                {
+                    "voice_id": fallback_voice_id,
+                    "reason": (
+                        "dialogue requires TTS but no person was assigned a voice"
+                    ),
+                }
+                if fallback_used
+                else None
+            ),
         }
         return enhanced_index, metadata, references, paths
 
@@ -1076,6 +1111,8 @@ class Pipeline:
                 # back to the Audio 1 voice.
                 voice_path = default_voice
             if voice_path is None:
+                # Defensive: fresh runs always materialize at least the
+                # catalog fallback voice in _run_object_replace.
                 raise ValueError("dialogue TTS requires a voice reference")
             destination = directory / f"line-{offset:04d}.wav"
 
