@@ -13,5 +13,8 @@ set +a
 export DATA_DIR=/home/xy/duet-ad1-h3-max-r2v-release/data
 export PUBLIC_API_ENABLED=1
 export PUBLIC_API_CLIENTS_FILE=/home/xy/.config/duet-ad1-h3-r2v/public-api-clients.json
+# Asset URLs must resolve back to THIS instance: 3211 is a dedicated public
+# port, so no path prefix is needed (unlike the shared 443 edge on :3301).
+export PUBLIC_BASE_URL=https://8.166.140.227:3211
 
 exec /home/xy/duet-ad1/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 3212
