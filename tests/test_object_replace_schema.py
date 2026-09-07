@@ -685,7 +685,6 @@ def test_normalizer_rejects_a_null_replacement_for_any_stable_key(
     [
         lambda value: value.update({"input_sha256": "0" * 64}),
         lambda value: value.update({"version": True}),
-        lambda value: value.update({"extra": True}),
         lambda value: value["people"].pop("person-02"),
         lambda value: value["entities"].update({"entity-99": {}}),
         lambda value: value["scenes"]["scene-01"].update({"extra": True}),
@@ -726,6 +725,22 @@ def test_normalizer_rejects_only_unusable_transport_shapes(mutation: Any) -> Non
 
     with pytest.raises(ValueError):
         _normalize(value, digest=digest, element_index=element_index)
+
+
+def test_normalizer_tolerates_extra_top_level_keys() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["is_project_index"] = False
+    value["notes"] = "stray model field"
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert "is_project_index" not in normalized
+    assert "notes" not in normalized
+    assert set(normalized) == {
+        "people", "entities", "scenes", "dialogue_voices",
+    }
 
 
 def test_normalizer_requires_unambiguous_stable_id_maps() -> None:

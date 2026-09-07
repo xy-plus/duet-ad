@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generic, Mapping, TypeVar
+from typing import Any, Callable, Generic, Mapping, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
@@ -274,7 +274,7 @@ def _deepseek_responses_url(base: str) -> str:
     return _deepseek_base(base) + "/responses"
 
 
-def _structured_output(body: Any) -> dict[str, Any]:
+def _structured_output_text(body: Any) -> str:
     if not isinstance(body, dict):
         raise TypeError("DeepSeek response must be an object")
     status = body.get("status")
@@ -301,10 +301,34 @@ def _structured_output(body: Any) -> dict[str, Any]:
     ]
     if len(text_parts) != 1 or not isinstance(text_parts[0].get("text"), str):
         raise ValueError("DeepSeek structured response must contain one output_text")
-    parsed = json.loads(text_parts[0]["text"])
+    return text_parts[0]["text"]
+
+
+def _parse_structured_json(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Models occasionally emit raw control characters inside string
+        # values even under a strict transport schema; accept them before
+        # asking the model to repair its output.
+        parsed = json.loads(text, strict=False)
     if not isinstance(parsed, dict):
         raise TypeError("DeepSeek structured output must decode to an object")
     return parsed
+
+
+# A malformed or schema-invalid structured output is repaired in the same
+# conversation: the bad assistant output and a correction instruction are
+# appended, and the model re-answers.  After JSON_REPAIR_MAX_ATTEMPTS repairs
+# the original error is raised so the caller's node-level retry still applies.
+JSON_REPAIR_MAX_ATTEMPTS = 3
+
+
+def _json_repair_instruction(error: Exception) -> str:
+    return (
+        f"Your previous output failed JSON validation: {error}. "
+        "Output corrected JSON only, no markdown, no commentary."
+    )
 
 
 class DeepSeekClient:
@@ -338,7 +362,18 @@ class DeepSeekClient:
         payload: Any,
         schema: dict[str, Any],
         images: list[Path] | None = None,
+        *,
+        validator: Callable[[dict[str, Any]], Any] | None = None,
     ) -> ProviderResult[dict[str, Any]]:
+        """Structured call with an in-conversation JSON repair loop.
+
+        When the model's output text fails to parse or the ``validator``
+        rejects it, the bad output and a correction instruction are appended
+        to the same conversation and the request is resent, up to
+        ``JSON_REPAIR_MAX_ATTEMPTS`` times.  Every repair exchange is kept in
+        the provider record under ``json_repairs``.  A persistent failure
+        raises the original error so node-level retry still applies.
+        """
         media = list(images or [])
         url = _deepseek_responses_url(self.settings.deepseek_api_base)
         try:
@@ -355,36 +390,82 @@ class DeepSeekClient:
             }
             raise ProviderFailure(record, media, exc) from exc
 
-        request: dict[str, Any] = {
-            "model": self.settings.deepseek_model,
-            "instructions": instruction,
-            "input": [{"role": "user", "content": content}],
-            "reasoning": {"effort": "high"},
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "duet_structured_result",
-                    "schema": schema,
-                }
-            },
-        }
+        conversation: list[dict[str, Any]] = [
+            {"role": "user", "content": content}
+        ]
         record: dict[str, Any] | None = None
+        repairs: list[dict[str, Any]] = []
         try:
             with httpx.Client(
                 timeout=self.settings.request_timeout_s,
                 transport=self.transport,
             ) as client:
-                response, record = _send(
-                    client,
-                    "POST",
-                    url,
-                    headers=_headers(self.settings.deepseek_api_key),
-                    json_body=request,
-                )
-            _ensure_success(response, record, media)
-            value = _structured_output(_json_body(response))
-            return ProviderResult(value=value, record=record, evidence_media=media)
+                for repair_round in range(JSON_REPAIR_MAX_ATTEMPTS + 1):
+                    request: dict[str, Any] = {
+                        "model": self.settings.deepseek_model,
+                        "instructions": instruction,
+                        "input": conversation,
+                        "reasoning": {"effort": "high"},
+                        "text": {
+                            "format": {
+                                "type": "json_schema",
+                                "name": "duet_structured_result",
+                                "schema": schema,
+                            }
+                        },
+                    }
+                    response, record = _send(
+                        client,
+                        "POST",
+                        url,
+                        headers=_headers(self.settings.deepseek_api_key),
+                        json_body=request,
+                    )
+                    _ensure_success(response, record, media)
+                    text = _structured_output_text(_json_body(response))
+                    try:
+                        value = _parse_structured_json(text)
+                        if validator is not None:
+                            validator(value)
+                    except Exception as exc:
+                        if repair_round >= JSON_REPAIR_MAX_ATTEMPTS:
+                            raise
+                        repairs.append({
+                            "repair": repair_round + 1,
+                            "exchange": record,
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        })
+                        conversation = [
+                            *conversation,
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": text}
+                                ],
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": _json_repair_instruction(exc),
+                                    }
+                                ],
+                            },
+                        ]
+                        continue
+                    if repairs:
+                        record = {**record, "json_repairs": repairs}
+                    return ProviderResult(
+                        value=value, record=record, evidence_media=media,
+                    )
+                raise AssertionError("unreachable")
         except ProviderFailure as exc:
+            if repairs and "json_repairs" not in exc.record:
+                exc.record = {**exc.record, "json_repairs": repairs}
             if exc.evidence_media:
                 raise
             raise ProviderFailure(exc.record, media, exc.cause) from exc.cause
@@ -394,10 +475,12 @@ class DeepSeekClient:
                     "method": "POST",
                     "url": url,
                     "headers": _headers(self.settings.deepseek_api_key),
-                    "body": request,
+                    "body": conversation,
                 },
                 "response": None,
             }
+            if repairs and "json_repairs" not in fallback:
+                fallback = {**fallback, "json_repairs": repairs}
             raise ProviderFailure(fallback, media, exc) from exc
 
 
@@ -608,7 +691,12 @@ class CodexClient:
         payload: Any,
         schema: dict[str, Any],
         images: list[Path] | None = None,
+        *,
+        validator: Callable[[dict[str, Any]], Any] | None = None,
     ) -> ProviderResult[dict[str, Any]]:
+        # Codex runs as a one-shot subprocess, so there is no conversation to
+        # repair in: the validator rejects the output here and the caller's
+        # node-level retry reruns the whole process.
         media = list(images or [])
         request_record: dict[str, Any] = {
             "provider": "codex",
@@ -714,6 +802,8 @@ class CodexClient:
                     _read_regular_file(output_path, _CODEX_OUTPUT_MAX_BYTES)
                 )
                 response_record["body"] = value
+                if validator is not None:
+                    validator(value)
                 return ProviderResult(
                     value=value,
                     record={"request": request_record, "response": response_record},

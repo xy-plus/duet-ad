@@ -54,7 +54,7 @@ def _split_video(path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
-def test_mask_faces_mosaics_the_expanded_box_and_preserves_timing(
+def test_mask_faces_covers_the_expanded_box_with_solid_gray_and_preserves_timing(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source-muted.mp4"
@@ -76,10 +76,16 @@ def test_mask_faces_mosaics_the_expanded_box_and_preserves_timing(
         frames.append(frame)
     capture.release()
     assert len(frames) == 3
-    # 15% padding grows the 16x16 box at (4, 4) to [2:22, 2:22]; at this tiny
-    # scale mosaic blocks are 1px, so masking is a no-op in the uniform area —
-    # the mosaic structure itself is covered by the direct unit test below.
-    # Here we assert the region outside the box is untouched.
+    # 25% padding grows the 16x16 box at (4, 4) to [0:24, 0:24]. The inner
+    # area of the masked region must be a flat gray block: zero variance and
+    # a mean pinned to the fill color, with no source pixel leaking through.
+    inner = frames[0][3:21, 3:21].astype(np.int32)
+    assert float(inner.std()) <= 4.0
+    assert all(
+        abs(float(inner[:, :, channel].mean()) - fill) <= 8.0
+        for channel, fill in enumerate(face_mask.GRAY_FILL)
+    )
+    # The region outside the box stays untouched.
     outside = frames[0][28, 40]
     assert all(
         abs(int(channel) - original) <= 8
@@ -143,25 +149,16 @@ def test_mask_faces_rejects_an_unreadable_source(tmp_path: Path) -> None:
         )
 
 
-def test_apply_mosaic_pixelates_into_coarse_blocks() -> None:
+def test_apply_gray_block_fills_the_box_with_solid_gray() -> None:
     frame = np.zeros((96, 96, 3), dtype=np.uint8)
     frame[:, :44] = (10, 20, 30)
     frame[:, 44:] = (200, 210, 220)
 
-    face_mask._apply_mosaic(frame, (0, 0, 96, 96))
+    face_mask._apply_gray_block(frame, (4, 4, 60, 60))
 
-    # 96px / 12 blocks = 8px mosaic cells; inside a uniform half the cell keeps
-    # its color, and all pixels within one cell are identical.
-    dark_cell = frame[0:8, 0:8]
-    assert np.all(dark_cell == dark_cell[0, 0])
-    assert all(
-        abs(int(channel) - original) <= 2
-        for channel, original in zip(dark_cell[0, 0], (10, 20, 30))
-    )
-    # The brightness boundary at x=44 sits mid-cell (cell spans x=40..47), so
-    # that cell blends both halves into a midtone.
-    blended = frame[0, 44]
-    assert all(
-        abs(int(channel) - mid) <= 30
-        for channel, mid in zip(blended, (105, 115, 125))
-    )
+    region = frame[4:60, 4:60]
+    assert np.all(region == np.array(face_mask.GRAY_FILL, dtype=np.uint8))
+    assert float(region.astype(np.int32).std()) == 0.0
+    # Pixels outside the box keep their original color.
+    assert frame[0, 0].tolist() == [10, 20, 30]
+    assert frame[80, 80].tolist() == [200, 210, 220]

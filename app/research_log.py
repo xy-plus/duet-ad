@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -89,6 +90,8 @@ class ResearchLog:
         except Exception as exc:
             self._report(exc)
 
+    _ATTEMPT_RE = re.compile(r"^attempt-(\d+)$")
+
     def attempt_dir(self, node: str, scope: str, attempt: int) -> Path:
         path = self.root / node / scope / f"attempt-{attempt}"
         try:
@@ -96,6 +99,25 @@ class ResearchLog:
         except Exception as exc:
             self._report(exc)
         return path
+
+    def next_attempt(self, node: str, scope: str) -> int:
+        """One past the highest existing attempt number for this node/scope.
+
+        Resumed nodes continue numbering instead of restarting at 1, so the
+        failed attempt's original input/output evidence is never overwritten.
+        """
+        try:
+            base = self.root / node / scope
+            highest = 0
+            if base.is_dir():
+                for child in base.iterdir():
+                    match = self._ATTEMPT_RE.match(child.name)
+                    if match is not None:
+                        highest = max(highest, int(match.group(1)))
+            return highest + 1
+        except Exception as exc:
+            self._report(exc)
+            return 1
 
     def write_json(self, path: Path, value: Any) -> None:
         try:
