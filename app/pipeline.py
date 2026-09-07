@@ -2483,6 +2483,81 @@ class Pipeline:
             None,
         )
 
+    def _backfill_resume_voice_fallback(
+        self,
+        project_id: str,
+        project: Path,
+        request: dict[str, Any],
+        prepared_segments: list[dict[str, Any]],
+        replacement: Path | None,
+        checkpoint: dict[str, Any],
+        log: ResearchLog,
+    ) -> None:
+        """Backfill the catalog default voice for projects frozen before the
+        object-replace fallback existed: dialogue waits for TTS but the
+        frozen plan materialized zero voice references.  The frozen sheet
+        stays byte-identical; only its stored upstream bindings are
+        recomputed so the added reference is honestly reflected."""
+        if checkpoint["voice_reference_paths"]:
+            return
+        state = self.store.read(project_id)
+        translated_lines = state.get("translated_voice_lines")
+        if (
+            not isinstance(translated_lines, list)
+            or not translated_lines
+            or any(not isinstance(line, dict) for line in translated_lines)
+        ):
+            return
+        reason = (
+            "resume: dialogue requires TTS but the frozen plan assigned "
+            "no voice"
+        )
+        fallback_voice_id = self.voice_library.default_voice(
+            request["dialogue"]["target_language"],
+        )["voice_id"]
+        (
+            _metadata_by_id, references, paths, fallback_used,
+        ) = self._materialize_voice_references(
+            project, {"people": {}}, fallback_voice_id=fallback_voice_id,
+        )
+        if not fallback_used or len(references) != 1:
+            raise ValueError("voice reference fallback did not materialize")
+        log.event(
+            "voice_reference_default_fallback",
+            voice_id=fallback_voice_id,
+            reason=reason,
+        )
+        object_replace = state.get("object_replace")
+        if not isinstance(object_replace, dict):
+            raise ValueError("stored object-replace state is invalid")
+        updated_object_replace = {
+            **object_replace,
+            "voice_reference_fallback": {
+                "voice_id": fallback_voice_id,
+                "reason": reason,
+            },
+        }
+        updated_sheet = {
+            **checkpoint["replacement_sheet"],
+            "upstream_bindings": self._replacement_sheet_upstream_bindings(
+                project,
+                prepared_segments,
+                checkpoint["enhanced_element_index"],
+                updated_object_replace,
+                references,
+                request,
+                replacement,
+            ),
+        }
+        self.store.update(
+            project_id,
+            voice_references=references,
+            object_replace=updated_object_replace,
+            replacement_sheet=updated_sheet,
+        )
+        checkpoint["replacement_sheet"] = updated_sheet
+        checkpoint["voice_reference_paths"] = paths
+
     def validate_pre_picsart_resume(self, project_id: str) -> None:
         self._load_pre_picsart_resume(project_id)
 
@@ -2501,6 +2576,15 @@ class Pipeline:
         log.event("pre_picsart_resume_started")
         try:
             if checkpoint is not None:
+                self._backfill_resume_voice_fallback(
+                    project_id,
+                    project,
+                    request,
+                    segments,
+                    replacement,
+                    checkpoint,
+                    log,
+                )
                 self._progress(
                     project_id,
                     55,

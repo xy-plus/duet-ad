@@ -3735,6 +3735,150 @@ def test_pre_picsart_resume_reuses_succeeded_sheet_without_seedream_or_upstream(
     assert store.read(project_id)["replacement_sheet"] == frozen_sheet
 
 
+def test_pre_picsart_resume_backfills_default_voice_for_voiceless_frozen_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, project_id, project, frozen_sheet, _initial_seedream = (
+        _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
+    )
+    # The frozen plan predates the object-replace voice fallback: dialogue
+    # waits for TTS but no person was assigned a voice.
+    assert store.read(project_id)["voice_references"] == []
+    store.update(
+        project_id,
+        translated_voice_lines=[
+            {"text": "第一句", "start_s": 0.0, "end_s": 2.0},
+        ],
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda *_args: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+    downstream: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_continue_after_replacement_sheet",
+        lambda *args, **_kwargs: downstream.append(args),
+    )
+
+    pipeline.resume_pre_picsart(project_id)
+
+    assert len(downstream) == 1
+    voice_paths = downstream[0][4]
+    fallback = pipeline.voice_library.voices[0]
+    assert [path.name for path in voice_paths] == ["audio-01.wav"]
+    assert voice_paths[0].is_file()
+    state = store.read(project_id)
+    assert [
+        reference["voice_id"] for reference in state["voice_references"]
+    ] == [fallback["voice_id"]]
+    assert state["object_replace"]["voice_reference_fallback"] == {
+        "voice_id": fallback["voice_id"],
+        "reason": (
+            "resume: dialogue requires TTS but the frozen plan assigned "
+            "no voice"
+        ),
+    }
+    # The frozen sheet keeps everything but its upstream bindings, which now
+    # honestly reflect the added Audio 1 reference.
+    updated_sheet = state["replacement_sheet"]
+    assert {
+        key: value
+        for key, value in updated_sheet.items()
+        if key != "upstream_bindings"
+    } == {
+        key: value
+        for key, value in frozen_sheet.items()
+        if key != "upstream_bindings"
+    }
+    updated_bindings = updated_sheet["upstream_bindings"]
+    old_bindings = frozen_sheet["upstream_bindings"]
+    assert updated_bindings["voice_references_sha256"] == (
+        Pipeline._json_sha256(state["voice_references"])
+    )
+    assert (
+        updated_bindings["voice_references_sha256"]
+        != old_bindings["voice_references_sha256"]
+    )
+    assert (
+        updated_bindings["segments_sha256"] == old_bindings["segments_sha256"]
+    )
+    fallback_events = [
+        event
+        for event in _trace_events(project)
+        if event["event"] == "voice_reference_default_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["voice_id"] == fallback["voice_id"]
+    assert fallback_events[0]["reason"].startswith("resume:")
+
+    # The updated state is a consistent frozen set: the load gate passes and
+    # a later resume (after another failure) does not backfill again.
+    store.update(
+        project_id,
+        status="failed",
+        project_progress={
+            "status": "failed", "percent": 56, "stage": "pipeline_failed",
+        },
+        generation={
+            "status": "failed", "stage": "pipeline_failed", "error": "failed",
+        },
+    )
+    pipeline.validate_pre_picsart_resume(project_id)
+    pipeline.resume_pre_picsart(project_id)
+    assert len(downstream) == 2
+    assert [path.resolve() for path in downstream[1][4]] == [
+        path.resolve() for path in voice_paths
+    ]
+    assert [
+        event
+        for event in _trace_events(project)
+        if event["event"] == "voice_reference_default_fallback"
+    ] == fallback_events
+
+
+def test_pre_picsart_resume_without_dialogue_keeps_the_empty_voice_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, project_id, project, frozen_sheet, _initial_seedream = (
+        _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda *_args: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+    downstream: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_continue_after_replacement_sheet",
+        lambda *args, **_kwargs: downstream.append(args),
+    )
+
+    pipeline.resume_pre_picsart(project_id)
+
+    assert len(downstream) == 1
+    assert downstream[0][4] == []
+    state = store.read(project_id)
+    assert state["voice_references"] == []
+    assert "voice_reference_fallback" not in state["object_replace"]
+    assert state["replacement_sheet"] == frozen_sheet
+    assert "voice_reference_default_fallback" not in (
+        project / "logs" / "trace.jsonl"
+    ).read_text(encoding="utf-8")
+
+
 def test_pre_picsart_resume_reuses_not_needed_sheet_and_keeps_upload_unbound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
