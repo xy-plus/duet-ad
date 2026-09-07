@@ -77,7 +77,7 @@ Picsart 使用 Advanced workflow `minimax/h3-max/reference-to-video`。提交地
 
 ## 重试、证据与付费边界
 
-普通节点有独立的 `attempt-1`/`attempt-2`，首次抛出自然执行错误后最多重试一次，不根据生成质量触发重试。Seedream 生成 POST 与 Picsart submit 都是付费边界，不使用这条通用重试规则。Whisper 返回空 ASR，或 YAMNet 与 ASR 没有可重叠的 spoken 区间时，直接以空台词继续，不因内容为空再跑一次；翻译结果缺行或某行为空时回退对应源文，也不失败或重试。
+普通节点每次尝试有独立的 `attempt-N` 证据目录，抛出可重试的自然执行错误后不限次数重试：第 2、3 次尝试立即重跑，第 4 次起按 1 分钟基准指数退避（封顶 30 分钟），直到成功；业务拒绝与输入错误立即失败不重试，也不根据生成质量触发重试。Seedream 生成 POST 与 Picsart submit 都是付费边界，不使用这条通用重试规则。Whisper 返回空 ASR，或 YAMNet 与 ASR 没有可重叠的 spoken 区间时，直接以空台词继续，不因内容为空再跑一次；翻译结果缺行或某行为空时回退对应源文，也不失败或重试。
 
 Seedream 在发出 POST 前原子持久化与 prompt、模型和输入图片哈希绑定的 receipt/claim。已存在成功响应时只物化同一结果；明确拒绝、协议错误或提交结果未知都不会自动再 POST，其中 `submission_unknown` 必须先人工对账。
 
