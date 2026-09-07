@@ -8,7 +8,7 @@ import os
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -115,6 +115,15 @@ PICSART_GENERATION_MIN_DURATION_S = 5
 PICSART_GENERATION_MAX_DURATION_S = 15
 PICSART_RESOLUTIONS = frozenset({"480p", "768p"})
 PICSART_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
+# Provider-side fetch/validation failures (the provider could not pull our
+# hosted reference assets) are transient: resubmit the same frozen segment at
+# most this many extra times within the same run.
+PICSART_FETCH_RESUBMIT_MAX = 2
+_PICSART_FETCH_FAILURE_MARKERS = (
+    "failed to download",
+    "unreachable",
+    "validationerror",
+)
 MUTED_ARTIFACT_NAMES = frozenset({
     "source-muted.mp4", "source-retargeted.mp4", "source-faces-masked.mp4",
 })
@@ -2601,6 +2610,34 @@ class Pipeline:
                 return True
         return False
 
+    @staticmethod
+    def _poll_failure_is_asset_fetch(record: dict[str, Any]) -> bool:
+        """True when a terminal task failure is a provider-side asset fetch
+        or validation error (safe to resubmit with the same frozen inputs)."""
+
+        texts: list[str] = []
+        for exchange in record.get("polls") or []:
+            if not isinstance(exchange, dict):
+                continue
+            response = exchange.get("response")
+            if not isinstance(response, dict):
+                continue
+            body = response.get("body")
+            if not isinstance(body, dict):
+                continue
+            envelope = body.get("response")
+            candidates = envelope if isinstance(envelope, dict) else body
+            error = candidates.get("error")
+            if isinstance(error, dict):
+                error = error.get("message")
+            for value in (error, candidates.get("message"), candidates.get("reason")):
+                if isinstance(value, str):
+                    texts.append(value)
+        haystack = "\n".join(texts).lower()
+        return any(
+            marker in haystack for marker in _PICSART_FETCH_FAILURE_MARKERS
+        )
+
     def _terminal_resume_task_ids(
         self, project: Path, scope: str,
     ) -> set[str]:
@@ -4779,52 +4816,85 @@ class Pipeline:
         node_prefix = prepared.run_identity
         artifact_suffix = prepared.artifact_suffix
         try:
+            current = prepared
             task_id = prepared.existing_task_id
-            if task_id is None:
-                task_id = self._node(
-                    log,
-                    f"{node_prefix}-submit",
-                    scope,
-                    prepared.submit_input(),
-                    [prepared.muted]
-                    + list(prepared.provider_images)
-                    + (
-                        [prepared.dialogue_track]
-                        if prepared.dialogue_track is not None
-                        else []
-                    ),
-                    lambda: self._submit_prepared_picsart(prepared),
-                    retry_if=lambda _exc: False,
-                )
-            else:
-                log.event(
-                    "picsart_task_reused",
-                    segment_index=index,
-                    task_id=task_id,
-                )
 
-            def poll_once() -> ProviderResult[str]:
+            fetch_resubmits = 0
+            while True:
+                # Submit/poll node names carry the run identity, so every
+                # (re)submission keeps its own complete receipt/log chain.
+                submit_prefix = current.run_identity
+                if task_id is None:
+                    task_id = self._node(
+                        log,
+                        f"{submit_prefix}-submit",
+                        scope,
+                        current.submit_input(),
+                        [current.muted]
+                        + list(current.provider_images)
+                        + ([current.dialogue_track] if current.dialogue_track is not None else []),
+                        lambda current=current: self._submit_prepared_picsart(current),
+                        retry_if=lambda _exc: False,
+                    )
+                else:
+                    log.event(
+                        "picsart_task_reused",
+                        segment_index=index,
+                        task_id=task_id,
+                    )
+
+                def poll_once(
+                    task_id: str = task_id,
+                    current: PreparedPicsartRequest = current,
+                ) -> ProviderResult[str]:
+                    try:
+                        return self.picsart.poll(task_id)
+                    except ProviderFailure as exc:
+                        if self._poll_record_is_terminal_failure(exc.record):
+                            self._mark_submission_task_failed(
+                                current.project_id, index, task_id,
+                            )
+                        raise
+
+
                 try:
-                    return self.picsart.poll(task_id)
+                    generated_url = self._node(
+                        log,
+                        f"{submit_prefix}-poll",
+                        scope,
+                        {"task_id": task_id},
+                        [],
+                        poll_once,
+                        retry_if=lambda exc: not (
+                            isinstance(exc, ProviderFailure)
+                            and self._poll_record_is_terminal_failure(exc.record)
+                        ),
+                    )
                 except ProviderFailure as exc:
-                    if self._poll_record_is_terminal_failure(exc.record):
-                        self._mark_submission_task_failed(
-                            prepared.project_id, index, task_id,
-                        )
-                    raise
-
-            generated_url = self._node(
-                log,
-                f"{node_prefix}-poll",
-                scope,
-                {"task_id": task_id},
-                [],
-                poll_once,
-                retry_if=lambda exc: not (
-                    isinstance(exc, ProviderFailure)
-                    and self._poll_record_is_terminal_failure(exc.record)
-                ),
-            )
+                    if not (
+                        fetch_resubmits < PICSART_FETCH_RESUBMIT_MAX
+                        and self._poll_record_is_terminal_failure(exc.record)
+                        and self._poll_failure_is_asset_fetch(exc.record)
+                    ):
+                        raise
+                    # The provider failed to pull our hosted assets; resubmit
+                    # the same frozen segment under a fresh run identity.
+                    fetch_resubmits += 1
+                    log.event(
+                        "picsart_asset_fetch_resubmit",
+                        segment_index=index,
+                        resubmit=fetch_resubmits,
+                        failed_task_id=task_id,
+                    )
+                    current = replace(
+                        prepared,
+                        run_identity=f"{node_prefix}-refetch-{fetch_resubmits:02d}",
+                        existing_task_id=None,
+                    )
+                    self._begin_submission_batch([current])
+                    task_id = None
+                    continue
+                break
             downloaded = segment_dir / f"h3-provider{artifact_suffix}.mp4"
             self._node(
                 log,
