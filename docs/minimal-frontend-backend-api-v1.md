@@ -28,8 +28,15 @@
       "remove_logo": true
     },
     "dialogue": {
+      "modes": ["auto_rewrite", "generate"],
       "mode": "auto_rewrite",
-      "translation": true
+      "translation": true,
+      "max_brief_chars": 1000,
+      "optional": true,
+      "default": {
+        "mode": "auto_rewrite",
+        "target_language": "与原视频相同"
+      }
     },
     "replacement": {
       "supported": true,
@@ -82,6 +89,13 @@
 
 `generation_request.version` 必须严格等于整数 `1`；其公开结构由上例中的 `output`、`processing`、`dialogue` 和 `replacement_guidance` 定义。
 
+`dialogue` 只接受两种封闭形态：
+
+- `{"mode": "auto_rewrite", "target_language": ...}`：自动识别原视频台词并改写为目标语种（上例）。
+- `{"mode": "generate", "target_language": ..., "brief": ...}`：不参考原视频台词，由后端 Agent 按用户的口播描述直接生成目标语种台词。`brief` 必填，去除首尾空白后必须非空，最长 1000 个字符。
+
+向后兼容的默认值：`dialogue` 整体可缺省，等价于能力声明中的 `default`（`{"mode": "auto_rewrite", "target_language": "与原视频相同"}`）；`dialogue` 内的 `mode` 键可缺省，默认 `auto_rewrite`。缺省值由服务端填充，归一化后的存储请求始终是完整形态。
+
 使用参考图时：
 
 ```json
@@ -99,15 +113,16 @@
 2. `target_language` 去除首尾空白后必须非空，最长 80 个字符。
 3. 三个 `processing` 值固定为 `true`，不能由用户关闭。
 4. `replacement_image` 与 `replacement_guidance` 必须同时存在或同时不存在。
-5. `generation_request` 不携带客户端台词文本或模型选择。
+5. `dialogue.mode` 为 `generate` 时 `brief` 必填；为 `auto_rewrite` 时不得携带 `brief`。
+6. `generation_request` 不携带客户端台词文本或模型选择。
 
 ## 3. 后端执行语义
 
 创建成功后，后端自动完成：
 
 1. 获取并校验原视频。
-2. 自动识别原视频台词。
-3. 由 Agent 改编台词并转换为 `target_language`。
+2. 自动识别原视频台词（`generate` 模式下识别照常进行，但识别结果不作为台词来源）。
+3. 由 Agent 改编（`auto_rewrite`）或按 `brief` 生成（`generate`）台词并转换为 `target_language`。
 4. 按固定图片优化、去字幕、去 Logo 配置生成视频。
 5. 直接运行到成功或失败，不进入中途台词校对。
 

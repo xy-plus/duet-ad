@@ -610,3 +610,128 @@ def test_concat_pads_short_outputs_and_normalizes_video_and_audio(tmp_path: Path
     assert info["fps"] == pytest.approx(24.0)
     assert info["duration_s"] == pytest.approx(2.0, abs=1 / 24)
     assert info["has_audio"] is True
+
+
+def _sine_wav(path: Path, frequency: int, duration: float) -> Path:
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"sine=frequency={frequency}:sample_rate=48000:duration={duration}",
+            "-c:a", "pcm_s16le", str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
+def _max_volume(path: Path) -> float:
+    result = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True, check=True,
+    )
+    for line in result.stderr.splitlines():
+        if "max_volume" in line:
+            return float(line.split("max_volume:")[1].split("dB")[0].strip())
+    raise AssertionError("volumedetect output is missing")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
+def test_assemble_dialogue_track_places_lines_on_a_silent_base(tmp_path: Path):
+    first = _sine_wav(tmp_path / "line-0001.wav", 440, 0.3)
+    second = _sine_wav(tmp_path / "line-0002.wav", 880, 0.5)
+
+    destination = tmp_path / "full-track.wav"
+    result = media.assemble_dialogue_track(
+        [
+            {"audio": first, "start_s": 0.1, "end_s": 0.5},
+            {"audio": second, "start_s": 0.8, "end_s": 1.1},
+        ],
+        1.5,
+        destination,
+    )
+
+    assert result["duration_s"] == 1.5
+    assert [line["start_s"] for line in result["lines"]] == [0.1, 0.8]
+    assert media._probe_audio_duration(destination) == pytest.approx(1.5, abs=0.05)
+    # The 0.5s line is atempo-compressed into its 0.3s window, so the track
+    # goes silent again before the end.
+    assert _max_volume(destination) > -20.0
+    tail = tmp_path / "tail.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-i", str(destination),
+            "-ss", "1.2", "-t", "0.3", "-c:a", "pcm_s16le", str(tail),
+        ],
+        check=True,
+    )
+    assert _max_volume(tail) < -60.0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
+def test_replace_audio_track_overwrites_audio_and_keeps_video(tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=red:size=64x48:rate=24:d=1.0",
+            "-f", "lavfi", "-i",
+            "sine=frequency=220:sample_rate=48000:duration=1.0",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            str(video),
+        ],
+        check=True,
+    )
+    audio = _sine_wav(tmp_path / "full-track.wav", 880, 0.5)
+
+    result = media.replace_audio_track(video, audio, video)
+
+    assert result["duration_s"] == pytest.approx(1.0, abs=1 / 24)
+    info = media.probe(video)
+    assert info["codec_name"] == "h264"
+    assert info["has_audio"] is True
+    assert info["duration_s"] == pytest.approx(1.0, abs=0.05)
+    assert _max_volume(video) > -30.0
+
+
+def test_detect_scenes_clamps_trailing_edge_to_the_container_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"fake")
+    monkeypatch.setattr(media, "probe_decoded_frames", lambda _path: [{"ok": 1}])
+    monkeypatch.setattr(
+        media, "detect_exact_scene_bounds", lambda *_args: [{"ok": 1}]
+    )
+    monkeypatch.setattr(
+        media,
+        "normalize_scene_inventory",
+        lambda _bounds, _frames: [
+            {"index": 1, "start_s": 0.0, "end_s": 5.933333},
+            {"index": 2, "start_s": 5.933333, "end_s": 16.000001},
+        ],
+    )
+
+    scenes = media.detect_scenes(source, 16.0)
+
+    assert scenes[-1]["end_s"] == 16.0
+    assert scenes[0]["end_s"] == 5.933333
+
+
+def test_detect_scenes_without_duration_keeps_the_frame_timeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"fake")
+    monkeypatch.setattr(media, "probe_decoded_frames", lambda _path: [{"ok": 1}])
+    monkeypatch.setattr(
+        media, "detect_exact_scene_bounds", lambda *_args: [{"ok": 1}]
+    )
+    monkeypatch.setattr(
+        media,
+        "normalize_scene_inventory",
+        lambda _bounds, _frames: [{"index": 1, "start_s": 0.0, "end_s": 16.000001}],
+    )
+
+    assert media.detect_scenes(source)[-1]["end_s"] == 16.000001

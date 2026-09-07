@@ -14,6 +14,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from app import media
+from app import face_mask
 from app.config import Settings
 from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
 from app.object_replace_schema import (
@@ -26,12 +27,14 @@ from app.object_replace_schema import (
 )
 from app.replacement_sheet import (
     build_replacement_sheet_spec,
+    extract_tile_reference,
     finalize_replacement_sheet,
     materialize_replacement_sheet_inputs,
     replacement_sheet_spec_sha256,
     validate_replacement_sheet_spec,
 )
 from app.providers import (
+    AutodlClient,
     CodexClient,
     DeepSeekClient,
     MediaKitClient,
@@ -62,6 +65,9 @@ R2V_SKILL = Path(__file__).resolve().parents[1] / "skills" / "h3-max-r2v-prompt"
 OBJECT_REPLACE_SKILL = (
     Path(__file__).resolve().parents[1] / "skills" / "object-replace" / "SKILL.md"
 )
+DIALOGUE_WRITER_SKILL = (
+    Path(__file__).resolve().parents[1] / "skills" / "dialogue-writer" / "SKILL.md"
+)
 SAME_AS_SOURCE_LANGUAGE = "与原视频相同"
 MASTER_EMPTY_ASR_SIGNAL = 51 / 256
 TRANSLATION_SCHEMA: dict[str, Any] = {
@@ -80,9 +86,28 @@ TRANSLATION_SCHEMA: dict[str, Any] = {
     "required": ["lines"],
     "additionalProperties": False,
 }
+DIALOGUE_GENERATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "segment_index": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["segment_index", "text"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["lines"],
+    "additionalProperties": False,
+}
 
 PICSART_RECEIPT_VERSION = 2
-H3_PREPARED_ARTIFACTS_VERSION = 4
+H3_PREPARED_ARTIFACTS_VERSION = 6
 REPLACEMENT_SHEET_VERSION = 4
 PICSART_PROMPT_MAX_CHARS = 50_000
 PICSART_REFERENCE_MIN_DURATION_S = 2
@@ -91,6 +116,10 @@ PICSART_GENERATION_MIN_DURATION_S = 5
 PICSART_GENERATION_MAX_DURATION_S = 15
 PICSART_RESOLUTIONS = frozenset({"480p", "768p"})
 PICSART_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
+FACE_RETARGET_MIN_FACE_SHARE_PERCENT = 50
+MUTED_ARTIFACT_NAMES = frozenset({
+    "source-muted.mp4", "source-retargeted.mp4", "source-faces-masked.mp4",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +176,7 @@ class Pipeline:
         mediakit: MediaKitClient | None = None,
         seedream: SeedreamClient | None = None,
         picsart: PicsartClient | None = None,
+        autodl: AutodlClient | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -156,6 +186,7 @@ class Pipeline:
         self.mediakit = mediakit or MediaKitClient(settings)
         self.seedream = seedream or SeedreamClient(settings)
         self.picsart = picsart or PicsartClient(settings)
+        self.autodl = autodl or AutodlClient(settings)
         self.voice_library: VoiceLibrary = load_voice_library()
         self._mediakit_gate = threading.BoundedSemaphore(
             settings.mediakit_concurrency,
@@ -347,6 +378,54 @@ class Pipeline:
                 raise ValueError("stored replacement image is outside the project")
         return source, replacement
 
+    def _erase_source_subtitles(
+        self,
+        project_id: str,
+        project: Path,
+        source: Path,
+        request: dict[str, Any],
+        log: ResearchLog,
+    ) -> Path:
+        """Erase burned-in subtitles from the source before any downstream use."""
+        processing = request.get("processing") if isinstance(request, dict) else None
+        if not (
+            isinstance(processing, dict)
+            and processing.get("remove_subtitle") is True
+        ):
+            return source
+        erased = project / "work" / "source-nosubs.mp4"
+
+        def operation() -> ProviderResult[Path]:
+            video_url = self.register_asset(project_id, source)
+            submitted = self.mediakit.submit_video_subtitle_erase(video_url)
+            record: dict[str, Any] = {
+                "submit": submitted.record,
+                "video_url": video_url,
+            }
+            polled = self.mediakit.poll_task(submitted.value)
+            record["poll"] = polled.record
+            downloaded = self.mediakit.download(polled.value, erased)
+            record["download"] = downloaded.record
+            return ProviderResult(
+                erased, record, list(downloaded.evidence_media),
+            )
+
+        self._progress(project_id, 3, "erase-source-subtitles")
+        self._node(
+            log,
+            "erase-source-subtitles",
+            "project",
+            {
+                "source": source,
+                "erase_mode": self.settings.mediakit_video_erase_mode,
+                "output": erased,
+            },
+            [source],
+            operation,
+            lambda value: [value],
+        )
+        return erased
+
     def run(self, project_id: str) -> None:
         project = self.store.path(project_id)
         log = ResearchLog(project)
@@ -367,6 +446,10 @@ class Pipeline:
             )
             duration_s = float(info["duration_s"])
             self.store.update(project_id, duration_s=duration_s, has_source=True)
+
+            source = self._erase_source_subtitles(
+                project_id, project, source, request, log,
+            )
 
             self._progress(project_id, 5, "source-4fps")
             source_frames = project / "work" / "source-4fps"
@@ -523,8 +606,6 @@ class Pipeline:
             }
             or any(processing[key] is not True for key in processing)
             or not isinstance(dialogue, dict)
-            or set(dialogue) != {"mode", "target_language"}
-            or dialogue.get("mode") != "auto_rewrite"
             or not isinstance(dialogue.get("target_language"), str)
             or not dialogue["target_language"]
             or dialogue["target_language"].strip()
@@ -533,6 +614,20 @@ class Pipeline:
             or set(fusion) != {"agent"}
             or fusion.get("agent") not in {"codex", "deepseek"}
         ):
+            raise ValueError("stored effective request is invalid")
+        dialogue_mode = dialogue.get("mode")
+        if dialogue_mode == "auto_rewrite":
+            dialogue_shape_valid = set(dialogue) == {"mode", "target_language"}
+        elif dialogue_mode == "generate":
+            dialogue_shape_valid = (
+                set(dialogue) == {"mode", "target_language", "brief"}
+                and isinstance(dialogue.get("brief"), str)
+                and bool(dialogue["brief"])
+                and dialogue["brief"].strip() == dialogue["brief"]
+            )
+        else:
+            dialogue_shape_valid = False
+        if not dialogue_shape_valid:
             raise ValueError("stored effective request is invalid")
         if guidance is not None and (
             not isinstance(guidance, dict)
@@ -763,6 +858,7 @@ class Pipeline:
                 voice_ids=voice_ids,
                 has_user_image=user_reference is not None,
                 user_instruction=user_instruction,
+                dialogue_line_count=len(translated_lines),
             )
             metadata_by_id, references, paths = self._materialize_voice_references(
                 project, patch,
@@ -803,6 +899,145 @@ class Pipeline:
             "voice_catalog_sha256": self.voice_library.digest,
         }
         return enhanced_index, metadata, references, paths
+
+    def _run_dialogue_audio(
+        self,
+        project_id: str,
+        project: Path,
+        prepared: list[dict[str, Any]],
+        enhanced_element_index: dict[str, Any],
+        voice_reference_paths: list[Path],
+        log: ResearchLog,
+    ) -> Path | None:
+        """Synthesize every dialogue line and assemble the full speech track."""
+        translated_lines = self.store.read(project_id).get(
+            "translated_voice_lines"
+        )
+        if not isinstance(translated_lines, list) or any(
+            not isinstance(line, dict) for line in translated_lines
+        ):
+            raise ValueError("stored translated dialogue is invalid")
+        if not translated_lines:
+            return None
+        dialogue_voices = enhanced_element_index.get("dialogue_voices")
+        people = enhanced_element_index.get("people")
+        if (
+            not isinstance(dialogue_voices, list)
+            or len(dialogue_voices) != len(translated_lines)
+            or not isinstance(people, dict)
+        ):
+            raise ValueError("enhanced index dialogue voices are invalid")
+        valid_voices = {
+            path.resolve(strict=True) for path in voice_reference_paths
+        }
+        default_voice = (
+            voice_reference_paths[0].resolve(strict=True)
+            if voice_reference_paths
+            else None
+        )
+        directory = project / "work" / "dialogue-audio"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        line_audios: list[dict[str, Any]] = []
+        for offset, (line, speaker) in enumerate(
+            zip(translated_lines, dialogue_voices), 1
+        ):
+            text = line.get("text")
+            try:
+                start_s = float(line["start_s"])
+                end_s = float(line["end_s"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(
+                    "stored translated dialogue is invalid"
+                ) from None
+            if (
+                not isinstance(text, str)
+                or not text.strip()
+                or not math.isfinite(start_s)
+                or not math.isfinite(end_s)
+                or not 0 <= start_s < end_s
+            ):
+                raise ValueError("stored translated dialogue is invalid")
+            voice_path: Path | None = None
+            record = people.get(speaker) if isinstance(speaker, str) else None
+            voice = record.get("voice") if isinstance(record, dict) else None
+            asset_path = (
+                voice.get("asset_path") if isinstance(voice, dict) else None
+            )
+            if isinstance(asset_path, str):
+                candidate = (project / asset_path).resolve()
+                if candidate in valid_voices:
+                    voice_path = candidate
+            if voice_path is None:
+                # Unattributed lines (narration) and voiceless people fall
+                # back to the Audio 1 voice.
+                voice_path = default_voice
+            if voice_path is None:
+                raise ValueError("dialogue TTS requires a voice reference")
+            destination = directory / f"line-{offset:04d}.wav"
+
+            def operation(
+                text: str = text,
+                voice_path: Path = voice_path,
+                destination: Path = destination,
+            ) -> ProviderResult[Path]:
+                submitted = self.autodl.submit_tts(
+                    text=text, voice_path=voice_path,
+                )
+                record: dict[str, Any] = {"submit": submitted.record}
+                polled = self.autodl.poll(submitted.value)
+                record["poll"] = polled.record
+                downloaded = self.autodl.download(polled.value, destination)
+                record["download"] = downloaded.record
+                return ProviderResult(
+                    destination, record, list(downloaded.evidence_media),
+                )
+
+            self._node(
+                log,
+                "dialogue-tts-line",
+                "project",
+                {
+                    "line_index": offset,
+                    "text": text,
+                    "start_s": start_s,
+                    "end_s": end_s,
+                    "speaker": speaker,
+                    "voice": voice_path,
+                    "output": destination,
+                },
+                [voice_path],
+                operation,
+                lambda value: [value],
+            )
+            line_audios.append(
+                {"audio": destination, "start_s": start_s, "end_s": end_s}
+            )
+        full_track = directory / "full-track.wav"
+        total_duration = sum(float(item["duration_s"]) for item in prepared)
+
+        def assemble() -> dict[str, Any]:
+            return media.assemble_dialogue_track(
+                line_audios, total_duration, full_track,
+            )
+
+        self._node(
+            log,
+            "assemble-dialogue-track",
+            "project",
+            {
+                "lines": [
+                    {**entry, "audio": entry["audio"].name}
+                    for entry in line_audios
+                ],
+                "total_duration_s": total_duration,
+                "output": full_track,
+            },
+            [entry["audio"] for entry in line_audios],
+            assemble,
+            output_media=lambda _value: [full_track],
+        )
+        return full_track
 
     @staticmethod
     def _enhanced_index_uses_user_image(
@@ -1251,6 +1486,13 @@ class Pipeline:
         }
 
     @staticmethod
+    def _muted_artifact_name(muted: Path) -> str:
+        name = muted.name
+        if name not in MUTED_ARTIFACT_NAMES:
+            raise ValueError("prepared H3 muted artifact is invalid")
+        return name
+
+    @staticmethod
     def _project_artifact_receipt(
         project: Path,
         path: Path,
@@ -1301,7 +1543,8 @@ class Pipeline:
                     project, item["source"], f"{base}/source.mp4",
                 ),
                 "muted_video": self._project_artifact_receipt(
-                    project, muted, f"{base}/source-muted.mp4",
+                    project, muted,
+                    f"{base}/{self._muted_artifact_name(muted)}",
                 ),
                 "prompt": self._project_artifact_receipt(
                     project, muted.parent / "h3_prompt.txt", f"{base}/h3_prompt.txt",
@@ -1475,24 +1718,43 @@ class Pipeline:
             for item in prepared
         )
         target_language = request["dialogue"]["target_language"]
-        self._progress(project_id, 43, "translation")
-        translated_lines = self._node(
-            log,
-            "deepseek-translation",
-            "project",
-            {
-                "target_language": target_language,
-                "source_lines": spoken_lines,
-                "visual_prompts": visual_prompts,
-            },
-            [],
-            lambda: self._translation_request(
-                spoken_lines, target_language, visual_prompts,
-            ),
-            transform=lambda value: self._normalize_translation(
-                value, spoken_lines,
-            ),
-        )
+        if request["dialogue"]["mode"] == "generate":
+            brief = request["dialogue"]["brief"]
+            self._progress(project_id, 43, "dialogue-generation")
+            translated_lines = self._node(
+                log,
+                "deepseek-dialogue-generation",
+                "project",
+                self._dialogue_generation_payload(
+                    brief, target_language, prepared,
+                ),
+                [],
+                lambda: self._dialogue_generation_request(
+                    brief, target_language, prepared,
+                ),
+                transform=lambda value: self._normalize_generated_dialogue(
+                    value, prepared,
+                ),
+            )
+        else:
+            self._progress(project_id, 43, "translation")
+            translated_lines = self._node(
+                log,
+                "deepseek-translation",
+                "project",
+                {
+                    "target_language": target_language,
+                    "source_lines": spoken_lines,
+                    "visual_prompts": visual_prompts,
+                },
+                [],
+                lambda: self._translation_request(
+                    spoken_lines, target_language, visual_prompts,
+                ),
+                transform=lambda value: self._normalize_translation(
+                    value, spoken_lines,
+                ),
+            )
         for item in prepared:
             item["dialogue"] = self._node(
                 log,
@@ -1648,6 +1910,15 @@ class Pipeline:
         # This is the public-input barrier.  No paid segment branch starts
         # before every visual prompt, translation, localization, the single
         # project index and project-wide replacement/voice plan have completed.
+        self._progress(project_id, 56, "dialogue-tts", segments=public_segments)
+        self._run_dialogue_audio(
+            project_id,
+            project,
+            prepared,
+            enhanced_element_index,
+            voice_reference_paths,
+            log,
+        )
         self._progress(
             project_id, 57, "h3-max-r2v", segments=public_segments,
         )
@@ -1691,6 +1962,7 @@ class Pipeline:
             ),
             lambda _value: [final],
         )
+        self._replace_dialogue_audio_track(project, prepared, final, log)
         self.store.update(
             project_id,
             status="succeeded",
@@ -1713,6 +1985,29 @@ class Pipeline:
             error=None,
         )
         log.event("pipeline_succeeded", output=final)
+
+    def _replace_dialogue_audio_track(
+        self,
+        project: Path,
+        prepared: list[dict[str, Any]],
+        final: Path,
+        log: ResearchLog,
+    ) -> None:
+        """Overwrite the stitched video with the assembled TTS speech track."""
+        if not any(item.get("dialogue") for item in prepared):
+            return
+        full_track = project / "work" / "dialogue-audio" / "full-track.wav"
+        if not full_track.is_file():
+            raise ValueError("assembled dialogue track is missing")
+        self._node(
+            log,
+            "replace-audio-track",
+            "project",
+            {"video": final, "audio": full_track, "output": final},
+            [final, full_track],
+            lambda: media.replace_audio_track(final, full_track, final),
+            lambda _value: [final],
+        )
 
     @staticmethod
     def _validated_stored_segments(
@@ -2547,9 +2842,19 @@ class Pipeline:
             cls._validate_artifact_receipt(
                 project, entry["source_video"], f"{base}/source.mp4",
             )
-            cls._validate_artifact_receipt(
-                project, entry["muted_video"], f"{base}/source-muted.mp4",
+            muted_receipt = entry["muted_video"]
+            muted_path = (
+                muted_receipt.get("path")
+                if isinstance(muted_receipt, dict)
+                else None
             )
+            if (
+                not isinstance(muted_path, str)
+                or muted_path
+                not in {f"{base}/{name}" for name in MUTED_ARTIFACT_NAMES}
+            ):
+                raise ValueError("stored H3 artifact receipt fields are invalid")
+            cls._validate_artifact_receipt(project, muted_receipt, muted_path)
             cls._validate_artifact_receipt(
                 project, entry["prompt"], f"{base}/h3_prompt.txt",
             )
@@ -3079,7 +3384,7 @@ class Pipeline:
             index = item["index"]
             segment_dir = project / "work" / "segments" / f"{index:04d}"
             source = segment_dir / "source.mp4"
-            muted = segment_dir / "source-muted.mp4"
+            muted = project / manifest[str(index)]["muted_video"]["path"]
             prompt_path = segment_dir / "h3_prompt.txt"
             for required in (source, muted, prompt_path):
                 if not required.is_file():
@@ -3245,6 +3550,7 @@ class Pipeline:
                 ),
                 lambda _value: [final],
             )
+            self._replace_dialogue_audio_track(project, prepared, final, log)
             self.store.update(
                 project_id,
                 status="succeeded",
@@ -3683,6 +3989,107 @@ class Pipeline:
         return translated
 
     @staticmethod
+    def _dialogue_generation_payload(
+        brief: str,
+        target_language: str,
+        prepared: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        segments = [
+            {
+                "index": int(item["index"]),
+                "start_s": float(item["start_s"]),
+                "end_s": float(item["end_s"]),
+                "visual_prompt": str(item["visual_prompt"]),
+            }
+            for item in prepared
+        ]
+        duration_s = segments[-1]["end_s"] if segments else 0.0
+        return {
+            "brief": brief,
+            "target_language": target_language,
+            "duration_s": duration_s,
+            "segments": segments,
+        }
+
+    def _dialogue_generation_request(
+        self,
+        brief: str,
+        target_language: str,
+        prepared: list[dict[str, Any]],
+    ) -> ProviderResult[Any]:
+        skill = DIALOGUE_WRITER_SKILL.read_text(encoding="utf-8")
+        if target_language == SAME_AS_SOURCE_LANGUAGE:
+            language_instruction = (
+                "台词语言使用源视频画面的原始语言；"
+                "target_language 的占位值只表示语言不变，没有源台词可抄。"
+            )
+        else:
+            language_instruction = f"台词语言为{target_language}。"
+        instruction = (
+            skill
+            + "\n\n本次执行口播台词生成；"
+            + language_instruction
+            + "最终输出严格遵循本次注入的 JSON Schema。"
+        )
+        return self.deepseek.complete_structured(
+            instruction,
+            self._dialogue_generation_payload(brief, target_language, prepared),
+            DIALOGUE_GENERATION_SCHEMA,
+        )
+
+    @staticmethod
+    def _normalize_generated_dialogue(
+        value: Any, prepared: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        # Same contract as translated_lines: [{start_s, end_s, text}] in
+        # absolute source time. Unusable entries are dropped instead of
+        # blocking the project; multiple lines inside one segment split that
+        # segment's window by text length.
+        parsed = value.get("lines") if isinstance(value, dict) else None
+        candidates = parsed if isinstance(parsed, list) else []
+        by_segment: dict[int, list[str]] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            segment_index = candidate.get("segment_index")
+            text = candidate.get("text")
+            if (
+                type(segment_index) is not int
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                continue
+            by_segment.setdefault(segment_index, []).append(text.strip())
+        generated: list[dict[str, Any]] = []
+        for item in prepared:
+            texts = by_segment.get(int(item["index"]))
+            if not texts:
+                continue
+            start = float(item["start_s"])
+            end = float(item["end_s"])
+            total_chars = sum(len(text) for text in texts)
+            for position, text in enumerate(texts):
+                line_start = (
+                    start
+                    if position == 0
+                    else generated[-1]["end_s"]
+                )
+                line_end = (
+                    end
+                    if position == len(texts) - 1
+                    else start
+                    + (end - start)
+                    * sum(len(text) for text in texts[: position + 1])
+                    / total_chars
+                )
+                generated.append({
+                    "start_s": line_start,
+                    "end_s": line_end,
+                    "text": text,
+                })
+        return generated
+
+    @staticmethod
     def _project_index_request(
         project: Path,
         prepared: list[dict[str, Any]],
@@ -3728,6 +4135,20 @@ class Pipeline:
             isinstance(occurrence, dict)
             and occurrence.get("segment_index") == segment_index
             for occurrence in occurrences
+        )
+
+    @classmethod
+    def _segment_has_replaced_person(
+        cls, element_index: dict[str, Any], segment_index: int
+    ) -> bool:
+        people = element_index.get("people")
+        if not isinstance(people, dict):
+            return False
+        return any(
+            isinstance(record, dict)
+            and isinstance(record.get("replacement"), dict)
+            and cls._appears_in_segment(record, segment_index)
+            for record in people.values()
         )
 
     @classmethod
@@ -3924,6 +4345,99 @@ class Pipeline:
         lines.append("END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN")
         return "\n".join(lines)
 
+    @classmethod
+    def _segment_retarget_person(
+        cls,
+        element_index: dict[str, Any],
+        segment_index: int,
+    ) -> str | None:
+        """Return the first replaced person when the segment is face-dominated."""
+        people = element_index.get("people")
+        if not isinstance(people, dict):
+            return None
+        candidate: str | None = None
+        for stable_key in sorted(
+            (key for key in people if isinstance(key, str)),
+            key=lambda value: value.encode("ascii", "backslashreplace"),
+        ):
+            record = people[stable_key]
+            if (
+                isinstance(record, dict)
+                and isinstance(record.get("replacement"), dict)
+                and cls._appears_in_segment(record, segment_index)
+            ):
+                candidate = stable_key
+                break
+        if candidate is None:
+            return None
+        metrics = element_index.get("segment_metrics")
+        share: Any = 0
+        if isinstance(metrics, dict):
+            share = metrics.get(segment_index, metrics.get(str(segment_index), 0))
+        if (
+            isinstance(share, bool)
+            or not isinstance(share, int)
+            or not 0 <= share <= 100
+        ):
+            raise ValueError("segment face share metric is invalid")
+        if share <= FACE_RETARGET_MIN_FACE_SHARE_PERCENT:
+            return None
+        return candidate
+
+    def _retarget_segment_reference(
+        self,
+        project: Path,
+        segment_dir: Path,
+        replacement_sheet: dict[str, Any],
+        index: int,
+        stable_key: str,
+        muted: Path,
+        log: ResearchLog,
+        scope: str,
+    ) -> Path:
+        """Replace the muted reference with a motion-retargeted video."""
+        spec = replacement_sheet.get("spec")
+        if not isinstance(spec, dict):
+            raise ValueError("motion retarget replacement sheet spec is invalid")
+        sheet_path = (
+            project / "work" / "global-reference-sheet" / "reference-sheet.png"
+        )
+        reference = segment_dir / "retarget-reference.png"
+        extract_tile_reference(sheet_path, spec, stable_key, reference)
+        retargeted = segment_dir / "source-retargeted.mp4"
+
+        def operation() -> ProviderResult[Path]:
+            submitted = self.autodl.submit_motion_retarget(
+                image_path=reference,
+                video_path=muted,
+            )
+            record: dict[str, Any] = {"submit": submitted.record}
+            polled = self.autodl.poll(submitted.value)
+            record["poll"] = polled.record
+            downloaded = self.autodl.download(polled.value, retargeted)
+            record["download"] = downloaded.record
+            return ProviderResult(
+                retargeted,
+                record,
+                list(downloaded.evidence_media),
+            )
+
+        return self._node(
+            log,
+            "motion-retarget",
+            scope,
+            {
+                "workflow": AutodlClient.WORKFLOW,
+                "stable_key": stable_key,
+                "reference_image": reference,
+                "source_video": muted,
+                "output": retargeted,
+            },
+            [reference, muted],
+            operation,
+            lambda value: [value],
+        )
+
     def _prepare_h3_segment(
         self,
         project: Path,
@@ -3994,17 +4508,10 @@ class Pipeline:
             processing = self._validated_effective_request(request)["processing"]
             face_block = ""
             sheet_reference = replacement_sheet.get("h3_image_reference")
-            people = element_index.get("people")
             if (
                 isinstance(sheet_reference, str)
                 and sheet_reference.strip()
-                and isinstance(people, dict)
-                and any(
-                    isinstance(record, dict)
-                    and isinstance(record.get("replacement"), dict)
-                    and self._appears_in_segment(record, index)
-                    for record in people.values()
-                )
+                and self._segment_has_replaced_person(element_index, index)
             ):
                 face_block = (
                     "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
@@ -4059,6 +4566,33 @@ class Pipeline:
                 lambda: media.mute(item["source"], muted),
                 lambda _value: [muted],
             )
+            retarget_person = self._segment_retarget_person(element_index, index)
+            if retarget_person is not None:
+                muted = self._retarget_segment_reference(
+                    project,
+                    segment_dir,
+                    replacement_sheet,
+                    index,
+                    retarget_person,
+                    muted,
+                    log,
+                    scope,
+                )
+            elif self._segment_has_replaced_person(element_index, index):
+                # Retarget output already carries the new identity; masking it
+                # would break its expression/pose extraction. Otherwise mask
+                # every source face so H3 must take the face from the tile.
+                masked = segment_dir / "source-faces-masked.mp4"
+                self._node(
+                    log,
+                    "mask-reference-faces",
+                    scope,
+                    {"source": muted, "output": masked},
+                    [muted],
+                    lambda: face_mask.mask_faces(muted, masked),
+                    lambda _value: [masked],
+                )
+                muted = masked
             return item, final_prompt, muted, fusion_input_sha256
         except Exception:
             item["status"] = "failed"
@@ -4129,7 +4663,7 @@ class Pipeline:
         muted_receipt = self._project_artifact_receipt(
             project,
             muted,
-            f"work/segments/{index:04d}/source-muted.mp4",
+            f"work/segments/{index:04d}/{self._muted_artifact_name(muted)}",
         )
         self._validate_reference_video(muted)
         if not isinstance(final_prompt, str):

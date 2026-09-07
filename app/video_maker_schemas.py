@@ -78,11 +78,20 @@ def _project_index_schema(
         "preserve": _TEXTS,
         "replace_together": _BOOL,
     })
+    segment_metric = _object({
+        "segment_index": dict(segment_index_schema),
+        "max_face_share_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+        },
+    })
     return _object({
         "people": _array(element),
         "entities": _array(element),
         "scenes": _array(element),
         "relations": _array(relation),
+        "segment_metrics": _array(segment_metric),
     })
 
 
@@ -106,7 +115,10 @@ def project_index_schema(segment_indices: Sequence[int]) -> dict[str, Any]:
         or len(indices) != len(set(indices))
     ):
         raise ValueError("project-index segment identities are invalid")
-    return _project_index_schema({"type": "integer", "enum": indices})
+    schema = _project_index_schema({"type": "integer", "enum": indices})
+    schema["properties"]["segment_metrics"]["minItems"] = len(indices)
+    schema["properties"]["segment_metrics"]["maxItems"] = len(indices)
+    return schema
 
 
 def normalize_visual_prompt(value: object) -> str:
@@ -135,12 +147,34 @@ def _index_records(
     return indexed
 
 
-def normalize_project_index(value: object) -> dict[str, dict[str, dict[str, Any]]]:
+def normalize_project_index(value: object) -> dict[str, Any]:
     """Mechanically replace invocation-local aliases with stable backend keys."""
     if not isinstance(value, dict) or set(value) != {
-        "people", "entities", "scenes", "relations",
+        "people", "entities", "scenes", "relations", "segment_metrics",
     }:
         raise ValueError("project index output is invalid")
+    segment_metrics_value = value["segment_metrics"]
+    if not isinstance(segment_metrics_value, list):
+        raise ValueError("project index segment metrics are invalid")
+    segment_metrics: dict[int, int] = {}
+    for item in segment_metrics_value:
+        if not isinstance(item, dict) or set(item) != {
+            "segment_index", "max_face_share_percent",
+        }:
+            raise ValueError("project index segment metric is invalid")
+        segment_index = item["segment_index"]
+        percent = item["max_face_share_percent"]
+        if (
+            isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or segment_index < 1
+            or segment_index in segment_metrics
+            or isinstance(percent, bool)
+            or not isinstance(percent, int)
+            or not 0 <= percent <= 100
+        ):
+            raise ValueError("project index segment metric is invalid")
+        segment_metrics[segment_index] = percent
     element_fields = {
         "source_visual_description", "occurrences", "replaceable", "preserve",
     }
@@ -153,7 +187,7 @@ def normalize_project_index(value: object) -> dict[str, dict[str, dict[str, Any]
         "replace_together",
     })
 
-    result: dict[str, dict[str, dict[str, Any]]] = {}
+    result: dict[str, Any] = {"segment_metrics": segment_metrics}
     alias_candidates: dict[str, list[str]] = {}
     for category, prefix in (
         ("people", "person"),

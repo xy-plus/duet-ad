@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Mapping, TypeVar
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -818,6 +819,20 @@ def _mediakit_result_url(body: Any) -> str:
     return result["image_url"]
 
 
+_MEDIAKIT_TASK_PENDING_STATUSES = frozenset(
+    {"PENDING", "QUEUED", "RUNNING", "PROCESSING", "CREATED"}
+)
+
+
+def _mediakit_task_result(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict) or body.get("success") is not True:
+        raise ValueError("MediaKit task query was not successful")
+    result = body.get("result")
+    if not isinstance(result, dict):
+        raise TypeError("MediaKit task query result must be an object")
+    return result
+
+
 class MediaKitClient:
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
@@ -918,6 +933,132 @@ class MediaKitClient:
             raise
         except Exception as exc:
             raise ProviderFailure(record, evidence_media, exc) from exc
+
+    def _mediakit_headers(self) -> dict[str, str]:
+        token = self.settings.mediakit_api_key
+        if not token:
+            raise ValueError("VOLC_MEDIAKIT_API_KEY must be set to a non-empty value")
+        return _headers(token)
+
+    def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
+        if (
+            not isinstance(video_url, str)
+            or not video_url
+            or video_url != video_url.strip()
+        ):
+            raise ValueError("MediaKit video URL is invalid")
+        mode = self.settings.mediakit_video_erase_mode
+        endpoint = (
+            "erase-video-subtitle-pro"
+            if mode == "pro"
+            else "erase-video-subtitle"
+        )
+        body: dict[str, Any] = {"video_url": video_url, "mode": "Subtitle"}
+        if mode == "pro":
+            # The pro tier pins v5: faster and optimized against subtitle
+            # flicker on AIGC video after erasure.
+            body["model_version"] = "v5"
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                response, record = _send(
+                    client,
+                    "POST",
+                    f"{self.settings.mediakit_api_base}/tools/{endpoint}",
+                    headers=self._mediakit_headers(),
+                    json_body=body,
+                )
+            _ensure_success(response, record)
+            # Submit returns a flat {"success": true, "task_id": ...}; only
+            # the poll response wraps its payload in "result".
+            submit_body = _json_body(response)
+            if not isinstance(submit_body, dict) or submit_body.get("success") is not True:
+                raise ValueError("MediaKit task submit was not successful")
+            task_id = submit_body.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("MediaKit task submit response has no task_id")
+            record["outcome"] = "accepted"
+            record["task_id"] = task_id
+            return ProviderResult(task_id, record)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+    def poll_task(self, task_id: str) -> ProviderResult[str]:
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or task_id != task_id.strip()
+        ):
+            raise ValueError("MediaKit task id is invalid")
+        record: dict[str, Any] = {"task_id": task_id, "polls": []}
+        poll_url = f"{self.settings.mediakit_api_base}/tasks/{task_id}"
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                while True:
+                    try:
+                        response, exchange = _send(
+                            client,
+                            "GET",
+                            poll_url,
+                            headers=self._mediakit_headers(),
+                        )
+                    except ProviderFailure as exc:
+                        record["polls"].append(exc.record)
+                        raise ProviderFailure(record, [], exc.cause) from exc.cause
+                    record["polls"].append(exchange)
+                    _ensure_success(response, record)
+                    # Task query is flat: {"success": true, "status": ...} with
+                    # "result": {"video_url": ...} only present once completed.
+                    task_body = _json_body(response)
+                    if (
+                        not isinstance(task_body, dict)
+                        or task_body.get("success") is not True
+                    ):
+                        raise ValueError("MediaKit task query was not successful")
+                    status = str(task_body.get("status") or "").upper()
+                    if status == "COMPLETED":
+                        result = _mediakit_task_result(task_body)
+                        video_url = result.get("video_url")
+                        if not isinstance(video_url, str) or not video_url:
+                            raise ValueError(
+                                "MediaKit completed task has no video_url"
+                            )
+                        return ProviderResult(video_url, record)
+                    if status not in _MEDIAKIT_TASK_PENDING_STATUSES:
+                        raise RuntimeError(
+                            "MediaKit task failed: "
+                            + json.dumps(task_body, ensure_ascii=False)
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"MediaKit task {task_id} timed out")
+                    time.sleep(self.settings.provider_poll_interval_s)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        record: dict[str, Any] | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+                follow_redirects=True,
+            ) as client:
+                response, record = _send(client, "GET", url)
+            if response.history:
+                record["redirects"] = [response_record(item) for item in response.history]
+            _ensure_success(response, record)
+            destination.write_bytes(response.content)
+            return ProviderResult(destination, record, [destination])
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
 
 
 class PicsartClient:
@@ -1070,6 +1211,260 @@ class PicsartClient:
                         raise RuntimeError("Picsart task failed: " + json.dumps(envelope, ensure_ascii=False))
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"Picsart task {task_id} timed out")
+                    time.sleep(self.settings.provider_poll_interval_s)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        record: dict[str, Any] | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+                follow_redirects=True,
+            ) as client:
+                response, record = _send(client, "GET", url)
+            if response.history:
+                record["redirects"] = [response_record(item) for item in response.history]
+            _ensure_success(response, record)
+            destination.write_bytes(response.content)
+            return ProviderResult(destination, record, [destination])
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+
+_AUTODL_SUBMIT_MAX_BYTES = 45 * 1024 * 1024
+_AUTODL_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+_AUTODL_VIDEO_SUFFIXES = frozenset({".mp4"})
+_AUTODL_VOICE_SUFFIXES = frozenset({".wav"})
+_AUTODL_TTS_MAX_TEXT_CHARS = 2048
+_AUTODL_PENDING_STATUSES = frozenset({"QUEUED", "RUNNING", "PROCESSING", "PENDING"})
+_AUTODL_SUCCESS_STATUSES = frozenset({"SUCCESS", "COMPLETED"})
+
+
+def _autodl_task_data(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise TypeError("AutoDL response must be an object")
+    data = body.get("data")
+    if not isinstance(data, dict):
+        raise TypeError("AutoDL response data must be an object")
+    return data
+
+
+def _autodl_result_url(results: Any) -> str:
+    urls: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            if value.startswith(("https://", "http://")):
+                urls.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(results)
+    if not urls:
+        raise ValueError("AutoDL task result has no artifact URL")
+    for url in urls:
+        if urlsplit(url).path.lower().endswith(".mp4"):
+            return url
+    return urls[0]
+
+
+class AutodlClient:
+    """Submit AutoDL ComfyUI workflow tasks (motion retargeting, TTS)."""
+
+    WORKFLOW = "wan2.2animate-v4-motion_retargeting"
+    WORKFLOW_TTS = "indextts2-v1"
+
+    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
+        self.settings = settings
+        self.transport = transport
+
+    def _headers(self) -> dict[str, str]:
+        token = self.settings.autodl_api_key
+        if not token:
+            raise ValueError("AUTODL_ART_TOKEN must be set to a non-empty value")
+        # The AutoDL gateway takes the bare token, without a Bearer prefix.
+        return {"Authorization": token, "Content-Type": "application/json"}
+
+    @staticmethod
+    def _media_file(path: Path, suffixes: frozenset[str], kind: str) -> bytes:
+        if (
+            not isinstance(path, Path)
+            or path.suffix.lower() not in suffixes
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            raise ValueError(f"AutoDL {kind} input file is invalid")
+        content = path.read_bytes()
+        if not content:
+            raise ValueError(f"AutoDL {kind} input file is empty")
+        return content
+
+    def submit_motion_retarget(
+        self,
+        *,
+        image_path: Path,
+        video_path: Path,
+    ) -> ProviderResult[str]:
+        image_bytes = self._media_file(image_path, _AUTODL_IMAGE_SUFFIXES, "image")
+        video_bytes = self._media_file(video_path, _AUTODL_VIDEO_SUFFIXES, "video")
+        image_mime = _media_type(image_path, image_bytes)
+        body = {
+            "ref_image": (
+                f"data:{image_mime};base64,"
+                f"{base64.b64encode(image_bytes).decode('ascii')}"
+            ),
+            "ref_video": (
+                f"data:video/mp4;base64,"
+                f"{base64.b64encode(video_bytes).decode('ascii')}"
+            ),
+        }
+        if (
+            len(body["ref_image"]) + len(body["ref_video"])
+            > _AUTODL_SUBMIT_MAX_BYTES
+        ):
+            raise ValueError("AutoDL submit body exceeds its size budget")
+        url = (
+            f"{self.settings.autodl_api_base}"
+            f"/api/v1/comfyui/comfyui_workflow/{self.WORKFLOW}"
+        )
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                response, record = _send(
+                    client,
+                    "POST",
+                    url,
+                    headers=self._headers(),
+                    json_body=body,
+                )
+            _ensure_success(response, record)
+            payload = _json_body(response)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("code") != "Success"
+            ):
+                raise ValueError("AutoDL submit was not accepted")
+            task_id = _autodl_task_data(payload).get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("AutoDL submit response has no task id")
+            record["outcome"] = "accepted"
+            record["task_id"] = task_id
+            return ProviderResult(task_id, record)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+    def submit_tts(
+        self,
+        *,
+        text: str,
+        voice_path: Path,
+    ) -> ProviderResult[str]:
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or len(text) > _AUTODL_TTS_MAX_TEXT_CHARS
+        ):
+            raise ValueError("AutoDL TTS text is invalid")
+        voice_bytes = self._media_file(voice_path, _AUTODL_VOICE_SUFFIXES, "voice")
+        body = {
+            "prompt_text": text,
+            "prompt_simple": (
+                "data:audio/wav;base64,"
+                f"{base64.b64encode(voice_bytes).decode('ascii')}"
+            ),
+            "emo_control_method": "与音色参考音频相同",
+        }
+        if (
+            len(body["prompt_text"]) + len(body["prompt_simple"])
+            > _AUTODL_SUBMIT_MAX_BYTES
+        ):
+            raise ValueError("AutoDL submit body exceeds its size budget")
+        url = (
+            f"{self.settings.autodl_api_base}"
+            f"/api/v1/comfyui/comfyui_workflow/{self.WORKFLOW_TTS}"
+        )
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                response, record = _send(
+                    client,
+                    "POST",
+                    url,
+                    headers=self._headers(),
+                    json_body=body,
+                )
+            _ensure_success(response, record)
+            payload = _json_body(response)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("code") != "Success"
+            ):
+                raise ValueError("AutoDL submit was not accepted")
+            task_id = _autodl_task_data(payload).get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("AutoDL submit response has no task id")
+            record["outcome"] = "accepted"
+            record["task_id"] = task_id
+            return ProviderResult(task_id, record)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+    def poll(self, task_id: str) -> ProviderResult[str]:
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or task_id != task_id.strip()
+        ):
+            raise ValueError("AutoDL task id is invalid")
+        record: dict[str, Any] = {"task_id": task_id, "polls": []}
+        poll_url = (
+            f"{self.settings.autodl_api_base}"
+            f"/api/v1/comfyui/comfyui_workflow/result/{task_id}"
+        )
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                while True:
+                    try:
+                        response, exchange = _send(
+                            client,
+                            "GET",
+                            poll_url,
+                            headers=self._headers(),
+                        )
+                    except ProviderFailure as exc:
+                        record["polls"].append(exc.record)
+                        raise ProviderFailure(record, [], exc.cause) from exc.cause
+                    record["polls"].append(exchange)
+                    _ensure_success(response, record)
+                    data = _autodl_task_data(_json_body(response))
+                    status = str(data.get("status") or "").upper()
+                    if status in _AUTODL_SUCCESS_STATUSES:
+                        return ProviderResult(
+                            _autodl_result_url(data.get("results")), record,
+                        )
+                    if status not in _AUTODL_PENDING_STATUSES:
+                        raise RuntimeError(
+                            "AutoDL task failed: "
+                            + json.dumps(data, ensure_ascii=False)
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"AutoDL task {task_id} timed out")
                     time.sleep(self.settings.provider_poll_interval_s)
         except ProviderFailure:
             raise

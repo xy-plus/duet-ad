@@ -998,6 +998,14 @@ input, textarea { font-family: inherit; }
 
 .translation-fields[hidden] { display: none; }
 
+.dialogue-brief-fields { margin: 0 0 10px; }
+
+.dialogue-brief-fields[hidden] { display: none; }
+
+.dialogue-brief-fields .setup-textarea { min-height: 78px; }
+
+.setup-section .language-fieldset + .language-fieldset { margin-top: 14px; }
+
 .language-fieldset {
   min-width: 0;
   margin: 0;

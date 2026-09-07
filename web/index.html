@@ -141,9 +141,27 @@
               <span class="setup-step">3</span>
               <div>
                 <h2 id="dialogue-title">改编台词</h2>
-                <p>系统自动识别并改编台词，你只需选择最终视频语种</p>
+                <p>自动改写原视频台词，或描述一段口播由 AI 直接生成</p>
               </div>
             </div>
+            <fieldset class="language-fieldset">
+              <legend>台词来源</legend>
+              <div class="language-switch">
+                <label class="language-option">
+                  <input type="radio" name="dialogue-write-mode" value="auto_rewrite" checked>
+                  <span>自动改写原台词</span>
+                </label>
+                <label class="language-option">
+                  <input type="radio" name="dialogue-write-mode" value="generate">
+                  <span>按描述生成口播</span>
+                </label>
+              </div>
+              <div id="dialogue-brief-fields" class="dialogue-brief-fields" hidden>
+                <label class="sr-only" for="dialogue-brief">口播描述</label>
+                <textarea id="dialogue-brief" class="setup-textarea" rows="3" maxlength="1000" disabled
+                          placeholder="例如：用轻松亲切的口吻介绍这款产品，突出续航和防水"></textarea>
+              </div>
+            </fieldset>
             <fieldset class="language-fieldset">
               <legend>最终视频语种</legend>
               <div class="language-switch">

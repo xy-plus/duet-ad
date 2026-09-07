@@ -21,6 +21,7 @@ const MINIMAL_PROCESSING_DEFAULTS = Object.freeze({
 const REPLACEMENT_IMAGE_TYPES = Object.freeze([
   "image/jpeg", "image/png", "image/webp",
 ]);
+const DIALOGUE_MODES = Object.freeze(["auto_rewrite", "generate"]);
 
 const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
 
@@ -133,9 +134,17 @@ function normalizeMinimalCreationCapability(payload) {
       || defaults.optimize_image !== true
       || defaults.remove_subtitle !== true
       || defaults.remove_logo !== true
-      || !hasExactKeys(dialogue, ["mode", "translation"])
+      || !hasExactKeys(dialogue, ["mode", "modes", "translation", "max_brief_chars", "optional", "default"])
+      || !Array.isArray(dialogue.modes)
+      || dialogue.modes.join("|") !== DIALOGUE_MODES.join("|")
       || dialogue.mode !== "auto_rewrite"
       || dialogue.translation !== true
+      || !Number.isInteger(dialogue.max_brief_chars)
+      || dialogue.max_brief_chars < 1
+      || dialogue.optional !== true
+      || !hasExactKeys(dialogue.default, ["mode", "target_language"])
+      || dialogue.default.mode !== "auto_rewrite"
+      || dialogue.default.target_language !== SAME_AS_SOURCE_LANGUAGE
       || !replacement || replacement.supported !== true
       || !Array.isArray(replacement.accept)
       || replacement.accept.join("|") !== REPLACEMENT_IMAGE_TYPES.join("|")
@@ -150,7 +159,14 @@ function normalizeMinimalCreationCapability(payload) {
     resolutions: capability.resolutions.slice(),
     dialogue: {
       mode: dialogue.mode,
+      modes: dialogue.modes.slice(),
       translation: dialogue.translation,
+      max_brief_chars: dialogue.max_brief_chars,
+      optional: dialogue.optional,
+      default: {
+        mode: dialogue.default.mode,
+        target_language: dialogue.default.target_language,
+      },
     },
     replacement: {
       accept: replacement.accept.slice(),
@@ -166,12 +182,18 @@ function buildMinimalGenerationRequest(input, capability) {
   const aspectRatio = String(input && input.aspectRatio || "");
   const resolution = String(input && input.resolution || "");
   const targetLanguage = String(input && input.targetLanguage || "").trim();
+  const dialogueMode = input && input.dialogueMode === "generate" ? "generate" : "auto_rewrite";
+  const dialogueBrief = String(input && input.dialogueBrief || "").trim();
   const hasReplacementImage = !!(input && input.hasReplacementImage);
   const replacementInstruction = String(input && input.replacementInstruction || "").trim();
   if (!normalized.aspect_ratios.includes(aspectRatio)) throw new Error("请选择画幅");
   if (!normalized.resolutions.includes(resolution)) throw new Error("请选择清晰度");
   if (!targetLanguage) throw new Error("请填写目标语言");
   if (targetLanguage.length > TARGET_LANGUAGE_MAX_CHARS) throw new Error("目标语言超过长度限制");
+  if (dialogueMode === "generate" && !dialogueBrief) throw new Error("请填写口播描述");
+  if (dialogueBrief.length > normalized.dialogue.max_brief_chars) {
+    throw new Error("口播描述超过长度限制");
+  }
   if (hasReplacementImage !== !!replacementInstruction) {
     throw new Error("参考图与替换说明需要一起提供");
   }
@@ -186,10 +208,16 @@ function buildMinimalGenerationRequest(input, capability) {
       fit_mode: "auto",
     },
     processing: Object.assign({}, MINIMAL_PROCESSING_DEFAULTS),
-    dialogue: {
-      mode: "auto_rewrite",
-      target_language: targetLanguage,
-    },
+    dialogue: dialogueMode === "generate"
+      ? {
+        mode: "generate",
+        target_language: targetLanguage,
+        brief: dialogueBrief,
+      }
+      : {
+        mode: "auto_rewrite",
+        target_language: targetLanguage,
+      },
     replacement_guidance: hasReplacementImage ? {
       instruction: replacementInstruction,
       image_field: normalized.replacement_image_field,
@@ -348,6 +376,9 @@ function projectComposerModel(detail, localDraft = null) {
   return {
     aspectRatio: output.aspect_ratio,
     resolution: output.resolution,
+    dialogueMode: dialogue.mode === "generate" ? "generate" : "auto_rewrite",
+    dialogueBrief: dialogue.mode === "generate" && typeof dialogue.brief === "string"
+      ? dialogue.brief : "",
     languageMode: dialogue.target_language.trim() === SAME_AS_SOURCE_LANGUAGE
       ? "same" : "other",
     targetLanguage: dialogue.target_language.trim() === SAME_AS_SOURCE_LANGUAGE
@@ -1325,6 +1356,18 @@ function sourceMode() {
   return checked ? checked.value : "link";
 }
 
+function dialogueWriteMode() {
+  const checked = document.querySelector('input[name="dialogue-write-mode"]:checked');
+  return checked ? checked.value : "auto_rewrite";
+}
+
+function syncDialogueModeControls() {
+  const isGenerate = dialogueWriteMode() === "generate";
+  $("dialogue-brief-fields").hidden = !isGenerate;
+  $("dialogue-brief").required = isGenerate;
+  $("dialogue-brief").disabled = state.uploading || state.viewingSubmittedConfig || !isGenerate;
+}
+
 function targetLanguageMode() {
   const checked = document.querySelector('input[name="target-language-mode"]:checked');
   return checked ? checked.value : "same";
@@ -1384,6 +1427,7 @@ async function loadMinimalCreationCapability() {
     const normalized = normalizeMinimalCreationCapability(payload);
     state.minimalCreationCapability = normalized ? payload.minimal_creation : null;
     if (normalized) {
+      $("dialogue-brief").maxLength = normalized.dialogue.max_brief_chars;
       $("replacement-instruction").maxLength = normalized.replacement.max_instruction_chars;
       $("replacement-image-input").accept = normalized.replacement.accept.join(",");
     }
@@ -1434,6 +1478,7 @@ function updateSendBtn() {
   const ready = sourceMode() === "upload" ? !!state.file : !!$("url-input").value.trim();
   const targetLanguage = selectedTargetLanguage();
   const langReady = !!targetLanguage && targetLanguage.length <= TARGET_LANGUAGE_MAX_CHARS;
+  const briefReady = dialogueWriteMode() !== "generate" || !!$("dialogue-brief").value.trim();
   const hasInstruction = !!$("replacement-instruction").value.trim();
   const replacementReady = !!state.replacementImage === hasInstruction;
   const replacementSizeReady = !state.replacementImage || !state.minimalCreationCapability
@@ -1443,7 +1488,7 @@ function updateSendBtn() {
     && !!state.minimalCreationCapability;
   $("send-btn").disabled = state.uploading || state.viewingSubmittedConfig
     || !state.minimalCreationCapability
-    || !ready || !langReady || !replacementReady
+    || !ready || !langReady || !briefReady || !replacementReady
     || !replacementSizeReady || !configReady;
 }
 
@@ -1568,11 +1613,13 @@ function prepareComposerForProjectLoad() {
   showUnavailableSource("正在加载项目配置…");
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
+  $("dialogue-brief").value = "";
   document.querySelectorAll(
-    'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"]'
+    'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"], input[name="dialogue-write-mode"]'
   ).forEach((control) => { control.checked = false; });
   $("lang-input").value = "";
   setComposerError(null);
+  syncDialogueModeControls();
   syncTargetLanguageControls();
   updateReplacementHint();
   setUploading(false);
@@ -1642,15 +1689,17 @@ function applyProjectComposer(detail) {
   $("url-input").placeholder = SOURCE_URL_PLACEHOLDER;
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
+  $("dialogue-brief").value = "";
 
   if (!model) {
     if (preservedPreview) URL.revokeObjectURL(preservedPreview);
     showUnavailableSource("历史项目未保存来源信息");
     document.querySelectorAll(
-      'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"]'
+      'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"], input[name="dialogue-write-mode"]'
     ).forEach((control) => { control.checked = false; });
     $("lang-input").value = "";
     setComposerError("该历史项目未保存创建配置，无法恢复原选项");
+    syncDialogueModeControls();
     syncTargetLanguageControls();
     updateReplacementHint();
     setUploading(false);
@@ -1660,10 +1709,13 @@ function applyProjectComposer(detail) {
   const aspect = document.querySelector(`input[name="aspect-ratio"][value="${model.aspectRatio}"]`);
   const resolution = document.querySelector(`input[name="resolution"][value="${model.resolution}"]`);
   const language = document.querySelector(`input[name="target-language-mode"][value="${model.languageMode}"]`);
+  const writeMode = document.querySelector(`input[name="dialogue-write-mode"][value="${model.dialogueMode}"]`);
   if (aspect) aspect.checked = true;
   if (resolution) resolution.checked = true;
   if (language) language.checked = true;
+  if (writeMode) writeMode.checked = true;
   $("lang-input").value = model.targetLanguage;
+  $("dialogue-brief").value = model.dialogueBrief;
   $("replacement-instruction").value = model.replacementInstruction;
   setComposerError(null);
 
@@ -1701,6 +1753,7 @@ function applyProjectComposer(detail) {
   }
 
   state.clientRequestId = newRequestId();
+  syncDialogueModeControls();
   syncTargetLanguageControls();
   updateReplacementHint();
   setUploading(false);
@@ -1716,13 +1769,16 @@ function resetComposerForNewProject() {
   $("url-input").placeholder = SOURCE_URL_PLACEHOLDER;
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
+  $("dialogue-brief").value = "";
   document.querySelector('input[name="source-mode"][value="link"]').checked = true;
   document.querySelector('input[name="aspect-ratio"][value="9:16"]').checked = true;
   document.querySelector('input[name="resolution"][value="768p"]').checked = true;
   document.querySelector('input[name="target-language-mode"][value="same"]').checked = true;
+  document.querySelector('input[name="dialogue-write-mode"][value="auto_rewrite"]').checked = true;
   $("lang-input").value = "";
   state.clientRequestId = newRequestId();
   syncSourceModeView("link");
+  syncDialogueModeControls();
   syncTargetLanguageControls();
   setComposerError(null);
   updateReplacementHint();
@@ -1747,9 +1803,13 @@ function setUploading(on) {
   document.querySelectorAll('input[name="target-language-mode"]').forEach((r) => {
     r.disabled = controlsDisabled;
   });
+  document.querySelectorAll('input[name="dialogue-write-mode"]').forEach((r) => {
+    r.disabled = controlsDisabled;
+  });
   document.querySelectorAll('input[name="aspect-ratio"], input[name="resolution"]').forEach((r) => {
     r.disabled = controlsDisabled;
   });
+  syncDialogueModeControls();
   syncTargetLanguageControls();
   updateSendBtn();
   if (!on) $("upload-progress").hidden = true;
@@ -1814,6 +1874,8 @@ async function handleSend(event) {
     generationRequest = buildMinimalGenerationRequest({
       aspectRatio: selectedAspectRatio(),
       resolution: selectedResolution(),
+      dialogueMode: dialogueWriteMode(),
+      dialogueBrief: $("dialogue-brief").value,
       targetLanguage: selectedTargetLanguage(),
       hasReplacementImage: !!state.replacementImage,
       replacementInstruction: $("replacement-instruction").value,
@@ -1959,6 +2021,20 @@ function bindEvents() {
       if (control.value === "other" && control.checked) $("lang-input").focus();
     });
   });
+  document.querySelectorAll('input[name="dialogue-write-mode"]').forEach((control) => {
+    control.addEventListener("change", () => {
+      state.clientRequestId = newRequestId();
+      setComposerError(null);
+      syncDialogueModeControls();
+      updateSendBtn();
+      if (control.value === "generate" && control.checked) $("dialogue-brief").focus();
+    });
+  });
+  $("dialogue-brief").addEventListener("input", () => {
+    state.clientRequestId = newRequestId();
+    setComposerError(null);
+    updateSendBtn();
+  });
   $("lang-input").addEventListener("input", () => {
     state.clientRequestId = newRequestId(); // 内容变 = 新意图 = 新键
     setComposerError(null);
@@ -2010,6 +2086,7 @@ function boot() {
   state.clientRequestId = newRequestId();
   bindEvents();
   setSourceMode(sourceMode());
+  syncDialogueModeControls();
   syncTargetLanguageControls();
   updateReplacementHint();
   const saved = localStorage.getItem(TOKEN_KEY);

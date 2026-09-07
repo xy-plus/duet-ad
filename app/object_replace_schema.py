@@ -11,7 +11,7 @@ from app.fusion_schema import canonical_input
 
 
 OBJECT_REPLACE_OUTPUT_NAME = "duet.object-replace-output"
-OBJECT_REPLACE_OUTPUT_VERSION = 3
+OBJECT_REPLACE_OUTPUT_VERSION = 4
 MAX_REFERENCE_AUDIO = 3
 
 _ELEMENT_CATEGORIES = ("people", "entities", "scenes")
@@ -172,6 +172,9 @@ def object_replace_schema(
     }
     if payload.get("replacement_set") != expected_replacement_set:
         raise ValueError("object-replace replacement set is invalid")
+    translated_dialogue = payload.get("translated_dialogue")
+    if not isinstance(translated_dialogue, list):
+        raise ValueError("object-replace translated dialogue is invalid")
     catalog_ids = _catalog_ids(voice_ids)
     input_sha256 = hashlib.sha256(canonical_input(payload)).hexdigest()
     user_instruction = payload.get("user_replacement_instruction")
@@ -197,6 +200,15 @@ def object_replace_schema(
         "version": {"type": "integer", "enum": [OBJECT_REPLACE_OUTPUT_VERSION]},
         "input_sha256": {"type": "string", "enum": [input_sha256]},
         **category_schemas,
+        "dialogue_voices": {
+            "type": "array",
+            "minItems": len(translated_dialogue),
+            "maxItems": len(translated_dialogue),
+            "items": {
+                "type": ["string", "null"],
+                "enum": [*sorted(element_ids["people"]), None],
+            },
+        },
     }
     return _closed_object(properties), input_sha256
 
@@ -225,6 +237,28 @@ def _normalize_replacement(
     }
 
 
+def _normalize_dialogue_voices(
+    value: object,
+    *,
+    dialogue_line_count: int,
+    people_ids: tuple[str, ...],
+) -> list[str | None]:
+    if (
+        isinstance(dialogue_line_count, bool)
+        or not isinstance(dialogue_line_count, int)
+        or dialogue_line_count < 0
+        or not isinstance(value, list)
+        or len(value) != dialogue_line_count
+        or any(
+            voice is not None
+            and (not isinstance(voice, str) or voice not in people_ids)
+            for voice in value
+        )
+    ):
+        raise ValueError("object-replace dialogue voices are invalid")
+    return list(value)
+
+
 def normalize_object_replace(
     value: object,
     *,
@@ -233,6 +267,7 @@ def normalize_object_replace(
     voice_ids: Collection[str],
     has_user_image: bool,
     user_instruction: str,
+    dialogue_line_count: int,
 ) -> dict[str, Any]:
     """Normalize the closed transport shape without judging model quality."""
     element_ids = _element_ids(element_index)
@@ -242,6 +277,7 @@ def normalize_object_replace(
         "version",
         "input_sha256",
         *_ELEMENT_CATEGORIES,
+        "dialogue_voices",
     }
     if not isinstance(value, dict) or set(value) != expected_top_level:
         raise ValueError("object-replace output is invalid")
@@ -306,6 +342,11 @@ def normalize_object_replace(
     expected_image_1_count = 1 if requires_image_1 else 0
     if len(image_1_locations) != expected_image_1_count:
         raise ValueError("object-replace user-image binding count is invalid")
+    normalized["dialogue_voices"] = _normalize_dialogue_voices(
+        value["dialogue_voices"],
+        dialogue_line_count=dialogue_line_count,
+        people_ids=element_ids["people"],
+    )
     return normalized
 
 
@@ -317,7 +358,7 @@ def merge_object_replace_index(
     """Merge a normalized patch without exposing source facts to model edits."""
     element_ids = _element_ids(original)
     patch_keys = set(patch) if isinstance(patch, dict) else set()
-    if patch_keys != set(_ELEMENT_CATEGORIES):
+    if patch_keys != {*_ELEMENT_CATEGORIES, "dialogue_voices"}:
         raise ValueError("object-replace patch root is invalid")
     if not isinstance(voice_metadata_by_id, Mapping):
         raise ValueError("object-replace voice metadata is invalid")
@@ -366,4 +407,12 @@ def merge_object_replace_index(
                 merged[category][stable_id]["voice"] = copy.deepcopy(
                     voice_metadata_by_id[voice_id],
                 )
+    dialogue_voices = patch["dialogue_voices"]
+    if not isinstance(dialogue_voices, list) or any(
+        voice is not None
+        and (not isinstance(voice, str) or voice not in element_ids["people"])
+        for voice in dialogue_voices
+    ):
+        raise ValueError("object-replace patch dialogue voices are invalid")
+    merged["dialogue_voices"] = list(dialogue_voices)
     return merged

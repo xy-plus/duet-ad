@@ -1136,7 +1136,17 @@ def detect_scenes(
         raise ValueError("duration_s must be finite and positive")
     frames = probe_decoded_frames(source)
     bounds = detect_exact_scene_bounds(source, 27.0, frames)
-    return normalize_scene_inventory(bounds, frames)
+    inventory = normalize_scene_inventory(bounds, frames)
+    if duration_s is not None:
+        # Providers may emit frame timestamps extending microseconds past the
+        # container duration (e.g. MediaKit outputs); a scene cannot end after
+        # the media itself, so clamp the trailing edge to the real duration.
+        ceiling = float(duration_s)
+        for scene in inventory:
+            end_s = scene.get("end_s")
+            if isinstance(end_s, (int, float)) and not isinstance(end_s, bool):
+                scene["end_s"] = min(float(end_s), ceiling)
+    return inventory
 
 
 def segment_duration_s(start_s: object, end_s: object) -> float:
@@ -1870,6 +1880,151 @@ def mute(source: Path, destination: Path) -> dict[str, Any]:
             "-map", "0:v:0", "-c:v", "copy", "-an", str(destination),
         ]
     )
+
+
+def _dialogue_line_duration(path: Path) -> float:
+    if (
+        not isinstance(path, Path)
+        or path.is_symlink()
+        or not path.is_file()
+        or path.suffix.lower() != ".wav"
+    ):
+        raise MediaError("dialogue line audio is invalid")
+    return _probe_audio_duration(path)
+
+
+def assemble_dialogue_track(
+    lines: Iterable[Mapping[str, object]],
+    total_duration_s: float,
+    destination: Path,
+) -> dict[str, Any]:
+    """Place each synthesized line on a silent base of the full timeline."""
+    if (
+        isinstance(total_duration_s, bool)
+        or not isinstance(total_duration_s, (int, float))
+        or not math.isfinite(float(total_duration_s))
+        or float(total_duration_s) <= 0
+    ):
+        raise MediaError("dialogue track duration is invalid")
+    total = float(total_duration_s)
+    placements: list[dict[str, Any]] = []
+    for raw in lines:
+        if not isinstance(raw, Mapping):
+            raise MediaError("dialogue track line is invalid")
+        try:
+            start_s = float(raw["start_s"])
+            end_s = float(raw["end_s"])
+        except (KeyError, TypeError, ValueError):
+            raise MediaError("dialogue track line is invalid") from None
+        if not (
+            math.isfinite(start_s)
+            and math.isfinite(end_s)
+            and 0 <= start_s < end_s
+            and end_s <= total + _EPS
+        ):
+            raise MediaError("dialogue track line window is invalid")
+        audio = raw.get("audio")
+        audio_duration = _dialogue_line_duration(audio)
+        placements.append(
+            {
+                "audio": audio,
+                "start_s": start_s,
+                "end_s": end_s,
+                "audio_duration_s": audio_duration,
+            }
+        )
+    if not placements:
+        raise MediaError("dialogue track has no lines")
+
+    filters: list[str] = []
+    labels: list[str] = []
+    for position, placement in enumerate(placements):
+        window = placement["end_s"] - placement["start_s"]
+        chain = f"[{position}:a]aresample=48000"
+        if placement["audio_duration_s"] > window + _EPS:
+            # Speech longer than its window is compressed into it exactly.
+            tempo = placement["audio_duration_s"] / window
+            while tempo > 100.0:
+                chain += ",atempo=100.0"
+                tempo /= 100.0
+            chain += f",atempo={tempo:.6f}"
+            chain += f",atrim=start=0:end={window:.9f}"
+        delay_ms = round(placement["start_s"] * 1000, 3)
+        chain += f",asetpts=PTS-STARTPTS,adelay={delay_ms}:all=1[line{position}]"
+        filters.append(chain)
+        labels.append(f"[line{position}]")
+    filters.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:normalize=0:duration=longest,"
+        f"apad=whole_dur={total:.9f},atrim=start=0:end={total:.9f},"
+        "asetpts=PTS-STARTPTS[out]"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = run_command(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            *(
+                argument
+                for placement in placements
+                for argument in ("-i", str(placement["audio"]))
+            ),
+            "-filter_complex", ";".join(filters),
+            "-map", "[out]",
+            "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
+            str(destination),
+        ],
+        timeout=300,
+    )
+    return {
+        **result,
+        "duration_s": total,
+        "lines": [
+            {
+                key: value
+                for key, value in placement.items()
+                if key != "audio"
+            }
+            for placement in placements
+        ],
+    }
+
+
+def replace_audio_track(
+    video: Path,
+    audio: Path,
+    destination: Path,
+) -> dict[str, Any]:
+    """Overwrite the video's audio with the assembled dialogue track."""
+    duration_s = probe(video)["duration_s"]
+    audio_filter = (
+        "aresample=48000,"
+        f"apad=whole_dur={duration_s:.9f},atrim=start=0:end={duration_s:.9f},"
+        "asetpts=PTS-STARTPTS"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=".replace-audio-",
+        suffix=destination.suffix or ".mp4",
+        dir=destination.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        result = run_command(
+            [
+                "ffmpeg", "-v", "error", "-y",
+                "-i", str(video), "-i", str(audio),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-af", audio_filter,
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                "-movflags", "+faststart", str(temporary),
+            ],
+            timeout=300,
+        )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {**result, "duration_s": duration_s}
 
 
 def _frame_budgets(durations: Sequence[float]) -> list[int]:

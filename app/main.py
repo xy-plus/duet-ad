@@ -24,7 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
-from app.pipeline import Pipeline
+from app.pipeline import SAME_AS_SOURCE_LANGUAGE, Pipeline
 from app.research_log import ResearchLog
 from app.safe_download import ReferenceDownloadError, Resolver, download_reference_url, resolve_addresses
 from app.store import (
@@ -43,6 +43,7 @@ REPLACEMENT_MAX_BYTES = 10 * MIB
 CLIENT_REQUEST_ID_MAX_CHARS = 64
 TARGET_LANGUAGE_MAX_CHARS = 80
 REPLACEMENT_INSTRUCTION_MAX_CHARS = 1000
+DIALOGUE_BRIEF_MAX_CHARS = 1000
 UPLOAD_CHUNK_BYTES = MIB
 CREATION_REQUEST_OVERHEAD_BYTES = 4 * MIB
 PROVIDER_ASSET_TTL_S = 24 * 60 * 60
@@ -77,7 +78,17 @@ CAPABILITY = {
         "aspect_ratios": ["16:9", "9:16"],
         "resolutions": ["480p", "768p"],
         "defaults": {"fit_mode": "auto", "optimize_image": True, "remove_subtitle": True, "remove_logo": True},
-        "dialogue": {"mode": "auto_rewrite", "translation": True},
+        "dialogue": {
+            "modes": ["auto_rewrite", "generate"],
+            "mode": "auto_rewrite",
+            "translation": True,
+            "max_brief_chars": DIALOGUE_BRIEF_MAX_CHARS,
+            "optional": True,
+            "default": {
+                "mode": "auto_rewrite",
+                "target_language": SAME_AS_SOURCE_LANGUAGE,
+            },
+        },
         "replacement": {
             "supported": True,
             "accept": ["image/jpeg", "image/png", "image/webp"],
@@ -231,9 +242,13 @@ def _parse_generation_request(
             "invalid_generation_request",
             "generation_request 必须是唯一 v1 JSON 对象",
         ) from None
-    if not isinstance(value, dict) or set(value) != {
-        "version", "output", "processing", "dialogue", "replacement_guidance",
-    }:
+    if not isinstance(value, dict) or not (
+        {"version", "output", "processing", "replacement_guidance"}
+        <= set(value)
+        <= {
+            "version", "output", "processing", "dialogue", "replacement_guidance",
+        }
+    ):
         raise _error(
             422,
             "invalid_generation_request",
@@ -262,12 +277,21 @@ def _parse_generation_request(
     ):
         raise _error(422, "invalid_generation_request", "generation_request.processing 无效")
 
-    dialogue = value["dialogue"]
-    if (
-        not isinstance(dialogue, dict)
-        or set(dialogue) != {"mode", "target_language"}
-        or dialogue.get("mode") != "auto_rewrite"
-    ):
+    # 兼容老客户端：dialogue 整体可缺省（默认自动改写为原视频语种），
+    # 也可只给 target_language（mode 默认 auto_rewrite）；归一化后始终完整。
+    dialogue = value.get("dialogue")
+    if dialogue is None and "dialogue" not in value:
+        dialogue = {"target_language": SAME_AS_SOURCE_LANGUAGE}
+    if not isinstance(dialogue, dict):
+        raise _error(422, "invalid_generation_request", "generation_request.dialogue 无效")
+    dialogue_mode = dialogue.get("mode", "auto_rewrite")
+    if dialogue_mode == "auto_rewrite":
+        if set(dialogue) not in ({"target_language"}, {"mode", "target_language"}):
+            raise _error(422, "invalid_generation_request", "generation_request.dialogue 无效")
+    elif dialogue_mode == "generate":
+        if set(dialogue) != {"mode", "target_language", "brief"}:
+            raise _error(422, "invalid_generation_request", "generation_request.dialogue 无效")
+    else:
         raise _error(422, "invalid_generation_request", "generation_request.dialogue 无效")
     target_language = dialogue.get("target_language")
     if not isinstance(target_language, str) or not target_language.strip():
@@ -275,6 +299,22 @@ def _parse_generation_request(
     target_language = target_language.strip()
     if _utf16_code_units(target_language) > TARGET_LANGUAGE_MAX_CHARS:
         raise _error(422, "invalid_generation_request", "target_language 过长")
+    brief = None
+    if dialogue_mode == "generate":
+        brief = dialogue.get("brief")
+        if not isinstance(brief, str) or not brief.strip():
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "generation_request.dialogue.brief 不能为空",
+            )
+        brief = brief.strip()
+        if _utf16_code_units(brief) > DIALOGUE_BRIEF_MAX_CHARS:
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "generation_request.dialogue.brief 过长",
+            )
 
     guidance = value["replacement_guidance"]
     normalized_guidance = None
@@ -314,10 +354,18 @@ def _parse_generation_request(
         "version": 1,
         "output": dict(output),
         "processing": dict(processing),
-        "dialogue": {
-            "mode": "auto_rewrite",
-            "target_language": target_language,
-        },
+        "dialogue": (
+            {
+                "mode": "generate",
+                "target_language": target_language,
+                "brief": brief,
+            }
+            if dialogue_mode == "generate"
+            else {
+                "mode": "auto_rewrite",
+                "target_language": target_language,
+            }
+        ),
         "replacement_guidance": normalized_guidance,
         "fusion": {"agent": internal_fusion_agent},
     }

@@ -14,6 +14,7 @@
 
 ```text
 保存原视频和可选替换图
+  -> 项目级 MediaKit 视频字幕擦除（remove_subtitle 开关；pro 固定 v5 / standard 由 MEDIAKIT_VIDEO_ERASE_MODE 选择），产出 work/source-nosubs.mp4，下游一律改用擦除后文件
   -> 原视频 4 fps 解帧
   -> 视频视觉轴音频 / YAMNet / Whisper / spoken 台词
   -> ContentDetector(threshold=27)
@@ -24,16 +25,17 @@
   -> 一次项目级台词翻译并按时间交集回挂
   -> 一次 video-maker 项目级 raw 全局对象索引：九帧为事实源，逐段 visual_prompt 仅作防漏清单
   -> 后端从 raw 索引生成全 stable-key replacement_set 和去除条目级 preserve/replaceable 的规划视图
-  -> 一次项目级 DeepSeek Object Replace v3：规划视图 + replacement_set + 全部视觉提示 + 用户图/说明 + 当前音色目录；输出分离外观/交互语义的 patch 和 voice
+  -> 一次项目级 DeepSeek Object Replace v4：规划视图 + replacement_set + 全部视觉提示 + 用户图/说明 + 当前音色目录；输出分离外观/交互语义的 patch、voice 和逐行 dialogue_voices 台词归属
   -> 后端机械合并 enhanced 索引，按可用 voice_id 生成同序 Audio 1..N（N <= 3）
+  -> 逐行 AutoDL indextts2-v1 台词 TTS（归属人物音色，null 回退 Audio 1），拼整条音轨供终剪覆盖；失败即 fail-closed
   -> 后端从 frozen enhanced index 生成 sheet bundle v4/spec v2：stable key -> TILE_XX
   -> Seedream 每项目一次，以 Image 1 空白布局 + 可选 Image 2 用户图生成一张隔离的新形象图版
   -> 公共输入屏障
-  -> 第一屏障：所有段并行完成 Fusion、最终提示词和静音 Video 1
+  -> 第一屏障：所有段并行完成 Fusion、最终提示词和静音 Video 1（有替换人物且不走 retarget 的段先做 YuNet 人脸灰块打码）
   -> 第二屏障：所有段完成有序 Images、素材注册和 H3 参数预检
   -> 每段并行 Picsart H3：Video 1 + 所有段完全同序的 Images + 所有段完全同序的 Audio 1..N
   -> 供应商片段裁回原时长并统一为 24 fps
-  -> 按原顺序合并 output/generated.mp4
+  -> 按原顺序合并 output/generated.mp4；有台词时整条 TTS 音轨覆盖成片音轨
 ```
 
 无音轨视频会显式跳过音频、YAMNet、Whisper 和 spoken 筛选节点，以空台词继续。跨段台词按各段时间交集分割文本；台词不参与切点选择。
@@ -106,7 +108,7 @@
 - 可选用户图（Object Replace 调用中的 Image 1）与用户替换说明；有图时同时传图片本身和 SHA-256。
 - 目录 SHA-256 及当前可用的 `voice_id - file - language - gender - 短特征` 行。仓库当前提供 30 条，但运行时不要求恰好 30 条。
 
-Object Replace v3 不回吐完整索引，只通过动态 closed JSON Schema 输出与 raw stable key 对齐的 patch。`replacement` 和人物 `voice_id` 都允许为 `null`；每个非空 replacement 包含 `source`、`appearance_description` 和 `target_visual_description`。`appearance_description` 只供 sheet，限定为单个 stable key 自身的内在可见外观，不得包含动作、接触、相对位置、所在场景或其他 stable key；`target_visual_description` 只供 Fusion/H3 承载动作、接触和关系。Skill 自身要求 `replacement_set` 中所有人物、实体和场景输出非空替换，并为人物选择合适音色。同一 stable key 跨图片、分段和 occurrence 使用同一套新设计。用户图只约束用户文字唯一语义对应的一个既有 stable key；其他 key 仍使用 `generated_variant`，不因参考图只指向一个元素而停止替换。
+Object Replace v4 不回吐完整索引，只通过动态 closed JSON Schema 输出与 raw stable key 对齐的 patch。`replacement` 和人物 `voice_id` 都允许为 `null`；每个非空 replacement 包含 `source`、`appearance_description` 和 `target_visual_description`。顶层另有 `dialogue_voices`：与 `translated_dialogue` 等长，每行归属一个 `people` stable key 或 `null`（旁白/画外音），合并时写入增强索引的独立块。`appearance_description` 只供 sheet，限定为单个 stable key 自身的内在可见外观，不得包含动作、接触、相对位置、所在场景或其他 stable key；`target_visual_description` 只供 Fusion/H3 承载动作、接触和关系。Skill 自身要求 `replacement_set` 中所有人物、实体和场景输出非空替换，并为人物选择合适音色。同一 stable key 跨图片、分段和 occurrence 使用同一套新设计。用户图只约束用户文字唯一语义对应的一个既有 stable key；其他 key 仍使用 `generated_variant`，不因参考图只指向一个元素而停止替换。
 
 人物保持索引明确的类型、性别、种族、年龄段、整体风格和服装主色，但更换身份，使人脸或可见身体产生差异；只露出身体局部时，统一改变局部形态、比例、肤色、纹理或标记，不为具体部位写特例；服装保持颜色和风格但改变款式。场景保持类型、用途、布局、色调、构图、机位、镜头运动、焦段和光线，但改成同类不同实例。实体保持功能、动作接口和尺度，但改变材质、颜色、品种、轮廓、结构或造型；动作、接触和相对关系只能写入 `target_visual_description`，不能回流到图版外观。完整 raw index 仍冻结，并作为 patch 的机械合并基底；Fusion 读取的 enhanced index 因而保留完整 raw 事实。上述是模型生成职责：Schema/normalizer 仍允许 nullable，后端不逐项复审，也不因未完成而失败或重试。
 
@@ -123,7 +125,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - `prompt_expansion_mode`: `quality`
 - `reference_video_urls`: 当前静音片段 Video 1 的临时签名公网 URL
 - `reference_image_urls`: 每段相同的有序图片 URL；新形象图版固定为 `Image 1`（身份锚点占主参考位），存在唯一有效用户图绑定时追加用户图，对应 `Image 2`；没有该绑定时不扩散原始用户图，仅发送 `[新形象图版]`
-- `reference_audio_urls`: 冻结的 0–3 条音频，按 `Audio 1..N` 原序写入；空列表时省略字段
+- `reference_audio_urls`: 冻结的 0–3 条音色库音频，按 `Audio 1..N` 原序写入；空列表时省略字段。音色库 wav 同时供 TTS 克隆，TTS 整条音轨只在终剪覆盖成片音轨，不送 H3
 - `duration`: `max(5, ceil(原片段秒数))`
 - `resolution`: 前端 `480p`/`768p` 映射为供应商 Advanced API 的 `480P`/`768P`
 - `aspect_ratio`: 前端请求值
@@ -156,6 +158,7 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - `POST /api/conversations/{id}/resume-pre-picsart` 只接受从未出现 Picsart submit 痕迹的失败项目。没有图版 checkpoint 时，它复用原切段、4 fps manifest、exact-9、MediaKit 帧、分析副本和逐段 video-maker，再重建免费上游；存在 checkpoint 时先在零写入边界验证冻结上游与图版绑定，`prepared` 只首次提交或本地 replay 同一 Seedream receipt，`succeeded/not_needed` 直接复用，均不重跑翻译、raw index 或 Object Replace。未知/损坏的付费证据停止恢复，不能盲目再 POST。
 - `POST /api/conversations/{id}/resume-picsart` 只复用 H3 manifest v4 冻结的静音 Video 1、R2V 提示词、同一张图版、相同顺序的有序图片和有序音频。它不重跑 raw/enhanced 索引、Object Replace、Seedream 或 Fusion；严格检查版本、路径、哈希、媒体和请求绑定，不把图版画面或 voice 与 enhanced index 做语义交叉复审。已有且未明确失败的 task ID 只继续 poll；只有供应商业务结果明确为 `FAILED`，或 submit 自身明确被拒绝且未产生 task ID，才允许重新 submit。
 - 不因生成质量、替换效果或媒体观感增加重试。
+- 明确决策（2026-09-07）：不做段级产出验收 + 自动重跑。H3 单段产出存在随机波动（场景替换、字幕复现都有随机性，已由受控实验证明与 prompt/素材无关），但我们的目标是通过输入侧控制让一次就跑过——凡是不想让 H3 保留的信息，在参考视频进 H3 之前从像素层面抹掉（人脸灰块打码、MediaKit 视频字幕擦除），而不是生成后再验收补救。
 - Whisper 返回空 ASR，或 YAMNet 与 ASR 没有重叠 spoken 区间时，直接以空台词继续，不因内容为空进行复核、失败或重试。
 
 ## 验证状态

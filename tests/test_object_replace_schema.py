@@ -186,6 +186,7 @@ def _output(
         "schema": OBJECT_REPLACE_OUTPUT_NAME,
         "version": OBJECT_REPLACE_OUTPUT_VERSION,
         "input_sha256": digest,
+        "dialogue_voices": [],
         "people": {
             stable_id: {
                 "matches_user_request": stable_id == image_1_key,
@@ -240,6 +241,7 @@ def _normalize(
     voice_ids: list[str] = VOICE_IDS,
     has_user_image: bool = True,
     instruction: str = "replace the held product",
+    dialogue_line_count: int = 0,
 ) -> dict[str, Any]:
     return normalize_object_replace(
         value,
@@ -248,6 +250,7 @@ def _normalize(
         voice_ids=voice_ids,
         has_user_image=has_user_image,
         user_instruction=instruction,
+        dialogue_line_count=dialogue_line_count,
     )
 
 
@@ -265,8 +268,9 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
         "people",
         "entities",
         "scenes",
+        "dialogue_voices",
     ]
-    assert OBJECT_REPLACE_OUTPUT_VERSION == 3
+    assert OBJECT_REPLACE_OUTPUT_VERSION == 4
     assert schema["properties"]["input_sha256"]["enum"] == [digest]
     assert set(schema["properties"]) == {
         "schema",
@@ -275,6 +279,15 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
         "people",
         "entities",
         "scenes",
+        "dialogue_voices",
+    }
+    dialogue_voices_schema = schema["properties"]["dialogue_voices"]
+    assert dialogue_voices_schema["type"] == "array"
+    assert dialogue_voices_schema["minItems"] == 0
+    assert dialogue_voices_schema["maxItems"] == 0
+    assert dialogue_voices_schema["items"] == {
+        "type": ["string", "null"],
+        "enum": ["person-01", "person-02", None],
     }
 
     for category in ("people", "entities", "scenes"):
@@ -437,8 +450,11 @@ def test_normalizer_allows_semantically_imperfect_but_consumable_output() -> Non
     )
 
     assert normalized == {
-        category: value[category]
-        for category in ("people", "entities", "scenes")
+        **{
+            category: value[category]
+            for category in ("people", "entities", "scenes")
+        },
+        "dialogue_voices": [],
     }
 
 
@@ -780,6 +796,7 @@ def test_merge_safely_copies_without_semantic_review() -> None:
     assert voice_metadata == metadata_snapshot
     assert merged is not element_index
     assert merged["relations"] == element_index["relations"]
+    assert merged["dialogue_voices"] == []
     assert merged["people"]["person-01"]["replacement"] == {
         "reason": "automatic",
         "source": "generated_variant",
@@ -819,3 +836,114 @@ def test_merge_degrades_missing_backend_voice_metadata_to_no_voice() -> None:
         person["voice_id"] = None
     merged = merge_object_replace_index(element_index, normalized, {})
     assert all(person["voice"] is None for person in merged["people"].values())
+
+
+def _dialogue_payload(element_index: dict[str, Any]) -> dict[str, Any]:
+    payload = _payload(element_index)
+    payload["has_user_image"] = False
+    payload["user_replacement_instruction"] = ""
+    payload["user_replacement_image"] = None
+    payload["translated_dialogue"] = [
+        {"text": "第一句", "start_s": 0.0, "end_s": 1.0},
+        {"text": "第二句", "start_s": 1.0, "end_s": 2.0},
+    ]
+    return payload
+
+
+def _dialogue_output(
+    element_index: dict[str, Any],
+    digest: str,
+    dialogue_voices: Any,
+) -> dict[str, Any]:
+    value = _output(element_index, digest)
+    for category in ("people", "entities", "scenes"):
+        for patch in value[category].values():
+            patch["matches_user_request"] = False
+            patch["replacement"]["source"] = "generated_variant"
+    value["dialogue_voices"] = dialogue_voices
+    return value
+
+
+def test_schema_locks_dialogue_voices_to_the_translated_lines() -> None:
+    element_index = _index()
+    schema, _digest = object_replace_schema(
+        _dialogue_payload(element_index), VOICE_IDS,
+    )
+
+    dialogue_voices_schema = schema["properties"]["dialogue_voices"]
+    assert dialogue_voices_schema["minItems"] == 2
+    assert dialogue_voices_schema["maxItems"] == 2
+    assert dialogue_voices_schema["items"]["enum"] == [
+        "person-01", "person-02", None,
+    ]
+
+
+def test_dialogue_voices_attribute_each_line_to_a_person_or_narration() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(
+        _dialogue_payload(element_index), VOICE_IDS,
+    )
+    value = _dialogue_output(element_index, digest, ["person-02", None])
+
+    normalized = _normalize(
+        value,
+        digest=digest,
+        element_index=element_index,
+        has_user_image=False,
+        instruction="",
+        dialogue_line_count=2,
+    )
+    merged = merge_object_replace_index(element_index, normalized, {})
+
+    assert normalized["dialogue_voices"] == ["person-02", None]
+    assert merged["dialogue_voices"] == ["person-02", None]
+
+
+@pytest.mark.parametrize(
+    "dialogue_voices",
+    [
+        ["person-02"],
+        ["person-02", None, None],
+        "person-02",
+        ["person-02", "entity-01"],
+        ["person-02", "unknown-person"],
+        ["person-02", 1],
+    ],
+)
+def test_normalizer_rejects_invalid_dialogue_voices(
+    dialogue_voices: Any,
+) -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(
+        _dialogue_payload(element_index), VOICE_IDS,
+    )
+    value = _dialogue_output(element_index, digest, dialogue_voices)
+
+    with pytest.raises(ValueError, match="dialogue voices"):
+        _normalize(
+            value,
+            digest=digest,
+            element_index=element_index,
+            has_user_image=False,
+            instruction="",
+            dialogue_line_count=2,
+        )
+
+
+def test_merge_rejects_dialogue_voices_outside_the_people_index() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(
+        _dialogue_payload(element_index), VOICE_IDS,
+    )
+    normalized = _normalize(
+        _dialogue_output(element_index, digest, ["person-01", None]),
+        digest=digest,
+        element_index=element_index,
+        has_user_image=False,
+        instruction="",
+        dialogue_line_count=2,
+    )
+    normalized["dialogue_voices"] = ["person-01", "entity-01"]
+
+    with pytest.raises(ValueError, match="dialogue voices"):
+        merge_object_replace_index(element_index, normalized, {})

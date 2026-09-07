@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from app import face_mask
 from app import media
 from app.config import SEEDREAM_API_BASE, SEEDREAM_PRO_MODEL, Settings
 from app.fusion_schema import AUTHORITY_BEGIN, AUTHORITY_END, FUSION_OUTPUT_NAME
@@ -18,6 +19,7 @@ from app.object_replace_schema import (
     OBJECT_REPLACE_OUTPUT_VERSION,
 )
 from app.pipeline import (
+    DIALOGUE_GENERATION_SCHEMA,
     H3_PREPARED_ARTIFACTS_VERSION,
     PICSART_RECEIPT_VERSION,
     Pipeline,
@@ -27,7 +29,12 @@ from app.pipeline import (
     TRANSLATION_SCHEMA,
 )
 from app.providers import ProviderFailure, ProviderResult
-from app.replacement_sheet import replacement_sheet_spec_sha256
+from app.replacement_sheet import (
+    build_replacement_sheet_spec,
+    finalize_replacement_sheet,
+    materialize_replacement_sheet_inputs,
+    replacement_sheet_spec_sha256,
+)
 from app.research_log import ResearchLog
 from app.seedream import (
     SEEDREAM_OUTPUT_HEIGHT,
@@ -67,6 +74,8 @@ def _effective_request(
     resolution: str = "768p",
     aspect_ratio: str = "16:9",
     target_language: str = SAME_AS_SOURCE_LANGUAGE,
+    dialogue_mode: str = "auto_rewrite",
+    brief: str | None = None,
     fusion_agent: str = "deepseek",
     replacement_instruction: str | None = None,
 ) -> dict[str, Any]:
@@ -82,10 +91,18 @@ def _effective_request(
             "remove_subtitle": True,
             "remove_logo": True,
         },
-        "dialogue": {
-            "mode": "auto_rewrite",
-            "target_language": target_language,
-        },
+        "dialogue": (
+            {
+                "mode": "generate",
+                "target_language": target_language,
+                "brief": brief,
+            }
+            if dialogue_mode == "generate"
+            else {
+                "mode": "auto_rewrite",
+                "target_language": target_language,
+            }
+        ),
         "replacement_guidance": (
             {
                 "instruction": replacement_instruction,
@@ -137,6 +154,37 @@ def test_effective_request_requires_the_complete_current_contract(
         Pipeline._validated_effective_request(request)
 
 
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_brief",
+        "empty_brief",
+        "blank_brief",
+        "unstripped_brief",
+        "extra_key",
+        "unknown_mode",
+    ],
+)
+def test_effective_request_generate_dialogue_shape(damage: str) -> None:
+    request = _effective_request(dialogue_mode="generate", brief="介绍产品")
+    assert Pipeline._validated_effective_request(request) is request
+    if damage == "missing_brief":
+        request["dialogue"].pop("brief")
+    elif damage == "empty_brief":
+        request["dialogue"]["brief"] = ""
+    elif damage == "blank_brief":
+        request["dialogue"]["brief"] = "   "
+    elif damage == "unstripped_brief":
+        request["dialogue"]["brief"] = " 介绍产品"
+    elif damage == "extra_key":
+        request["dialogue"]["extra"] = True
+    else:
+        request["dialogue"]["mode"] = "manual"
+
+    with pytest.raises(ValueError, match="effective request"):
+        Pipeline._validated_effective_request(request)
+
+
 def test_stored_voice_references_reject_noncurrent_asset_path(
     tmp_path: Path,
 ) -> None:
@@ -173,6 +221,7 @@ class _FlowMediaKit:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.calls: list[list[str]] = []
+        self.video_erase_calls: list[str] = []
 
     def erase(
         self, source: Path, destination: Path, scenes: list[str],
@@ -184,6 +233,27 @@ class _FlowMediaKit:
             destination,
             {"stages": list(scenes), "raw": "mediakit-response"},
             [destination],
+        )
+
+    def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
+        with self.lock:
+            self.video_erase_calls.append(video_url)
+        return ProviderResult(
+            "mediakit-video-task",
+            {"outcome": "accepted", "task_id": "mediakit-video-task"},
+        )
+
+    def poll_task(self, task_id: str) -> ProviderResult[str]:
+        assert task_id == "mediakit-video-task"
+        return ProviderResult(
+            "https://result.invalid/erased.mp4", {"task_id": task_id},
+        )
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"erased-source")
+        return ProviderResult(
+            destination, {"request": {"url": url}}, [destination],
         )
 
 
@@ -501,11 +571,18 @@ class _FlowDeepSeek:
                     },
                     "voice_id": voice_ids[offset],
                 }
+            people_keys = list(people_schema)
             return ProviderResult(
                 {
                     "schema": OBJECT_REPLACE_OUTPUT_NAME,
                     "version": OBJECT_REPLACE_OUTPUT_VERSION,
                     "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
+                    "dialogue_voices": [
+                        people_keys[offset % len(people_keys)] if people_keys else None
+                        for offset, _line in enumerate(
+                            payload["translated_dialogue"]
+                        )
+                    ],
                     "people": people,
                     "entities": {
                         stable_id: {
@@ -642,10 +719,39 @@ class _FlowDeepSeek:
                 "preserve": ["hand contact"],
                 "replace_together": True,
             }],
+            "segment_metrics": [
+                {"segment_index": index, "max_face_share_percent": 0}
+                for index in segment_indices
+            ],
         }
         return ProviderResult(
             raw,
             {"response": {"api": "responses", "phase": "project_index"}},
+        )
+
+
+class _FlowAutodlTTS:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.tts_calls: list[dict[str, Any]] = []
+
+    def submit_tts(self, *, text: str, voice_path: Path) -> ProviderResult[str]:
+        with self.lock:
+            task_id = f"tts-task-{len(self.tts_calls) + 1}"
+            self.tts_calls.append({"text": text, "voice_path": voice_path})
+        return ProviderResult(
+            task_id, {"outcome": "accepted", "task_id": task_id},
+        )
+
+    def poll(self, task_id: str) -> ProviderResult[str]:
+        return ProviderResult(
+            f"https://result.invalid/{task_id}.wav", {"task_id": task_id},
+        )
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        destination.write_bytes(b"tts-audio")
+        return ProviderResult(
+            destination, {"request": {"url": url}}, [destination],
         )
 
 
@@ -807,6 +913,12 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
         destination.write_bytes(source.read_bytes())
         return {"stdout": "", "stderr": ""}
 
+    def mask_faces(
+        source: Path, destination: Path, **_kwargs: Any,
+    ) -> dict[str, Any]:
+        destination.write_bytes(source.read_bytes() + b"-masked")
+        return {"frames": 1, "frames_with_face": 1, "faces_total": 1}
+
     def trim(source: Path, duration_s: float, destination: Path) -> dict[str, Any]:
         events.append(f"trim-{duration_s}")
         destination.write_bytes(source.read_bytes())
@@ -823,6 +935,23 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
         assert join_modes == ["hard_cut", "hard_cut"]
         destination.write_bytes(b"".join(path.read_bytes() for path in paths))
         return {"fps": 24}
+
+    def assemble(
+        lines: list[dict[str, Any]],
+        total_duration_s: float,
+        destination: Path,
+    ) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(
+            b"".join(line["audio"].read_bytes() for line in lines)
+        )
+        return {"duration_s": total_duration_s, "lines": list(lines)}
+
+    def replace_audio(
+        video: Path, audio: Path, destination: Path,
+    ) -> dict[str, Any]:
+        destination.write_bytes(video.read_bytes() + b"|tts-track")
+        return {"duration_s": 9.2}
 
     monkeypatch.setattr(media, "probe", probe)
     monkeypatch.setattr(media, "extract_frames_4fps", frames, raising=False)
@@ -858,8 +987,15 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
     )
     monkeypatch.setattr(media, "localize_dialogue", localize, raising=False)
     monkeypatch.setattr(media, "mute", mute)
+    monkeypatch.setattr(face_mask, "mask_faces", mask_faces)
     monkeypatch.setattr(media, "trim_24fps", trim, raising=False)
     monkeypatch.setattr(media, "concat", concat)
+    monkeypatch.setattr(
+        media, "assemble_dialogue_track", assemble, raising=False,
+    )
+    monkeypatch.setattr(
+        media, "replace_audio_track", replace_audio, raising=False,
+    )
 
 
 def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
@@ -896,6 +1032,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     picsart = _FlowPicsart()
     mediakit = _FlowMediaKit()
     seedream = _FlowSeedream(deepseek.events)
+    autodl = _FlowAutodlTTS()
     registered: list[Path] = []
 
     def register(_project_id: str, path: Path) -> str:
@@ -910,6 +1047,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         mediakit=mediakit,
         picsart=picsart,
         seedream=seedream,
+        autodl=autodl,
     )
 
     pipeline.run(project_id)
@@ -927,6 +1065,19 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert len(picsart.submits) == 2
     assert len(seedream.calls) == 1
     assert len(mediakit.calls) == 18
+    # The source's burned-in subtitles are erased once at project level and
+    # every downstream consumer switches to the erased file.
+    assert mediakit.video_erase_calls == [
+        "https://assets.invalid/inputs/source.mp4",
+    ]
+    assert (project / "work" / "source-nosubs.mp4").is_file()
+    cut_input = json.loads(
+        (
+            project / "logs" / "segment-cut" / "segment-0001"
+            / "attempt-1" / "input.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert cut_input["source"].endswith("work/source-nosubs.mp4")
     assert all(
         call == ["full_screen_text_erase", "full_screen_icon_erase"]
         for call in mediakit.calls
@@ -938,6 +1089,15 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         "trim-4.2",
         "trim-5.0",
     ]
+    # Both segments have replaced people and no retarget: every reference
+    # video is face-masked before submission.
+    assert sorted(
+        scope.name
+        for scope in (project / "logs" / "mask-reference-faces").iterdir()
+    ) == ["segment-0001", "segment-0002"]
+    assert [
+        path.name for path in registered
+    ].count("source-faces-masked.mp4") == 2
 
     visual_calls = [
         call for call in deepseek.structured_calls
@@ -1110,11 +1270,12 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     raw_index = state["element_index"]
     enhanced_index = state["enhanced_element_index"]
     assert all(
-        call["payload"]["global_element_index"] == enhanced_index
+        json.loads(json.dumps(call["payload"]["global_element_index"]))
+        == enhanced_index
         for call in fusion_calls
     )
     assert set(raw_index) == {
-        "people", "entities", "scenes", "relations",
+        "people", "entities", "scenes", "relations", "segment_metrics",
     }
     assert list(raw_index["people"]) == [
         "person-01", "person-02", "person-03",
@@ -1205,12 +1366,31 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         (project / reference["asset_path"]).is_file()
         for reference in state["voice_references"]
     )
+    # The only translated line is attributed to person-01 and synthesized
+    # with that person's Audio 1 voice.
+    assert [call["text"] for call in autodl.tts_calls] == ["translated line"]
+    assert [call["voice_path"].name for call in autodl.tts_calls] == [
+        "audio-01.wav",
+    ]
+    full_track = project / "work" / "dialogue-audio" / "full-track.wav"
+    assert full_track.is_file()
+    assert (project / "work" / "dialogue-audio" / "line-0001.wav").is_file()
+    # No per-segment dialogue slices are produced: H3 receives the frozen
+    # voice-library wavs as Audio 1..N, and the TTS track only overwrites
+    # the final video's audio.
+    assert not any(
+        (project / "work" / "segments").glob("*/dialogue-track.wav")
+    )
     expected_audio_urls = [
         f"https://assets.invalid/voice-references/audio-{slot:02d}.wav"
         for slot in range(1, 4)
     ]
     assert all(
         call["audio_urls"] == expected_audio_urls for call in picsart.submits
+    )
+    assert state["enhanced_element_index"]["dialogue_voices"] == ["person-01"]
+    assert (project / "output" / "generated.mp4").read_bytes().endswith(
+        b"|tts-track"
     )
     ledger = state["picsart_submission_receipts"]
     preparation_sha256 = Pipeline._json_sha256(
@@ -1400,6 +1580,14 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     monkeypatch.setattr(
         media, "mute", lambda input_path, target: target.write_bytes(input_path.read_bytes()),
     )
+    monkeypatch.setattr(
+        face_mask,
+        "mask_faces",
+        lambda input_path, target, **_kwargs: (
+            target.write_bytes(input_path.read_bytes() + b"-masked")
+            or {"frames": 1, "frames_with_face": 1, "faces_total": 1}
+        ),
+    )
     replacement_sheet = {
         "spec_sha256": "s" * 64,
         "h3_image_reference": "Image 1",
@@ -1444,7 +1632,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert result_item["index"] == 1
     assert result_prompt.startswith("FACE REPLACEMENT IS MANDATORY")
     assert "Preserve the source motion" in result_prompt
-    assert result_muted == segment_dir / "source-muted.mp4"
+    assert result_muted == segment_dir / "source-faces-masked.mp4"
     assert len(fusion_input_sha256) == 64
     assert len(calls) == 1
     assert calls[0]["payload"]["segment_index"] == 1
@@ -2248,6 +2436,213 @@ def test_translation_quality_is_not_a_local_blocker(value: Any) -> None:
     assert Pipeline._normalize_translation(value, source) == source
 
 
+class _RecordingDeepSeek:
+    def __init__(self, value: dict[str, Any]) -> None:
+        self.value = value
+        self.calls: list[dict[str, Any]] = []
+
+    def complete_structured(
+        self,
+        instruction: str,
+        payload: Any,
+        schema: dict[str, Any],
+        images: list[Path] | None = None,
+    ) -> ProviderResult[dict[str, Any]]:
+        self.calls.append({
+            "instruction": instruction,
+            "payload": payload,
+            "schema": schema,
+            "images": list(images or []),
+        })
+        return ProviderResult(
+            self.value,
+            {"response": {"api": "responses", "phase": "dialogue-generation"}},
+        )
+
+
+def _generation_prepared() -> list[dict[str, Any]]:
+    return [
+        {"index": 1, "start_s": 0.0, "end_s": 5.0, "visual_prompt": "开场画面"},
+        {"index": 2, "start_s": 5.0, "end_s": 8.0, "visual_prompt": "结尾画面"},
+    ]
+
+
+def test_dialogue_generation_node_carries_brief_and_segment_context(
+    tmp_path: Path,
+) -> None:
+    deepseek = _RecordingDeepSeek({
+        "lines": [
+            {"segment_index": 1, "text": "第一句台词呀"},
+            {"segment_index": 1, "text": "第二句"},
+            {"segment_index": 2, "text": "结尾"},
+            {"segment_index": 99, "text": "非法段落"},
+            {"segment_index": 2, "text": "   "},
+        ],
+    })
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(dialogue_mode="generate", brief="介绍产品"), "request-generate",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=deepseek,
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    prepared = _generation_prepared()
+
+    generated = pipeline._node(
+        log,
+        "deepseek-dialogue-generation",
+        "project",
+        pipeline._dialogue_generation_payload("介绍产品", "中文", prepared),
+        [],
+        lambda: pipeline._dialogue_generation_request("介绍产品", "中文", prepared),
+        transform=lambda value: pipeline._normalize_generated_dialogue(
+            value, prepared,
+        ),
+    )
+
+    assert len(deepseek.calls) == 1
+    call = deepseek.calls[0]
+    assert call["schema"] == DIALOGUE_GENERATION_SCHEMA
+    assert call["payload"] == {
+        "brief": "介绍产品",
+        "target_language": "中文",
+        "duration_s": 8.0,
+        "segments": [
+            {"index": 1, "start_s": 0.0, "end_s": 5.0, "visual_prompt": "开场画面"},
+            {"index": 2, "start_s": 5.0, "end_s": 8.0, "visual_prompt": "结尾画面"},
+        ],
+    }
+    assert "# dialogue-writer" in call["instruction"]
+    assert "台词语言为中文" in call["instruction"]
+    # 段内多条按字数比例切分：第一句 6 字、第二句 3 字，共 9 字切 5 秒。
+    assert generated == [
+        {"start_s": 0.0, "end_s": pytest.approx(5.0 * 6 / 9), "text": "第一句台词呀"},
+        {"start_s": pytest.approx(5.0 * 6 / 9), "end_s": 5.0, "text": "第二句"},
+        {"start_s": 5.0, "end_s": 8.0, "text": "结尾"},
+    ]
+    output = json.loads(
+        (project / "logs" / "deepseek-dialogue-generation" / "project" / "attempt-1" / "output.json").read_text(encoding="utf-8")
+    )
+    assert output["provider_record"] == {
+        "response": {"api": "responses", "phase": "dialogue-generation"},
+    }
+
+
+def test_dialogue_generation_same_language_still_calls_deepseek(
+    tmp_path: Path,
+) -> None:
+    deepseek = _RecordingDeepSeek({"lines": [{"segment_index": 1, "text": "口播"}]})
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(dialogue_mode="generate", brief="介绍产品"),
+        "request-generate-same-language",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=deepseek,
+        mediakit=object(),
+        picsart=object(),
+    )
+
+    result = pipeline._dialogue_generation_request(
+        "介绍产品", SAME_AS_SOURCE_LANGUAGE, _generation_prepared(),
+    )
+
+    assert result.value == {"lines": [{"segment_index": 1, "text": "口播"}]}
+    assert len(deepseek.calls) == 1
+    assert "没有源台词可抄" in deepseek.calls[0]["instruction"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"lines": []},
+        {"lines": [{"segment_index": 9, "text": "无此段"}]},
+        {"lines": [{"segment_index": 1, "text": "   "}]},
+        {"lines": [{"segment_index": "1", "text": "类型错误"}]},
+        {"lines": "not-a-list"},
+        {},
+    ],
+)
+def test_generated_dialogue_drops_unusable_entries(value: Any) -> None:
+    prepared = _generation_prepared()
+
+    assert Pipeline._normalize_generated_dialogue(value, prepared) == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_node"),
+    [
+        ("auto_rewrite", "deepseek-translation"),
+        ("generate", "deepseek-dialogue-generation"),
+    ],
+)
+def test_continue_after_prepared_selects_dialogue_node_by_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_node: str,
+) -> None:
+    request = (
+        _effective_request(dialogue_mode="generate", brief="介绍产品")
+        if mode == "generate"
+        else _effective_request()
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(request, f"dialogue-mode-{mode}")
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda *_args: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    calls: list[tuple[str, Any]] = []
+
+    def spy(
+        log: ResearchLog,
+        node: str,
+        scope: str,
+        inputs: Any,
+        input_media: list[Path],
+        operation: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        calls.append((node, inputs))
+        raise RuntimeError("stop after the dialogue node")
+
+    monkeypatch.setattr(pipeline, "_node", spy)
+
+    with pytest.raises(RuntimeError, match="stop after the dialogue node"):
+        pipeline._continue_after_prepared(
+            project_id, project, _generation_prepared(), [], None, request,
+            ResearchLog(project),
+        )
+
+    assert [node for node, _inputs in calls] == [expected_node]
+    if mode == "generate":
+        assert calls[0][1]["brief"] == "介绍产品"
+        assert calls[0][1]["duration_s"] == 8.0
+        assert [
+            segment["visual_prompt"] for segment in calls[0][1]["segments"]
+        ] == ["开场画面", "结尾画面"]
+        assert store.read(project_id)["project_progress"]["stage"] == (
+            "dialogue-generation"
+        )
+    else:
+        assert store.read(project_id)["project_progress"]["stage"] == "translation"
+
+
 def test_no_audio_skips_audio_analysis_without_creating_fake_media(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
@@ -2359,6 +2754,7 @@ def test_project_index_normalizer_mechanically_maps_ids_without_metadata() -> No
             "preserve": [],
             "replace_together": False,
         }],
+        "segment_metrics": [{"segment_index": 1, "max_face_share_percent": 0}],
     })
 
     assert list(normalized["people"]) == ["person-01"]
@@ -4742,3 +5138,831 @@ def test_current_first_submit_resume_rejects_ambiguous_submission_evidence(
 
     assert registered == []
     assert provider_calls == []
+
+
+def _retarget_element_index(
+    share: Any,
+    *,
+    replaced: bool = True,
+    appears: bool = True,
+    category: str = "people",
+    metrics: Any = "default",
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "source_visual_description": "a visible subject",
+        "occurrences": [
+            {"segment_index": 1 if appears else 2, "frame_orders": [1]},
+        ],
+    }
+    if replaced:
+        record["replacement"] = {
+            "reason": "automatic",
+            "source": "generated_variant",
+            "target_visual_description": "a replacement subject",
+            "appearance_description": "an isolated replacement subject",
+        }
+    index: dict[str, Any] = {
+        "people": {},
+        "entities": {},
+        "scenes": {},
+        "relations": {},
+        "segment_metrics": {1: share} if metrics == "default" else metrics,
+    }
+    index[category]["person-01" if category == "people" else "entity-01"] = record
+    return index
+
+
+@pytest.mark.parametrize(
+    ("share", "expected"),
+    [(51, "person-01"), (100, "person-01"), (50, None), (0, None)],
+)
+def test_segment_retarget_person_applies_the_face_share_threshold(
+    share: int, expected: str | None
+) -> None:
+    index = _retarget_element_index(share)
+
+    assert Pipeline._segment_retarget_person(index, 1) == expected
+
+
+def test_segment_retarget_person_accepts_json_round_tripped_metric_keys() -> None:
+    index = _retarget_element_index(80, metrics={"1": 80})
+
+    assert Pipeline._segment_retarget_person(index, 1) == "person-01"
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        _retarget_element_index(80, appears=False),
+        _retarget_element_index(80, replaced=False),
+        _retarget_element_index(80, category="entities"),
+        _retarget_element_index(80, metrics={2: 80}),
+        _retarget_element_index(80, metrics=None),
+    ],
+)
+def test_segment_retarget_person_requires_a_replaced_person_in_segment(
+    index: dict[str, Any],
+) -> None:
+    assert Pipeline._segment_retarget_person(index, 1) is None
+
+
+@pytest.mark.parametrize("share", [-1, 101, 12.5, True, "80"])
+def test_segment_retarget_person_rejects_invalid_metrics(share: Any) -> None:
+    with pytest.raises(ValueError, match="face share metric"):
+        Pipeline._segment_retarget_person(_retarget_element_index(share), 1)
+
+
+class _RejectAutodl:
+    def submit_motion_retarget(self, **_kwargs: Any) -> None:
+        raise AssertionError("motion retarget must not run")
+
+
+def _prepare_h3_retarget_fixture(
+    tmp_path: Path,
+    monkeypatch: Any,
+    autodl: Any,
+    share: int,
+) -> tuple[
+    Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
+    list[tuple[Path, Path]],
+]:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "retarget",
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    source = segment_dir / "source.mp4"
+    source.write_bytes(b"source")
+    enhanced_index = _retarget_element_index(share)
+    spec = build_replacement_sheet_spec(enhanced_index)
+    sheet_directory = project / "work" / "global-reference-sheet"
+    inputs = materialize_replacement_sheet_inputs(sheet_directory, spec)
+    finalize_replacement_sheet(
+        inputs["canvas_path"], spec, sheet_directory / "reference-sheet.png",
+    )
+    replacement_sheet = {
+        "spec_sha256": spec["spec_sha256"],
+        "h3_image_reference": "Image 1",
+        "h3_reference_images": [],
+        "user_image_present": False,
+        "spec": spec,
+    }
+    item = {
+        "index": 1,
+        "source": source,
+        "visual_prompt": "a person close-up",
+        "dialogue": [],
+    }
+
+    class FakeFusion:
+        def complete_structured(
+            self,
+            _instruction: str,
+            _payload: dict[str, Any],
+            schema: dict[str, Any],
+            _images: list[Path],
+        ) -> ProviderResult[dict[str, Any]]:
+            return ProviderResult({
+                "schema": FUSION_OUTPUT_NAME,
+                "version": 1,
+                "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
+                "segment_index": 1,
+                "prompt": "Preserve the source motion, camera, light, and timing",
+            }, {"provider": "deepseek"})
+
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, path: f"https://assets.invalid/{path.name}",
+        deepseek=FakeFusion(),
+        mediakit=object(),
+        picsart=object(),
+        autodl=autodl,
+    )
+    monkeypatch.setattr(
+        media,
+        "mute",
+        lambda input_path, target: target.write_bytes(input_path.read_bytes()),
+    )
+    mask_calls: list[tuple[Path, Path]] = []
+
+    def fake_mask_faces(
+        source_path: Path, destination: Path, **_kwargs: Any,
+    ) -> dict[str, Any]:
+        mask_calls.append((source_path, destination))
+        destination.write_bytes(source_path.read_bytes() + b"-masked")
+        return {"frames": 1, "frames_with_face": 1, "faces_total": 1}
+
+    monkeypatch.setattr(face_mask, "mask_faces", fake_mask_faces)
+    return (
+        pipeline, project, item, enhanced_index, replacement_sheet, mask_calls,
+    )
+
+
+def test_h3_face_dominated_segment_is_motion_retargeted(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    submits: list[dict[str, Any]] = []
+
+    class FakeAutodl:
+        def submit_motion_retarget(
+            self, *, image_path: Path, video_path: Path,
+        ) -> ProviderResult[str]:
+            submits.append({"image": image_path, "video": video_path})
+            return ProviderResult("autodl-task-1", {"task_id": "autodl-task-1"})
+
+        def poll(self, task_id: str) -> ProviderResult[str]:
+            assert task_id == "autodl-task-1"
+            return ProviderResult(
+                "https://cdn.invalid/retargeted.mp4", {"status": "SUCCESS"},
+            )
+
+        def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+            assert url == "https://cdn.invalid/retargeted.mp4"
+            destination.write_bytes(b"retargeted-video")
+            return ProviderResult(destination, {"url": url}, [destination])
+
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, FakeAutodl(), 80)
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert muted == segment_dir / "source-retargeted.mp4"
+    assert muted.read_bytes() == b"retargeted-video"
+    assert mask_calls == []
+    assert len(submits) == 1
+    assert submits[0]["image"] == segment_dir / "retarget-reference.png"
+    assert submits[0]["video"] == segment_dir / "source-muted.mp4"
+    import cv2
+
+    crop = cv2.imread(str(submits[0]["image"]))
+    assert crop is not None
+    # The label band is cropped off the 2048x2048 single-tile sheet.
+    assert 0 < crop.shape[0] < 2048
+    assert crop.shape[1] == 2048
+    output = json.loads(
+        (
+            project / "logs" / "motion-retarget" / "segment-0001"
+            / "attempt-1" / "output.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert output["value"].endswith("source-retargeted.mp4")
+
+
+def test_h3_motion_retarget_failure_fails_closed(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    class FailingAutodl:
+        def submit_motion_retarget(self, **_kwargs: Any) -> None:
+            raise ProviderFailure({}, [], RuntimeError("autodl unavailable"))
+
+    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls = (
+        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, FailingAutodl(), 80)
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    with pytest.raises(ProviderFailure, match="autodl unavailable"):
+        pipeline._prepare_h3_segment(
+            project,
+            item,
+            enhanced_index,
+            replacement_sheet,
+            _effective_request(),
+            ResearchLog(project),
+        )
+
+    assert item["status"] == "failed"
+    assert not (segment_dir / "source-retargeted.mp4").exists()
+
+
+def test_h3_low_face_share_segment_masks_faces_without_retarget(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, _RejectAutodl(), 50)
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert muted.read_bytes() == b"source-masked"
+    assert not (segment_dir / "source-retargeted.mp4").exists()
+    assert mask_calls == [
+        (segment_dir / "source-muted.mp4", muted),
+    ]
+    output = json.loads(
+        (
+            project / "logs" / "mask-reference-faces" / "segment-0001"
+            / "attempt-1" / "output.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert output == {"frames": 1, "frames_with_face": 1, "faces_total": 1}
+
+
+def _dialogue_audio_fixture(
+    tmp_path: Path,
+    monkeypatch: Any,
+    autodl: Any,
+) -> tuple[ProjectStore, str, Path, Pipeline, list[dict[str, Any]], dict[str, Any], list[Path]]:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "dialogue-audio",
+    )
+    store.update(
+        project_id,
+        translated_voice_lines=[
+            {"text": "第一句", "start_s": 0.0, "end_s": 2.0},
+            {"text": "第二句", "start_s": 5.0, "end_s": 7.0},
+        ],
+    )
+    library = load_voice_library()
+    voice_directory = project / "work" / "voice-references"
+    voice_directory.mkdir(parents=True)
+    voice_paths: list[Path] = []
+    people: dict[str, Any] = {}
+    for slot, voice in enumerate(library.voices[:2], 1):
+        destination = voice_directory / f"audio-{slot:02d}.wav"
+        destination.write_bytes(library.files[voice["voice_id"]].read_bytes())
+        voice_paths.append(destination)
+        people[f"person-{slot:02d}"] = {
+            "voice": {
+                "audio_reference": f"Audio {slot}",
+                "voice_id": voice["voice_id"],
+                "asset_path": f"work/voice-references/audio-{slot:02d}.wav",
+                "asset_sha256": voice["sha256"],
+                "features": library.model_line(voice["voice_id"]),
+            },
+        }
+    enhanced_index = {
+        "people": people,
+        "entities": {},
+        "scenes": {},
+        "relations": {},
+        "dialogue_voices": ["person-02", None],
+    }
+    prepared = [
+        {
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": 5.0,
+            "duration_s": 5.0,
+            "join_mode": "hard_cut",
+            "dialogue": [{"text": "第一句", "start_s": 0.0, "end_s": 2.0}],
+        },
+        {
+            "index": 2,
+            "start_s": 5.0,
+            "end_s": 10.0,
+            "duration_s": 5.0,
+            "join_mode": "continue",
+            "dialogue": [{"text": "第二句", "start_s": 0.0, "end_s": 2.0}],
+        },
+    ]
+
+    def assemble(
+        lines: list[dict[str, Any]],
+        total_duration_s: float,
+        destination: Path,
+    ) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(
+            b"".join(line["audio"].read_bytes() for line in lines)
+        )
+        return {"duration_s": total_duration_s}
+
+    monkeypatch.setattr(media, "assemble_dialogue_track", assemble)
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        autodl=autodl,
+    )
+    return store, project_id, project, pipeline, prepared, enhanced_index, voice_paths
+
+
+def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    autodl = _FlowAutodlTTS()
+    (
+        _store, project_id, project, pipeline,
+        prepared, enhanced_index, voice_paths,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+
+    full_track = pipeline._run_dialogue_audio(
+        project_id,
+        project,
+        prepared,
+        enhanced_index,
+        voice_paths,
+        ResearchLog(project),
+    )
+
+    assert full_track == (
+        project / "work" / "dialogue-audio" / "full-track.wav"
+    )
+    assert full_track.is_file()
+    # person-02's line uses Audio 2; the unattributed line falls back to
+    # Audio 1.
+    assert [call["text"] for call in autodl.tts_calls] == ["第一句", "第二句"]
+    assert [call["voice_path"] for call in autodl.tts_calls] == [
+        voice_paths[1].resolve(),
+        voice_paths[0].resolve(),
+    ]
+    for offset in (1, 2):
+        assert (
+            project / "work" / "dialogue-audio" / f"line-{offset:04d}.wav"
+        ).is_file()
+    output = json.loads(
+        (
+            project / "logs" / "dialogue-tts-line" / "project"
+            / "attempt-1" / "output.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert output["provider_record"]["submit"]["outcome"] == "accepted"
+    # The TTS chain only feeds the final audio replacement; no per-segment
+    # H3 dialogue slices are produced.
+    assert not any(
+        (project / "work" / "segments").glob("*/dialogue-track.wav")
+    )
+
+
+def test_dialogue_tts_failure_fails_closed(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    class FailingAutodl:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def submit_tts(self, **_kwargs: Any) -> None:
+            self.calls += 1
+            raise ProviderFailure({}, [], RuntimeError("autodl tts unavailable"))
+
+    autodl = FailingAutodl()
+    (
+        _store, project_id, project, pipeline,
+        prepared, enhanced_index, voice_paths,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+
+    with pytest.raises(ProviderFailure, match="autodl tts unavailable"):
+        pipeline._run_dialogue_audio(
+            project_id,
+            project,
+            prepared,
+            enhanced_index,
+            voice_paths,
+            ResearchLog(project),
+        )
+
+    # The node retries once, then the failure escapes without any assembled
+    # track or segment slices.
+    assert autodl.calls == 2
+    assert not (project / "work" / "dialogue-audio" / "full-track.wav").exists()
+    assert not any(
+        (project / "work" / "segments").glob("*/dialogue-track.wav")
+    )
+
+
+def test_dialogue_tts_without_any_voice_reference_fails_closed(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    (
+        _store, project_id, project, pipeline,
+        prepared, enhanced_index, _voice_paths,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, _FlowAutodlTTS())
+
+    with pytest.raises(ValueError, match="voice reference"):
+        pipeline._run_dialogue_audio(
+            project_id,
+            project,
+            prepared,
+            enhanced_index,
+            [],
+            ResearchLog(project),
+        )
+
+
+def test_no_dialogue_skips_the_whole_tts_chain(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    (
+        store, project_id, project, pipeline,
+        prepared, enhanced_index, voice_paths,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, _FlowAutodlTTS())
+    store.update(project_id, translated_voice_lines=[])
+    monkeypatch.setattr(
+        media,
+        "assemble_dialogue_track",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("assemble must not run without dialogue")
+        ),
+    )
+
+    assert pipeline._run_dialogue_audio(
+        project_id,
+        project,
+        [{**item, "dialogue": []} for item in prepared],
+        enhanced_index,
+        voice_paths,
+        ResearchLog(project),
+    ) is None
+
+
+def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request()
+    project_id, project, _state = store.create(request, "dialogue-audio-url")
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    source = segment_dir / "source.mp4"
+    muted = segment_dir / "source-muted.mp4"
+    source.write_bytes(b"source")
+    muted.write_bytes(b"muted")
+    (segment_dir / "h3_prompt.txt").write_text("prompt", encoding="utf-8")
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 5.0,
+        "duration_s": 5.0,
+        "join_mode": "hard_cut",
+        "dialogue": [{"text": "第一句", "start_s": 0.0, "end_s": 2.0}],
+        "visual_prompt": "visual",
+        "status": "running",
+    }
+    library = load_voice_library()
+    voice_directory = project / "work" / "voice-references"
+    voice_directory.mkdir(parents=True)
+    voice = library.voices[0]
+    voice_path = voice_directory / "audio-01.wav"
+    voice_path.write_bytes(library.files[voice["voice_id"]].read_bytes())
+    reference = {
+        "audio_reference": "Audio 1",
+        "voice_id": voice["voice_id"],
+        "asset_path": "work/voice-references/audio-01.wav",
+        "asset_sha256": voice["sha256"],
+        "features": library.model_line(voice["voice_id"]),
+    }
+    store.update(
+        project_id,
+        source_path="inputs/source.mp4",
+        segment_count=1,
+        segments=[Pipeline._public_segment(segment)],
+        enhanced_element_index={
+            "people": {}, "entities": {}, "scenes": {}, "relations": {},
+        },
+        voice_references=[reference],
+        object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "a" * 64,
+        },
+    )
+    registered: list[Path] = []
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, path: (
+            registered.append(path) or f"https://assets.invalid/{path.name}"
+        ),
+        deepseek=object(),
+        mediakit=object(),
+        picsart=_FlowPicsart(),
+    )
+    monkeypatch.setattr(
+        media,
+        "probe",
+        lambda _path: {
+            "duration_s": 5.0,
+            "width": 1280,
+            "height": 720,
+            "has_audio": False,
+        },
+    )
+    replacement_sheet, replacement_sheet_path = (
+        _materialize_test_replacement_sheet(
+            pipeline,
+            project_id,
+            project,
+            [dict(segment, source=source, analysis_paths=[])],
+            store.read(project_id)["enhanced_element_index"],
+        )
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [(dict(segment, source=source), "prompt", muted, "b" * 64)],
+        replacement_sheet=replacement_sheet,
+        request=request,
+    )
+
+    prepared = pipeline._prepare_picsart_segment(
+        project_id,
+        project,
+        dict(segment, source=source),
+        [voice_path],
+        None,
+        replacement_sheet_path,
+        request,
+        ResearchLog(project),
+        final_prompt="prompt",
+        muted=muted,
+    )
+
+    assert prepared.voice_references == (voice_path.resolve(),)
+    assert prepared.audio_urls == ("https://assets.invalid/audio-01.wav",)
+    assert not (segment_dir / "dialogue-track.wav").exists()
+
+
+def test_h3_segment_without_a_replaced_person_keeps_the_muted_reference(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, _RejectAutodl(), 50)
+    )
+    # The replaced person never appears in segment 1.
+    enhanced_index["people"]["person-01"]["occurrences"] = [
+        {"segment_index": 2, "frame_orders": [1]},
+    ]
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert muted == segment_dir / "source-muted.mp4"
+    assert mask_calls == []
+    assert not (segment_dir / "source-faces-masked.mp4").exists()
+
+
+def test_masked_reference_is_frozen_and_resumed(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request()
+    project_id, project, _state = store.create(request, "masked-resume")
+    (project / "inputs" / "source.mp4").write_bytes(b"project-source")
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    source = segment_dir / "source.mp4"
+    masked = segment_dir / "source-faces-masked.mp4"
+    source.write_bytes(b"source")
+    masked.write_bytes(b"masked")
+    (segment_dir / "h3_prompt.txt").write_text("prompt", encoding="utf-8")
+    mute_log = (
+        project / "logs" / "mask-reference-faces" / "segment-0001" / "attempt-1"
+    )
+    mute_log.mkdir(parents=True)
+    (mute_log / "output.json").write_text("{}", encoding="utf-8")
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 5.0,
+        "duration_s": 5.0,
+        "join_mode": "hard_cut",
+        "dialogue": [],
+        "visual_prompt": "visual",
+        "status": "failed",
+    }
+    store.update(
+        project_id,
+        status="failed",
+        source_path="inputs/source.mp4",
+        segment_count=1,
+        segments=[segment],
+        enhanced_element_index={
+            "people": {}, "entities": {}, "scenes": {}, "relations": {},
+        },
+        voice_references=[],
+        object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "a" * 64,
+        },
+        project_progress={
+            "status": "failed", "percent": 57, "stage": "pipeline_failed",
+        },
+        generation={
+            "status": "failed", "stage": "pipeline_failed", "error": "failed",
+        },
+    )
+    registered: list[Path] = []
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, path: (
+            registered.append(path) or f"https://assets.invalid/{path.name}"
+        ),
+        deepseek=object(),
+        mediakit=object(),
+        picsart=_FlowPicsart(),
+    )
+    monkeypatch.setattr(
+        media,
+        "probe",
+        lambda _path: {
+            "duration_s": 5.0,
+            "width": 1280,
+            "height": 720,
+            "has_audio": False,
+        },
+    )
+    replacement_sheet, replacement_sheet_path = (
+        _materialize_test_replacement_sheet(
+            pipeline,
+            project_id,
+            project,
+            [dict(segment, source=source, analysis_paths=[])],
+            store.read(project_id)["enhanced_element_index"],
+        )
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [(dict(segment, source=source), "prompt", masked, "b" * 64)],
+        replacement_sheet=replacement_sheet,
+        request=request,
+    )
+
+    manifest = store.read(project_id)["h3_prepared_artifacts"]
+    assert manifest["segments"]["1"]["muted_video"]["path"] == (
+        "work/segments/0001/source-faces-masked.mp4"
+    )
+
+    pipeline.validate_r2v_resume(project_id)
+
+    prepared = pipeline._prepare_picsart_segment(
+        project_id,
+        project,
+        dict(segment, source=source),
+        [],
+        None,
+        replacement_sheet_path,
+        request,
+        ResearchLog(project),
+        final_prompt="prompt",
+        muted=masked,
+    )
+
+    assert prepared.muted == masked.resolve()
+    assert [path.name for path in registered] == ["source-faces-masked.mp4"]
+
+
+class _RejectMediaKitVideoErase:
+    def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("video subtitle erase must not run")
+
+
+def test_erase_source_subtitles_switch_off_is_a_complete_skip(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "erase-off",
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=_RejectMediaKitVideoErase(),
+        picsart=object(),
+    )
+    request = _effective_request()
+    request["processing"]["remove_subtitle"] = False
+
+    result = pipeline._erase_source_subtitles(
+        project_id, project, source, request, ResearchLog(project),
+    )
+
+    assert result == source
+    assert not (project / "work" / "source-nosubs.mp4").exists()
+    assert not (project / "logs" / "erase-source-subtitles").exists()
+
+
+def test_erase_source_subtitles_failure_fails_closed(
+    tmp_path: Path,
+) -> None:
+    class FailingMediaKit:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> None:
+            self.calls += 1
+            raise ProviderFailure({}, [], RuntimeError("mediakit unavailable"))
+
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "erase-fails",
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    mediakit = FailingMediaKit()
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=mediakit,
+        picsart=object(),
+    )
+
+    with pytest.raises(ProviderFailure, match="mediakit unavailable"):
+        pipeline._erase_source_subtitles(
+            project_id, project, source, _effective_request(),
+            ResearchLog(project),
+        )
+
+    # The node retries once, then the failure escapes without an artifact.
+    assert mediakit.calls == 2
+    assert not (project / "work" / "source-nosubs.mp4").exists()
+
+
+def test_pre_picsart_resume_does_not_require_the_erased_source(
+    tmp_path: Path,
+) -> None:
+    # Projects frozen before the erase node existed carry no
+    # work/source-nosubs.mp4; resume must reuse frozen segment artifacts.
+    store, project_id, project, _sheet, _seedream = (
+        _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
+    )
+
+    assert not (project / "work" / "source-nosubs.mp4").exists()
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda *_args: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=_RejectMediaKitVideoErase(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+
+    pipeline.validate_pre_picsart_resume(project_id)

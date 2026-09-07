@@ -502,3 +502,45 @@ def finalize_replacement_sheet(
         "width": REPLACEMENT_SHEET_WIDTH,
         "height": REPLACEMENT_SHEET_HEIGHT,
     }
+
+
+def extract_tile_reference(
+    sheet_path: Path,
+    spec: Mapping[str, Any],
+    stable_key: str,
+    destination: Path,
+) -> Path:
+    """Crop one tile below its label band from the finished sheet image."""
+    tiles = validate_replacement_sheet_spec(spec, allow_empty=False)
+    matches = [tile for tile in tiles if tile.get("stable_key") == stable_key]
+    if len(matches) != 1:
+        raise ValueError("replacement sheet tile binding is invalid")
+    bounds = _tile_bounds(
+        matches[0],
+        columns=int(spec["columns"]),
+        rows=int(spec["rows"]),
+    )
+    if bounds is None:
+        raise ValueError("replacement sheet tile bounds are invalid")
+    x0, y0, x1, y1 = bounds
+    width = x1 - x0
+    height = y1 - y0
+    # Mirror the _draw_layout label band so the crop excludes it.
+    scale = min(0.72, max(0.20, min(width, height) / 420.0))
+    line_height = max(7, int(round(22 * scale)))
+    band_height = min(height - 2, max(12, line_height * 2 + 8))
+    decoded = cv2.imdecode(
+        np.frombuffer(sheet_path.read_bytes(), np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+    if (
+        decoded is None
+        or decoded.shape[0] != REPLACEMENT_SHEET_HEIGHT
+        or decoded.shape[1] != REPLACEMENT_SHEET_WIDTH
+    ):
+        raise ValueError("replacement sheet image is invalid")
+    crop = decoded[y0 + band_height:y1, x0:x1]
+    if crop.size == 0:
+        raise ValueError("replacement sheet tile crop is empty")
+    _atomic_write(destination, _png_bytes(crop))
+    return destination

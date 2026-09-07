@@ -25,8 +25,15 @@ def _capability(**overrides):
             "remove_logo": True,
         },
         "dialogue": {
+            "modes": ["auto_rewrite", "generate"],
             "mode": "auto_rewrite",
             "translation": True,
+            "max_brief_chars": 1000,
+            "optional": True,
+            "default": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
         },
         "replacement": {
             "supported": True,
@@ -75,6 +82,16 @@ def _target_language_mode_attrs(source, value):
     return match.group("attrs")
 
 
+def _dialogue_write_mode_attrs(source, value):
+    match = re.search(
+        rf'<input\b(?=[^>]*\bname="dialogue-write-mode")(?=[^>]*\bvalue="{re.escape(value)}")(?P<attrs>[^>]*)>',
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group("attrs")
+
+
 def _css_rule_bodies(source, selector):
     return re.findall(rf'{re.escape(selector)}\s*\{{(?P<body>[^}}]*)\}}', source)
 
@@ -113,17 +130,47 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     dialogue = visible.split('aria-labelledby="dialogue-title"', 1)[1].split(
         "</section>", 1
     )[0]
-    assert "自动识别并改编台词" in dialogue
+    assert "自动改写原视频台词，或描述一段口播由 AI 直接生成" in dialogue
     assert 'id="script-input"' not in html
     assert "script-input" not in source
     assert re.findall(r'<textarea\b[^>]*\bid="([^"]+)"', visible) == [
-        "replacement-instruction"
+        "dialogue-brief",
+        "replacement-instruction",
     ]
     assert 'name="voice-mode"' not in visible
     assert 'name="dialogue-mode"' not in visible
     assert 'id="dialogue-review-fields"' not in visible
     assert 'id="generation-config"' not in visible
     assert "后处理" not in visible
+
+    assert "台词来源" in dialogue
+    rewrite_attrs = _dialogue_write_mode_attrs(dialogue, "auto_rewrite")
+    generate_attrs = _dialogue_write_mode_attrs(dialogue, "generate")
+    assert re.search(r"\bchecked\b", rewrite_attrs) is not None
+    assert re.search(r"\bchecked\b", generate_attrs) is None
+    brief_fields = re.search(
+        r'<div\b(?P<attrs>[^>]*)id="dialogue-brief-fields"(?P<tail>[^>]*)>',
+        visible,
+        flags=re.DOTALL,
+    )
+    assert brief_fields is not None
+    assert "hidden" in brief_fields.group("attrs") + brief_fields.group("tail")
+    brief_attrs = _tag_attrs(visible, "textarea", "dialogue-brief")
+    assert 'maxlength="1000"' in brief_attrs
+    assert "disabled" in brief_attrs
+    assert "required" not in brief_attrs
+
+    dialogue_write_mode = _function_source(source, "dialogueWriteMode")
+    assert 'input[name="dialogue-write-mode"]:checked' in dialogue_write_mode
+    assert 'return checked ? checked.value : "auto_rewrite"' in dialogue_write_mode
+    sync_dialogue_controls = _function_source(source, "syncDialogueModeControls")
+    assert 'dialogueWriteMode() === "generate"' in sync_dialogue_controls
+    assert '$("dialogue-brief-fields").hidden = !isGenerate' in sync_dialogue_controls
+    assert '$("dialogue-brief").required = isGenerate' in sync_dialogue_controls
+    assert (
+        '$("dialogue-brief").disabled = state.uploading || state.viewingSubmittedConfig || !isGenerate'
+        in sync_dialogue_controls
+    )
 
     assert 'id="translation-toggle"' not in html
     assert '<fieldset class="language-fieldset">' in dialogue
@@ -168,6 +215,8 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     bind_events = _function_source(source, "bindEvents")
     assert 'input[name="target-language-mode"]' in bind_events
     assert "syncTargetLanguageControls();" in bind_events
+    assert 'input[name="dialogue-write-mode"]' in bind_events
+    assert "syncDialogueModeControls();" in bind_events
 
     source_mode = _function_source(source, "sourceMode")
     assert 'return checked ? checked.value : "link"' in source_mode
@@ -188,6 +237,10 @@ def test_minimal_creation_capability_is_exact_and_fails_closed():
         "extraDefault:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,defaults:{...good.defaults,extra:true}}}),"
         "dialogueDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,translation:false}}}),"
         "dialogueExtra:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,max_target_language_chars:80}}}),"
+        "dialogueModesDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,modes:['generate','auto_rewrite']}}}),"
+        "dialogueBriefLimitDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,max_brief_chars:0}}}),"
+        "dialogueOptionalDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,optional:false}}}),"
+        "dialogueDefaultDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,default:{mode:'auto_rewrite',target_language:'中文'}}}}),"
         "replacementDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,accept:['image/png']}}})"
         "}})()"
     )
@@ -199,8 +252,15 @@ def test_minimal_creation_capability_is_exact_and_fails_closed():
         "aspect_ratios": ["16:9", "9:16"],
         "resolutions": ["480p", "768p"],
         "dialogue": {
+            "modes": ["auto_rewrite", "generate"],
             "mode": "auto_rewrite",
             "translation": True,
+            "max_brief_chars": 1000,
+            "optional": True,
+            "default": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
         },
         "replacement": {
             "accept": ["image/jpeg", "image/png", "image/webp"],
@@ -288,15 +348,44 @@ def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair()
         "catch(error){return error.message}};return {"
         "language:capture({...base,targetLanguage:'  '}),"
         "longLanguage:capture({...base,targetLanguage:'a'.repeat(81)}),"
+        "briefMissing:capture({...base,dialogueMode:'generate'}),"
+        "briefBlank:capture({...base,dialogueMode:'generate',dialogueBrief:'  '}),"
+        "briefLong:capture({...base,dialogueMode:'generate',dialogueBrief:'好'.repeat(1001)}),"
         "imageOnly:capture({...base,hasReplacementImage:true}),"
         "instructionOnly:capture({...base,replacementInstruction:'替换产品'})}})()"
     )
     assert result == {
         "language": "请填写目标语言",
         "longLanguage": "目标语言超过长度限制",
+        "briefMissing": "请填写口播描述",
+        "briefBlank": "请填写口播描述",
+        "briefLong": "口播描述超过长度限制",
         "imageOnly": "参考图与替换说明需要一起提供",
         "instructionOnly": "参考图与替换说明需要一起提供",
     }
+
+
+def test_minimal_request_generate_mode_carries_exact_brief_shape():
+    capability = _capability()
+    result = _run_contract(
+        "(()=>{const capability="
+        + json.dumps(capability)
+        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        "targetLanguage:'日语',dialogueMode:'generate',"
+        "dialogueBrief:' 用轻松口吻介绍产品 ',hasReplacementImage:false,replacementInstruction:''};"
+        "return {generate:contract.buildMinimalGenerationRequest(base,capability),"
+        "rewrite:contract.buildMinimalGenerationRequest({...base,dialogueMode:'auto_rewrite'},capability)}})()"
+    )
+    assert result["generate"]["dialogue"] == {
+        "mode": "generate",
+        "target_language": "日语",
+        "brief": "用轻松口吻介绍产品",
+    }
+    assert result["rewrite"]["dialogue"] == {
+        "mode": "auto_rewrite",
+        "target_language": "日语",
+    }
+    assert "brief" not in result["rewrite"]["dialogue"]
 
 
 def test_active_upload_appends_only_the_minimal_multipart_contract():
@@ -549,12 +638,18 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "input_receipt:{replacement_image:null}},null);"
         "const historical=contract.projectComposerModel({effective_request:{...request,replacement_guidance:null},"
         "creation_input:null,input_receipt:{replacement_image:null}},local);"
+        "const generate=contract.projectComposerModel({effective_request:{...request,"
+        "dialogue:{mode:'generate',target_language:'日语',brief:'口播描述文本'},replacement_guidance:null},"
+        "creation_input:{version:1,source:{mode:'upload',filename:'clip.mp4',bytes:456},replacement_image:null},"
+        "input_receipt:{replacement_image:null}},null);"
         "const invalid=contract.projectComposerModel({effective_request:{version:1,output:{aspect_ratio:'1:1'}}},local);"
-        "return {restored,same,historical,invalid}})()"
+        "return {restored,same,historical,generate,invalid}})()"
     )
     assert result["restored"] == {
         "aspectRatio": "16:9",
         "resolution": "480p",
+        "dialogueMode": "auto_rewrite",
+        "dialogueBrief": "",
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "替换成参考产品",
@@ -567,6 +662,8 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
     assert result["same"] == {
         "aspectRatio": "16:9",
         "resolution": "480p",
+        "dialogueMode": "auto_rewrite",
+        "dialogueBrief": "",
         "languageMode": "same",
         "targetLanguage": "",
         "replacementInstruction": "",
@@ -576,10 +673,23 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
     assert result["historical"] == {
         "aspectRatio": "16:9",
         "resolution": "480p",
+        "dialogueMode": "auto_rewrite",
+        "dialogueBrief": "",
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "",
         "source": None,
+        "replacementImage": None,
+    }
+    assert result["generate"] == {
+        "aspectRatio": "16:9",
+        "resolution": "480p",
+        "dialogueMode": "generate",
+        "dialogueBrief": "口播描述文本",
+        "languageMode": "other",
+        "targetLanguage": "日语",
+        "replacementInstruction": "",
+        "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
         "replacementImage": None,
     }
     assert result["invalid"] is None

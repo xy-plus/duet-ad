@@ -818,7 +818,6 @@ def test_generation_request_accepts_only_the_closed_v1_shape(tmp_path: Path):
             "null",
             '"text"',
             json.dumps({}),
-            json.dumps({key: value for key, value in GENERATION_REQUEST.items() if key != "dialogue"}),
             json.dumps({**GENERATION_REQUEST, "extra": True}),
             json.dumps({**GENERATION_REQUEST, "version": True}),
             json.dumps({**GENERATION_REQUEST, "version": 2}),
@@ -859,6 +858,40 @@ def test_generation_request_accepts_only_the_closed_v1_shape(tmp_path: Path):
             json.dumps({
                 **GENERATION_REQUEST,
                 "dialogue": {"mode": "manual", "target_language": "日语"},
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {"mode": "generate", "target_language": "日语"},
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {
+                    "mode": "generate",
+                    "target_language": "日语",
+                    "brief": "   ",
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {
+                    "mode": "generate",
+                    "target_language": "日语",
+                    "brief": "长" * 1001,
+                },
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {"mode": "auto_rewrite", "target_language": "日语", "brief": "介绍产品"},
+            }),
+            json.dumps({**GENERATION_REQUEST, "dialogue": None}),
+            json.dumps({**GENERATION_REQUEST, "dialogue": {}}),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {"target_language": "日语", "brief": "介绍产品"},
+            }),
+            json.dumps({
+                **GENERATION_REQUEST,
+                "dialogue": {"mode": "auto_rewrite"},
             }),
             json.dumps({
                 **GENERATION_REQUEST,
@@ -909,6 +942,86 @@ def test_generation_request_accepts_only_the_closed_v1_shape(tmp_path: Path):
         assert blank_language.status_code == 422
         assert blank_language.json()["detail"]["code"] == "target_language_required"
         assert client.get("/api/conversations", headers=AUTH).json() == []
+
+
+def test_generation_request_accepts_generate_mode_with_brief(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        capability = client.get("/api/capabilities", headers=AUTH).json()
+        assert capability["minimal_creation"]["dialogue"] == {
+            "modes": ["auto_rewrite", "generate"],
+            "mode": "auto_rewrite",
+            "translation": True,
+            "max_brief_chars": 1000,
+            "optional": True,
+            "default": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
+        }
+        response = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="generate-dialogue",
+                generation_request=json.dumps({
+                    **GENERATION_REQUEST,
+                    "dialogue": {
+                        "mode": "generate",
+                        "target_language": " 日语 ",
+                        "brief": " 用轻松口吻介绍新产品 ",
+                    },
+                }),
+            ),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
+        )
+        assert response.status_code == 201
+        assert response.json()["effective_request"]["dialogue"] == {
+            "mode": "generate",
+            "target_language": "日语",
+            "brief": "用轻松口吻介绍新产品",
+        }
+
+
+def test_generation_request_fills_dialogue_defaults_for_legacy_clients(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        legacy_mode = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="legacy-no-mode",
+                generation_request=json.dumps({
+                    **GENERATION_REQUEST,
+                    "dialogue": {"target_language": " 中文 "},
+                }),
+            ),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
+        )
+        assert legacy_mode.status_code == 201
+        assert legacy_mode.json()["effective_request"]["dialogue"] == {
+            "mode": "auto_rewrite",
+            "target_language": "中文",
+        }
+
+        legacy_dialogue = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="legacy-no-dialogue",
+                generation_request=json.dumps({
+                    key: value
+                    for key, value in GENERATION_REQUEST.items()
+                    if key != "dialogue"
+                }),
+            ),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
+        )
+        assert legacy_dialogue.status_code == 201
+        assert legacy_dialogue.json()["effective_request"]["dialogue"] == {
+            "mode": "auto_rewrite",
+            "target_language": "与原视频相同",
+        }
 
 
 def test_creation_multipart_surface_rejects_extra_and_duplicate_fields(tmp_path: Path):

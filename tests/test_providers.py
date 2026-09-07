@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -11,6 +12,7 @@ from app import providers
 from app.config import Settings
 from app.fusion_schema import FUSION_OUTPUT_NAME, fusion_prompt_schema
 from app.providers import (
+    AutodlClient,
     CodexClient,
     DeepSeekClient,
     MediaKitClient,
@@ -934,3 +936,509 @@ def test_picsart_poll_preserves_workflow_failed_422_exchange(
     assert caught.value.record["task_id"] == "failed-task"
     assert caught.value.record["polls"][-1]["response"]["status_code"] == 422
     assert caught.value.record["polls"][-1]["response"]["body"] == body
+
+
+def _autodl_client(
+    tmp_path: Path, handler: Any, **overrides: object
+) -> AutodlClient:
+    return AutodlClient(
+        _settings(
+            tmp_path,
+            autodl_api_key="autodl-secret",
+            autodl_api_base="https://autodl.test",
+            **overrides,
+        ),
+        httpx.MockTransport(handler),
+    )
+
+
+def _autodl_media(tmp_path: Path) -> tuple[Path, Path]:
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
+    video = tmp_path / "source-muted.mp4"
+    video.write_bytes(b"video-bytes")
+    return image, video
+
+
+def test_autodl_submit_uses_bare_token_and_exact_body(tmp_path: Path) -> None:
+    image, video = _autodl_media(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url == httpx.URL(
+            "https://autodl.test/api/v1/comfyui/comfyui_workflow/"
+            "wan2.2animate-v4-motion_retargeting"
+        )
+        assert request.headers["authorization"] == "autodl-secret"
+        assert request.headers["content-type"] == "application/json"
+        body = json.loads(request.content)
+        assert set(body) == {"ref_image", "ref_video"}
+        assert body["ref_image"].startswith("data:image/png;base64,")
+        assert body["ref_video"].startswith("data:video/mp4;base64,")
+        return httpx.Response(
+            200, json={"code": "Success", "data": {"task_id": "task-1"}}
+        )
+
+    result = _autodl_client(tmp_path, handler).submit_motion_retarget(
+        image_path=image, video_path=video,
+    )
+
+    assert result.value == "task-1"
+    assert result.record["outcome"] == "accepted"
+    assert result.record["task_id"] == "task-1"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={"code": "Failed", "msg": "bad params"}),
+        httpx.Response(200, json={"code": "Success", "data": {}}),
+        httpx.Response(400, json={"code": "Failed", "msg": "too many params"}),
+    ],
+)
+def test_autodl_submit_rejections_fail_closed(
+    tmp_path: Path, response: httpx.Response
+) -> None:
+    image, video = _autodl_media(tmp_path)
+    client = _autodl_client(tmp_path, lambda request: response)
+
+    with pytest.raises(ProviderFailure):
+        client.submit_motion_retarget(image_path=image, video_path=video)
+
+
+def test_autodl_submit_network_failure_keeps_transport_record(
+    tmp_path: Path,
+) -> None:
+    image, video = _autodl_media(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable", request=request)
+
+    client = _autodl_client(tmp_path, handler)
+    with pytest.raises(ProviderFailure, match="unreachable") as caught:
+        client.submit_motion_retarget(image_path=image, video_path=video)
+    assert caught.value.record["response"] is None
+
+
+@pytest.mark.parametrize(
+    ("image_name", "video_name", "message"),
+    [
+        ("reference.txt", "source-muted.mp4", "image input file is invalid"),
+        ("missing.png", "source-muted.mp4", "image input file is invalid"),
+        ("reference.png", "source-muted.webm", "video input file is invalid"),
+    ],
+)
+def test_autodl_submit_validates_input_files(
+    tmp_path: Path, image_name: str, video_name: str, message: str
+) -> None:
+    image, video = _autodl_media(tmp_path)
+    image = image.with_name(image_name)
+    if image.name != "missing.png":
+        image.write_bytes(b"image-bytes")
+    video = video.with_name(video_name)
+    video.write_bytes(b"video-bytes")
+    client = _autodl_client(
+        tmp_path, lambda request: pytest.fail("no request allowed")
+    )
+
+    with pytest.raises(ValueError, match=message):
+        client.submit_motion_retarget(image_path=image, video_path=video)
+
+
+def test_autodl_submit_rejects_oversized_body(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    image, video = _autodl_media(tmp_path)
+    monkeypatch.setattr(providers, "_AUTODL_SUBMIT_MAX_BYTES", 10)
+    client = _autodl_client(
+        tmp_path, lambda request: pytest.fail("no request allowed")
+    )
+
+    with pytest.raises(ValueError, match="size budget"):
+        client.submit_motion_retarget(image_path=image, video_path=video)
+
+
+def test_autodl_submit_requires_a_token(tmp_path: Path) -> None:
+    image, video = _autodl_media(tmp_path)
+    client = AutodlClient(
+        _settings(tmp_path, autodl_api_base="https://autodl.test"),
+        httpx.MockTransport(lambda request: pytest.fail("no request allowed")),
+    )
+
+    with pytest.raises(ProviderFailure, match="AUTODL_ART_TOKEN"):
+        client.submit_motion_retarget(image_path=image, video_path=video)
+
+
+def test_autodl_poll_waits_for_success_and_returns_artifact_url(
+    tmp_path: Path,
+) -> None:
+    statuses = iter(["QUEUED", "RUNNING", "SUCCESS"])
+    poll_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal poll_count
+        poll_count += 1
+        assert request.method == "GET"
+        assert request.url == httpx.URL(
+            "https://autodl.test/api/v1/comfyui/comfyui_workflow/result/task-1"
+        )
+        assert request.headers["authorization"] == "autodl-secret"
+        status = next(statuses)
+        results: list[dict[str, str]] = []
+        if status == "SUCCESS":
+            results = [{"url": "https://cdn.test/output/task-1.mp4"}]
+        return httpx.Response(
+            200,
+            json={"code": "Success", "data": {"status": status, "results": results}},
+        )
+
+    result = _autodl_client(tmp_path, handler).poll("task-1")
+
+    assert result.value == "https://cdn.test/output/task-1.mp4"
+    assert poll_count == 3
+    assert len(result.record["polls"]) == 3
+
+
+def test_autodl_poll_accepts_dict_results_and_prefers_mp4(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "code": "Success",
+                "data": {
+                    "status": "SUCCESS",
+                    "results": {
+                        "preview": {"url": "https://cdn.test/preview.png"},
+                        "video": {"url": "https://cdn.test/output.mp4"},
+                    },
+                },
+            },
+        )
+
+    assert _autodl_client(tmp_path, handler).poll("task-1").value == (
+        "https://cdn.test/output.mp4"
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"code": "Success", "data": {"status": "FAILED", "msg": "boom"}},
+            "AutoDL task failed",
+        ),
+        (
+            {"code": "Success", "data": {"status": "SUCCESS", "results": []}},
+            "no artifact URL",
+        ),
+        (
+            {"code": "Failed", "msg": "unknown task"},
+            "data must be an object",
+        ),
+    ],
+)
+def test_autodl_poll_failures_fail_closed(
+    tmp_path: Path, payload: dict[str, Any], message: str
+) -> None:
+    client = _autodl_client(
+        tmp_path, lambda request: httpx.Response(200, json=payload)
+    )
+
+    with pytest.raises(ProviderFailure, match=message):
+        client.poll("task-1")
+
+
+def test_autodl_poll_times_out(tmp_path: Path) -> None:
+    client = _autodl_client(
+        tmp_path,
+        lambda request: httpx.Response(
+            200, json={"code": "Success", "data": {"status": "RUNNING"}}
+        ),
+        provider_poll_timeout_s=0.0,
+    )
+
+    with pytest.raises(ProviderFailure, match="timed out"):
+        client.poll("task-1")
+
+
+def test_autodl_download_writes_artifact(tmp_path: Path) -> None:
+    destination = tmp_path / "nested" / "source-retargeted.mp4"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("https://cdn.test/output.mp4")
+        return httpx.Response(200, content=b"retargeted-video")
+
+    result = _autodl_client(tmp_path, handler).download(
+        "https://cdn.test/output.mp4", destination,
+    )
+
+    assert result.value == destination
+    assert destination.read_bytes() == b"retargeted-video"
+    assert result.evidence_media == [destination]
+
+
+def _autodl_voice(tmp_path: Path) -> Path:
+    voice = tmp_path / "audio-01.wav"
+    voice.write_bytes(b"RIFF" + b"voice-bytes")
+    return voice
+
+
+def test_autodl_submit_tts_uses_tts_workflow_and_exact_body(
+    tmp_path: Path,
+) -> None:
+    voice = _autodl_voice(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url == httpx.URL(
+            "https://autodl.test/api/v1/comfyui/comfyui_workflow/indextts2-v1"
+        )
+        assert request.headers["authorization"] == "autodl-secret"
+        body = json.loads(request.content)
+        assert set(body) == {"prompt_text", "prompt_simple", "emo_control_method"}
+        assert body["prompt_text"] == "第一句台词"
+        assert body["prompt_simple"].startswith("data:audio/wav;base64,")
+        assert body["emo_control_method"] == "与音色参考音频相同"
+        return httpx.Response(
+            200, json={"code": "Success", "data": {"task_id": "tts-task-1"}}
+        )
+
+    result = _autodl_client(tmp_path, handler).submit_tts(
+        text="第一句台词", voice_path=voice,
+    )
+
+    assert result.value == "tts-task-1"
+    assert result.record["outcome"] == "accepted"
+    assert result.record["task_id"] == "tts-task-1"
+
+
+@pytest.mark.parametrize(
+    ("text", "voice_name", "message"),
+    [
+        ("", "audio-01.wav", "TTS text is invalid"),
+        ("   ", "audio-01.wav", "TTS text is invalid"),
+        ("x" * 2049, "audio-01.wav", "TTS text is invalid"),
+        ("台词", "audio-01.mp3", "voice input file is invalid"),
+        ("台词", "missing.wav", "voice input file is invalid"),
+    ],
+)
+def test_autodl_submit_tts_validates_inputs(
+    tmp_path: Path, text: str, voice_name: str, message: str
+) -> None:
+    voice = _autodl_voice(tmp_path).with_name(voice_name)
+    if voice.name != "missing.wav":
+        voice.write_bytes(b"voice-bytes")
+    client = _autodl_client(
+        tmp_path, lambda request: pytest.fail("no request allowed")
+    )
+
+    with pytest.raises(ValueError, match=message):
+        client.submit_tts(text=text, voice_path=voice)
+
+
+def test_autodl_submit_tts_rejection_fails_closed(tmp_path: Path) -> None:
+    voice = _autodl_voice(tmp_path)
+    client = _autodl_client(
+        tmp_path,
+        lambda request: httpx.Response(
+            200, json={"code": "Failed", "msg": "bad params"}
+        ),
+    )
+
+    with pytest.raises(ProviderFailure):
+        client.submit_tts(text="台词", voice_path=voice)
+
+
+def test_autodl_poll_returns_wav_artifact_url(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "code": "Success",
+                "data": {
+                    "status": "SUCCESS",
+                    "results": [{"url": "https://cdn.test/output/line-0001.wav"}],
+                },
+            },
+        )
+
+    assert _autodl_client(tmp_path, handler).poll("tts-task-1").value == (
+        "https://cdn.test/output/line-0001.wav"
+    )
+
+
+def test_mediakit_video_subtitle_erase_pro_uses_v5_and_exact_body(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url == httpx.URL(
+            "https://mediakit.test/api/v1/tools/erase-video-subtitle-pro"
+        )
+        assert request.headers["authorization"] == "Bearer mediakit-secret"
+        body = json.loads(request.content)
+        assert body == {
+            "video_url": "https://assets.test/source.mp4",
+            "mode": "Subtitle",
+            "model_version": "v5",
+        }
+        return httpx.Response(
+            200, json={"success": True, "task_id": "task-1", "request_id": "req-1"}
+        )
+
+    result = MediaKitClient(
+        _settings(tmp_path), httpx.MockTransport(handler),
+    ).submit_video_subtitle_erase("https://assets.test/source.mp4")
+
+    assert result.value == "task-1"
+    assert result.record["outcome"] == "accepted"
+    assert result.record["task_id"] == "task-1"
+
+
+def test_mediakit_video_subtitle_erase_standard_omits_model_version(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL(
+            "https://mediakit.test/api/v1/tools/erase-video-subtitle"
+        )
+        body = json.loads(request.content)
+        assert body == {
+            "video_url": "https://assets.test/source.mp4",
+            "mode": "Subtitle",
+        }
+        return httpx.Response(
+            200, json={"success": True, "task_id": "task-2", "request_id": "req-2"}
+        )
+
+    result = MediaKitClient(
+        _settings(tmp_path, mediakit_video_erase_mode="standard"),
+        httpx.MockTransport(handler),
+    ).submit_video_subtitle_erase("https://assets.test/source.mp4")
+
+    assert result.value == "task-2"
+
+
+def test_mediakit_video_subtitle_erase_requires_a_key_and_a_url(
+    tmp_path: Path,
+) -> None:
+    no_key = MediaKitClient(
+        _settings(tmp_path, mediakit_api_key=""),
+        httpx.MockTransport(lambda request: pytest.fail("no request allowed")),
+    )
+    with pytest.raises(ProviderFailure, match="VOLC_MEDIAKIT_API_KEY"):
+        no_key.submit_video_subtitle_erase("https://assets.test/source.mp4")
+
+    client = MediaKitClient(
+        _settings(tmp_path),
+        httpx.MockTransport(lambda request: pytest.fail("no request allowed")),
+    )
+    with pytest.raises(ValueError, match="video URL is invalid"):
+        client.submit_video_subtitle_erase("  ")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={"success": False, "error": "bad params"}),
+        httpx.Response(200, json={"success": True, "result": {}}),
+        httpx.Response(400, json={"success": False, "error": "rejected"}),
+    ],
+)
+def test_mediakit_video_subtitle_erase_rejections_fail_closed(
+    tmp_path: Path, response: httpx.Response
+) -> None:
+    client = MediaKitClient(
+        _settings(tmp_path), httpx.MockTransport(lambda request: response)
+    )
+
+    with pytest.raises(ProviderFailure):
+        client.submit_video_subtitle_erase("https://assets.test/source.mp4")
+
+
+def test_mediakit_poll_task_waits_for_completed_and_returns_video_url(
+    tmp_path: Path,
+) -> None:
+    statuses = iter(["RUNNING", "COMPLETED"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url == httpx.URL(
+            "https://mediakit.test/api/v1/tasks/task-1"
+        )
+        assert request.headers["authorization"] == "Bearer mediakit-secret"
+        status = next(statuses)
+        body: dict[str, object] = {"success": True, "task_id": "task-1", "status": status.lower()}
+        if status == "COMPLETED":
+            body["result"] = {"video_url": "https://cdn.test/erased.mp4"}
+        return httpx.Response(200, json=body)
+
+    result = MediaKitClient(
+        _settings(tmp_path), httpx.MockTransport(handler),
+    ).poll_task("task-1")
+
+    assert result.value == "https://cdn.test/erased.mp4"
+    assert len(result.record["polls"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            {"success": True, "status": "FAILED", "error": "boom"},
+            "MediaKit task failed",
+        ),
+        (
+            {"success": True, "status": "COMPLETED", "result": {}},
+            "no video_url",
+        ),
+    ],
+)
+def test_mediakit_poll_task_failures_fail_closed(
+    tmp_path: Path, body: dict[str, Any], message: str
+) -> None:
+    client = MediaKitClient(
+        _settings(tmp_path),
+        httpx.MockTransport(lambda request: httpx.Response(200, json=body)),
+    )
+
+    with pytest.raises(ProviderFailure, match=message):
+        client.poll_task("task-1")
+
+
+def test_mediakit_poll_task_times_out(tmp_path: Path) -> None:
+    client = MediaKitClient(
+        _settings(tmp_path, provider_poll_timeout_s=0.0),
+        httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"success": True, "status": "RUNNING"}
+            )
+        ),
+    )
+
+    with pytest.raises(ProviderFailure, match="timed out"):
+        client.poll_task("task-1")
+
+
+def test_mediakit_download_writes_artifact(tmp_path: Path) -> None:
+    destination = tmp_path / "nested" / "source-nosubs.mp4"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("https://cdn.test/erased.mp4")
+        return httpx.Response(200, content=b"erased-video")
+
+    result = MediaKitClient(
+        _settings(tmp_path), httpx.MockTransport(handler),
+    ).download("https://cdn.test/erased.mp4", destination)
+
+    assert result.value == destination
+    assert destination.read_bytes() == b"erased-video"
+
+
+def test_mediakit_video_erase_mode_rejects_unknown_values(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="MEDIAKIT_VIDEO_ERASE_MODE"):
+        _settings(tmp_path, mediakit_video_erase_mode="turbo")
