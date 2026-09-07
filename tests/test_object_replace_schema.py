@@ -126,7 +126,7 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "replacement_set",
         "全部 stable key",
         "同类型但不同身份",
-        "人脸或可见身体",
+        "至少两个可见维度",
         "只有身体局部可见时",
         "服装保持颜色和风格但改变款式",
         "同类但不同实例",

@@ -61,7 +61,6 @@ def _settings(path: Path, **changes: Any) -> Settings:
         "access_token": "test-token",
         "data_dir": path,
         "public_base_url": "https://pipeline.test",
-        "retry_delay_s": 0,
         "enable_mediakit": False,
         "provider_poll_interval_s": 0,
     }
@@ -2924,9 +2923,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "facial identity" not in person_line
     assert "original haircut" not in person_line
     assert "source role, action, pose, position, and continuity" in person_line
-    assert "only explicitly stated gender, race" in person_line
-    assert "replace with a different identity" in person_line
-    assert "visibly change the face or visible body" in person_line
+    assert "keep only explicitly stated gender and age group" in person_line
+    assert "replace with a clearly different identity" in person_line
+    assert "must differ visibly from the source in at least two of" in person_line
     assert "when clothing is visible, change its design" in person_line
     assert "slightly different" not in person_line
 
@@ -3067,7 +3066,7 @@ def test_fusion_authority_keeps_global_index_element_with_empty_occurrences() ->
     assert "one fixed new product design" in authority
 
 
-def test_node_records_both_failed_attempts_and_process_streams(
+def test_node_records_the_failed_attempt_and_process_streams(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
@@ -3095,10 +3094,10 @@ def test_node_records_both_failed_attempts_and_process_streams(
     except media.CommandError:
         pass
     else:
-        raise AssertionError("the second command failure must escape")
+        raise AssertionError("the command failure must escape")
 
-    assert calls == 2
-    for attempt in (1, 2):
+    assert calls == 1
+    for attempt in (1,):
         root = project / "logs" / "command" / "project" / f"attempt-{attempt}"
         assert (root / "error.json").is_file()
         assert (root / "stdout.log").read_text(encoding="utf-8") == f"stdout-{attempt}"
@@ -3147,7 +3146,7 @@ def test_pipeline_keeps_raw_failure_in_logs_but_not_public_state(
     assert "private provider response" in trace
 
 
-def test_submit_node_never_retries_without_an_explicit_safe_policy(
+def test_submit_node_retries_only_with_an_explicit_safe_policy(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
@@ -3182,6 +3181,7 @@ def test_submit_node_never_retries_without_an_explicit_safe_policy(
             {},
             [],
             unknown,
+            retry_if=lambda _exc: False,
         )
     assert unknown_calls == 1
     assert not (
@@ -3207,6 +3207,7 @@ def test_submit_node_never_retries_without_an_explicit_safe_policy(
             {},
             [],
             rejected,
+            retry_if=lambda _exc: False,
         )
     except ProviderFailure:
         pass
@@ -5381,7 +5382,11 @@ def test_dialogue_tts_failure_fails_closed(
 
         def submit_tts(self, **_kwargs: Any) -> None:
             self.calls += 1
-            raise ProviderFailure({}, [], RuntimeError("autodl tts unavailable"))
+            raise ProviderFailure(
+                {"error": "content policy violation"},
+                [],
+                RuntimeError("autodl tts content policy rejection"),
+            )
 
     autodl = FailingAutodl()
     (
@@ -5389,7 +5394,7 @@ def test_dialogue_tts_failure_fails_closed(
         prepared, enhanced_index, voice_paths,
     ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
 
-    with pytest.raises(ProviderFailure, match="autodl tts unavailable"):
+    with pytest.raises(ProviderFailure, match="autodl tts content policy rejection"):
         pipeline._run_dialogue_audio(
             project_id,
             project,
@@ -5399,9 +5404,9 @@ def test_dialogue_tts_failure_fails_closed(
             ResearchLog(project),
         )
 
-    # The node retries once, then the failure escapes without any assembled
-    # track or segment slices.
-    assert autodl.calls == 2
+    # Business rejections are not retried: the failure escapes on the first
+    # attempt without any assembled track or segment slices.
+    assert autodl.calls == 1
     assert not (project / "work" / "dialogue-audio" / "full-track.wav").exists()
     assert not any(
         (project / "work" / "segments").glob("*/dialogue-track.wav")
@@ -6032,3 +6037,110 @@ def test_h3_content_moderation_failure_is_not_resubmitted(
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "picsart_asset_fetch_resubmit" not in trace
 
+
+def test_node_retries_provider_failures_until_success_with_backoff(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-retry-schedule",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", delays.append)
+    calls = 0
+
+    def flaky() -> str:
+        nonlocal calls
+        calls += 1
+        if calls <= 4:
+            raise ProviderFailure(
+                {"outcome": "unknown", "attempt": calls},
+                [],
+                OSError("connection ended"),
+            )
+        return "ok"
+
+    result = pipeline._node(log, "deepseek-call", "project", {}, [], flaky)
+
+    assert result == "ok"
+    assert calls == 5
+    # Attempts 2 and 3 rerun immediately; attempt 4 waits 60s, attempt 5 120s.
+    assert delays == [60.0, 120.0]
+    for attempt in (1, 2, 3, 4):
+        assert (
+            project / "logs" / "deepseek-call" / "project" / f"attempt-{attempt}"
+        ).is_dir()
+
+
+def test_node_never_retries_business_rejections(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-rejection",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    calls = 0
+
+    def rejected() -> None:
+        nonlocal calls
+        calls += 1
+        raise ProviderFailure(
+            {"outcome": "rejected", "error": "image_rejected by moderation"},
+            [],
+            RuntimeError("rejected"),
+        )
+
+    with pytest.raises(ProviderFailure):
+        pipeline._node(log, "seedream-submit", "project", {}, [], rejected)
+    assert calls == 1
+
+
+def test_node_never_retries_input_errors(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-input-error",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    calls = 0
+
+    def invalid() -> None:
+        nonlocal calls
+        calls += 1
+        raise ValueError("bad input")
+
+    with pytest.raises(ValueError):
+        pipeline._node(log, "probe", "project", {}, [], invalid)
+    assert calls == 1
+
+
+def test_node_retry_delay_schedule() -> None:
+    assert Pipeline._node_retry_delay(1) == 0.0
+    assert Pipeline._node_retry_delay(2) == 0.0
+    assert Pipeline._node_retry_delay(3) == 60.0
+    assert Pipeline._node_retry_delay(4) == 120.0
+    assert Pipeline._node_retry_delay(5) == 240.0
+    assert Pipeline._node_retry_delay(20) == 1800.0

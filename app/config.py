@@ -46,7 +46,6 @@ class Settings:
     provider_poll_interval_s: float = 3.0
     provider_poll_timeout_s: float = 1800.0
     max_upload_mb: int = 500
-    retry_delay_s: float = 1.0
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
@@ -215,7 +214,6 @@ def get_settings() -> Settings:
         provider_poll_interval_s=float(os.environ.get("PROVIDER_POLL_INTERVAL_S", "3")),
         provider_poll_timeout_s=float(os.environ.get("PROVIDER_POLL_TIMEOUT_S", "1800")),
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
-        retry_delay_s=float(os.environ.get("RETRY_DELAY_S", "1")),
         public_api_enabled=_bool("PUBLIC_API_ENABLED", False),
         public_api_clients_file=(
             Path(clients_file).expanduser() if (clients_file := os.environ.get("PUBLIC_API_CLIENTS_FILE", "").strip()) else None
