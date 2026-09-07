@@ -388,7 +388,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
-            app.state.store.fail_incomplete_after_restart()
+            restarted = app.state.store.fail_incomplete_after_restart()
+            for item in restarted:
+                _auto_resume_after_restart(item)
             yield
         finally:
             tasks = tuple(app.state.tasks)
@@ -608,6 +610,77 @@ def create_app(
         task = asyncio.create_task(asyncio.to_thread(pipeline_entry, project_id, operation))
         app.state.tasks.add(task)
         task.add_done_callback(app.state.tasks.discard)
+
+    def _auto_resume_after_restart(item: dict[str, Any]) -> None:
+        """Requeue a project cut off by a process restart when a resume gate
+        passes; otherwise keep it failed with manual-reconciliation guidance
+        in the research log.  A restart must never be a dead end."""
+        project_id = item.get("project_id")
+        if not isinstance(project_id, str):
+            return
+        log = ResearchLog(app.state.store.path(project_id))
+        try:
+            with app.state.resume_lock:
+                try:
+                    state = app.state.store.read(project_id)
+                except (FileNotFoundError, OSError, ProjectStateError):
+                    return
+                if state.get("status") != "failed":
+                    return
+                operation: str | None = None
+                try:
+                    app.state.pipeline.validate_r2v_resume(project_id)
+                    operation = "resume_r2v"
+                except (FileNotFoundError, TypeError, ValueError, OSError):
+                    try:
+                        app.state.pipeline.validate_pre_picsart_resume(project_id)
+                        operation = "resume_pre_picsart"
+                    except (FileNotFoundError, TypeError, ValueError, OSError):
+                        operation = None
+                if operation is None:
+                    log.event(
+                        "auto_resume_after_restart_blocked",
+                        project_id=project_id,
+                        downgraded_receipts=item.get("downgraded_receipts"),
+                        guidance=(
+                            "存在 submission_unknown 回执或缺少可复用前置产物；"
+                            "先按 AGENTS.md 与供应商人工对账，确认未建任务/未扣费后"
+                            "把对应回执 status 改为 rejected，再调 resume-picsart"
+                        ),
+                    )
+                    return
+                stage = (
+                    "picsart_resume_queued"
+                    if operation == "resume_r2v"
+                    else "pre_picsart_resume_queued"
+                )
+                app.state.store.update(
+                    project_id,
+                    status="queued",
+                    has_video=False,
+                    project_progress={
+                        "status": "queued",
+                        "percent": 0,
+                        "stage": stage,
+                    },
+                    generation={
+                        "status": "queued",
+                        "stage": stage,
+                        "error": None,
+                    },
+                    error=None,
+                )
+            log.event(
+                "auto_resumed_after_restart",
+                project_id=project_id,
+                operation=operation,
+                downgraded_receipts=item.get("downgraded_receipts"),
+            )
+            start_pipeline(project_id, operation)
+        except Exception:
+            LOGGER.exception(
+                "auto-resume after restart failed for project %s", project_id,
+            )
 
     @asynccontextmanager
     async def staged_creation(

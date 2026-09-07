@@ -192,6 +192,28 @@ def _result_path(receipt_path: Path) -> Path:
     return receipt_path.with_name(receipt_path.name + ".result")
 
 
+def reset_attempt(receipt_path: Path, destination: Path) -> list[str]:
+    """Delete every durable artifact of a terminal Seedream attempt so a fresh
+    POST may be issued under the same receipt path.  Returns removed names."""
+    removed: list[str] = []
+    candidates = (
+        receipt_path,
+        _claim_path(receipt_path),
+        _response_marker_path(receipt_path),
+        _result_path(receipt_path),
+        Path(destination),
+    )
+    for path in candidates:
+        if path.is_symlink():
+            raise ValueError(f"Seedream attempt artifact is a symlink: {path.name}")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        removed.append(path.name)
+    return removed
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))

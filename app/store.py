@@ -754,7 +754,66 @@ class ProjectStore:
                 error={"code": code, "message": message},
             )
 
-    def fail_incomplete_after_restart(self) -> None:
+    @staticmethod
+    def _submit_accepted_evidence(project: Path, run_identity: str) -> bool:
+        """True when the research log proves this submission was accepted."""
+        submit_root = project / "logs" / f"{run_identity}-submit"
+        for output in submit_root.glob("*/attempt-*/output.json"):
+            try:
+                logged = json.loads(output.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            record = (
+                logged.get("provider_record") if isinstance(logged, dict) else None
+            )
+            if (
+                isinstance(record, dict)
+                and record.get("outcome") == "accepted"
+                and isinstance(record.get("task_id"), str)
+                and record["task_id"]
+            ):
+                return True
+        return False
+
+    def _downgrade_unproven_submissions(self, project_id: str) -> list[dict[str, Any]]:
+        """Downgrade submission_started receipts without accepted-submit log
+        evidence to rejected, so a restart cannot lock the resume gate."""
+        project = self.root / project_id
+        state = self._read_unlocked(project_id)
+        ledger = state.get("picsart_submission_receipts")
+        if not isinstance(ledger, dict):
+            return []
+        segments = ledger.get("segments")
+        if not isinstance(segments, dict):
+            return []
+        downgraded: list[dict[str, Any]] = []
+        changed = False
+        for records in segments.values():
+            if not isinstance(records, list):
+                continue
+            for receipt in records:
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("status") != "submission_started"
+                ):
+                    continue
+                run_identity = receipt.get("run_identity")
+                if not isinstance(run_identity, str) or not run_identity:
+                    continue
+                if self._submit_accepted_evidence(project, run_identity):
+                    continue
+                receipt["status"] = "rejected"
+                changed = True
+                downgraded.append({
+                    "segment_index": receipt.get("segment_index"),
+                    "run_identity": run_identity,
+                })
+        if changed:
+            self.update(project_id, picsart_submission_receipts=ledger)
+        return downgraded
+
+    def fail_incomplete_after_restart(self) -> list[dict[str, Any]]:
+        restarted: list[dict[str, Any]] = []
         with self._lock:
             for project in self.root.iterdir():
                 if not project.is_dir() or PROJECT_ID_RE.fullmatch(project.name) is None:
@@ -767,8 +826,14 @@ class ProjectStore:
                 except (FileNotFoundError, OSError, json.JSONDecodeError, ProjectStateError):
                     continue
                 if state["status"] in {"queued", "running"}:
+                    downgraded = self._downgrade_unproven_submissions(project.name)
                     self.mark_failed(
                         project.name,
                         code="process_restarted",
                         message="后端重启，研究任务未恢复",
                     )
+                    restarted.append({
+                        "project_id": project.name,
+                        "downgraded_receipts": downgraded,
+                    })
+        return restarted

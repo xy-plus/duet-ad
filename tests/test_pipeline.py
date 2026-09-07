@@ -4,7 +4,9 @@ import base64
 import hashlib
 import json
 import stat
+import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +24,15 @@ from app.pipeline import (
     DIALOGUE_GENERATION_SCHEMA,
     H3_PREPARED_ARTIFACTS_VERSION,
     PICSART_RECEIPT_VERSION,
+    FACE_MASK_MAX_ATTEMPTS,
     Pipeline,
+    PicsartTaskHungError,
     PreparedPicsartRequest,
     REPLACEMENT_SHEET_VERSION,
     SAME_AS_SOURCE_LANGUAGE,
     TRANSLATION_SCHEMA,
 )
-from app.providers import ProviderFailure, ProviderResult
+from app.providers import CodexProcessError, ProviderFailure, ProviderResult
 from app.replacement_sheet import (
     build_replacement_sheet_spec,
     finalize_replacement_sheet,
@@ -40,6 +44,7 @@ from app.seedream import (
     SEEDREAM_OUTPUT_HEIGHT,
     SEEDREAM_OUTPUT_SIZE,
     SEEDREAM_OUTPUT_WIDTH,
+    SeedreamError,
 )
 from app.store import ProjectStore
 from app.voice_catalog import load_voice_library
@@ -3113,20 +3118,19 @@ def test_node_records_the_failed_attempt_and_process_streams(
     log = ResearchLog(project)
     calls = 0
 
-    def fail() -> None:
+    def fail() -> str:
         nonlocal calls
         calls += 1
-        raise media.CommandError(["fake"], 1, f"stdout-{calls}", f"stderr-{calls}")
+        if calls <= 2:
+            raise media.CommandError(["fake"], 1, f"stdout-{calls}", f"stderr-{calls}")
+        return "ok"
 
-    try:
-        pipeline._node(log, "command", "project", {}, [], fail)
-    except media.CommandError:
-        pass
-    else:
-        raise AssertionError("the command failure must escape")
+    # CommandError (a non-zero ffmpeg exit) is transient: the node retries
+    # until the command succeeds instead of escaping on the first failure.
+    assert pipeline._node(log, "command", "project", {}, [], fail) == "ok"
 
-    assert calls == 1
-    for attempt in (1,):
+    assert calls == 3
+    for attempt in (1, 2):
         root = project / "logs" / "command" / "project" / f"attempt-{attempt}"
         assert (root / "error.json").is_file()
         assert (root / "stdout.log").read_text(encoding="utf-8") == f"stdout-{attempt}"
@@ -3892,7 +3896,7 @@ def test_pre_picsart_resume_submits_only_when_prepared_has_no_attempt_evidence(
 
 @pytest.mark.parametrize(
     "damage",
-    ["orphan_claim", "unknown", "corrupt_result", "missing_claim", "request"],
+    ["orphan_claim", "corrupt_result", "missing_claim", "request"],
 )
 def test_pre_picsart_checkpoint_damage_fails_before_resume_writes_or_provider_calls(
     tmp_path: Path,
@@ -3907,10 +3911,6 @@ def test_pre_picsart_checkpoint_damage_fails_before_resume_writes_or_provider_ca
     result_path = directory / "seedream-receipt.json.result"
     if damage == "orphan_claim":
         receipt_path.unlink()
-    elif damage == "unknown":
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        receipt["status"] = "submission_unknown"
-        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     elif damage == "corrupt_result":
         result_path.write_bytes(_TEST_PNG[:-8])
     elif damage == "missing_claim":
@@ -3943,6 +3943,61 @@ def test_pre_picsart_checkpoint_damage_fails_before_resume_writes_or_provider_ca
     assert trace_path.read_bytes() == trace_before
     assert seedream.calls == []
     assert seedream.replay_calls == []
+
+
+@pytest.mark.parametrize("terminal_status", ["rejected", "submission_unknown"])
+def test_pre_picsart_resume_regenerates_a_terminal_seedream_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    store, project_id, project, _sheet, _initial_seedream = (
+        _failed_replacement_sheet_checkpoint(tmp_path, prepared=True)
+    )
+    directory = project / "work" / "global-reference-sheet"
+    receipt_path = directory / "seedream-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["status"] = terminal_status
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    seedream = _FlowSeedream()
+    pipeline = Pipeline(
+        _settings(tmp_path, seedream_api_key="configured-test-key"),
+        store,
+        lambda *_args: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=seedream,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_continue_after_prepared",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("upstream nodes must not rerun")
+        ),
+    )
+    downstream: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_continue_after_replacement_sheet",
+        lambda *args, **_kwargs: downstream.append(args),
+    )
+
+    # A terminally rejected/unknown Seedream attempt no longer blocks the
+    # resume paths: its artifacts are reset and the frozen request re-POSTs.
+    pipeline.validate_pre_picsart_resume(project_id)
+    pipeline.resume_pre_picsart(project_id)
+
+    assert len(seedream.calls) == 1
+    assert seedream.replay_calls == []
+    assert len(downstream) == 1
+    sheet = store.read(project_id)["replacement_sheet"]
+    assert sheet["status"] == "succeeded"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "succeeded"
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "seedream_receipt_reset" in trace
+    assert f'"prior_status": "{terminal_status}"' in trace
 
 
 def test_pre_picsart_resume_rejects_existing_h3_manifest_before_writes(
@@ -5394,44 +5449,48 @@ def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
     )
 
 
-def test_dialogue_tts_failure_fails_closed(
+def test_dialogue_tts_moderation_rejection_retries_until_success(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    class FailingAutodl:
+    class FlakyAutodl(_FlowAutodlTTS):
         def __init__(self) -> None:
+            super().__init__()
             self.calls = 0
 
-        def submit_tts(self, **_kwargs: Any) -> None:
+        def submit_tts(self, **kwargs: Any) -> ProviderResult[str]:
             self.calls += 1
-            raise ProviderFailure(
-                {"error": "content policy violation"},
-                [],
-                RuntimeError("autodl tts content policy rejection"),
-            )
+            if self.calls <= 4:
+                raise ProviderFailure(
+                    {"error": "content policy violation"},
+                    [],
+                    RuntimeError("autodl tts content policy rejection"),
+                )
+            return super().submit_tts(**kwargs)
 
-    autodl = FailingAutodl()
+    autodl = FlakyAutodl()
     (
         _store, project_id, project, pipeline,
         prepared, enhanced_index, voice_paths,
     ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", delays.append)
 
-    with pytest.raises(ProviderFailure, match="autodl tts content policy rejection"):
-        pipeline._run_dialogue_audio(
-            project_id,
-            project,
-            prepared,
-            enhanced_index,
-            voice_paths,
-            ResearchLog(project),
-        )
-
-    # Business rejections are not retried: the failure escapes on the first
-    # attempt without any assembled track or segment slices.
-    assert autodl.calls == 1
-    assert not (project / "work" / "dialogue-audio" / "full-track.wav").exists()
-    assert not any(
-        (project / "work" / "segments").glob("*/dialogue-track.wav")
+    pipeline._run_dialogue_audio(
+        project_id,
+        project,
+        prepared,
+        enhanced_index,
+        voice_paths,
+        ResearchLog(project),
     )
+
+    # Moderation rejections retry with backoff instead of failing closed.
+    # Two dialogue lines: the first burns four failures plus its success,
+    # the second succeeds on its first attempt.
+    assert autodl.calls == 6
+    # Retries 2-3 rerun immediately; attempts 3 and 4 back off 60s and 120s.
+    assert delays == [60.0, 120.0]
+    assert (project / "work" / "dialogue-audio" / "full-track.wav").is_file()
 
 
 def test_dialogue_tts_without_any_voice_reference_fails_closed(
@@ -5757,20 +5816,34 @@ def test_erase_source_subtitles_switch_off_is_a_complete_skip(
     assert not (project / "logs" / "erase-source-subtitles").exists()
 
 
-def test_erase_source_subtitles_failure_fails_closed(
+def test_erase_source_subtitles_moderation_rejection_retries_until_success(
     tmp_path: Path,
+    monkeypatch: Any,
 ) -> None:
-    class FailingMediaKit:
+    class FlakyMediaKit:
         def __init__(self) -> None:
             self.calls = 0
 
-        def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> None:
+        def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> ProviderResult[str]:
             self.calls += 1
-            raise ProviderFailure(
-                {"error": "content policy violation"},
-                [],
-                RuntimeError("mediakit content policy rejection"),
+            if self.calls <= 5:
+                raise ProviderFailure(
+                    {"error": "content policy violation"},
+                    [],
+                    RuntimeError("mediakit content policy rejection"),
+                )
+            return ProviderResult(
+                "erase-task-1", {"outcome": "accepted", "task_id": "erase-task-1"},
             )
+
+        def poll_task(self, task_id: str) -> ProviderResult[str]:
+            return ProviderResult(
+                "https://mediakit.invalid/erased.mp4", {"task_id": task_id},
+            )
+
+        def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+            destination.write_bytes(b"erased")
+            return ProviderResult(destination, {"request": {"url": url}}, [destination])
 
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(
@@ -5778,7 +5851,7 @@ def test_erase_source_subtitles_failure_fails_closed(
     )
     source = project / "inputs" / "source.mp4"
     source.write_bytes(b"source")
-    mediakit = FailingMediaKit()
+    mediakit = FlakyMediaKit()
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -5787,17 +5860,22 @@ def test_erase_source_subtitles_failure_fails_closed(
         mediakit=mediakit,
         picsart=object(),
     )
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", delays.append)
 
-    with pytest.raises(ProviderFailure, match="mediakit content policy rejection"):
-        pipeline._erase_source_subtitles(
-            project_id, project, source, _effective_request(),
-            ResearchLog(project),
-        )
+    # Moderation rejections retry with backoff instead of failing closed.
+    result = pipeline._erase_source_subtitles(
+        project_id, project, source, _effective_request(),
+        ResearchLog(project),
+    )
 
-    # Business rejections are not retried: the failure escapes on the first
-    # attempt without an artifact.
-    assert mediakit.calls == 1
-    assert not (project / "work" / "source-nosubs.mp4").exists()
+    assert result == project / "work" / "source-nosubs.mp4"
+    assert result.read_bytes() == b"erased"
+    assert mediakit.calls == 6
+    assert delays == [60.0, 120.0, 240.0]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "node_moderation_persistent" in trace
+    assert '"consecutive": 5' in trace
 
 
 def test_pre_picsart_resume_does_not_require_the_erased_source(
@@ -5877,7 +5955,10 @@ class _FetchFailPicsart(_FlowPicsart):
 
 
 def _run_h3_with_picsart(
-    tmp_path: Path, monkeypatch: Any, picsart: _FlowPicsart
+    tmp_path: Path,
+    monkeypatch: Any,
+    picsart: _FlowPicsart,
+    customize: Any = None,
 ) -> tuple[ProjectStore, str, Path]:
     store = ProjectStore(tmp_path / "projects")
     request = _effective_request(
@@ -5893,6 +5974,8 @@ def _run_h3_with_picsart(
         replacement_image_path="inputs/replacement-image",
     )
     _install_fake_media(monkeypatch, [])
+    if customize is not None:
+        customize()
     deepseek = _FlowDeepSeek()
     pipeline = Pipeline(
         _settings(tmp_path, enable_mediakit=True),
@@ -5934,57 +6017,66 @@ def test_h3_asset_fetch_failure_is_resubmitted_with_frozen_inputs(
     for key in ("1", "2"):
         assert [r["status"] for r in ledger[key]] == ["provider_failed", "accepted"]
         assert ledger[key][0]["request_sha256"] == ledger[key][1]["request_sha256"]
-        assert ledger[key][1]["run_identity"].endswith("-refetch-01")
-    assert (project / "logs" / "picsart-refetch-01-submit").is_dir()
-    assert (project / "logs" / "picsart-refetch-01-poll").is_dir()
+        assert ledger[key][1]["run_identity"].endswith("-resubmit-01")
+    assert (project / "logs" / "picsart-resubmit-01-submit").is_dir()
+    assert (project / "logs" / "picsart-resubmit-01-poll").is_dir()
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
-    assert trace.count("picsart_asset_fetch_resubmit") == 2
+    assert trace.count("picsart_terminal_failure_resubmit") == 2
+    assert trace.count('"reason": "asset_fetch"') == 2
 
 
-def test_h3_asset_fetch_failure_exhaustion_keeps_fail_closed(
+def test_h3_asset_fetch_failure_resubmits_without_a_cap(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     picsart = _FetchFailPicsart(
-        fail_always=True,
+        fail_once_for=6,
         message="Failed to download video file: All validated IPs unreachable",
     )
-    store, project_id, _project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
+    store, project_id, project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
 
     state = store.read(project_id)
-    assert state["status"] == "failed"
-    # Exactly 3 submissions per segment (initial + 2 resubmits), then the
-    # project stays fail-closed.
-    assert len(picsart.submits) == 6
+    assert state["status"] == "succeeded"
+    # No resubmit cap: each segment burns the initial submit plus three
+    # resubmits (beyond the old two-resubmit limit) before succeeding.
+    assert len(picsart.submits) == 8
     ledger = state["picsart_submission_receipts"]["segments"]
     for key in ("1", "2"):
         records = ledger[key]
-        assert len(records) == 3
-        assert [r["status"] for r in records] == ["provider_failed"] * 3
+        assert [r["status"] for r in records] == ["provider_failed"] * 3 + [
+            "accepted"
+        ]
         assert [r["run_identity"] for r in records] == [
             "picsart",
-            "picsart-refetch-01",
-            "picsart-refetch-02",
+            "picsart-resubmit-01",
+            "picsart-resubmit-02",
+            "picsart-resubmit-03",
         ]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert trace.count("picsart_terminal_failure_resubmit") == 6
 
 
-def test_h3_content_moderation_failure_is_not_resubmitted(
+def test_h3_content_moderation_failure_is_also_resubmitted(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     picsart = _FetchFailPicsart(
-        fail_always=True,
+        fail_once_for=1,
         message="content policy violation: image rejected by moderation",
     )
     store, project_id, project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
 
     state = store.read(project_id)
-    assert state["status"] == "failed"
-    assert len(picsart.submits) == 2
+    assert state["status"] == "succeeded"
+    # Every terminal task failure — moderation included — resubmits the
+    # frozen segment under a fresh run identity.  Exactly one segment fails
+    # terminally once; the other succeeds on its initial submit.
+    assert len(picsart.submits) == 3
     ledger = state["picsart_submission_receipts"]["segments"]
-    for key in ("1", "2"):
-        assert [r["status"] for r in ledger[key]] == ["provider_failed"]
-    assert not (project / "logs" / "picsart-refetch-01-submit").exists()
+    statuses = [r["status"] for key in ("1", "2") for r in ledger[key]]
+    assert sorted(statuses) == ["accepted", "accepted", "provider_failed"]
+    assert (project / "logs" / "picsart-resubmit-01-submit").is_dir()
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
-    assert "picsart_asset_fetch_resubmit" not in trace
+    assert trace.count("picsart_terminal_failure_resubmit") == 1
+    assert trace.count('"reason": "terminal_failure"') == 1
 
 
 def test_node_retries_provider_failures_until_success_with_backoff(
@@ -6030,7 +6122,9 @@ def test_node_retries_provider_failures_until_success_with_backoff(
         ).is_dir()
 
 
-def test_node_never_retries_business_rejections(tmp_path: Path) -> None:
+def test_node_retries_moderation_rejections_with_backoff_and_logs(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
         _effective_request(), "request-rejection",
@@ -6044,20 +6138,29 @@ def test_node_never_retries_business_rejections(tmp_path: Path) -> None:
         picsart=object(),
     )
     log = ResearchLog(project)
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", delays.append)
     calls = 0
 
-    def rejected() -> None:
+    def rejected() -> str:
         nonlocal calls
         calls += 1
-        raise ProviderFailure(
-            {"outcome": "rejected", "error": "image_rejected by moderation"},
-            [],
-            RuntimeError("rejected"),
-        )
+        if calls <= 6:
+            raise ProviderFailure(
+                {"outcome": "rejected", "error": "image_rejected by moderation"},
+                [],
+                RuntimeError("rejected"),
+            )
+        return "ok"
 
-    with pytest.raises(ProviderFailure):
-        pipeline._node(log, "seedream-submit", "project", {}, [], rejected)
-    assert calls == 1
+    # Moderation rejections never fail the project: the node backs off and
+    # retries, logging a prominent event once the same rejection persists.
+    assert pipeline._node(log, "seedream-submit", "project", {}, [], rejected) == "ok"
+    assert calls == 7
+    assert delays[:2] == [60.0, 120.0]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert trace.count("node_moderation_persistent") == 2  # attempts 5 and 6
+    assert '"consecutive": 6' in trace
 
 
 def test_node_never_retries_input_errors(tmp_path: Path) -> None:
@@ -6159,3 +6262,364 @@ def test_node_retry_delay_schedule() -> None:
     assert Pipeline._node_retry_delay(4) == 120.0
     assert Pipeline._node_retry_delay(5) == 240.0
     assert Pipeline._node_retry_delay(20) == 1800.0
+
+
+def _node_pipeline(tmp_path: Path, client_request_id: str) -> tuple[Pipeline, ResearchLog]:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create({}, client_request_id)
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    return pipeline, ResearchLog(project)
+
+
+def test_retryable_node_error_covers_subprocess_and_process_failures() -> None:
+    assert Pipeline._retryable_node_error(subprocess.TimeoutExpired(["ffmpeg"], 10))
+    assert Pipeline._retryable_node_error(
+        media.CommandError(["ffmpeg"], 1, "", "boom")
+    )
+    assert Pipeline._retryable_node_error(CodexProcessError("codex exited"))
+    assert not Pipeline._retryable_node_error(ValueError("bad input"))
+    assert not Pipeline._retryable_node_error(
+        face_mask.FaceMaskError("could not open video: x")
+    )
+
+
+def test_node_retries_subprocess_timeouts_until_success(tmp_path: Path) -> None:
+    pipeline, log = _node_pipeline(tmp_path, "request-timeout-retry")
+    calls = 0
+
+    def flaky() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.TimeoutExpired(["ffmpeg", "-i", "in"], 900)
+        return "ok"
+
+    assert pipeline._node(log, "ffmpeg-concat", "project", {}, [], flaky) == "ok"
+    assert calls == 2
+    assert (
+        Path(log.root) / "ffmpeg-concat" / "project" / "attempt-1" / "error.json"
+    ).is_file()
+
+
+def test_face_mask_failure_degrades_to_unmasked_reference(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    def broken_mask(_source: Path, _destination: Path, **_kwargs: Any) -> None:
+        raise face_mask.FaceMaskError("could not open video: source-muted.mp4")
+
+    monkeypatch.setattr(face_mask, "mask_faces", broken_mask)
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    # Masking is load-bearing but must never block the render: after
+    # FACE_MASK_MAX_ATTEMPTS failures the unmasked reference is used and a
+    # prominent degradation event is logged.
+    segment_dir = project / "work" / "segments" / "0001"
+    assert muted == segment_dir / "source-muted.mp4"
+    assert mask_calls == []  # the patched mask_faces replaced the fake
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "face_mask_degraded" in trace
+    assert '"attempts": 3' in trace
+    attempts = (
+        project / "logs" / "mask-reference-faces" / "segment-0001"
+    ).iterdir()
+    assert sorted(path.name for path in attempts) == [
+        f"attempt-{index}" for index in range(1, FACE_MASK_MAX_ATTEMPTS + 1)
+    ]
+
+
+def test_face_mask_missing_model_stays_fatal(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls = (
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    )
+    calls = 0
+
+    def missing_model(_source: Path, _destination: Path, **_kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        raise face_mask.FaceMaskError("face detection model is missing")
+
+    monkeypatch.setattr(face_mask, "mask_faces", missing_model)
+
+    # A missing detection model is a configuration error: no retry, no
+    # degrade — the segment fails loudly.
+    with pytest.raises(face_mask.FaceMaskError, match="model is missing"):
+        pipeline._prepare_h3_segment(
+            project,
+            item,
+            enhanced_index,
+            replacement_sheet,
+            _effective_request(),
+            ResearchLog(project),
+        )
+    assert calls == 1
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "face_mask_degraded" not in trace
+
+
+def test_h3_task_hang_limit_resubmits_with_fresh_identity(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    class _HungPicsart(_FlowPicsart):
+        def poll(self, task_id: str) -> ProviderResult[str]:
+            if task_id == "task-1":
+                clock["now"] += 22000  # past the default 21600s hang limit
+                raise ProviderFailure(
+                    {"task_id": task_id, "polls": [{"status": "RUNNING"}]},
+                    [],
+                    RuntimeError("Picsart task still running"),
+                )
+            return super().poll(task_id)
+
+    picsart = _HungPicsart()
+    store, project_id, project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
+
+    state = store.read(project_id)
+    assert state["status"] == "succeeded"
+    ledger = state["picsart_submission_receipts"]["segments"]
+    # Both segments were submitted before either polled, so the frozen fake
+    # clock is already past the hang limit when each task is first polled:
+    # both hang once and resubmit under a fresh identity.
+    for key in ("1", "2"):
+        assert [r["status"] for r in ledger[key]] == ["provider_failed", "accepted"]
+        assert [r["run_identity"] for r in ledger[key]] == [
+            "picsart",
+            "picsart-resubmit-01",
+        ]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert trace.count('"reason": "task_hung"') == 2
+    assert trace.count("picsart_terminal_failure_resubmit") == 2
+
+
+def test_missing_full_track_degrades_to_stitched_video(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    def customize() -> None:
+        base_concat = media.concat
+
+        def concat(
+            paths: list[Path],
+            destination: Path,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            result = base_concat(paths, destination, **kwargs)
+            # Simulate the assembled dialogue track going missing between
+            # dialogue-audio assembly and the final audio replacement.
+            for track in (tmp_path / "projects").glob(
+                "*/work/dialogue-audio/full-track.wav"
+            ):
+                track.unlink()
+            return result
+
+        monkeypatch.setattr(media, "concat", concat)
+
+    store, project_id, project = _run_h3_with_picsart(
+        tmp_path, monkeypatch, _FlowPicsart(), customize,
+    )
+
+    state = store.read(project_id)
+    assert state["status"] == "succeeded"
+    assert state["has_video"] is True
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "dialogue_track_missing_degraded" in trace
+    assert not (project / "logs" / "replace-audio-track").exists()
+
+
+def test_pipeline_failure_persists_actionable_error_code(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "request-actionable-error",
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    store.update(project_id, source_path="inputs/source.mp4", has_source=True)
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    monkeypatch.setattr(
+        media,
+        "probe",
+        lambda _source: (_ for _ in ()).throw(
+            media.MediaError("source video has no audio track")
+        ),
+    )
+
+    pipeline.run(project_id)
+
+    state = store.read(project_id)
+    assert state["status"] == "failed"
+    # The public error map keys off this code: it must be the actionable
+    # MediaError code, not the generic pipeline_failed.
+    assert state["error"] == {
+        "code": "source video has no audio track",
+        "message": "输入视频不满足处理要求",
+    }
+    assert state["generation"]["error"] == "source video has no audio track"
+
+
+class _RejectOnceSeedream(_FlowSeedream):
+    """First POST ends in a terminal outcome; the re-POST succeeds."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__()
+        self._code = code
+        self._failed_once = False
+
+    def generate(
+        self,
+        *,
+        prompt: str,
+        images: list[Path],
+        destination: Path,
+        receipt_path: Path,
+    ) -> ProviderResult[Path]:
+        if not self._failed_once:
+            self._failed_once = True
+            self.calls.append({
+                "prompt": prompt,
+                "images": list(images),
+                "destination": destination,
+                "receipt_path": receipt_path,
+                "failed": True,
+            })
+            raise ProviderFailure(
+                {"provider": "ark_seedream", "outcome": "rejected"},
+                [],
+                SeedreamError(self._code, f"Seedream attempt ended: {self._code}"),
+            )
+        result = _FlowSeedream.generate(
+            self,
+            prompt=prompt,
+            images=images,
+            destination=destination,
+            receipt_path=receipt_path,
+        )
+        self.calls[-1]["failed"] = False
+        return result
+
+
+def _run_sheet_with_seedream(
+    tmp_path: Path,
+    monkeypatch: Any,
+    seedream: _FlowSeedream,
+) -> tuple[ProjectStore, str, Path, list[float]]:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "sheet-regeneration",
+    )
+    (project / "inputs" / "source.mp4").write_bytes(b"project-source")
+    enhanced_element_index = {
+        "people": {
+            "person-01": {
+                "source_visual_description": "the source person",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replacement": {
+                    "reason": "automatic",
+                    "source": "generated_variant",
+                    "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
+                },
+            },
+        },
+        "entities": {},
+        "scenes": {},
+        "relations": {},
+    }
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=seedream,
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", sleeps.append)
+    _materialize_test_replacement_sheet(
+        pipeline,
+        project_id,
+        project,
+        [{
+            "index": 1,
+            "start_s": 0.0,
+            "end_s": 5.0,
+            "duration_s": 5.0,
+            "join_mode": "hard_cut",
+            "visual_prompt": "frozen visual prompt",
+            "dialogue": [],
+            "analysis_paths": [],
+        }],
+        enhanced_element_index,
+    )
+    return store, project_id, project, sleeps
+
+
+def test_seedream_rejection_regenerates_with_perturbed_prompt(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    seedream = _RejectOnceSeedream("provider_rejected")
+    store, project_id, project, sleeps = _run_sheet_with_seedream(
+        tmp_path, monkeypatch, seedream,
+    )
+
+    assert len(seedream.calls) == 2
+    assert [call["failed"] for call in seedream.calls] == [True, False]
+    # Content rejections perturb the prompt before re-POSTing.
+    assert "Regeneration 1" in seedream.calls[1]["prompt"]
+    assert seedream.calls[0]["prompt"] != seedream.calls[1]["prompt"]
+    assert sleeps == [60.0]
+    sheet = store.read(project_id)["replacement_sheet"]
+    assert sheet["status"] == "succeeded"
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "seedream_submission_regenerated" in trace
+    assert '"reason": "provider_rejected"' in trace
+
+
+def test_seedream_submission_unknown_reposts_the_frozen_prompt(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    seedream = _RejectOnceSeedream("submission_unknown")
+    store, project_id, project, sleeps = _run_sheet_with_seedream(
+        tmp_path, monkeypatch, seedream,
+    )
+
+    assert len(seedream.calls) == 2
+    assert [call["failed"] for call in seedream.calls] == [True, False]
+    # Unknown submission outcomes re-POST the frozen prompt unchanged.
+    assert seedream.calls[0]["prompt"] == seedream.calls[1]["prompt"]
+    assert sleeps == [60.0]
+    assert store.read(project_id)["replacement_sheet"]["status"] == "succeeded"
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "seedream_submission_regenerated" in trace
+    assert '"reason": "submission_unknown"' in trace

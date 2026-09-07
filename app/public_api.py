@@ -104,6 +104,8 @@ _JOB_ERROR_MAP = {
     "long_video_duration_exceeded": ("video_duration_exceeds_h3_limit", "视频时长超过限制，请裁剪后重新创建任务"),
     "video_duration_exceeds_h3_limit": ("video_duration_exceeds_h3_limit", "视频时长超过限制，请裁剪后重新创建任务"),
     "invalid_duration": ("video_duration_invalid", "无法确认视频时长，请更换视频后重新创建任务"),
+    "long_video_invalid_duration": ("video_duration_invalid", "无法确认视频时长，请更换视频后重新创建任务"),
+    "long_video_no_safe_dialogue_boundary": ("video_duration_exceeds_h3_limit", "长视频找不到安全的台词切分点，请裁剪后重新创建任务"),
     "long_video_audio_mode_unsupported": ("video_audio_unsupported", "视频音频模式不受支持，请更换视频后重新创建任务"),
     "picsart_submit_rejected": ("video_rejected_by_provider", "视频内容未通过供应商审核，请调整素材后重新创建任务"),
     "h3_submit_rejected": ("video_rejected_by_provider", "视频内容未通过供应商审核，请调整素材后重新创建任务"),
