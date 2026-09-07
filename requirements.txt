@@ -7,3 +7,4 @@ numpy>=1.26,<3
 scenedetect>=0.7,<1
 ai-edge-litert==2.1.6
 pytest>=8,<10
+pytest-xdist>=3.6,<4

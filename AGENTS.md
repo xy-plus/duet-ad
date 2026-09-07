@@ -23,3 +23,7 @@
 ## 工作方式
 
 - 主代理只负责验收结果和与用户对齐；实施类工作（改代码、跑实验、写文档）一律拆给子代理并行执行，不要把实施工作揽在主代理手里串行做。
+
+## E2E 前置门禁
+
+- 发起 E2E 前先跑节点重放测试（见 `docs/node-replay-tests.md`）：先 `scripts/harvest_node_fixtures.py` 采集 fixtures，再 `pytest tests/test_node_replay_{local,external,boundary}.py -n auto`，全绿才放行 E2E。
