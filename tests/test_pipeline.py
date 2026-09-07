@@ -5291,6 +5291,12 @@ def _prepare_h3_retarget_fixture(
         "mute",
         lambda input_path, target: target.write_bytes(input_path.read_bytes()),
     )
+    monkeypatch.setattr(
+        media,
+        "add_silent_audio",
+        lambda input_path, target: target.write_bytes(input_path.read_bytes()),
+        raising=False,
+    )
     mask_calls: list[tuple[Path, Path]] = []
 
     def fake_mask_faces(
