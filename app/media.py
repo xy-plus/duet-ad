@@ -1882,6 +1882,19 @@ def mute(source: Path, destination: Path) -> dict[str, Any]:
     )
 
 
+def add_silent_audio(source: Path, destination: Path) -> dict[str, Any]:
+    """Mux a silent AAC track in; some providers reject video-only uploads."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return run_command(
+        [
+            "ffmpeg", "-v", "error", "-y", "-i", str(source),
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-shortest", str(destination),
+        ]
+    )
+
+
 def _dialogue_line_duration(path: Path) -> float:
     if (
         not isinstance(path, Path)

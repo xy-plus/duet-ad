@@ -4407,9 +4407,13 @@ class Pipeline:
         retargeted = segment_dir / "source-retargeted.mp4"
 
         def operation() -> ProviderResult[Path]:
+            # The AutoDL wan2.2animate workflow crashes on video-only input
+            # (fails after ~46s with empty results); give it a silent track.
+            submittable = segment_dir / "source-muted-silent.mp4"
+            media.add_silent_audio(muted, submittable)
             submitted = self.autodl.submit_motion_retarget(
                 image_path=reference,
-                video_path=muted,
+                video_path=submittable,
             )
             record: dict[str, Any] = {"submit": submitted.record}
             polled = self.autodl.poll(submitted.value)
