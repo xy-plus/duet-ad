@@ -33,6 +33,7 @@ OUTPUT_DIR = PROJECT_ROOT / "data/smoke-runs/public-api-e2e"
 STATE_FILE = OUTPUT_DIR / "jobs.json"
 BASE = "https://8.166.140.227:3211/api/v1"
 POLL_INTERVAL_S = 30
+POLL_TIMEOUT_S = 3 * 3600
 
 CASES = {
     "dog": {
@@ -125,7 +126,8 @@ def main() -> int:
         if command == "poll":
             jobs = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             pending = dict(jobs)
-            while pending:
+            deadline = time.monotonic() + POLL_TIMEOUT_S
+            while pending and time.monotonic() < deadline:
                 for name, record in list(pending.items()):
                     job = client.get(f"{BASE}/video-generations/{record['id']}").json()
                     status = job["status"]
@@ -142,13 +144,19 @@ def main() -> int:
                         record["file"] = str(destination)
                         print(f"{name}: downloaded {destination} sha256 ok", flush=True)
                         del pending[name]
-                    elif status in {"failed", "submission_unknown"}:
+                    elif status == "failed":
                         record["status"] = status
                         record["error"] = job.get("error")
                         print(f"{name}: TERMINAL {status} {job.get('error')}", flush=True)
                         del pending[name]
+                    # submission_unknown is an intermediate state (the provider
+                    # submission outcome is still being reconciled) and can
+                    # recover on its own — keep polling, don't stop downloads.
                 if pending:
                     time.sleep(POLL_INTERVAL_S)
+            for name, record in pending.items():
+                record["status"] = "timeout"
+                print(f"{name}: TIMEOUT after {POLL_TIMEOUT_S}s", flush=True)
             STATE_FILE.write_text(json.dumps(jobs, indent=2) + "\n", encoding="utf-8")
             failed = [n for n, r in jobs.items() if r.get("status") != "succeeded"]
             print("FAILED:", failed if failed else "none", flush=True)
