@@ -107,7 +107,7 @@ DIALOGUE_GENERATION_SCHEMA: dict[str, Any] = {
 }
 
 PICSART_RECEIPT_VERSION = 2
-H3_PREPARED_ARTIFACTS_VERSION = 6
+H3_PREPARED_ARTIFACTS_VERSION = 7
 REPLACEMENT_SHEET_VERSION = 4
 PICSART_PROMPT_MAX_CHARS = 50_000
 PICSART_REFERENCE_MIN_DURATION_S = 2
@@ -134,7 +134,7 @@ class PreparedPicsartRequest:
     final_prompt: str
     muted: Path
     provider_images: tuple[Path, ...]
-    voice_references: tuple[Path, ...]
+    dialogue_track: Path | None
     video_url: str | None
     image_urls: tuple[str, ...]
     audio_urls: tuple[str, ...]
@@ -378,54 +378,6 @@ class Pipeline:
                 raise ValueError("stored replacement image is outside the project")
         return source, replacement
 
-    def _erase_source_subtitles(
-        self,
-        project_id: str,
-        project: Path,
-        source: Path,
-        request: dict[str, Any],
-        log: ResearchLog,
-    ) -> Path:
-        """Erase burned-in subtitles from the source before any downstream use."""
-        processing = request.get("processing") if isinstance(request, dict) else None
-        if not (
-            isinstance(processing, dict)
-            and processing.get("remove_subtitle") is True
-        ):
-            return source
-        erased = project / "work" / "source-nosubs.mp4"
-
-        def operation() -> ProviderResult[Path]:
-            video_url = self.register_asset(project_id, source)
-            submitted = self.mediakit.submit_video_subtitle_erase(video_url)
-            record: dict[str, Any] = {
-                "submit": submitted.record,
-                "video_url": video_url,
-            }
-            polled = self.mediakit.poll_task(submitted.value)
-            record["poll"] = polled.record
-            downloaded = self.mediakit.download(polled.value, erased)
-            record["download"] = downloaded.record
-            return ProviderResult(
-                erased, record, list(downloaded.evidence_media),
-            )
-
-        self._progress(project_id, 3, "erase-source-subtitles")
-        self._node(
-            log,
-            "erase-source-subtitles",
-            "project",
-            {
-                "source": source,
-                "erase_mode": self.settings.mediakit_video_erase_mode,
-                "output": erased,
-            },
-            [source],
-            operation,
-            lambda value: [value],
-        )
-        return erased
-
     def run(self, project_id: str) -> None:
         project = self.store.path(project_id)
         log = ResearchLog(project)
@@ -446,10 +398,6 @@ class Pipeline:
             )
             duration_s = float(info["duration_s"])
             self.store.update(project_id, duration_s=duration_s, has_source=True)
-
-            source = self._erase_source_subtitles(
-                project_id, project, source, request, log,
-            )
 
             self._progress(project_id, 5, "source-4fps")
             source_frames = project / "work" / "source-4fps"
@@ -1014,12 +962,28 @@ class Pipeline:
                 {"audio": destination, "start_s": start_s, "end_s": end_s}
             )
         full_track = directory / "full-track.wav"
+        slices = [
+            (
+                float(item["start_s"]),
+                float(item["duration_s"]),
+                project
+                / "work" / "segments" / f"{int(item['index']):04d}"
+                / "dialogue-track.wav",
+            )
+            for item in prepared
+            if item.get("dialogue")
+        ]
         total_duration = sum(float(item["duration_s"]) for item in prepared)
 
         def assemble() -> dict[str, Any]:
-            return media.assemble_dialogue_track(
+            result = media.assemble_dialogue_track(
                 line_audios, total_duration, full_track,
             )
+            for start_s, duration_s, slice_path in slices:
+                media.slice_dialogue_track(
+                    full_track, start_s, duration_s, slice_path,
+                )
+            return result
 
         self._node(
             log,
@@ -1032,10 +996,14 @@ class Pipeline:
                 ],
                 "total_duration_s": total_duration,
                 "output": full_track,
+                "slices": [slice_path for _start, _duration, slice_path in slices],
             },
             [entry["audio"] for entry in line_audios],
             assemble,
-            output_media=lambda _value: [full_track],
+            output_media=lambda _value: [
+                full_track,
+                *(slice_path for _s, _d, slice_path in slices),
+            ],
         )
         return full_track
 
@@ -1537,6 +1505,15 @@ class Pipeline:
             if str(final_prompt).strip() != final_prompt:
                 raise ValueError("prepared H3 prompt is not canonical")
             base = f"work/segments/{index:04d}"
+            dialogue_track_receipt = (
+                self._project_artifact_receipt(
+                    project,
+                    muted.parent / "dialogue-track.wav",
+                    f"{base}/dialogue-track.wav",
+                )
+                if item.get("dialogue")
+                else None
+            )
             segments[str(index)] = {
                 "segment_index": index,
                 "source_video": self._project_artifact_receipt(
@@ -1549,6 +1526,7 @@ class Pipeline:
                 "prompt": self._project_artifact_receipt(
                     project, muted.parent / "h3_prompt.txt", f"{base}/h3_prompt.txt",
                 ),
+                "dialogue_track": dialogue_track_receipt,
                 "fusion_input_sha256": fusion_input_sha256,
                 "segment_metadata_sha256": self._json_sha256({
                     "index": item.get("index"),
@@ -1638,7 +1616,6 @@ class Pipeline:
         project: Path,
         prepared: list[dict[str, Any]],
         enhanced_element_index: dict[str, Any],
-        voice_reference_paths: list[Path],
         replacement: Path | None,
         replacement_sheet: dict[str, Any],
         replacement_sheet_path: Path | None,
@@ -1676,7 +1653,6 @@ class Pipeline:
                     project_id,
                     project,
                     item,
-                    voice_reference_paths,
                     replacement,
                     replacement_sheet_path,
                     request,
@@ -1927,7 +1903,6 @@ class Pipeline:
             project,
             prepared,
             enhanced_element_index,
-            voice_reference_paths,
             replacement,
             replacement_sheet,
             replacement_sheet_path,
@@ -2814,6 +2789,7 @@ class Pipeline:
             entry = raw["segments"].get(str(index))
             if not isinstance(entry, dict) or set(entry) != {
                 "segment_index", "source_video", "muted_video", "prompt",
+                "dialogue_track",
                 "fusion_input_sha256", "segment_metadata_sha256",
             }:
                 raise ValueError("stored H3 preparation segment is invalid")
@@ -2858,6 +2834,15 @@ class Pipeline:
             cls._validate_artifact_receipt(
                 project, entry["prompt"], f"{base}/h3_prompt.txt",
             )
+            dialogue_track = entry["dialogue_track"]
+            if (dialogue_track is not None) != bool(item.get("dialogue")):
+                raise ValueError(
+                    "stored H3 preparation dialogue track does not match"
+                )
+            if dialogue_track is not None:
+                cls._validate_artifact_receipt(
+                    project, dialogue_track, f"{base}/dialogue-track.wav",
+                )
             normalized[str(index)] = dict(entry)
         return normalized
 
@@ -3386,7 +3371,13 @@ class Pipeline:
             source = segment_dir / "source.mp4"
             muted = project / manifest[str(index)]["muted_video"]["path"]
             prompt_path = segment_dir / "h3_prompt.txt"
-            for required in (source, muted, prompt_path):
+            required_artifacts = [source, muted, prompt_path]
+            dialogue_track_receipt = manifest[str(index)]["dialogue_track"]
+            if dialogue_track_receipt is not None:
+                required_artifacts.append(
+                    project / dialogue_track_receipt["path"]
+                )
+            for required in required_artifacts:
                 if not required.is_file():
                     raise FileNotFoundError(
                         f"reusable segment artifact is missing: {required.name}"
@@ -3453,7 +3444,7 @@ class Pipeline:
             replacement,
             replacement_sheet,
             request,
-            voice_references,
+            _voice_references,
         ) = (
             self._load_r2v_resume(project_id)
         )
@@ -3488,7 +3479,6 @@ class Pipeline:
                         project_id,
                         project,
                         item,
-                        voice_references,
                         replacement,
                         replacement_sheet,
                         request,
@@ -4278,8 +4268,10 @@ class Pipeline:
                         line += (
                             f" | voice: {cls._one_line(voice['audio_reference'])}"
                             f" | voice features: {cls._one_line(voice.get('features'))}"
-                            " | use this voice only when this stable person speaks; "
-                            "ignore the reference audio words"
+                            " | this person's lines are pre-recorded with this "
+                            "voice in Audio 1, the segment dialogue speech "
+                            "track; when this stable person speaks, lip-sync "
+                            "exactly to Audio 1 and never generate new speech"
                         )
                     if isinstance(replacement, dict):
                         line += (
@@ -4544,11 +4536,14 @@ class Pipeline:
                 for line in item["dialogue"]
             )
             final_prompt = face_block + prompt + overlay_block + (
-                "\n\nDialogue requirements: Speak the following lines naturally in "
-                "the target language. Do not speak the original-language dialogue. "
-                "Do not render captions or subtitles. Finish every line within the "
-                "frozen source-segment time window. Do not add dialogue in padded "
-                "time.\n" + dialogue
+                "\n\nDialogue requirements: Audio 1 is this segment's "
+                "pre-recorded dialogue speech track in the target language. "
+                "Every speaking person must lip-sync precisely to Audio 1: "
+                "match its timing, rhythm, and mouth movements exactly, and do "
+                "not change its words. Do not generate any speech beyond "
+                "Audio 1, do not speak the original-language dialogue, and do "
+                "not render captions or subtitles. Do not add dialogue in "
+                "padded time. The spoken lines in Audio 1 are:\n" + dialogue
                 if dialogue
                 else "\n\nDo not add captions, subtitles, or new dialogue."
             )
@@ -4634,7 +4629,6 @@ class Pipeline:
         project_id: str,
         project: Path,
         item: dict[str, Any],
-        voice_references: list[Path],
         replacement: Path | None,
         replacement_sheet: Path | None,
         request: dict[str, Any],
@@ -4671,27 +4665,24 @@ class Pipeline:
         final_prompt = final_prompt.strip()
         if not final_prompt or len(final_prompt) > PICSART_PROMPT_MAX_CHARS:
             raise ValueError("prepared Picsart prompt is invalid")
-        if len(voice_references) > MAX_REFERENCE_AUDIO:
-            raise ValueError("H3 accepts at most three reference voices")
         project_root = project.resolve(strict=True)
-        resolved_voice_references: list[Path] = []
-        for slot, path in enumerate(voice_references, 1):
-            resolved = path.resolve(strict=True)
-            valid_paths = {(
-                project / "work" / "voice-references"
-                / f"audio-{slot:02d}.wav"
-            ).resolve()}
+        dialogue_track: Path | None = None
+        if item.get("dialogue"):
+            candidate = segment_dir / "dialogue-track.wav"
+            resolved_track = candidate.resolve(strict=True)
             if (
-                project_root not in resolved.parents
-                or resolved not in valid_paths
-                or path.is_symlink()
-                or not resolved.is_file()
-                or resolved.stat().st_size < 1
+                project_root not in resolved_track.parents
+                or resolved_track
+                != (
+                    project / "work" / "segments" / f"{index:04d}"
+                    / "dialogue-track.wav"
+                ).resolve()
+                or candidate.is_symlink()
+                or not resolved_track.is_file()
+                or resolved_track.stat().st_size < 1
             ):
-                raise ValueError("H3 reference voice file is invalid")
-            resolved_voice_references.append(resolved)
-        if len(resolved_voice_references) != len(set(resolved_voice_references)):
-            raise ValueError("H3 reference voice files must be unique")
+                raise ValueError("prepared H3 dialogue track is invalid")
+            dialogue_track = resolved_track
         if existing_task_id is not None and (
             not isinstance(existing_task_id, str)
             or not existing_task_id
@@ -4783,14 +4774,15 @@ class Pipeline:
             ]
             if len(image_urls) != len(set(image_urls)):
                 raise ValueError("prepared Picsart image URLs must be unique")
-            audio_urls = [
-                self._validated_provider_asset_url(
-                    self.register_asset(project_id, voice_reference)
-                )
-                for voice_reference in resolved_voice_references
-            ]
-            if len(audio_urls) != len(set(audio_urls)):
-                raise ValueError("prepared Picsart audio URLs must be unique")
+            audio_urls = (
+                [
+                    self._validated_provider_asset_url(
+                        self.register_asset(project_id, dialogue_track)
+                    )
+                ]
+                if dialogue_track is not None
+                else []
+            )
         request_payload = (
             {
                 "existing_task_id": existing_task_id,
@@ -4819,7 +4811,7 @@ class Pipeline:
             final_prompt=final_prompt,
             muted=muted.resolve(strict=True),
             provider_images=tuple(provider_images),
-            voice_references=tuple(resolved_voice_references),
+            dialogue_track=dialogue_track,
             video_url=video_url,
             image_urls=tuple(image_urls),
             audio_urls=tuple(audio_urls),
@@ -4904,7 +4896,11 @@ class Pipeline:
                     prepared.submit_input(),
                     [prepared.muted]
                     + list(prepared.provider_images)
-                    + list(prepared.voice_references),
+                    + (
+                        [prepared.dialogue_track]
+                        if prepared.dialogue_track is not None
+                        else []
+                    ),
                     lambda: self._submit_prepared_picsart(prepared),
                     retry_if=lambda _exc: False,
                 )

@@ -39,7 +39,6 @@ class Settings:
     mediakit_api_base: str = "https://mediakit.cn-beijing.volces.com/api/v1"
     enable_mediakit: bool = True
     mediakit_concurrency: int = 1
-    mediakit_video_erase_mode: str = "pro"
     asr_cli: Path = Path("/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli")
     asr_model: Path = Path("/home/xy/.local/share/duet-asr/ggml-small.bin")
     yamnet_model: Path = ROOT / "models" / "yamnet.tflite"
@@ -144,8 +143,6 @@ class Settings:
             or self.mediakit_concurrency < 1
         ):
             raise ValueError("MEDIAKIT_CONCURRENCY must be a positive integer")
-        if self.mediakit_video_erase_mode not in {"pro", "standard"}:
-            raise ValueError("MEDIAKIT_VIDEO_ERASE_MODE must be pro or standard")
         if self.fusion_agent not in FUSION_AGENTS:
             raise ValueError("FUSION_AGENT must be codex or deepseek")
         if (
@@ -201,9 +198,6 @@ def get_settings() -> Settings:
         mediakit_api_base=os.environ.get("MEDIAKIT_API_BASE", "https://mediakit.cn-beijing.volces.com/api/v1").rstrip("/"),
         enable_mediakit=_bool("ENABLE_MEDIAKIT", True),
         mediakit_concurrency=int(os.environ.get("MEDIAKIT_CONCURRENCY", "1")),
-        mediakit_video_erase_mode=os.environ.get(
-            "MEDIAKIT_VIDEO_ERASE_MODE", "pro"
-        ).strip().lower(),
         asr_cli=Path(os.environ.get("ASR_CLI", "/home/xy/.local/share/duet-asr/whisper.cpp-1.9.2-src/build/bin/whisper-cli")),
         asr_model=Path(os.environ.get("ASR_MODEL", "/home/xy/.local/share/duet-asr/ggml-small.bin")),
         yamnet_model=Path(os.environ.get("YAMNET_MODEL_PATH", str(ROOT / "models" / "yamnet.tflite"))),

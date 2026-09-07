@@ -11,8 +11,7 @@
 项目级公共输入依次产生：
 
 1. 原视频精确解码帧轴、4 fps 分析帧与规范音频。
-2. 项目级视频字幕擦除（`remove_subtitle` 开关）：MediaKit 异步 `erase-video-subtitle-pro`（固定 `model_version=v5`）或标准版（`MEDIAKIT_VIDEO_ERASE_MODE=pro|standard`）抹掉烧录字幕，产出 `work/source-nosubs.mp4`；分段、抽帧、ASR 等下游全部改用擦除后的文件，失败 fail-closed。H3 prompt 的 overlay removal 声明保留为双保险。
-3. YAMNet 声学分类和 Whisper 台词；自动台词只投影 spoken 行。
+2. YAMNet 声学分类和 Whisper 台词；自动台词只投影 spoken 行。
 3. `ContentDetector(threshold=27)` 的精确镜头边界。
 4. 4–10 秒 scene-first 片段计划及逐段 exact-9。
 5. 可选 MediaKit 处理，先文本擦除、再图标擦除。
@@ -21,7 +20,7 @@
 8. 后端从 raw stable index 确定性生成 `replacement_set`：`people/entities/scenes` 分别包含本类全部 stable key 并排序；同时生成仅移除这三类记录顶层 `preserve/replaceable` 的模型规划视图，relations 和其他事实不变。
 9. 一次项目级 DeepSeek Object Replace v4：读取规划视图、`replacement_set`、全部逐段视觉提示、目标语言与项目级翻译台词、可选用户图及说明，以及当前音色目录；输出绑定 stable key 的 replacement/voice patch，每个非空 replacement 分离 `appearance_description` 与 `target_visual_description`，并逐行输出 `dialogue_voices` 台词说话人归属（人物 stable key 或 null=旁白）。
 10. 后端深拷贝完整 raw index 并机械合并 patch；对可用的 `voice_id` 按稳定顺序映射 `Audio N`，生成项目级增强索引（含独立 `dialogue_voices` 块）和同序的 0–3 条冻结音频。
-11. 逐行台词 TTS：AutoDL `indextts2-v1` 按归属人物的音色克隆合成每行台词（null 归属回退 Audio 1），拼成整条静音底轨音轨（超窗 atempo 压进、欠窗留停顿）供终剪覆盖；任一环节失败项目 fail-closed。无台词项目跳过整条音频链。
+11. 逐行台词 TTS：AutoDL `indextts2-v1` 按归属人物的音色克隆合成每行台词（null 归属回退 Audio 1），拼成整条静音底轨音轨（超窗 atempo 压进、欠窗留停顿），并切出每段 `dialogue-track.wav`；任一环节失败项目 fail-closed。无台词项目跳过整条音频链。
 12. 后端以冻结 enhanced index 为唯一身份锚点，把所有实际非空 replacement 确定性映射为 `stable key -> TILE_XX -> row/column`，生成 sheet bundle v4/spec v2 并从 `appearance_description` 编译隔离式提示词；Seedream 每项目调用一次，以空白布局为 Image 1、可选规范化用户图为 Image 2，生成一张 2048×2048 新形象图版，不生成或发送源帧证据。
 
 只有上述公共输入完成并能传给下游，才启动逐段 R2V 准备。所有片段先并行完成 Fusion、最终提示词和静音 Video 1；随后完成有序参考图、素材 URL 注册和 Picsart 硬参数预检，才允许发出 Picsart POST。这些屏障只防止缺文件、供应商参数不合法和半批次付费，不判断模型内容质量。
@@ -32,7 +31,7 @@
 h3-max-r2v-prompt Skill
   -> 后端机械附加台词与相对时间窗
   -> 有替换人物且不走 retarget 的段：静音参考先经 YuNet 灰块打码（mask-reference-faces）
-  -> H3 接收静音（或打码）源片段 Video 1、项目级同序 Images 和项目级同序 Audio 1..N
+  -> H3 接收静音（或打码）源片段 Video 1、项目级同序 Images 和本段台词语音切片 Audio 1（无台词段不传音频）
   -> Picsart submit
   -> 使用同一 task ID poll
   -> 立即下载供应商结果
@@ -65,15 +64,15 @@ closed JSON Schema v3 由 raw index 中已有 stable key、音色 ID 集合和�
 
 新 `h3-max-r2v-prompt` Skill 每段执行一次并通过 closed JSON Schema 返回提示词。它的业务事实源是本段视觉提示、完整增强索引、本段翻译台词，以及后端冻结的 `h3_reference_images`/`replacement_sheet` 映射；不再传用户原始说明，也不接收独立音色输入。Skill 负责读取增强索引，并让 H3 从权威 `stable key -> TILE_XX -> 实际 Image N` 指向的图版格取得新形象、替换 Video 1 中对应源形象。后端只校验返回对象的 closed 结构、`input_sha256` 与 `segment_index`，随后根据增强索引和图版 spec 中实际可用字段 best-effort 编译并附加约束块及台词时间窗。增强索引保存 raw `preserve`，但 `REPLACE` 项编译时只保留动作、功能、尺度、接触、相对位置、运动连续性、人物明确属性、场景色调/构图/机位/光线等类别安全不变量，不带入冲突的源脸、服装款式、物体外观或场景陈设；raw `preserve` 只直接用于 `KEEP`。关系任一端被替换时，同样只保留通用交互类型、接触、相对位置和运动连续性，不带入指向源对象外观的 predicate/preserve；两端都未替换时保留原关系描述。后端不扫描 Fusion 正文是否出现或遗漏 stable key、TILE、`Image N`、`Audio N`，也不因增强索引中 nullable/缺失的替换或音色而失败。最终语义覆盖与画面执行都交给模型和供应商。
 
-Picsart 使用 Advanced workflow `minimax/h3-max/reference-to-video`。提交地址为 `/workflows/minimax/h3-max/reference-to-video/submit`，请求体只有一层 `params`，字段使用供应商原生的 `reference_video_urls`、`reference_image_urls`、`reference_audio_urls`、`aspect_ratio` 和 `prompt_expansion_mode: "quality"`；分辨率映射为 `480P`/`768P`。对 H3 而言，当前静音（或打码）片段是 Video 1；新形象图版固定为 `Image 1`（身份锚点占主参考位），存在唯一有效的用户图 stable-key 绑定时追加 `Image 2=用户图`，即 `reference_image_urls=[新形象图版, 用户图]`；没有该绑定时不发送原始用户图，`reference_image_urls=[新形象图版]`。冻结音频列表按原序对应 `Audio 1..N`；音色库 wav 同时作为 TTS 克隆参考，TTS 整条音轨只在终剪覆盖成片，不送 H3。所有 segment 都提交同一份、同一顺序的完整图片与音频列表，不按段删除、去重、排序或重新编号。用户参考图先复用 `duet-ad1` 的 MiniMax 代理规则，等比落入 `256–5760` 双边和 `1:2.5–2.5:1` 比例范围，必要时补黑边，再编码为 PNG。轮询同一 workflow 下的 `/{taskId}/result`，从 `response.result.video.url` 读取结果。4.x 秒片段提交为 5 秒，结果再裁回源时长。
+Picsart 使用 Advanced workflow `minimax/h3-max/reference-to-video`。提交地址为 `/workflows/minimax/h3-max/reference-to-video/submit`，请求体只有一层 `params`，字段使用供应商原生的 `reference_video_urls`、`reference_image_urls`、`reference_audio_urls`、`aspect_ratio` 和 `prompt_expansion_mode: "quality"`；分辨率映射为 `480P`/`768P`。对 H3 而言，当前静音（或打码）片段是 Video 1；新形象图版固定为 `Image 1`（身份锚点占主参考位），存在唯一有效的用户图 stable-key 绑定时追加 `Image 2=用户图`，即 `reference_image_urls=[新形象图版, 用户图]`；没有该绑定时不发送原始用户图，`reference_image_urls=[新形象图版]`。有台词段的 `reference_audio_urls` 是该段 TTS 台词语音切片（即 H3 的 Audio 1，只做口型同步），无台词段不传音频；音色库 wav 只供 TTS 克隆，不再直接送 H3。所有 segment 都提交同一份、同一顺序的完整图片列表，不按段删除、去重、排序或重新编号。用户参考图先复用 `duet-ad1` 的 MiniMax 代理规则，等比落入 `256–5760` 双边和 `1:2.5–2.5:1` 比例范围，必要时补黑边，再编码为 PNG。轮询同一 workflow 下的 `/{taskId}/result`，从 `response.result.video.url` 读取结果。4.x 秒片段提交为 5 秒，结果再裁回源时长。
 
 ## 原始/增强索引与续跑边界
 
 - `work/element_index.json` 和 `state.element_index` 始终保留 `video-maker` raw index；`work/enhanced_element_index.json` 和 `state.enhanced_element_index` 只保存后端机械合并结果。两者不覆盖、不混用。
 - `state.object_replace.version=4` 保存 `input_sha256` 与音色目录哈希；`state.replacement_sheet.version=4` 保存 frozen `spec.version=2`、Seedream 输入/提交/输出回执、H3 图片角色和最终图版文件回执；`state.voice_references` 保存按 `Audio 1..N` 排列的 `voice_id`、项目内路径、文件哈希与特征行。增强索引先原子落盘，再与这些项目级元数据一起更新 state；签名 URL 不是冻结状态。
-- `state.h3_prepared_artifacts.version=6` 在所有段免费准备完成后一次发布，逐段冻结 source、muted、prompt 的路径/大小/哈希、Fusion 输入哈希和 segment metadata 哈希；metadata 覆盖 index、start/end、duration 与 join mode。bindings 同时覆盖增强索引、冻结图版状态、音色列表、Object Replace 输入、可选用户图的文件回执和 output request。Object Replace、sheet bundle、spec 和 H3 manifest 的版本字段都必须严格等于当前合同值；任何缺失或不等都立即失败，不能转换、推断或跨版本拼装。`state.picsart_submission_receipts` 记录每段每次允许提交的 request 哈希、run identity、状态和 task ID；研究日志只是证据副本，不承担付费恢复真相。
+- `state.h3_prepared_artifacts.version=7` 在所有段免费准备完成后一次发布，逐段冻结 source、muted、prompt、台词语音切片（无台词段为 null）的路径/大小/哈希、Fusion 输入哈希和 segment metadata 哈希；metadata 覆盖 index、start/end、duration 与 join mode。bindings 同时覆盖增强索引、冻结图版状态、音色列表、Object Replace 输入、可选用户图的文件回执和 output request。Object Replace、sheet bundle、spec 和 H3 manifest 的版本字段都必须严格等于当前合同值；任何缺失或不等都立即失败，不能转换、推断或跨版本拼装。`state.picsart_submission_receipts` 记录每段每次允许提交的 request 哈希、run identity、状态和 task ID；研究日志只是证据副本，不承担付费恢复真相。
 - `resume-pre-picsart` 仅允许没有任何 Picsart submit 痕迹的失败项目。没有图版 checkpoint 时可复用合格的源片段、exact-9、MediaKit/分析副本和逐段视觉提示，再按当前合同重建免费上游；一旦存在图版 checkpoint，就必须先在零写入边界校验冻结的版本字段、segments、source、enhanced index、Object Replace、音色、请求、prompt 和有序输入。`prepared` 只允许首次提交或本地回放同一 Seedream receipt，`succeeded/not_needed` 直接复用，均不得重跑上游或另建 stable-key 映射。
-- `resume-picsart` 已越过付费屏障，只复用 H3 manifest v6 冻结的每段 `source-muted.mp4`（或 retarget/打码产物）、`h3_prompt.txt`、同一张图版和相同顺序的有序图片，以及按哈希验证的有序音频文件；它不重跑 raw index、Object Replace、TTS、Seedream 或 Fusion。恢复严格校验版本、路径、哈希、媒体和请求绑定，不把图版画面或 `voice_references` 与 enhanced index 做二次语义复审。已有且未明确失败的 task ID 只继续 poll/download。
+- `resume-picsart` 已越过付费屏障，只复用 H3 manifest v7 冻结的每段 `source-muted.mp4`（或 retarget/打码产物）、`h3_prompt.txt`、台词语音切片、同一张图版和相同顺序的有序图片；它不重跑 raw index、Object Replace、TTS、Seedream 或 Fusion。恢复严格校验版本、路径、哈希、媒体和请求绑定，不把图版画面或 `voice_references` 与 enhanced index 做二次语义复审。已有且未明确失败的 task ID 只继续 poll/download。
 
 ## 重试、证据与付费边界
 

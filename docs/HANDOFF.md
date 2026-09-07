@@ -14,7 +14,6 @@
 
 ```text
 保存原视频和可选替换图
-  -> 项目级 MediaKit 视频字幕擦除（remove_subtitle 开关；pro 固定 v5 / standard 由 MEDIAKIT_VIDEO_ERASE_MODE 选择），产出 work/source-nosubs.mp4，下游一律改用擦除后文件
   -> 原视频 4 fps 解帧
   -> 视频视觉轴音频 / YAMNet / Whisper / spoken 台词
   -> ContentDetector(threshold=27)
@@ -27,13 +26,13 @@
   -> 后端从 raw 索引生成全 stable-key replacement_set 和去除条目级 preserve/replaceable 的规划视图
   -> 一次项目级 DeepSeek Object Replace v4：规划视图 + replacement_set + 全部视觉提示 + 用户图/说明 + 当前音色目录；输出分离外观/交互语义的 patch、voice 和逐行 dialogue_voices 台词归属
   -> 后端机械合并 enhanced 索引，按可用 voice_id 生成同序 Audio 1..N（N <= 3）
-  -> 逐行 AutoDL indextts2-v1 台词 TTS（归属人物音色，null 回退 Audio 1），拼整条音轨供终剪覆盖；失败即 fail-closed
+  -> 逐行 AutoDL indextts2-v1 台词 TTS（归属人物音色，null 回退 Audio 1），拼整条音轨并切每段 dialogue-track.wav；失败即 fail-closed
   -> 后端从 frozen enhanced index 生成 sheet bundle v4/spec v2：stable key -> TILE_XX
   -> Seedream 每项目一次，以 Image 1 空白布局 + 可选 Image 2 用户图生成一张隔离的新形象图版
   -> 公共输入屏障
   -> 第一屏障：所有段并行完成 Fusion、最终提示词和静音 Video 1（有替换人物且不走 retarget 的段先做 YuNet 人脸灰块打码）
   -> 第二屏障：所有段完成有序 Images、素材注册和 H3 参数预检
-  -> 每段并行 Picsart H3：Video 1 + 所有段完全同序的 Images + 所有段完全同序的 Audio 1..N
+  -> 每段并行 Picsart H3：Video 1 + 所有段完全同序的 Images + 本段台词语音切片 Audio 1（无台词段不传音频）
   -> 供应商片段裁回原时长并统一为 24 fps
   -> 按原顺序合并 output/generated.mp4；有台词时整条 TTS 音轨覆盖成片音轨
 ```
@@ -125,12 +124,12 @@ patch 结构可读取后，后端深拷贝 raw index，机械添加 nullable rep
 - `prompt_expansion_mode`: `quality`
 - `reference_video_urls`: 当前静音片段 Video 1 的临时签名公网 URL
 - `reference_image_urls`: 每段相同的有序图片 URL；新形象图版固定为 `Image 1`（身份锚点占主参考位），存在唯一有效用户图绑定时追加用户图，对应 `Image 2`；没有该绑定时不扩散原始用户图，仅发送 `[新形象图版]`
-- `reference_audio_urls`: 冻结的 0–3 条音色库音频，按 `Audio 1..N` 原序写入；空列表时省略字段。音色库 wav 同时供 TTS 克隆，TTS 整条音轨只在终剪覆盖成片音轨，不送 H3
+- `reference_audio_urls`: 有台词段为该段 TTS 台词语音切片（H3 的 Audio 1，只用于口型同步）；无台词段省略字段。音色库 wav 只作 TTS 克隆参考，不再送 H3
 - `duration`: `max(5, ceil(原片段秒数))`
 - `resolution`: 前端 `480p`/`768p` 映射为供应商 Advanced API 的 `480P`/`768P`
 - `aspect_ratio`: 前端请求值
 
-每个 segment 都必须提交完全相同且顺序相同的整组图片与音频，不允许按段过滤、重排、截断或重新去重，否则提示词中的 `Image N`/`Audio N` 会漂移。用户图片沿用 `duet-ad1` 的 MiniMax 图片代理机制：内容保持原比例等比缩放；宽、高均限制在 `256–5760`，宽高比限制在 `1:2.5–2.5:1`；极端比例通过黑边补齐，不拉伸、不裁掉内容。签名素材端点同时支持 `GET` 和 `HEAD`。
+每个 segment 都必须提交完全相同且顺序相同的整组图片，不允许按段过滤、重排、截断或重新去重，否则提示词中的 `Image N` 会漂移；音频只携带本段台词切片，段间天然不同。用户图片沿用 `duet-ad1` 的 MiniMax 图片代理机制：内容保持原比例等比缩放；宽、高均限制在 `256–5760`，宽高比限制在 `1:2.5–2.5:1`；极端比例通过黑边补齐，不拉伸、不裁掉内容。签名素材端点同时支持 `GET` 和 `HEAD`。
 
 ## API、存储与技术边界
 

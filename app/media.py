@@ -1137,15 +1137,6 @@ def detect_scenes(
     frames = probe_decoded_frames(source)
     bounds = detect_exact_scene_bounds(source, 27.0, frames)
     inventory = normalize_scene_inventory(bounds, frames)
-    if duration_s is not None:
-        # Providers may emit frame timestamps extending microseconds past the
-        # container duration (e.g. MediaKit outputs); a scene cannot end after
-        # the media itself, so clamp the trailing edge to the real duration.
-        ceiling = float(duration_s)
-        for scene in inventory:
-            end_s = scene.get("end_s")
-            if isinstance(end_s, (int, float)) and not isinstance(end_s, bool):
-                scene["end_s"] = min(float(end_s), ceiling)
     return inventory
 
 
@@ -1987,6 +1978,24 @@ def assemble_dialogue_track(
             for placement in placements
         ],
     }
+
+
+def slice_dialogue_track(
+    source: Path,
+    start_s: float,
+    duration_s: float,
+    destination: Path,
+) -> dict[str, Any]:
+    """Cut one segment's dialogue speech slice out of the full track."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return run_command(
+        [
+            "ffmpeg", "-v", "error", "-y", "-i", str(source),
+            "-ss", f"{start_s:.6f}", "-t", f"{duration_s:.6f}",
+            "-c:a", "pcm_s16le", str(destination),
+        ],
+        timeout=120,
+    )
 
 
 def replace_audio_track(

@@ -221,7 +221,6 @@ class _FlowMediaKit:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.calls: list[list[str]] = []
-        self.video_erase_calls: list[str] = []
 
     def erase(
         self, source: Path, destination: Path, scenes: list[str],
@@ -234,28 +233,6 @@ class _FlowMediaKit:
             {"stages": list(scenes), "raw": "mediakit-response"},
             [destination],
         )
-
-    def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
-        with self.lock:
-            self.video_erase_calls.append(video_url)
-        return ProviderResult(
-            "mediakit-video-task",
-            {"outcome": "accepted", "task_id": "mediakit-video-task"},
-        )
-
-    def poll_task(self, task_id: str) -> ProviderResult[str]:
-        assert task_id == "mediakit-video-task"
-        return ProviderResult(
-            "https://result.invalid/erased.mp4", {"task_id": task_id},
-        )
-
-    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"erased-source")
-        return ProviderResult(
-            destination, {"request": {"url": url}}, [destination],
-        )
-
 
 class _FlowSeedream:
     def __init__(self, events: list[str] | None = None) -> None:
@@ -947,6 +924,16 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
         )
         return {"duration_s": total_duration_s, "lines": list(lines)}
 
+    def slice_track(
+        source: Path,
+        start_s: float,
+        duration_s: float,
+        destination: Path,
+    ) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+        return {"stdout": "", "stderr": ""}
+
     def replace_audio(
         video: Path, audio: Path, destination: Path,
     ) -> dict[str, Any]:
@@ -992,6 +979,9 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
     monkeypatch.setattr(media, "concat", concat)
     monkeypatch.setattr(
         media, "assemble_dialogue_track", assemble, raising=False,
+    )
+    monkeypatch.setattr(
+        media, "slice_dialogue_track", slice_track, raising=False,
     )
     monkeypatch.setattr(
         media, "replace_audio_track", replace_audio, raising=False,
@@ -1065,19 +1055,6 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert len(picsart.submits) == 2
     assert len(seedream.calls) == 1
     assert len(mediakit.calls) == 18
-    # The source's burned-in subtitles are erased once at project level and
-    # every downstream consumer switches to the erased file.
-    assert mediakit.video_erase_calls == [
-        "https://assets.invalid/inputs/source.mp4",
-    ]
-    assert (project / "work" / "source-nosubs.mp4").is_file()
-    cut_input = json.loads(
-        (
-            project / "logs" / "segment-cut" / "segment-0001"
-            / "attempt-1" / "input.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert cut_input["source"].endswith("work/source-nosubs.mp4")
     assert all(
         call == ["full_screen_text_erase", "full_screen_icon_erase"]
         for call in mediakit.calls
@@ -1375,19 +1352,19 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     full_track = project / "work" / "dialogue-audio" / "full-track.wav"
     assert full_track.is_file()
     assert (project / "work" / "dialogue-audio" / "line-0001.wav").is_file()
-    # No per-segment dialogue slices are produced: H3 receives the frozen
-    # voice-library wavs as Audio 1..N, and the TTS track only overwrites
-    # the final video's audio.
-    assert not any(
-        (project / "work" / "segments").glob("*/dialogue-track.wav")
+    segment_slice = (
+        project / "work" / "segments" / "0001" / "dialogue-track.wav"
     )
-    expected_audio_urls = [
-        f"https://assets.invalid/voice-references/audio-{slot:02d}.wav"
-        for slot in range(1, 4)
+    assert segment_slice.is_file()
+    assert not (
+        project / "work" / "segments" / "0002" / "dialogue-track.wav"
+    ).exists()
+    # H3 receives the per-segment dialogue speech slice as Audio 1, not the
+    # voice-library wavs; the segment without dialogue gets no audio input.
+    assert sorted(call["audio_urls"] for call in picsart.submits) == [
+        [],
+        ["https://assets.invalid/0001/dialogue-track.wav"],
     ]
-    assert all(
-        call["audio_urls"] == expected_audio_urls for call in picsart.submits
-    )
     assert state["enhanced_element_index"]["dialogue_voices"] == ["person-01"]
     assert (project / "output" / "generated.mp4").read_bytes().endswith(
         b"|tts-track"
@@ -1701,7 +1678,6 @@ def test_h3_barrier_never_submits_if_any_fusion_preparation_fails(
             project,
             [{"index": 1}, {"index": 2}],
             {},
-            [],
             None,
             {},
             None,
@@ -1822,7 +1798,6 @@ def test_h3_without_user_image_uses_sheet_as_image_1_and_keeps_tile_authority(
         project_id,
         project,
         {"index": 1, "duration_s": 5.0},
-        [],
         None,
         replacement_sheet_path,
         request,
@@ -1937,7 +1912,6 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
         project_id,
         project,
         {"index": 1, "duration_s": 5.0},
-        [],
         replacement,
         None,
         request,
@@ -2221,19 +2195,16 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         for receipt in state["picsart_submission_receipts"]["segments"]["2"]
     ] == ["provider_failed", "accepted"]
     expected_registered = {
-        "source-muted.mp4", "audio-01.wav", "audio-02.wav", "audio-03.wav",
-        "reference-sheet.png",
+        "source-muted.mp4", "reference-sheet.png",
     }
-    expected_audio_urls = [
-        f"https://assets.invalid/audio-{slot:02d}.wav"
-        for slot in range(1, 4)
-    ]
     assert picsart.submits[0]["image_urls"] == [
         "https://assets.invalid/reference-sheet.png",
     ]
     assert len(seedream.calls) == 1
     assert {path.name for path in registered} == expected_registered
-    assert picsart.submits[0]["audio_urls"] == expected_audio_urls
+    # Both frozen segments have no dialogue: no TTS slice is registered and
+    # H3 receives no reference audio.
+    assert picsart.submits[0]["audio_urls"] == []
     assert (project / "output" / "generated.mp4").is_file()
     assert (project / "logs" / "picsart-resume-submit").is_dir()
     assert not (
@@ -3444,7 +3415,6 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
             project,
             items,
             enhanced_element_index,
-            [],
             effective_replacement,
             replacement_sheet,
             replacement_sheet_path,
@@ -4011,7 +3981,7 @@ def _prepared_submit(
         final_prompt="frozen prompt",
         muted=muted,
         provider_images=(),
-        voice_references=(),
+        dialogue_track=None,
         video_url="https://assets.invalid/video.mp4",
         image_urls=(),
         audio_urls=(),
@@ -4925,7 +4895,6 @@ def _frozen_current_after_global_preflight_failure(
             project,
             items,
             enhanced_element_index,
-            [],
             None,
             replacement_sheet,
             replacement_sheet_path,
@@ -5488,7 +5457,18 @@ def _dialogue_audio_fixture(
         )
         return {"duration_s": total_duration_s}
 
+    def slice_track(
+        source: Path,
+        start_s: float,
+        duration_s: float,
+        destination: Path,
+    ) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+        return {"stdout": "", "stderr": ""}
+
     monkeypatch.setattr(media, "assemble_dialogue_track", assemble)
+    monkeypatch.setattr(media, "slice_dialogue_track", slice_track)
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
@@ -5541,11 +5521,10 @@ def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
         ).read_text(encoding="utf-8")
     )
     assert output["provider_record"]["submit"]["outcome"] == "accepted"
-    # The TTS chain only feeds the final audio replacement; no per-segment
-    # H3 dialogue slices are produced.
-    assert not any(
-        (project / "work" / "segments").glob("*/dialogue-track.wav")
-    )
+    for index in (1, 2):
+        assert (
+            project / "work" / "segments" / f"{index:04d}" / "dialogue-track.wav"
+        ).is_file()
 
 
 def test_dialogue_tts_failure_fails_closed(
@@ -5629,7 +5608,7 @@ def test_no_dialogue_skips_the_whole_tts_chain(
     ) is None
 
 
-def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
+def test_picsart_segment_uses_the_dialogue_slice_as_audio_1(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
@@ -5639,8 +5618,10 @@ def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
     segment_dir.mkdir(parents=True, exist_ok=True)
     source = segment_dir / "source.mp4"
     muted = segment_dir / "source-muted.mp4"
+    dialogue_track = segment_dir / "dialogue-track.wav"
     source.write_bytes(b"source")
     muted.write_bytes(b"muted")
+    dialogue_track.write_bytes(b"dialogue-slice")
     (segment_dir / "h3_prompt.txt").write_text("prompt", encoding="utf-8")
     segment = {
         "index": 1,
@@ -5652,19 +5633,6 @@ def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
         "visual_prompt": "visual",
         "status": "running",
     }
-    library = load_voice_library()
-    voice_directory = project / "work" / "voice-references"
-    voice_directory.mkdir(parents=True)
-    voice = library.voices[0]
-    voice_path = voice_directory / "audio-01.wav"
-    voice_path.write_bytes(library.files[voice["voice_id"]].read_bytes())
-    reference = {
-        "audio_reference": "Audio 1",
-        "voice_id": voice["voice_id"],
-        "asset_path": "work/voice-references/audio-01.wav",
-        "asset_sha256": voice["sha256"],
-        "features": library.model_line(voice["voice_id"]),
-    }
     store.update(
         project_id,
         source_path="inputs/source.mp4",
@@ -5673,7 +5641,7 @@ def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
         enhanced_element_index={
             "people": {}, "entities": {}, "scenes": {}, "relations": {},
         },
-        voice_references=[reference],
+        voice_references=[],
         object_replace={
             "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": "a" * 64,
@@ -5721,7 +5689,6 @@ def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
         project_id,
         project,
         dict(segment, source=source),
-        [voice_path],
         None,
         replacement_sheet_path,
         request,
@@ -5730,9 +5697,11 @@ def test_picsart_segment_with_dialogue_still_uses_the_voice_references(
         muted=muted,
     )
 
-    assert prepared.voice_references == (voice_path.resolve(),)
-    assert prepared.audio_urls == ("https://assets.invalid/audio-01.wav",)
-    assert not (segment_dir / "dialogue-track.wav").exists()
+    assert prepared.dialogue_track == dialogue_track.resolve()
+    assert prepared.audio_urls == (
+        "https://assets.invalid/dialogue-track.wav",
+    )
+    assert dialogue_track.resolve() in [path.resolve() for path in registered]
 
 
 def test_h3_segment_without_a_replaced_person_keeps_the_muted_reference(
@@ -5860,7 +5829,6 @@ def test_masked_reference_is_frozen_and_resumed(
         project_id,
         project,
         dict(segment, source=source),
-        [],
         None,
         replacement_sheet_path,
         request,
@@ -5873,96 +5841,183 @@ def test_masked_reference_is_frozen_and_resumed(
     assert [path.name for path in registered] == ["source-faces-masked.mp4"]
 
 
-class _RejectMediaKitVideoErase:
-    def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> None:
-        raise AssertionError("video subtitle erase must not run")
-
-
-def test_erase_source_subtitles_switch_off_is_a_complete_skip(
-    tmp_path: Path,
+def test_freeze_binds_dialogue_track_and_resume_requires_it(
+    tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create(
-        _effective_request(), "erase-off",
-    )
-    source = project / "inputs" / "source.mp4"
-    source.write_bytes(b"source")
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=_RejectMediaKitVideoErase(),
-        picsart=object(),
-    )
     request = _effective_request()
-    request["processing"]["remove_subtitle"] = False
-
-    result = pipeline._erase_source_subtitles(
-        project_id, project, source, request, ResearchLog(project),
-    )
-
-    assert result == source
-    assert not (project / "work" / "source-nosubs.mp4").exists()
-    assert not (project / "logs" / "erase-source-subtitles").exists()
-
-
-def test_erase_source_subtitles_failure_fails_closed(
-    tmp_path: Path,
-) -> None:
-    class FailingMediaKit:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> None:
-            self.calls += 1
-            raise ProviderFailure({}, [], RuntimeError("mediakit unavailable"))
-
-    store = ProjectStore(tmp_path / "projects")
-    project_id, project, _state = store.create(
-        _effective_request(), "erase-fails",
-    )
-    source = project / "inputs" / "source.mp4"
+    project_id, project, _state = store.create(request, "dialogue-freeze")
+    (project / "inputs" / "source.mp4").write_bytes(b"project-source")
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    source = segment_dir / "source.mp4"
+    muted = segment_dir / "source-muted.mp4"
+    dialogue_track = segment_dir / "dialogue-track.wav"
     source.write_bytes(b"source")
-    mediakit = FailingMediaKit()
+    muted.write_bytes(b"muted")
+    dialogue_track.write_bytes(b"dialogue-slice")
+    (segment_dir / "h3_prompt.txt").write_text("prompt", encoding="utf-8")
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 5.0,
+        "duration_s": 5.0,
+        "join_mode": "hard_cut",
+        "dialogue": [{"text": "第一句", "start_s": 0.0, "end_s": 2.0}],
+        "visual_prompt": "visual",
+        "status": "failed",
+    }
+    store.update(
+        project_id,
+        status="failed",
+        source_path="inputs/source.mp4",
+        segment_count=1,
+        segments=[segment],
+        enhanced_element_index={
+            "people": {}, "entities": {}, "scenes": {}, "relations": {},
+            "dialogue_voices": [None],
+        },
+        voice_references=[],
+        object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "a" * 64,
+        },
+        project_progress={
+            "status": "failed", "percent": 57, "stage": "pipeline_failed",
+        },
+        generation={
+            "status": "failed", "stage": "pipeline_failed", "error": "failed",
+        },
+    )
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
-        lambda _project_id, _path: "https://assets.invalid/value",
+        lambda _project_id, path: f"https://assets.invalid/{path.name}",
         deepseek=object(),
-        mediakit=mediakit,
-        picsart=object(),
+        mediakit=object(),
+        picsart=_FlowPicsart(),
+    )
+    monkeypatch.setattr(
+        media,
+        "probe",
+        lambda _path: {
+            "duration_s": 5.0,
+            "width": 1280,
+            "height": 720,
+            "has_audio": False,
+        },
+    )
+    replacement_sheet, _sheet_path = _materialize_test_replacement_sheet(
+        pipeline,
+        project_id,
+        project,
+        [dict(segment, source=source, analysis_paths=[])],
+        store.read(project_id)["enhanced_element_index"],
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [(dict(segment, source=source), "prompt", muted, "b" * 64)],
+        replacement_sheet=replacement_sheet,
+        request=request,
     )
 
-    with pytest.raises(ProviderFailure, match="mediakit unavailable"):
-        pipeline._erase_source_subtitles(
-            project_id, project, source, _effective_request(),
-            ResearchLog(project),
-        )
+    manifest = store.read(project_id)["h3_prepared_artifacts"]
+    receipt = manifest["segments"]["1"]["dialogue_track"]
+    assert receipt["path"] == "work/segments/0001/dialogue-track.wav"
+    assert receipt["sha256"] == Pipeline._sha256(dialogue_track)
 
-    # The node retries once, then the failure escapes without an artifact.
-    assert mediakit.calls == 2
-    assert not (project / "work" / "source-nosubs.mp4").exists()
+    pipeline.validate_r2v_resume(project_id)
+
+    dialogue_track.unlink()
+    with pytest.raises(FileNotFoundError, match="dialogue-track.wav"):
+        pipeline.validate_r2v_resume(project_id)
 
 
-def test_pre_picsart_resume_does_not_require_the_erased_source(
-    tmp_path: Path,
+def test_h3_manifest_rejects_dialogue_track_mismatch(
+    tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    # Projects frozen before the erase node existed carry no
-    # work/source-nosubs.mp4; resume must reuse frozen segment artifacts.
-    store, project_id, project, _sheet, _seedream = (
-        _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request()
+    project_id, project, _state = store.create(request, "dialogue-mismatch")
+    (project / "inputs" / "source.mp4").write_bytes(b"project-source")
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    source = segment_dir / "source.mp4"
+    muted = segment_dir / "source-muted.mp4"
+    source.write_bytes(b"source")
+    muted.write_bytes(b"muted")
+    (segment_dir / "h3_prompt.txt").write_text("prompt", encoding="utf-8")
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 5.0,
+        "duration_s": 5.0,
+        "join_mode": "hard_cut",
+        "dialogue": [{"text": "第一句", "start_s": 0.0, "end_s": 2.0}],
+        "visual_prompt": "visual",
+        "status": "failed",
+    }
+    store.update(
+        project_id,
+        status="failed",
+        source_path="inputs/source.mp4",
+        segment_count=1,
+        segments=[segment],
+        enhanced_element_index={
+            "people": {}, "entities": {}, "scenes": {}, "relations": {},
+        },
+        voice_references=[],
+        object_replace={
+            "version": OBJECT_REPLACE_OUTPUT_VERSION,
+            "input_sha256": "a" * 64,
+        },
+        project_progress={
+            "status": "failed", "percent": 57, "stage": "pipeline_failed",
+        },
+        generation={
+            "status": "failed", "stage": "pipeline_failed", "error": "failed",
+        },
     )
-
-    assert not (project / "work" / "source-nosubs.mp4").exists()
     pipeline = Pipeline(
         _settings(tmp_path),
         store,
-        lambda *_args: "https://assets.invalid/value",
+        lambda _project_id, path: f"https://assets.invalid/{path.name}",
         deepseek=object(),
-        mediakit=_RejectMediaKitVideoErase(),
-        picsart=object(),
-        seedream=_RejectSeedream(),
+        mediakit=object(),
+        picsart=_FlowPicsart(),
+    )
+    monkeypatch.setattr(
+        media,
+        "probe",
+        lambda _path: {
+            "duration_s": 5.0,
+            "width": 1280,
+            "height": 720,
+            "has_audio": False,
+        },
+    )
+    replacement_sheet, _sheet_path = _materialize_test_replacement_sheet(
+        pipeline,
+        project_id,
+        project,
+        [dict(segment, source=source, analysis_paths=[])],
+        store.read(project_id)["enhanced_element_index"],
+    )
+    pipeline._freeze_h3_prepared_artifacts(
+        project_id,
+        project,
+        [
+            (
+                {**segment, "dialogue": [], "source": source},
+                "prompt",
+                segment_dir / "source-muted.mp4",
+                "b" * 64,
+            )
+        ],
+        replacement_sheet=replacement_sheet,
+        request=request,
     )
 
-    pipeline.validate_pre_picsart_resume(project_id)
+    with pytest.raises(ValueError, match="dialogue track does not match"):
+        pipeline.validate_r2v_resume(project_id)
