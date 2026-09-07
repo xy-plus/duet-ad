@@ -735,25 +735,3 @@ def test_detect_scenes_without_duration_keeps_the_frame_timeline(
     )
 
     assert media.detect_scenes(source)[-1]["end_s"] == 16.000001
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
-def test_add_silent_audio_muxes_aac_track(tmp_path: Path) -> None:
-    source = tmp_path / "muted.mp4"
-    subprocess.run(
-        [
-            "ffmpeg", "-v", "error", "-y",
-            "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10:duration=1",
-            "-map", "0:v:0", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
-            str(source),
-        ],
-        check=True,
-    )
-    assert media.probe(source).get("has_audio") is not True
-
-    destination = tmp_path / "silent.mp4"
-    media.add_silent_audio(source, destination)
-
-    info = media.probe(destination)
-    assert info.get("has_audio") is True
-    assert abs(info["duration_s"] - 1.0) < 0.2

@@ -120,13 +120,11 @@ def test_project_index_normalizer_accepts_empty_collections() -> None:
         "entities": [],
         "scenes": [],
         "relations": [],
-        "segment_metrics": [],
     }) == {
         "people": {},
         "entities": {},
         "scenes": {},
         "relations": {},
-        "segment_metrics": {},
     }
 
 
@@ -153,9 +151,6 @@ def test_duplicate_aliases_are_numbered_and_ambiguous_relations_pass_through() -
                 object_key="prop-local",
             ),
         ],
-        "segment_metrics": [
-            {"segment_index": 1, "max_face_share_percent": 42},
-        ],
     })
 
     assert list(normalized["people"]) == ["person-01", "person-02"]
@@ -168,82 +163,22 @@ def test_duplicate_aliases_are_numbered_and_ambiguous_relations_pass_through() -
     assert normalized["relations"]["relation-02"]["subject_key"] == (
         "unresolved:missing-local"
     )
-    assert normalized["segment_metrics"] == {1: 42}
 
-
-def test_project_index_schema_covers_segment_metrics_for_each_input() -> None:
+def test_project_index_schema_has_no_segment_metrics() -> None:
     schema = project_index_schema([1, 3, 5])
-    metrics = schema["properties"]["segment_metrics"]
 
-    assert metrics["minItems"] == 3
-    assert metrics["maxItems"] == 3
-    item = metrics["items"]
-    assert item["additionalProperties"] is False
-    assert set(item["properties"]) == {
-        "segment_index", "max_face_share_percent",
-    }
-    assert item["properties"]["segment_index"] == {
-        "type": "integer", "enum": [1, 3, 5],
-    }
-    assert item["properties"]["max_face_share_percent"] == {
-        "type": "integer", "minimum": 0, "maximum": 100,
-    }
     assert set(schema["properties"]) == {
-        "people", "entities", "scenes", "relations", "segment_metrics",
+        "people", "entities", "scenes", "relations",
     }
-    assert PROJECT_INDEX_SCHEMA["properties"]["segment_metrics"]["minItems"] == 0
+    assert "segment_metrics" not in PROJECT_INDEX_SCHEMA["properties"]
 
 
-def test_project_index_normalizer_collects_segment_metrics() -> None:
-    normalized = normalize_project_index({
-        "people": [],
-        "entities": [],
-        "scenes": [],
-        "relations": [],
-        "segment_metrics": [
-            {"segment_index": 1, "max_face_share_percent": 0},
-            {"segment_index": 3, "max_face_share_percent": 100},
-        ],
-    })
-
-    assert normalized["segment_metrics"] == {1: 0, 3: 100}
-
-
-@pytest.mark.parametrize(
-    "segment_metrics",
-    [
-        [{"segment_index": 1}],
-        [{"segment_index": 1, "max_face_share_percent": 10, "extra": 1}],
-        [{"segment_index": True, "max_face_share_percent": 10}],
-        [{"segment_index": "1", "max_face_share_percent": 10}],
-        [{"segment_index": 1, "max_face_share_percent": -1}],
-        [{"segment_index": 1, "max_face_share_percent": 101}],
-        [{"segment_index": 1, "max_face_share_percent": 12.5}],
-        [{"segment_index": 1, "max_face_share_percent": True}],
-        [
-            {"segment_index": 1, "max_face_share_percent": 10},
-            {"segment_index": 1, "max_face_share_percent": 20},
-        ],
-    ],
-)
-def test_project_index_normalizer_rejects_invalid_segment_metrics(
-    segment_metrics: list[dict[str, Any]],
-) -> None:
-    with pytest.raises(ValueError, match="segment metric"):
-        normalize_project_index({
-            "people": [],
-            "entities": [],
-            "scenes": [],
-            "relations": [],
-            "segment_metrics": segment_metrics,
-        })
-
-
-def test_project_index_normalizer_requires_segment_metrics_key() -> None:
+def test_project_index_normalizer_rejects_extra_segment_metrics_key() -> None:
     with pytest.raises(ValueError, match="project index output is invalid"):
         normalize_project_index({
             "people": [],
             "entities": [],
             "scenes": [],
             "relations": [],
+            "segment_metrics": [],
         })

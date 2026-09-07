@@ -31,7 +31,7 @@
 ```text
 h3-max-r2v-prompt Skill
   -> 后端机械附加台词与相对时间窗
-  -> 有替换人物且不走 retarget 的段：静音参考先经 YuNet 灰块打码（mask-reference-faces）
+  -> 有替换人物的段：静音参考先经 YuNet 灰块打码（mask-reference-faces）
   -> H3 接收静音（或打码）源片段 Video 1、项目级同序 Images 和项目级同序 Audio 1..N
   -> Picsart submit
   -> 使用同一 task ID poll
@@ -73,7 +73,7 @@ Picsart 使用 Advanced workflow `minimax/h3-max/reference-to-video`。提交地
 - `state.object_replace.version=4` 保存 `input_sha256` 与音色目录哈希；`state.replacement_sheet.version=4` 保存 frozen `spec.version=2`、Seedream 输入/提交/输出回执、H3 图片角色和最终图版文件回执；`state.voice_references` 保存按 `Audio 1..N` 排列的 `voice_id`、项目内路径、文件哈希与特征行。增强索引先原子落盘，再与这些项目级元数据一起更新 state；签名 URL 不是冻结状态。
 - `state.h3_prepared_artifacts.version=6` 在所有段免费准备完成后一次发布，逐段冻结 source、muted、prompt 的路径/大小/哈希、Fusion 输入哈希和 segment metadata 哈希；metadata 覆盖 index、start/end、duration 与 join mode。bindings 同时覆盖增强索引、冻结图版状态、音色列表、Object Replace 输入、可选用户图的文件回执和 output request。Object Replace、sheet bundle、spec 和 H3 manifest 的版本字段都必须严格等于当前合同值；任何缺失或不等都立即失败，不能转换、推断或跨版本拼装。`state.picsart_submission_receipts` 记录每段每次允许提交的 request 哈希、run identity、状态和 task ID；研究日志只是证据副本，不承担付费恢复真相。
 - `resume-pre-picsart` 仅允许没有任何 Picsart submit 痕迹的失败项目。没有图版 checkpoint 时可复用合格的源片段、exact-9、MediaKit/分析副本和逐段视觉提示，再按当前合同重建免费上游；一旦存在图版 checkpoint，就必须先在零写入边界校验冻结的版本字段、segments、source、enhanced index、Object Replace、音色、请求、prompt 和有序输入。`prepared` 只允许首次提交或本地回放同一 Seedream receipt，`succeeded/not_needed` 直接复用，均不得重跑上游或另建 stable-key 映射。
-- `resume-picsart` 已越过付费屏障，只复用 H3 manifest v6 冻结的每段 `source-muted.mp4`（或 retarget/打码产物）、`h3_prompt.txt`、同一张图版和相同顺序的有序图片，以及按哈希验证的有序音频文件；它不重跑 raw index、Object Replace、TTS、Seedream 或 Fusion。恢复严格校验版本、路径、哈希、媒体和请求绑定，不把图版画面或 `voice_references` 与 enhanced index 做二次语义复审。已有且未明确失败的 task ID 只继续 poll/download。
+- `resume-picsart` 已越过付费屏障，只复用 H3 manifest v6 冻结的每段 `source-muted.mp4`（或打码产物）、`h3_prompt.txt`、同一张图版和相同顺序的有序图片，以及按哈希验证的有序音频文件；它不重跑 raw index、Object Replace、TTS、Seedream 或 Fusion。恢复严格校验版本、路径、哈希、媒体和请求绑定，不把图版画面或 `voice_references` 与 enhanced index 做二次语义复审。已有且未明确失败的 task ID 只继续 poll/download。
 
 ## 重试、证据与付费边界
 

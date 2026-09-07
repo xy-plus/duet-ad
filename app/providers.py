@@ -270,24 +270,8 @@ def _deepseek_base(base: str) -> str:
     return canonical
 
 
-def _deepseek_chat_url(base: str) -> str:
-    return _deepseek_base(base) + "/chat/completions"
-
-
 def _deepseek_responses_url(base: str) -> str:
     return _deepseek_base(base) + "/responses"
-
-
-def _message_content(body: Any) -> str:
-    if not isinstance(body, dict):
-        raise TypeError("DeepSeek response must be an object")
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise ValueError("DeepSeek response has no first choice")
-    message = choices[0].get("message")
-    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-        raise ValueError("DeepSeek response has no message content")
-    return message["content"]
 
 
 def _structured_output(body: Any) -> dict[str, Any]:
@@ -329,23 +313,6 @@ class DeepSeekClient:
         self.transport = transport
 
     @staticmethod
-    def _content(instruction: str, payload: Any, images: list[Path]) -> list[dict[str, Any]]:
-        content: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": instruction + "\n\nINPUT:\n" + json.dumps(payload, ensure_ascii=False),
-            }
-        ]
-        for image in images:
-            image_bytes = image.read_bytes()
-            mime = _media_type(image, image_bytes)
-            encoded = base64.b64encode(image_bytes).decode("ascii")
-            content.append(
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
-            )
-        return content
-
-    @staticmethod
     def _responses_content(payload: Any, images: list[Path]) -> list[dict[str, Any]]:
         content: list[dict[str, Any]] = [
             {
@@ -364,83 +331,6 @@ class DeepSeekClient:
                 }
             )
         return content
-
-    def _request(
-        self,
-        instruction: str,
-        payload: Any,
-        images: list[Path] | None,
-        *,
-        json_mode: bool = False,
-    ) -> ProviderResult[str]:
-        media = list(images or [])
-        try:
-            content = self._content(instruction, payload, media)
-        except Exception as exc:
-            record = {
-                "request": {
-                    "method": "POST",
-                    "url": _deepseek_chat_url(self.settings.deepseek_api_base),
-                    "headers": _headers(self.settings.deepseek_api_key),
-                    "body": {"instruction": instruction, "payload": payload},
-                },
-                "response": None,
-            }
-            raise ProviderFailure(record, media, exc) from exc
-
-        request: dict[str, Any] = {
-            "model": self.settings.deepseek_model,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0.2,
-            "thinking": {"type": "enabled"},
-        }
-        if json_mode:
-            request["response_format"] = {"type": "json_object"}
-
-        record: dict[str, Any] | None = None
-        try:
-            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
-                response, record = _send(
-                    client,
-                    "POST",
-                    _deepseek_chat_url(self.settings.deepseek_api_base),
-                    headers=_headers(self.settings.deepseek_api_key),
-                    json_body=request,
-                )
-            _ensure_success(response, record, media)
-            body = _json_body(response)
-            value = _message_content(body)
-            return ProviderResult(value=value, record=record, evidence_media=media)
-        except ProviderFailure as exc:
-            if exc.evidence_media:
-                raise
-            raise ProviderFailure(exc.record, media, exc.cause) from exc.cause
-        except Exception as exc:
-            fallback = record or {
-                "request": {
-                    "method": "POST",
-                    "url": _deepseek_chat_url(self.settings.deepseek_api_base),
-                    "headers": _headers(self.settings.deepseek_api_key),
-                    "body": request,
-                },
-                "response": None,
-            }
-            raise ProviderFailure(fallback, media, exc) from exc
-
-    def complete(
-        self,
-        instruction: str,
-        payload: Any,
-        images: list[Path] | None = None,
-        *,
-        json_mode: bool = False,
-    ) -> ProviderResult[str]:
-        return self._request(
-            instruction,
-            payload,
-            images,
-            json_mode=json_mode,
-        )
 
     def complete_structured(
         self,
@@ -1319,8 +1209,6 @@ class PicsartClient:
 
 
 _AUTODL_SUBMIT_MAX_BYTES = 45 * 1024 * 1024
-_AUTODL_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"})
-_AUTODL_VIDEO_SUFFIXES = frozenset({".mp4"})
 _AUTODL_VOICE_SUFFIXES = frozenset({".wav"})
 _AUTODL_TTS_MAX_TEXT_CHARS = 2048
 _AUTODL_PENDING_STATUSES = frozenset({"QUEUED", "RUNNING", "PROCESSING", "PENDING"})
@@ -1360,9 +1248,8 @@ def _autodl_result_url(results: Any) -> str:
 
 
 class AutodlClient:
-    """Submit AutoDL ComfyUI workflow tasks (motion retargeting, TTS)."""
+    """Submit voice-clone TTS tasks to the AutoDL ComfyUI workflow API."""
 
-    WORKFLOW = "wan2.2animate-v4-motion_retargeting"
     WORKFLOW_TTS = "indextts2-v1"
 
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
@@ -1389,62 +1276,6 @@ class AutodlClient:
         if not content:
             raise ValueError(f"AutoDL {kind} input file is empty")
         return content
-
-    def submit_motion_retarget(
-        self,
-        *,
-        image_path: Path,
-        video_path: Path,
-    ) -> ProviderResult[str]:
-        image_bytes = self._media_file(image_path, _AUTODL_IMAGE_SUFFIXES, "image")
-        video_bytes = self._media_file(video_path, _AUTODL_VIDEO_SUFFIXES, "video")
-        image_mime = _media_type(image_path, image_bytes)
-        body = {
-            "ref_image": (
-                f"data:{image_mime};base64,"
-                f"{base64.b64encode(image_bytes).decode('ascii')}"
-            ),
-            "ref_video": (
-                f"data:video/mp4;base64,"
-                f"{base64.b64encode(video_bytes).decode('ascii')}"
-            ),
-        }
-        if (
-            len(body["ref_image"]) + len(body["ref_video"])
-            > _AUTODL_SUBMIT_MAX_BYTES
-        ):
-            raise ValueError("AutoDL submit body exceeds its size budget")
-        url = (
-            f"{self.settings.autodl_api_base}"
-            f"/api/v1/comfyui/comfyui_workflow/{self.WORKFLOW}"
-        )
-        record: dict[str, Any] | None = None
-        try:
-            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
-                response, record = _send(
-                    client,
-                    "POST",
-                    url,
-                    headers=self._headers(),
-                    json_body=body,
-                )
-            _ensure_success(response, record)
-            payload = _json_body(response)
-            if (
-                not isinstance(payload, dict)
-                or payload.get("code") != "Success"
-            ):
-                raise ValueError("AutoDL submit was not accepted")
-            task_id = _autodl_task_data(payload).get("task_id")
-            if not isinstance(task_id, str) or not task_id:
-                raise ValueError("AutoDL submit response has no task id")
-            record["outcome"] = "accepted"
-            record["task_id"] = task_id
-            return ProviderResult(task_id, record)
-        except ProviderFailure:
-            raise
-        except Exception as exc:
-            raise ProviderFailure(record or {}, [], exc) from exc
 
     def submit_tts(
         self,

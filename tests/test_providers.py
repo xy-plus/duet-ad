@@ -47,64 +47,6 @@ def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(providers, "retry_sleep", lambda _seconds: None)
 
 
-def test_deepseek_complete_uses_canonical_url_json_mode_and_preserves_record(
-    tmp_path: Path,
-) -> None:
-    image = tmp_path / "reference.png"
-    image.write_bytes(b"reference-bytes")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
-        assert request.url == httpx.URL("https://deepseek.test/chat/completions")
-        assert request.headers["authorization"] == "Bearer deepseek-secret"
-        body = json.loads(request.content)
-        assert body["response_format"] == {"type": "json_object"}
-        assert body["thinking"] == {"type": "enabled"}
-        assert "max_tokens" not in body
-        assert body["messages"][0]["content"][1]["image_url"]["url"].startswith(
-            "data:image/png;base64,"
-        )
-        return httpx.Response(
-            200,
-            headers={"X-Provider": "deepseek"},
-            json={"choices": [{"message": {"content": '{"ok":true}'}}]},
-        )
-
-    result = DeepSeekClient(
-        _settings(tmp_path), httpx.MockTransport(handler)
-    ).complete("instruction", {"input": "原样"}, [image], json_mode=True)
-
-    assert isinstance(result, ProviderResult)
-    assert result.value == '{"ok":true}'
-    assert result.evidence_media == [image]
-    assert result.record["request"]["method"] == "POST"
-    assert result.record["request"]["url"] == "https://deepseek.test/chat/completions"
-    assert result.record["response"]["status_code"] == 200
-    assert result.record["response"]["body"] == {
-        "choices": [{"message": {"content": '{"ok":true}'}}]
-    }
-
-
-def test_deepseek_image_mime_uses_bytes_when_processing_suffix_is_stale(tmp_path: Path) -> None:
-    image = tmp_path / "mediakit-output.png"
-    image.write_bytes(b"RIFF\x04\x00\x00\x00WEBP")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        assert body["messages"][0]["content"][1]["image_url"]["url"].startswith(
-            "data:image/webp;base64,"
-        )
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": "ok"}}]},
-        )
-
-    result = DeepSeekClient(
-        _settings(tmp_path), httpx.MockTransport(handler)
-    ).complete("instruction", {}, [image])
-    assert result.value == "ok"
-
-
 def test_deepseek_structured_uses_responses_json_schema_and_preserves_exchange(
     tmp_path: Path,
 ) -> None:
@@ -193,27 +135,6 @@ def test_deepseek_structured_uses_responses_json_schema_and_preserves_exchange(
     assert result.record["response"]["status_code"] == 200
     assert result.record["response"]["headers"]["x-provider"] == "deepseek"
     assert result.record["response"]["body"] == response_payload
-
-
-@pytest.mark.parametrize(
-    "response",
-    [
-        httpx.Response(502, json={"error": {"message": "upstream failed"}}),
-        httpx.Response(200, json={"choices": [{"message": {}}]}),
-    ],
-)
-def test_deepseek_http_and_structure_failures_keep_exchange(
-    tmp_path: Path, response: httpx.Response
-) -> None:
-    client = DeepSeekClient(
-        _settings(tmp_path), httpx.MockTransport(lambda request: response)
-    )
-    with pytest.raises(ProviderFailure) as caught:
-        client.complete("instruction", {"input": 1})
-    assert isinstance(caught.value.cause, Exception)
-    assert caught.value.record["request"]["url"] == "https://deepseek.test/chat/completions"
-    assert caught.value.record["response"]["status_code"] == response.status_code
-    assert caught.value.record["response"]["body"] == response.json()
 
 
 def test_deepseek_structured_http_error_keeps_exchange_and_media(tmp_path: Path) -> None:
@@ -957,123 +878,6 @@ def _autodl_client(
     )
 
 
-def _autodl_media(tmp_path: Path) -> tuple[Path, Path]:
-    image = tmp_path / "reference.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
-    video = tmp_path / "source-muted.mp4"
-    video.write_bytes(b"video-bytes")
-    return image, video
-
-
-def test_autodl_submit_uses_bare_token_and_exact_body(tmp_path: Path) -> None:
-    image, video = _autodl_media(tmp_path)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
-        assert request.url == httpx.URL(
-            "https://autodl.test/api/v1/comfyui/comfyui_workflow/"
-            "wan2.2animate-v4-motion_retargeting"
-        )
-        assert request.headers["authorization"] == "autodl-secret"
-        assert request.headers["content-type"] == "application/json"
-        body = json.loads(request.content)
-        assert set(body) == {"ref_image", "ref_video"}
-        assert body["ref_image"].startswith("data:image/png;base64,")
-        assert body["ref_video"].startswith("data:video/mp4;base64,")
-        return httpx.Response(
-            200, json={"code": "Success", "data": {"task_id": "task-1"}}
-        )
-
-    result = _autodl_client(tmp_path, handler).submit_motion_retarget(
-        image_path=image, video_path=video,
-    )
-
-    assert result.value == "task-1"
-    assert result.record["outcome"] == "accepted"
-    assert result.record["task_id"] == "task-1"
-
-
-@pytest.mark.parametrize(
-    "response",
-    [
-        httpx.Response(200, json={"code": "Failed", "msg": "bad params"}),
-        httpx.Response(200, json={"code": "Success", "data": {}}),
-        httpx.Response(400, json={"code": "Failed", "msg": "too many params"}),
-    ],
-)
-def test_autodl_submit_rejections_fail_closed(
-    tmp_path: Path, response: httpx.Response
-) -> None:
-    image, video = _autodl_media(tmp_path)
-    client = _autodl_client(tmp_path, lambda request: response)
-
-    with pytest.raises(ProviderFailure):
-        client.submit_motion_retarget(image_path=image, video_path=video)
-
-
-def test_autodl_submit_network_failure_keeps_transport_record(
-    tmp_path: Path,
-) -> None:
-    image, video = _autodl_media(tmp_path)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("unreachable", request=request)
-
-    client = _autodl_client(tmp_path, handler)
-    with pytest.raises(ProviderFailure, match="unreachable") as caught:
-        client.submit_motion_retarget(image_path=image, video_path=video)
-    assert caught.value.record["response"] is None
-
-
-@pytest.mark.parametrize(
-    ("image_name", "video_name", "message"),
-    [
-        ("reference.txt", "source-muted.mp4", "image input file is invalid"),
-        ("missing.png", "source-muted.mp4", "image input file is invalid"),
-        ("reference.png", "source-muted.webm", "video input file is invalid"),
-    ],
-)
-def test_autodl_submit_validates_input_files(
-    tmp_path: Path, image_name: str, video_name: str, message: str
-) -> None:
-    image, video = _autodl_media(tmp_path)
-    image = image.with_name(image_name)
-    if image.name != "missing.png":
-        image.write_bytes(b"image-bytes")
-    video = video.with_name(video_name)
-    video.write_bytes(b"video-bytes")
-    client = _autodl_client(
-        tmp_path, lambda request: pytest.fail("no request allowed")
-    )
-
-    with pytest.raises(ValueError, match=message):
-        client.submit_motion_retarget(image_path=image, video_path=video)
-
-
-def test_autodl_submit_rejects_oversized_body(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    image, video = _autodl_media(tmp_path)
-    monkeypatch.setattr(providers, "_AUTODL_SUBMIT_MAX_BYTES", 10)
-    client = _autodl_client(
-        tmp_path, lambda request: pytest.fail("no request allowed")
-    )
-
-    with pytest.raises(ValueError, match="size budget"):
-        client.submit_motion_retarget(image_path=image, video_path=video)
-
-
-def test_autodl_submit_requires_a_token(tmp_path: Path) -> None:
-    image, video = _autodl_media(tmp_path)
-    client = AutodlClient(
-        _settings(tmp_path, autodl_api_base="https://autodl.test"),
-        httpx.MockTransport(lambda request: pytest.fail("no request allowed")),
-    )
-
-    with pytest.raises(ProviderFailure, match="AUTODL_ART_TOKEN"):
-        client.submit_motion_retarget(image_path=image, video_path=video)
-
-
 def test_autodl_poll_waits_for_success_and_returns_artifact_url(
     tmp_path: Path,
 ) -> None:
@@ -1169,18 +973,18 @@ def test_autodl_poll_times_out(tmp_path: Path) -> None:
 
 
 def test_autodl_download_writes_artifact(tmp_path: Path) -> None:
-    destination = tmp_path / "nested" / "source-retargeted.mp4"
+    destination = tmp_path / "nested" / "line-0001.wav"
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("https://cdn.test/output.mp4")
-        return httpx.Response(200, content=b"retargeted-video")
+        return httpx.Response(200, content=b"tts-audio")
 
     result = _autodl_client(tmp_path, handler).download(
         "https://cdn.test/output.mp4", destination,
     )
 
     assert result.value == destination
-    assert destination.read_bytes() == b"retargeted-video"
+    assert destination.read_bytes() == b"tts-audio"
     assert result.evidence_media == [destination]
 
 
@@ -1488,14 +1292,23 @@ def test_deepseek_retries_remote_protocol_error_then_succeeds(tmp_path: Path) ->
         if calls == 1:
             raise httpx.RemoteProtocolError("eof mid-stream", request=request)
         return httpx.Response(
-            200, json={"choices": [{"message": {"content": "ok"}}]}
+            200,
+            json={
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": '{"ok": true}'}],
+                }],
+            },
         )
 
     result = DeepSeekClient(
         _settings(tmp_path), httpx.MockTransport(handler)
-    ).complete("instruction", {"input": 1})
+    ).complete_structured("instruction", {"input": 1}, {"type": "object"})
 
-    assert result.value == "ok"
+    assert result.value == {"ok": True}
     assert calls == 2
     attempts = result.record["attempts"]
     assert [entry["attempt"] for entry in attempts] == [1, 2]
@@ -1516,7 +1329,7 @@ def test_transport_failure_is_retried_twice_with_backoff_then_raises(
 
     client = DeepSeekClient(_settings(tmp_path), httpx.MockTransport(handler))
     with pytest.raises(ProviderFailure, match="unreachable") as caught:
-        client.complete("instruction", {"input": 1})
+        client.complete_structured("instruction", {"input": 1}, {"type": "object"})
 
     assert calls == 3
     assert sleeps == [2.0, 5.0]
@@ -1528,7 +1341,8 @@ def test_transport_failure_is_retried_twice_with_backoff_then_raises(
 
 def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
     calls = 0
-    image, video = _autodl_media(tmp_path)
+    voice = tmp_path / "audio-01.wav"
+    voice.write_bytes(b"voice-bytes")
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
@@ -1540,7 +1354,7 @@ def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
         )
 
     client = _autodl_client(tmp_path, handler)
-    result = client.submit_motion_retarget(image_path=image, video_path=video)
+    result = client.submit_tts(text="台词", voice_path=voice)
 
     assert result.value == "task-1"
     assert result.record["outcome"] == "accepted"
