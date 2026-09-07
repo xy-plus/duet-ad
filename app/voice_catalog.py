@@ -16,8 +16,6 @@ VOICE_LIBRARY_ROOT = ROOT / "assets" / "voice-library"
 VOICE_CATALOG_PATH = VOICE_LIBRARY_ROOT / "catalog.json"
 VOICE_CATALOG_NAME = "duet.voice-library"
 VOICE_CATALOG_VERSION = 1
-VOICE_SELECTION_OUTPUT_NAME = "duet.voice-selection-output"
-VOICE_SELECTION_OUTPUT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -166,41 +164,3 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
         files=files,
         digest=hashlib.sha256(_canonical(raw)).hexdigest(),
     )
-
-
-def voice_selection_schema(
-    payload: dict[str, Any], voice_ids: list[str],
-) -> tuple[dict[str, Any], str]:
-    if not voice_ids or len(voice_ids) != len(set(voice_ids)):
-        raise ValueError("voice selection requires unique catalog ids")
-    input_sha256 = hashlib.sha256(_canonical(payload)).hexdigest()
-    properties = {
-        "schema": {"type": "string", "enum": [VOICE_SELECTION_OUTPUT_NAME]},
-        "version": {"type": "integer", "enum": [VOICE_SELECTION_OUTPUT_VERSION]},
-        "input_sha256": {"type": "string", "enum": [input_sha256]},
-        "voice_id": {"type": "string", "enum": voice_ids},
-    }
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(properties),
-        "additionalProperties": False,
-    }, input_sha256
-
-
-def normalize_voice_selection(
-    value: object, *, input_sha256: str, voice_ids: set[str],
-) -> str:
-    if not isinstance(value, dict) or set(value) != {
-        "schema", "version", "input_sha256", "voice_id",
-    }:
-        raise ValueError("voice selection output is invalid")
-    if (
-        value["schema"] != VOICE_SELECTION_OUTPUT_NAME
-        or type(value["version"]) is not int
-        or value["version"] != VOICE_SELECTION_OUTPUT_VERSION
-        or value["input_sha256"] != input_sha256
-        or value["voice_id"] not in voice_ids
-    ):
-        raise ValueError("voice selection output is not bound to its input")
-    return value["voice_id"]

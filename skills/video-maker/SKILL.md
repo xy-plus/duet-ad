@@ -26,8 +26,6 @@ description: 分析后端为每个 segment 冻结的 9 张原始关键帧并生�
 
 输出格式以本次调用注入的 JSON Schema 为唯一权威。`people/entities/scenes/relations` 都是数组，调用内引用写入各记录的 `key`；人物、实体和场景记录包含 `source_visual_description/occurrences/replaceable/preserve`，关系记录包含 `subject_key/predicate/object_key/occurrences/preserve/replace_together`，关系逐帧记录包含 `frame_order/state/geometry`。后端把调用内 `key` 机械映射为稳定 ID；不接受重复 key、额外字段或缺字段。
 
-为每个输入 segment 输出一条 `segment_metrics`：`max_face_share_percent` 是逐帧估计该段画面中占比最大的单张人脸（完整面部区域）面积占整帧面积的整数百分比，取九帧最大值；无可见人脸记 0；只依据像素证据；必须逐项覆盖全部输入 segment，`segment_index` 逐字复用输入段的值，不得缺漏或重复。
-
 `scenes` 必须非空，且每个输入帧必须且只能归属一个 scene occurrence；所有 scene occurrences 合并后逐项等于输入中的全部 segment/frame，不得引用未知帧、重复归属或漏帧。人物、实体和关系只记录有直接证据的内容，可以为空。
 
 关系必须是像素可证实的物理、空间或功能关系，例如连接、容纳、持有、驱动、释放、接触、支撑或组成；用 `subject_key/predicate/object_key` 固定角色，不能把主客体互换。逐帧记录当前状态和相对几何，使装配、作用、释放、分离等变化保持同一关系 ID；这是下游逐帧关系状态和几何的唯一 producer，后续 phase 不重新生成。仅当两个元素需要保持接口、尺度或功能配合时设 `replace_together=true`。不因常识补造功能，不把动作先后误写为关系。

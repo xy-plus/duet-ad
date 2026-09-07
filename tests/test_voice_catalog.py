@@ -11,10 +11,7 @@ import pytest
 from app.voice_catalog import (
     VOICE_CATALOG_NAME,
     VOICE_CATALOG_VERSION,
-    VOICE_SELECTION_OUTPUT_NAME,
     load_voice_library,
-    normalize_voice_selection,
-    voice_selection_schema,
 )
 
 
@@ -125,35 +122,3 @@ def test_voice_library_keeps_actual_provider_duration_boundary(tmp_path) -> None
 
     with pytest.raises(ValueError, match="between 2 and 5 seconds"):
         load_voice_library(catalog_path)
-
-
-def test_voice_selection_schema_binds_input_and_catalog() -> None:
-    payload = {"voice_catalog_lines": "voice-a - voices/voice-a.wav - English - male"}
-    schema, input_sha256 = voice_selection_schema(payload, ["voice-a", "voice-b"])
-
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["schema"]["enum"] == [VOICE_SELECTION_OUTPUT_NAME]
-    assert schema["properties"]["voice_id"]["enum"] == ["voice-a", "voice-b"]
-    value = {
-        "schema": VOICE_SELECTION_OUTPUT_NAME,
-        "version": 1,
-        "input_sha256": input_sha256,
-        "voice_id": "voice-b",
-    }
-    assert normalize_voice_selection(
-        value, input_sha256=input_sha256, voice_ids={"voice-a", "voice-b"},
-    ) == "voice-b"
-
-    with pytest.raises(ValueError, match="not bound"):
-        normalize_voice_selection(
-            {**value, "voice_id": "voice-c"},
-            input_sha256=input_sha256,
-            voice_ids={"voice-a", "voice-b"},
-        )
-    for invalid_version in (True, 1.0):
-        with pytest.raises(ValueError, match="not bound"):
-            normalize_voice_selection(
-                {**value, "version": invalid_version},
-                input_sha256=input_sha256,
-                voice_ids={"voice-a", "voice-b"},
-            )

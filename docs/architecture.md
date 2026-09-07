@@ -30,7 +30,7 @@
 ```text
 h3-max-r2v-prompt Skill
   -> 后端机械附加台词与相对时间窗
-  -> 有替换人物且不走 retarget 的段：静音参考先经 YuNet 灰块打码（mask-reference-faces）
+  -> 有替换人物的段：静音参考先经 YuNet 灰块打码（mask-reference-faces）
   -> H3 接收静音（或打码）源片段 Video 1、项目级同序 Images 和本段台词语音切片 Audio 1（无台词段不传音频）
   -> Picsart submit
   -> 使用同一 task ID poll

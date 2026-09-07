@@ -30,7 +30,7 @@
   -> 后端从 frozen enhanced index 生成 sheet bundle v4/spec v2：stable key -> TILE_XX
   -> Seedream 每项目一次，以 Image 1 空白布局 + 可选 Image 2 用户图生成一张隔离的新形象图版
   -> 公共输入屏障
-  -> 第一屏障：所有段并行完成 Fusion、最终提示词和静音 Video 1（有替换人物且不走 retarget 的段先做 YuNet 人脸灰块打码）
+  -> 第一屏障：所有段并行完成 Fusion、最终提示词和静音 Video 1（有替换人物的段先做 YuNet 人脸灰块打码）
   -> 第二屏障：所有段完成有序 Images、素材注册和 H3 参数预检
   -> 每段并行 Picsart H3：Video 1 + 所有段完全同序的 Images + 本段台词语音切片 Audio 1（无台词段不传音频）
   -> 供应商片段裁回原时长并统一为 24 fps

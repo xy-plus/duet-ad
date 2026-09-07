@@ -27,7 +27,6 @@ from app.object_replace_schema import (
 )
 from app.replacement_sheet import (
     build_replacement_sheet_spec,
-    extract_tile_reference,
     finalize_replacement_sheet,
     materialize_replacement_sheet_inputs,
     replacement_sheet_spec_sha256,
@@ -116,7 +115,6 @@ PICSART_GENERATION_MIN_DURATION_S = 5
 PICSART_GENERATION_MAX_DURATION_S = 15
 PICSART_RESOLUTIONS = frozenset({"480p", "768p"})
 PICSART_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
-FACE_RETARGET_MIN_FACE_SHARE_PERCENT = 50
 MUTED_ARTIFACT_NAMES = frozenset({
     "source-muted.mp4", "source-retargeted.mp4", "source-faces-masked.mp4",
 })
@@ -4337,98 +4335,6 @@ class Pipeline:
         lines.append("END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN")
         return "\n".join(lines)
 
-    @classmethod
-    def _segment_retarget_person(
-        cls,
-        element_index: dict[str, Any],
-        segment_index: int,
-    ) -> str | None:
-        """Return the first replaced person when the segment is face-dominated."""
-        people = element_index.get("people")
-        if not isinstance(people, dict):
-            return None
-        candidate: str | None = None
-        for stable_key in sorted(
-            (key for key in people if isinstance(key, str)),
-            key=lambda value: value.encode("ascii", "backslashreplace"),
-        ):
-            record = people[stable_key]
-            if (
-                isinstance(record, dict)
-                and isinstance(record.get("replacement"), dict)
-                and cls._appears_in_segment(record, segment_index)
-            ):
-                candidate = stable_key
-                break
-        if candidate is None:
-            return None
-        metrics = element_index.get("segment_metrics")
-        share: Any = 0
-        if isinstance(metrics, dict):
-            share = metrics.get(segment_index, metrics.get(str(segment_index), 0))
-        if (
-            isinstance(share, bool)
-            or not isinstance(share, int)
-            or not 0 <= share <= 100
-        ):
-            raise ValueError("segment face share metric is invalid")
-        if share <= FACE_RETARGET_MIN_FACE_SHARE_PERCENT:
-            return None
-        return candidate
-
-    def _retarget_segment_reference(
-        self,
-        project: Path,
-        segment_dir: Path,
-        replacement_sheet: dict[str, Any],
-        index: int,
-        stable_key: str,
-        muted: Path,
-        log: ResearchLog,
-        scope: str,
-    ) -> Path:
-        """Replace the muted reference with a motion-retargeted video."""
-        spec = replacement_sheet.get("spec")
-        if not isinstance(spec, dict):
-            raise ValueError("motion retarget replacement sheet spec is invalid")
-        sheet_path = (
-            project / "work" / "global-reference-sheet" / "reference-sheet.png"
-        )
-        reference = segment_dir / "retarget-reference.png"
-        extract_tile_reference(sheet_path, spec, stable_key, reference)
-        retargeted = segment_dir / "source-retargeted.mp4"
-
-        def operation() -> ProviderResult[Path]:
-            submitted = self.autodl.submit_motion_retarget(
-                image_path=reference,
-                video_path=muted,
-            )
-            record: dict[str, Any] = {"submit": submitted.record}
-            polled = self.autodl.poll(submitted.value)
-            record["poll"] = polled.record
-            downloaded = self.autodl.download(polled.value, retargeted)
-            record["download"] = downloaded.record
-            return ProviderResult(
-                retargeted,
-                record,
-                list(downloaded.evidence_media),
-            )
-
-        return self._node(
-            log,
-            "motion-retarget",
-            scope,
-            {
-                "workflow": AutodlClient.WORKFLOW,
-                "stable_key": stable_key,
-                "reference_image": reference,
-                "source_video": muted,
-                "output": retargeted,
-            },
-            [reference, muted],
-            operation,
-            lambda value: [value],
-        )
 
     def _prepare_h3_segment(
         self,
@@ -4561,22 +4467,8 @@ class Pipeline:
                 lambda: media.mute(item["source"], muted),
                 lambda _value: [muted],
             )
-            retarget_person = self._segment_retarget_person(element_index, index)
-            if retarget_person is not None:
-                muted = self._retarget_segment_reference(
-                    project,
-                    segment_dir,
-                    replacement_sheet,
-                    index,
-                    retarget_person,
-                    muted,
-                    log,
-                    scope,
-                )
-            elif self._segment_has_replaced_person(element_index, index):
-                # Retarget output already carries the new identity; masking it
-                # would break its expression/pose extraction. Otherwise mask
-                # every source face so H3 must take the face from the tile.
+            if self._segment_has_replaced_person(element_index, index):
+                # Mask every source face so H3 must take the face from its tile.
                 masked = segment_dir / "source-faces-masked.mp4"
                 self._node(
                     log,

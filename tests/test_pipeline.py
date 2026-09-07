@@ -696,10 +696,6 @@ class _FlowDeepSeek:
                 "preserve": ["hand contact"],
                 "replace_together": True,
             }],
-            "segment_metrics": [
-                {"segment_index": index, "max_face_share_percent": 0}
-                for index in segment_indices
-            ],
         }
         return ProviderResult(
             raw,
@@ -1066,8 +1062,8 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         "trim-4.2",
         "trim-5.0",
     ]
-    # Both segments have replaced people and no retarget: every reference
-    # video is face-masked before submission.
+    # Both segments have replaced people: every reference video is
+    # face-masked before submission.
     assert sorted(
         scope.name
         for scope in (project / "logs" / "mask-reference-faces").iterdir()
@@ -1252,7 +1248,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for call in fusion_calls
     )
     assert set(raw_index) == {
-        "people", "entities", "scenes", "relations", "segment_metrics",
+        "people", "entities", "scenes", "relations",
     }
     assert list(raw_index["people"]) == [
         "person-01", "person-02", "person-03",
@@ -2725,7 +2721,6 @@ def test_project_index_normalizer_mechanically_maps_ids_without_metadata() -> No
             "preserve": [],
             "replace_together": False,
         }],
-        "segment_metrics": [{"segment_index": 1, "max_face_share_percent": 0}],
     })
 
     assert list(normalized["people"]) == ["person-01"]
@@ -5109,101 +5104,38 @@ def test_current_first_submit_resume_rejects_ambiguous_submission_evidence(
     assert provider_calls == []
 
 
-def _retarget_element_index(
-    share: Any,
-    *,
-    replaced: bool = True,
-    appears: bool = True,
-    category: str = "people",
-    metrics: Any = "default",
-) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "source_visual_description": "a visible subject",
-        "occurrences": [
-            {"segment_index": 1 if appears else 2, "frame_orders": [1]},
-        ],
-    }
-    if replaced:
-        record["replacement"] = {
-            "reason": "automatic",
-            "source": "generated_variant",
-            "target_visual_description": "a replacement subject",
-            "appearance_description": "an isolated replacement subject",
-        }
-    index: dict[str, Any] = {
-        "people": {},
-        "entities": {},
-        "scenes": {},
-        "relations": {},
-        "segment_metrics": {1: share} if metrics == "default" else metrics,
-    }
-    index[category]["person-01" if category == "people" else "entity-01"] = record
-    return index
-
-
-@pytest.mark.parametrize(
-    ("share", "expected"),
-    [(51, "person-01"), (100, "person-01"), (50, None), (0, None)],
-)
-def test_segment_retarget_person_applies_the_face_share_threshold(
-    share: int, expected: str | None
-) -> None:
-    index = _retarget_element_index(share)
-
-    assert Pipeline._segment_retarget_person(index, 1) == expected
-
-
-def test_segment_retarget_person_accepts_json_round_tripped_metric_keys() -> None:
-    index = _retarget_element_index(80, metrics={"1": 80})
-
-    assert Pipeline._segment_retarget_person(index, 1) == "person-01"
-
-
-@pytest.mark.parametrize(
-    "index",
-    [
-        _retarget_element_index(80, appears=False),
-        _retarget_element_index(80, replaced=False),
-        _retarget_element_index(80, category="entities"),
-        _retarget_element_index(80, metrics={2: 80}),
-        _retarget_element_index(80, metrics=None),
-    ],
-)
-def test_segment_retarget_person_requires_a_replaced_person_in_segment(
-    index: dict[str, Any],
-) -> None:
-    assert Pipeline._segment_retarget_person(index, 1) is None
-
-
-@pytest.mark.parametrize("share", [-1, 101, 12.5, True, "80"])
-def test_segment_retarget_person_rejects_invalid_metrics(share: Any) -> None:
-    with pytest.raises(ValueError, match="face share metric"):
-        Pipeline._segment_retarget_person(_retarget_element_index(share), 1)
-
-
-class _RejectAutodl:
-    def submit_motion_retarget(self, **_kwargs: Any) -> None:
-        raise AssertionError("motion retarget must not run")
-
-
-def _prepare_h3_retarget_fixture(
+def _prepare_h3_mask_fixture(
     tmp_path: Path,
     monkeypatch: Any,
-    autodl: Any,
-    share: int,
 ) -> tuple[
     Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
     list[tuple[Path, Path]],
 ]:
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
-        _effective_request(), "retarget",
+        _effective_request(), "face-mask",
     )
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
     source = segment_dir / "source.mp4"
     source.write_bytes(b"source")
-    enhanced_index = _retarget_element_index(share)
+    enhanced_index = {
+        "people": {
+            "person-01": {
+                "source_visual_description": "a visible subject",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replacement": {
+                    "reason": "automatic",
+                    "source": "generated_variant",
+                    "target_visual_description": "a replacement subject",
+                    "appearance_description": "an isolated replacement subject",
+                },
+            },
+        },
+        "entities": {},
+        "scenes": {},
+        "relations": {},
+    }
     spec = build_replacement_sheet_spec(enhanced_index)
     sheet_directory = project / "work" / "global-reference-sheet"
     inputs = materialize_replacement_sheet_inputs(sheet_directory, spec)
@@ -5247,7 +5179,6 @@ def _prepare_h3_retarget_fixture(
         deepseek=FakeFusion(),
         mediakit=object(),
         picsart=object(),
-        autodl=autodl,
     )
     monkeypatch.setattr(
         media,
@@ -5269,96 +5200,11 @@ def _prepare_h3_retarget_fixture(
     )
 
 
-def test_h3_face_dominated_segment_is_motion_retargeted(
-    tmp_path: Path, monkeypatch: Any,
-) -> None:
-    submits: list[dict[str, Any]] = []
-
-    class FakeAutodl:
-        def submit_motion_retarget(
-            self, *, image_path: Path, video_path: Path,
-        ) -> ProviderResult[str]:
-            submits.append({"image": image_path, "video": video_path})
-            return ProviderResult("autodl-task-1", {"task_id": "autodl-task-1"})
-
-        def poll(self, task_id: str) -> ProviderResult[str]:
-            assert task_id == "autodl-task-1"
-            return ProviderResult(
-                "https://cdn.invalid/retargeted.mp4", {"status": "SUCCESS"},
-            )
-
-        def download(self, url: str, destination: Path) -> ProviderResult[Path]:
-            assert url == "https://cdn.invalid/retargeted.mp4"
-            destination.write_bytes(b"retargeted-video")
-            return ProviderResult(destination, {"url": url}, [destination])
-
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
-        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, FakeAutodl(), 80)
-    )
-    segment_dir = project / "work" / "segments" / "0001"
-
-    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
-        project,
-        item,
-        enhanced_index,
-        replacement_sheet,
-        _effective_request(),
-        ResearchLog(project),
-    )
-
-    assert muted == segment_dir / "source-retargeted.mp4"
-    assert muted.read_bytes() == b"retargeted-video"
-    assert mask_calls == []
-    assert len(submits) == 1
-    assert submits[0]["image"] == segment_dir / "retarget-reference.png"
-    assert submits[0]["video"] == segment_dir / "source-muted.mp4"
-    import cv2
-
-    crop = cv2.imread(str(submits[0]["image"]))
-    assert crop is not None
-    # The label band is cropped off the 2048x2048 single-tile sheet.
-    assert 0 < crop.shape[0] < 2048
-    assert crop.shape[1] == 2048
-    output = json.loads(
-        (
-            project / "logs" / "motion-retarget" / "segment-0001"
-            / "attempt-1" / "output.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert output["value"].endswith("source-retargeted.mp4")
-
-
-def test_h3_motion_retarget_failure_fails_closed(
-    tmp_path: Path, monkeypatch: Any,
-) -> None:
-    class FailingAutodl:
-        def submit_motion_retarget(self, **_kwargs: Any) -> None:
-            raise ProviderFailure({}, [], RuntimeError("autodl unavailable"))
-
-    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls = (
-        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, FailingAutodl(), 80)
-    )
-    segment_dir = project / "work" / "segments" / "0001"
-
-    with pytest.raises(ProviderFailure, match="autodl unavailable"):
-        pipeline._prepare_h3_segment(
-            project,
-            item,
-            enhanced_index,
-            replacement_sheet,
-            _effective_request(),
-            ResearchLog(project),
-        )
-
-    assert item["status"] == "failed"
-    assert not (segment_dir / "source-retargeted.mp4").exists()
-
-
-def test_h3_low_face_share_segment_masks_faces_without_retarget(
+def test_h3_segment_with_a_replaced_person_masks_faces(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
-        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, _RejectAutodl(), 50)
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
     )
     segment_dir = project / "work" / "segments" / "0001"
 
@@ -5373,7 +5219,6 @@ def test_h3_low_face_share_segment_masks_faces_without_retarget(
 
     assert muted == segment_dir / "source-faces-masked.mp4"
     assert muted.read_bytes() == b"source-masked"
-    assert not (segment_dir / "source-retargeted.mp4").exists()
     assert mask_calls == [
         (segment_dir / "source-muted.mp4", muted),
     ]
@@ -5708,7 +5553,7 @@ def test_h3_segment_without_a_replaced_person_keeps_the_muted_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
-        _prepare_h3_retarget_fixture(tmp_path, monkeypatch, _RejectAutodl(), 50)
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
     )
     # The replaced person never appears in segment 1.
     enhanced_index["people"]["person-01"]["occurrences"] = [

@@ -2153,10 +2153,6 @@ def trim_24fps(
     }
 
 
-def trim(source: Path, duration_s: float, destination: Path) -> dict[str, Any]:
-    return trim_24fps(source, duration_s, destination)
-
-
 def concat(
     paths: Sequence[Path],
     destination: Path,
