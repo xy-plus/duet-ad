@@ -6137,6 +6137,72 @@ def test_node_never_retries_input_errors(tmp_path: Path) -> None:
     assert calls == 1
 
 
+def test_node_retries_transient_model_output_errors(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-output-parse",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    cases = (
+        json.JSONDecodeError("Expecting ',' delimiter", "{", 0),
+        ValueError("visual prompt output is invalid"),
+        media.MediaError("ASR output is invalid"),
+    )
+    for index, exc in enumerate(cases):
+        calls = 0
+
+        def flaky() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise exc
+            return "ok"
+
+        node = f"deepseek-call-{index}"
+        assert pipeline._node(log, node, "project", {}, [], flaky) == "ok"
+        assert calls == 2
+
+
+def test_node_never_retries_other_value_errors(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-other-value-error",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    cases = (
+        ValueError("stored source path must be inputs/source.mp4"),
+        ValueError("output is invalid but keeps talking"),
+        media.MediaError("audio stream is missing"),
+    )
+    for index, exc in enumerate(cases):
+        calls = 0
+
+        def invalid() -> None:
+            nonlocal calls
+            calls += 1
+            raise exc
+
+        with pytest.raises(type(exc)):
+            pipeline._node(log, f"probe-{index}", "project", {}, [], invalid)
+        assert calls == 1
+
+
 def test_node_retry_delay_schedule() -> None:
     assert Pipeline._node_retry_delay(1) == 0.0
     assert Pipeline._node_retry_delay(2) == 0.0
