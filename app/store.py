@@ -385,6 +385,15 @@ class ProjectStore:
                 )
         return project, state
 
+    def lookup_claim(self, client_request_id: str) -> str | None:
+        """Return the project id durably claimed for a client request id."""
+
+        with self._lock:
+            index = self._read_idempotency_index_unlocked()
+            key_digest = hashlib.sha256(client_request_id.encode("utf-8")).hexdigest()
+            entry = index["entries"].get(key_digest)
+            return entry["project_id"] if entry is not None else None
+
     def create_from_staging(
         self,
         effective_request: dict[str, Any],
@@ -396,6 +405,8 @@ class ProjectStore:
         staged_source: Path,
         replacement_snapshot: dict[str, Any] | None,
         staged_replacement: Path | None,
+        project_id: str | None = None,
+        extra_state: dict[str, Any] | None = None,
     ) -> tuple[str, Path, dict[str, Any], bool]:
         """Commit staged inputs and a durable idempotency claim as one create step.
 
@@ -410,6 +421,18 @@ class ProjectStore:
             raise ValueError("client_request_id must be nonempty")
         if not isinstance(request_digest, str) or SHA256_RE.fullmatch(request_digest) is None:
             raise ValueError("invalid request digest")
+        if project_id is not None and (
+            not isinstance(project_id, str)
+            or PROJECT_ID_RE.fullmatch(project_id) is None
+        ):
+            raise ValueError("invalid caller-supplied project id")
+        if extra_state is not None:
+            reserved_keys = {
+                "schema", "version", "id", "status", "created_at", "updated_at",
+                "effective_request", "client_request_id", "input_receipt",
+            }
+            if not isinstance(extra_state, dict) or set(extra_state) & reserved_keys:
+                raise ValueError("extra state must not override core project fields")
         receipt_digest = self._validated_receipt_digest(
             input_receipt,
             client_request_id=client_request_id,
@@ -474,9 +497,12 @@ class ProjectStore:
                 )
                 return existing["project_id"], project, state, False
 
-            project_id = uuid.uuid4().hex
-            while self.path(project_id).exists():
+            if project_id is None:
                 project_id = uuid.uuid4().hex
+                while self.path(project_id).exists():
+                    project_id = uuid.uuid4().hex
+            elif self.path(project_id).exists():
+                raise ValueError("caller-supplied project id already exists")
             index["entries"][key_digest] = {
                 "project_id": project_id,
                 "request_digest": request_digest,
@@ -551,6 +577,8 @@ class ProjectStore:
                 },
                 "error": None,
             }
+            if extra_state:
+                state.update(extra_state)
             self.write(project_id, state)
             return project_id, project, state, True
 

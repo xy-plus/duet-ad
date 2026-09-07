@@ -49,6 +49,8 @@ class Settings:
     max_upload_mb: int = 500
     retry_delay_s: float = 1.0
     store_lock_enabled: bool = True
+    public_api_enabled: bool = False
+    public_api_clients_file: Path | None = None
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -158,6 +160,14 @@ class Settings:
             or self.codex_concurrency < 1
         ):
             raise ValueError("CODEX_CONCURRENCY must be a positive integer")
+        if isinstance(self.public_api_enabled, bool) is not True:
+            raise ValueError("PUBLIC_API_ENABLED must be a boolean")
+        clients_file = self.public_api_clients_file
+        if clients_file is None:
+            clients_file = self.data_dir / ".public-api" / "public-api-clients.json"
+        if not isinstance(clients_file, Path):
+            raise ValueError("PUBLIC_API_CLIENTS_FILE must be a filesystem path")
+        object.__setattr__(self, "public_api_clients_file", clients_file)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -212,6 +222,10 @@ def get_settings() -> Settings:
         provider_poll_timeout_s=float(os.environ.get("PROVIDER_POLL_TIMEOUT_S", "1800")),
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
         retry_delay_s=float(os.environ.get("RETRY_DELAY_S", "1")),
+        public_api_enabled=_bool("PUBLIC_API_ENABLED", False),
+        public_api_clients_file=(
+            Path(clients_file).expanduser() if (clients_file := os.environ.get("PUBLIC_API_CLIENTS_FILE", "").strip()) else None
+        ),
         # Provider asset grants live in process memory.  Production settings
         # therefore cannot disable the single-worker store lock; tests may do
         # so only by constructing Settings explicitly.
