@@ -2808,8 +2808,10 @@ def test_nullable_object_replace_plan_is_compiled_without_a_quality_gate(
         },
     }
 
-    metadata, references, paths = pipeline._materialize_voice_references(
-        store.path(project_id), patch,
+    metadata, references, paths, fallback_used = (
+        pipeline._materialize_voice_references(
+            store.path(project_id), patch,
+        )
     )
     authority = pipeline._fusion_authority_block({
         "people": {
@@ -2832,6 +2834,7 @@ def test_nullable_object_replace_plan_is_compiled_without_a_quality_gate(
     assert metadata == {}
     assert references == []
     assert paths == []
+    assert fallback_used is False
     assert "person-01 | KEEP" in authority
     assert "scene-01 | KEEP" in authority
     assert "Audio " not in authority
@@ -5518,6 +5521,263 @@ def test_dialogue_tts_without_any_voice_reference_fails_closed(
             [],
             ResearchLog(project),
         )
+
+
+class _ObjectReplaceOnlyDeepSeek:
+    """Object-replace node stub with a configurable voice assignment."""
+
+    def __init__(self, voice_id: str | None = None) -> None:
+        self.voice_id = voice_id
+
+    def complete_structured(
+        self,
+        instruction: str,
+        payload: Any,
+        schema: dict[str, Any],
+        images: list[Path] | None = None,
+        validator: Any = None,
+    ) -> ProviderResult[dict[str, Any]]:
+        people = {
+            stable_id: {
+                "matches_user_request": False,
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": (
+                        f"replacement appearance for {stable_id}"
+                    ),
+                    "appearance_description": (
+                        f"isolated replacement person {stable_id}"
+                    ),
+                },
+                "voice_id": self.voice_id,
+            }
+            for stable_id in schema["properties"]["people"]["properties"]
+        }
+        return ProviderResult(
+            {
+                "schema": OBJECT_REPLACE_OUTPUT_NAME,
+                "version": OBJECT_REPLACE_OUTPUT_VERSION,
+                "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
+                "dialogue_voices": [
+                    "person-01" if self.voice_id is not None else None
+                    for _line in payload["translated_dialogue"]
+                ],
+                "people": people,
+                "entities": {},
+                "scenes": {},
+            },
+            {"response": {"api": "responses", "phase": "object-replace"}},
+        )
+
+
+def _object_replace_fixture(
+    tmp_path: Path,
+    deepseek: Any,
+    *,
+    target_language: str = "中文",
+) -> tuple[
+    ProjectStore, str, Path, Pipeline, dict[str, Any], ResearchLog,
+]:
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request(target_language=target_language)
+    project_id, project, _state = store.create(
+        request, "object-replace-fallback",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=deepseek,
+        mediakit=object(),
+        picsart=object(),
+        autodl=_FlowAutodlTTS(),
+    )
+    return store, project_id, project, pipeline, request, ResearchLog(project)
+
+
+_OBJECT_REPLACE_ELEMENT_INDEX = {
+    "people": {
+        "person-01": {
+            "source_visual_description": "only a hand holding a comb",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+        },
+    },
+    "entities": {},
+    "scenes": {},
+    "relations": {},
+}
+
+_OBJECT_REPLACE_PREPARED = [
+    {
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 5.0,
+        "duration_s": 5.0,
+        "join_mode": "hard_cut",
+        "visual_prompt": "visual",
+    },
+]
+
+_OBJECT_REPLACE_TRANSLATED_LINES = [
+    {"text": "第一句", "start_s": 0.0, "end_s": 2.0},
+]
+
+
+def _trace_events(project: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in (project / "logs" / "trace.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+
+def test_object_replace_voiceless_people_fall_back_to_default_voice(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    library = load_voice_library()
+    (
+        store, project_id, project, pipeline, request, log,
+    ) = _object_replace_fixture(
+        tmp_path, _ObjectReplaceOnlyDeepSeek(), target_language="中文",
+    )
+
+    enhanced_index, metadata, references, paths = pipeline._run_object_replace(
+        project,
+        [dict(item) for item in _OBJECT_REPLACE_PREPARED],
+        [dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES],
+        {
+            category: dict(records)
+            for category, records in _OBJECT_REPLACE_ELEMENT_INDEX.items()
+        },
+        None,
+        request,
+        log,
+    )
+
+    # The catalog has no Chinese voice yet, so the first voice is picked.
+    fallback = library.default_voice("中文")
+    assert fallback == library.voices[0]
+    assert [reference["voice_id"] for reference in references] == [
+        fallback["voice_id"]
+    ]
+    assert [path.name for path in paths] == ["audio-01.wav"]
+    assert paths[0].is_file()
+    # The model's deliberate "no voice" decision is kept in the index; the
+    # fallback only materializes the Audio 1 reference.
+    assert enhanced_index["people"]["person-01"]["voice"] is None
+    assert metadata["voice_reference_fallback"] == {
+        "voice_id": fallback["voice_id"],
+        "reason": "dialogue requires TTS but no person was assigned a voice",
+    }
+    fallback_events = [
+        event
+        for event in _trace_events(project)
+        if event["event"] == "voice_reference_default_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["voice_id"] == fallback["voice_id"]
+
+    # Resume path: the fallback entry is a regular frozen Audio 1 reference.
+    store.update(
+        project_id,
+        voice_references=references,
+        translated_voice_lines=[
+            dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES
+        ],
+    )
+    assert Pipeline._stored_voice_references(
+        project, store.read(project_id),
+    ) == [paths[0].resolve()]
+
+    # The dialogue TTS chain no longer fails closed on voiceless people.
+    def assemble(
+        lines: list[dict[str, Any]],
+        total_duration_s: float,
+        destination: Path,
+    ) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(
+            b"".join(line["audio"].read_bytes() for line in lines)
+        )
+        return {"duration_s": total_duration_s}
+
+    monkeypatch.setattr(media, "assemble_dialogue_track", assemble)
+    full_track = pipeline._run_dialogue_audio(
+        project_id,
+        project,
+        [dict(item) for item in _OBJECT_REPLACE_PREPARED],
+        enhanced_index,
+        paths,
+        log,
+    )
+    assert full_track == (
+        project / "work" / "dialogue-audio" / "full-track.wav"
+    )
+    assert full_track.is_file()
+    assert [
+        call["voice_path"] for call in pipeline.autodl.tts_calls
+    ] == [paths[0].resolve()]
+
+
+def test_object_replace_with_assigned_voice_never_falls_back(
+    tmp_path: Path,
+) -> None:
+    library = load_voice_library()
+    assigned = library.voices[1]["voice_id"]
+    (
+        _store, _project_id, project, pipeline, request, log,
+    ) = _object_replace_fixture(
+        tmp_path, _ObjectReplaceOnlyDeepSeek(assigned),
+    )
+
+    enhanced_index, metadata, references, paths = pipeline._run_object_replace(
+        project,
+        [dict(item) for item in _OBJECT_REPLACE_PREPARED],
+        [dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES],
+        {
+            category: dict(records)
+            for category, records in _OBJECT_REPLACE_ELEMENT_INDEX.items()
+        },
+        None,
+        request,
+        log,
+    )
+
+    assert [reference["voice_id"] for reference in references] == [assigned]
+    assert enhanced_index["people"]["person-01"]["voice"]["voice_id"] == assigned
+    assert metadata["voice_reference_fallback"] is None
+    assert "voice_reference_default_fallback" not in (
+        project / "logs" / "trace.jsonl"
+    ).read_text(encoding="utf-8")
+
+
+def test_object_replace_without_dialogue_materializes_no_voice(
+    tmp_path: Path,
+) -> None:
+    (
+        _store, _project_id, project, pipeline, request, log,
+    ) = _object_replace_fixture(tmp_path, _ObjectReplaceOnlyDeepSeek())
+
+    _enhanced_index, metadata, references, paths = pipeline._run_object_replace(
+        project,
+        [dict(item) for item in _OBJECT_REPLACE_PREPARED],
+        [],
+        {
+            category: dict(records)
+            for category, records in _OBJECT_REPLACE_ELEMENT_INDEX.items()
+        },
+        None,
+        request,
+        log,
+    )
+
+    assert references == []
+    assert paths == []
+    assert metadata["voice_reference_fallback"] is None
+    assert "voice_reference_default_fallback" not in (
+        project / "logs" / "trace.jsonl"
+    ).read_text(encoding="utf-8")
 
 
 def test_no_dialogue_skips_the_whole_tts_chain(

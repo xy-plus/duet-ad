@@ -40,6 +40,32 @@ def test_voice_library_assets_are_usable_and_model_lines_are_transportable() -> 
     assert all(voice["file"] in line for voice, line in zip(library.voices, lines))
 
 
+def test_default_voice_prefers_target_language_then_first_catalog_voice() -> None:
+    library = load_voice_library()
+    first = library.voices[0]
+
+    # Empty or unmatchable targets fall back to the first catalog voice.
+    assert library.default_voice(None) == first
+    assert library.default_voice("") == first
+    assert library.default_voice("与原视频相同") == first
+    # The catalog has no Chinese voice yet: Chinese targets take the first.
+    for target in ("中文", "Chinese", "zh-CN", "普通话"):
+        assert library.default_voice(target) == first
+
+    english = next(
+        voice
+        for voice in library.voices
+        if voice["features"].get("language") == "English"
+    )
+    assert library.default_voice("english") == english
+    german = next(
+        voice
+        for voice in library.voices
+        if voice["features"].get("language") == "German"
+    )
+    assert library.default_voice("German") == german
+
+
 def test_voice_library_keeps_open_feature_metadata_but_closes_catalog_records(
     tmp_path,
 ) -> None:

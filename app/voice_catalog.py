@@ -17,6 +17,8 @@ VOICE_CATALOG_PATH = VOICE_LIBRARY_ROOT / "catalog.json"
 VOICE_CATALOG_NAME = "duet.voice-library"
 VOICE_CATALOG_VERSION = 1
 
+_CHINESE_LANGUAGE_MARKERS = ("chinese", "mandarin", "zh", "中文", "汉语", "普通话")
+
 
 @dataclass(frozen=True)
 class VoiceLibrary:
@@ -61,6 +63,23 @@ class VoiceLibrary:
     def model_lines(self) -> str:
         """One terse ``-`` separated sentence per voice; never JSON."""
         return "\n".join(self.model_line(voice["voice_id"]) for voice in self.voices)
+
+    def default_voice(self, target_language: str | None = None) -> dict[str, Any]:
+        """Fallback voice: the first catalog voice in the target language
+        (Chinese targets prefer Chinese voices), else the first catalog
+        voice."""
+        target = (target_language or "").strip().lower()
+        if any(marker in target for marker in _CHINESE_LANGUAGE_MARKERS):
+            target = "chinese"
+        for voice in self.voices:
+            language = str(
+                voice["features"].get("language") or ""
+            ).strip().lower()
+            if any(marker in language for marker in _CHINESE_LANGUAGE_MARKERS):
+                language = "chinese"
+            if target and language == target:
+                return voice
+        return self.voices[0]
 
 
 def _canonical(value: object) -> bytes:
