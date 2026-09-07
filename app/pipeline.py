@@ -247,9 +247,17 @@ class Pipeline:
         transform: Callable[[Any], Any] | None = None,
         retry_if: Callable[[Exception], bool] | None = None,
     ) -> Any:
-        """Run one node at most twice and keep transport evidence per attempt."""
+        """Run one node, retrying retryable failures until they succeed.
+
+        Attempts 2 and 3 rerun immediately; from attempt 4 on the wait backs
+        off exponentially from one minute (capped at thirty minutes). Nodes
+        with an explicit ``retry_if`` keep their own gate (paid submissions
+        with receipt semantics). Transport evidence is kept per attempt.
+        """
         last_error: Exception | None = None
-        for attempt in (1, 2):
+        attempt = 0
+        while True:
+            attempt += 1
             directory = log.attempt_dir(node, scope, attempt)
             log.write_json(directory / "input.json", inputs)
             log.copy_media(directory / "input-media", input_media)
@@ -327,17 +335,54 @@ class Pipeline:
                     attempt=attempt,
                     error=str(exc),
                 )
-            should_retry = attempt == 1 and (
+            should_retry = (
                 retry_if(last_error)
                 if retry_if is not None
-                else not node.endswith("-submit")
+                else self._retryable_node_error(last_error)
             )
             if not should_retry:
                 break
-            if self.settings.retry_delay_s:
-                time.sleep(self.settings.retry_delay_s)
+            delay = self._node_retry_delay(attempt)
+            if delay:
+                log.event(
+                    "node_retry_wait",
+                    node=node,
+                    scope=scope,
+                    attempt=attempt,
+                    delay_s=delay,
+                )
+                self._retry_sleep(delay)
         assert last_error is not None
         raise last_error
+
+    _NODE_FATAL_MARKERS = (
+        "image_rejected",
+        "content policy",
+        "moderation",
+        "审核",
+    )
+
+    @classmethod
+    def _retryable_node_error(cls, exc: Exception) -> bool:
+        """Provider/network failures retry; input and business rejections don't."""
+        if isinstance(exc, ProviderFailure):
+            text = (
+                json.dumps(exc.record, ensure_ascii=False, default=str).lower()
+                + str(exc).lower()
+            )
+            return not any(marker in text for marker in cls._NODE_FATAL_MARKERS)
+        return isinstance(exc, (TimeoutError, ConnectionError))
+
+    @staticmethod
+    def _node_retry_delay(failed_attempt: int) -> float:
+        """Attempts 2-3 rerun immediately; from attempt 4 on, back off
+        exponentially from one minute, capped at thirty minutes."""
+        if failed_attempt < 3:
+            return 0.0
+        return min(60.0 * 2 ** (failed_attempt - 3), 1800.0)
+
+    def _retry_sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
 
     @staticmethod
     def _write_process_evidence(
