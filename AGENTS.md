@@ -19,3 +19,7 @@
 - 主工作区服务：3301（caddy 前端）→ 3302（后端），`systemctl --user restart duet-ad1-h3-max-r2v.service`。
 - release 工作区 `/home/xy/duet-ad1-h3-max-r2v-release`（分支 `release/v1-compat-3211`）：3211（前端，含对外 v1 API）→ 3212（后端），服务 `duet-ad1-h3-max-r2v-release{,-caddy}.service`。
 - 重启服务会掐断在飞项目（重启后标记失败），部署前先确认没有在跑的项目。
+
+## 工作方式
+
+- 主代理只负责验收结果和与用户对齐；实施类工作（改代码、跑实验、写文档）一律拆给子代理并行执行，不要把实施工作揽在主代理手里串行做。
