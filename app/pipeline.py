@@ -364,14 +364,22 @@ class Pipeline:
 
     @classmethod
     def _retryable_node_error(cls, exc: Exception) -> bool:
-        """Provider/network failures retry; input and business rejections don't."""
+        """Provider/network failures and transient model-output parse
+        failures retry; input and business rejections don't."""
         if isinstance(exc, ProviderFailure):
             text = (
                 json.dumps(exc.record, ensure_ascii=False, default=str).lower()
                 + str(exc).lower()
             )
             return not any(marker in text for marker in cls._NODE_FATAL_MARKERS)
-        return isinstance(exc, (TimeoutError, ConnectionError))
+        if isinstance(exc, (TimeoutError, ConnectionError, json.JSONDecodeError)):
+            return True
+        # Model-output validation failures ("... output is invalid") are
+        # transient; other ValueError/MediaError cases (input validation,
+        # deterministic media invariants) stay fatal.
+        if isinstance(exc, (ValueError, media.MediaError)):
+            return str(exc).endswith("output is invalid")
+        return False
 
     @staticmethod
     def _node_retry_delay(failed_attempt: int) -> float:
