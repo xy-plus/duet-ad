@@ -42,6 +42,11 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
     return Settings(**values)
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(providers, "retry_sleep", lambda _seconds: None)
+
+
 def test_deepseek_complete_uses_canonical_url_json_mode_and_preserves_record(
     tmp_path: Path,
 ) -> None:
@@ -1267,3 +1272,202 @@ def test_autodl_poll_returns_wav_artifact_url(tmp_path: Path) -> None:
     assert _autodl_client(tmp_path, handler).poll("tts-task-1").value == (
         "https://cdn.test/output/line-0001.wav"
     )
+
+
+def test_picsart_submit_retries_connect_error_then_succeeds(tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("ssl eof", request=request)
+        return httpx.Response(200, json={"response": {"id": "task-after-retry"}})
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    result = client.submit(
+        prompt="prompt",
+        video_url="https://assets.test/source.mp4",
+        image_urls=None,
+        duration=5,
+        resolution="768p",
+        aspect_ratio="16:9",
+    )
+
+    assert result.value == "task-after-retry"
+    assert result.record["outcome"] == "accepted"
+    assert calls == 2
+    attempts = result.record["attempts"]
+    assert [entry["attempt"] for entry in attempts] == [1, 2]
+    assert attempts[0]["error"]["type"] == "ConnectError"
+    assert attempts[0]["response"] is None
+    assert attempts[1]["response"]["status_code"] == 200
+
+
+def test_deepseek_retries_remote_protocol_error_then_succeeds(tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError("eof mid-stream", request=request)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}}]}
+        )
+
+    result = DeepSeekClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).complete("instruction", {"input": 1})
+
+    assert result.value == "ok"
+    assert calls == 2
+    attempts = result.record["attempts"]
+    assert [entry["attempt"] for entry in attempts] == [1, 2]
+    assert attempts[0]["error"]["type"] == "RemoteProtocolError"
+
+
+def test_transport_failure_is_retried_twice_with_backoff_then_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("unreachable", request=request)
+
+    client = DeepSeekClient(_settings(tmp_path), httpx.MockTransport(handler))
+    with pytest.raises(ProviderFailure, match="unreachable") as caught:
+        client.complete("instruction", {"input": 1})
+
+    assert calls == 3
+    assert sleeps == [2.0, 5.0]
+    assert caught.value.record["response"] is None
+    attempts = caught.value.record["attempts"]
+    assert [entry["attempt"] for entry in attempts] == [1, 2, 3]
+    assert [entry["error"]["type"] for entry in attempts] == ["ConnectError"] * 3
+
+
+def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
+    calls = 0
+    image, video = _autodl_media(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return httpx.Response(503, json={"error": "upstream unavailable"})
+        return httpx.Response(
+            200, json={"code": "Success", "data": {"task_id": "task-1"}}
+        )
+
+    client = _autodl_client(tmp_path, handler)
+    result = client.submit_motion_retarget(image_path=image, video_path=video)
+
+    assert result.value == "task-1"
+    assert result.record["outcome"] == "accepted"
+    assert calls == 3
+    attempts = result.record["attempts"]
+    assert [entry["attempt"] for entry in attempts] == [1, 2, 3]
+    assert [entry["response"]["status_code"] for entry in attempts] == [503, 503, 200]
+
+
+def test_gateway_status_exhaustion_keeps_picsart_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(502, json={"error": "bad gateway"})
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    with pytest.raises(ProviderFailure) as caught:
+        client.submit(
+            prompt="prompt",
+            video_url="https://assets.test/source.mp4",
+            image_urls=None,
+            duration=5,
+            resolution="768p",
+            aspect_ratio="16:9",
+        )
+
+    assert calls == 3
+    assert caught.value.record["outcome"] == "unknown"
+    assert [
+        entry["response"]["status_code"]
+        for entry in caught.value.record["attempts"]
+    ] == [502, 502, 502]
+
+
+def test_client_errors_are_not_retried(tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(422, json={"error": "invalid prompt"})
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    with pytest.raises(ProviderFailure) as caught:
+        client.submit(
+            prompt="prompt",
+            video_url="https://assets.test/source.mp4",
+            image_urls=None,
+            duration=5,
+            resolution="768p",
+            aspect_ratio="16:9",
+        )
+
+    assert calls == 1
+    assert caught.value.record["outcome"] == "rejected"
+    assert "attempts" not in caught.value.record
+
+
+def test_mediakit_erase_retries_each_stage_call(tmp_path: Path) -> None:
+    source = tmp_path / "input.png"
+    source.write_bytes(b"input")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path.endswith("request-media-upload-url"):
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectError("flaky", request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "result": {
+                        "file_id": "mediakit://one",
+                        "upload_url": "https://upload.test/one",
+                        "upload_headers": {},
+                    },
+                },
+            )
+        if request.url.host == "upload.test":
+            return httpx.Response(204)
+        if request.url.path.endswith("erase-image"):
+            return httpx.Response(
+                200,
+                json={"success": True, "result": {"image_url": "https://result.test/1"}},
+            )
+        if request.url.host == "result.test":
+            return httpx.Response(200, content=b"out", headers={"Content-Type": "image/png"})
+        raise AssertionError(str(request.url))
+
+    result = MediaKitClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).erase(source, tmp_path / "out.png", ["erase-text"])
+
+    assert result.value.read_bytes() == b"out"
+    assert calls == 2
+    initialize = result.record["stages"][0]["initialize"]
+    assert [entry["attempt"] for entry in initialize["attempts"]] == [1, 2]
+    assert initialize["attempts"][0]["error"]["type"] == "ConnectError"
+
