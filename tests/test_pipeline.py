@@ -5354,7 +5354,7 @@ def test_h3_face_dominated_segment_is_motion_retargeted(
     assert mask_calls == []
     assert len(submits) == 1
     assert submits[0]["image"] == segment_dir / "retarget-reference.png"
-    assert submits[0]["video"] == segment_dir / "source-muted.mp4"
+    assert submits[0]["video"] == segment_dir / "source-muted-silent.mp4"
     import cv2
 
     crop = cv2.imread(str(submits[0]["image"]))
