@@ -5811,3 +5811,167 @@ def test_pre_picsart_resume_does_not_require_the_erased_source(
     )
 
     pipeline.validate_pre_picsart_resume(project_id)
+
+
+class _FetchFailPicsart(_FlowPicsart):
+    """Poll fails terminally with a provider-side asset fetch/validation error."""
+
+    def __init__(
+        self,
+        *,
+        fail_once_for: int = 0,
+        fail_always: bool = False,
+        message: str,
+    ) -> None:
+        super().__init__()
+        self._fail_once_for = fail_once_for
+        self._fail_always = fail_always
+        self._message = message
+
+    def poll(self, task_id: str) -> ProviderResult[str]:
+        with self.lock:
+            count = self.poll_counts.get(task_id, 0) + 1
+            self.poll_counts[task_id] = count
+        submit_number = int(task_id.rsplit("-", 1)[1])
+        if self._fail_always or (
+            count == 1 and submit_number <= self._fail_once_for
+        ):
+            raise ProviderFailure(
+                {
+                    "task_id": task_id,
+                    "polls": [
+                        {
+                            "request": {
+                                "method": "GET",
+                                "url": f"https://picsart.invalid/{task_id}",
+                            },
+                            "response": {
+                                "status_code": 200,
+                                "body": {
+                                    "response": {
+                                        "status": "FAILED",
+                                        "error": {"message": self._message},
+                                    }
+                                },
+                            },
+                        }
+                    ],
+                },
+                [],
+                RuntimeError(f"Picsart task failed: {self._message}"),
+            )
+        return ProviderResult(
+            f"https://result.invalid/{task_id}.mp4",
+            {"task_id": task_id, "polls": [{"status": "COMPLETED"}]},
+        )
+
+
+def _run_h3_with_picsart(
+    tmp_path: Path, monkeypatch: Any, picsart: _FlowPicsart
+) -> tuple[ProjectStore, str, Path]:
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request(
+        target_language="日语",
+        replacement_instruction="把主角替换成用户参考形象",
+    )
+    project_id, project, _state = store.create(request, "request-fetch-retry")
+    (project / "inputs" / "source.mp4").write_bytes(b"source")
+    (project / "inputs" / "replacement-image").write_bytes(b"replacement")
+    store.update(
+        project_id,
+        source_path="inputs/source.mp4",
+        replacement_image_path="inputs/replacement-image",
+    )
+    _install_fake_media(monkeypatch, [])
+    deepseek = _FlowDeepSeek()
+    pipeline = Pipeline(
+        _settings(tmp_path, enable_mediakit=True),
+        store,
+        lambda _project_id, path: (
+            f"https://assets.invalid/{path.parent.name}/{path.name}"
+        ),
+        deepseek=deepseek,
+        mediakit=_FlowMediaKit(),
+        picsart=picsart,
+        seedream=_FlowSeedream(deepseek.events),
+        autodl=_FlowAutodlTTS(),
+    )
+    pipeline.run(project_id)
+    return store, project_id, project
+
+
+def test_h3_asset_fetch_failure_is_resubmitted_with_frozen_inputs(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    picsart = _FetchFailPicsart(
+        fail_once_for=2,
+        message=(
+            "ValidationError: Failed to download audio file: "
+            "All validated IPs unreachable"
+        ),
+    )
+    store, project_id, project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
+
+    state = store.read(project_id)
+    assert state["status"] == "succeeded"
+    # Each segment: original submit (provider-side fetch failure) + one
+    # automatic resubmit with the same frozen prompt.
+    assert len(picsart.submits) == 4
+    prompts = [call["prompt"] for call in picsart.submits]
+    assert len(set(prompts)) == 2
+    assert sorted(prompts.count(prompt) for prompt in set(prompts)) == [2, 2]
+    ledger = state["picsart_submission_receipts"]["segments"]
+    for key in ("1", "2"):
+        assert [r["status"] for r in ledger[key]] == ["provider_failed", "accepted"]
+        assert ledger[key][0]["request_sha256"] == ledger[key][1]["request_sha256"]
+        assert ledger[key][1]["run_identity"].endswith("-refetch-01")
+    assert (project / "logs" / "picsart-refetch-01-submit").is_dir()
+    assert (project / "logs" / "picsart-refetch-01-poll").is_dir()
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert trace.count("picsart_asset_fetch_resubmit") == 2
+
+
+def test_h3_asset_fetch_failure_exhaustion_keeps_fail_closed(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    picsart = _FetchFailPicsart(
+        fail_always=True,
+        message="Failed to download video file: All validated IPs unreachable",
+    )
+    store, project_id, _project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
+
+    state = store.read(project_id)
+    assert state["status"] == "failed"
+    # Exactly 3 submissions per segment (initial + 2 resubmits), then the
+    # project stays fail-closed.
+    assert len(picsart.submits) == 6
+    ledger = state["picsart_submission_receipts"]["segments"]
+    for key in ("1", "2"):
+        records = ledger[key]
+        assert len(records) == 3
+        assert [r["status"] for r in records] == ["provider_failed"] * 3
+        assert [r["run_identity"] for r in records] == [
+            "picsart",
+            "picsart-refetch-01",
+            "picsart-refetch-02",
+        ]
+
+
+def test_h3_content_moderation_failure_is_not_resubmitted(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    picsart = _FetchFailPicsart(
+        fail_always=True,
+        message="content policy violation: image rejected by moderation",
+    )
+    store, project_id, project = _run_h3_with_picsart(tmp_path, monkeypatch, picsart)
+
+    state = store.read(project_id)
+    assert state["status"] == "failed"
+    assert len(picsart.submits) == 2
+    ledger = state["picsart_submission_receipts"]["segments"]
+    for key in ("1", "2"):
+        assert [r["status"] for r in ledger[key]] == ["provider_failed"]
+    assert not (project / "logs" / "picsart-refetch-01-submit").exists()
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "picsart_asset_fetch_resubmit" not in trace
