@@ -987,6 +987,12 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
     )
     monkeypatch.setattr(media, "localize_dialogue", localize, raising=False)
     monkeypatch.setattr(media, "mute", mute)
+    monkeypatch.setattr(
+        media,
+        "add_silent_audio",
+        lambda source, destination: mute(source, destination),
+        raising=False,
+    )
     monkeypatch.setattr(face_mask, "mask_faces", mask_faces)
     monkeypatch.setattr(media, "trim_24fps", trim, raising=False)
     monkeypatch.setattr(media, "concat", concat)
