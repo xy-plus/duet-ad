@@ -12,6 +12,7 @@ import secrets
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -454,6 +455,52 @@ def create_app(
                     )
         return await call_next(request)
 
+    if configured.public_api_enabled:
+
+        @app.middleware("http")
+        async def public_api_request_context(request: Request, call_next):
+            path = request.url.path
+            if path != "/api/v1" and not path.startswith("/api/v1/"):
+                return await call_next(request)
+            request.state.public_request_id = f"req_{uuid.uuid4().hex}"
+            if request.method == "POST" and path == "/api/v1/video-generations":
+                raw_length = request.headers.get("content-length")
+                if raw_length is not None:
+                    try:
+                        declared_length = int(raw_length)
+                    except ValueError:
+                        declared_length = -1
+
+                    def public_error(status: int, code: str, message: str) -> JSONResponse:
+                        return JSONResponse(
+                            status_code=status,
+                            content={
+                                "error": {
+                                    "code": code,
+                                    "message": message,
+                                    "request_id": request.state.public_request_id,
+                                }
+                            },
+                            headers={
+                                "Cache-Control": "private, no-store",
+                                "X-Request-ID": request.state.public_request_id,
+                            },
+                        )
+
+                    if declared_length < 0:
+                        return public_error(400, "invalid_content_length", "Content-Length 无效")
+                    request_limit = (
+                        configured.max_upload_mb * MIB
+                        + REPLACEMENT_MAX_BYTES
+                        + CREATION_REQUEST_OVERHEAD_BYTES
+                    )
+                    if declared_length > request_limit:
+                        return public_error(413, "request_too_large", "创建请求超过大小限制")
+            response = await call_next(request)
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["X-Request-ID"] = request.state.public_request_id
+            return response
+
     def register_asset(project_id: str, path: Path) -> str:
         state = _read_project(app.state.store, project_id)
         try:
@@ -557,17 +604,26 @@ def create_app(
     async def conversations(request: Request):
         return _store(request).list()
 
-    @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
-    async def create_conversation(
-        request: Request,
-        response: Response,
-        file: UploadFile | None = File(default=None),
-        reference_url: str | None = Form(default=None),
-        client_request_id: str | None = Form(default=None),
-        generation_request: str | None = Form(default=None),
-        replacement_image: UploadFile | None = File(default=None),
+    def start_pipeline(project_id: str, operation: str = "run") -> None:
+        task = asyncio.create_task(asyncio.to_thread(pipeline_entry, project_id, operation))
+        app.state.tasks.add(task)
+        task.add_done_callback(app.state.tasks.discard)
+
+    @asynccontextmanager
+    async def staged_creation(
+        *,
+        file: UploadFile | None,
+        reference_url: str | None,
+        client_request_id: str | None,
+        generation_request: str | None,
+        replacement_image: UploadFile | None,
     ):
-        await _validate_creation_form(request)
+        """Validate and stage a creation request, yielding commit inputs.
+
+        Shared by the internal /api/conversations endpoint and the public v1
+        API so both enforce the exact same input rules and idempotency store.
+        """
+
         normalized_client_request_id = _normalize_client_request_id(client_request_id)
         effective_request = _parse_generation_request(
             generation_request,
@@ -598,91 +654,133 @@ def create_app(
             if replacement_media_type not in REPLACEMENT_MEDIA_TYPES:
                 raise _error(415, "unsupported_replacement_image", "替换图片类型不受支持")
 
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix=".create-staging-",
-                dir=app.state.store.root,
-            ) as staging_name:
-                staging = Path(staging_name)
-                os.chmod(staging, 0o700)
-                staged_source = staging / "source.mp4"
-                staged_replacement = staging / "replacement-image"
-                if file is not None:
-                    source_bytes = await _write_upload(file, staged_source, source_limit)
-                    source_snapshot = {
-                        "mode": "upload",
-                        "filename": _safe_basename(file.filename, "source.mp4"),
-                        "bytes": source_bytes,
-                    }
-                else:
-                    source_bytes = await download_reference_url(
-                        normalized_reference_url,
-                        staged_source,
-                        max_bytes=source_limit,
-                        timeout_s=configured.request_timeout_s,
-                        resolver=reference_resolver,
-                        transport=reference_transport,
-                    )
-                    source_snapshot = {
-                        "mode": "link",
-                        "reference_url": normalized_reference_url,
-                    }
-                source_sha256 = _sha256_file(staged_source)
-
-                replacement_snapshot = None
-                replacement_receipt = None
-                if replacement_image is not None:
-                    replacement_bytes = await _write_upload(
-                        replacement_image,
-                        staged_replacement,
-                        REPLACEMENT_MAX_BYTES,
-                    )
-                    replacement_sha256 = _sha256_file(staged_replacement)
-                    replacement_snapshot = {
-                        "filename": _safe_basename(
-                            replacement_image.filename,
-                            "replacement-image",
-                        ),
-                        "bytes": replacement_bytes,
-                        "media_type": replacement_media_type,
-                    }
-                    replacement_receipt = {
-                        "sha256": replacement_sha256,
-                        "bytes": replacement_bytes,
-                    }
-
-                generation_request_sha256 = canonical_json_sha256(effective_request)
-                input_receipt = {
-                    "version": 1,
-                    "client_request_id": normalized_client_request_id,
-                    "generation_request_sha256": generation_request_sha256,
-                    "source": {
-                        "sha256": source_sha256,
-                        "bytes": source_bytes,
-                    },
-                    "replacement_image": replacement_receipt,
+        with tempfile.TemporaryDirectory(
+            prefix=".create-staging-",
+            dir=app.state.store.root,
+        ) as staging_name:
+            staging = Path(staging_name)
+            os.chmod(staging, 0o700)
+            staged_source = staging / "source.mp4"
+            staged_replacement = staging / "replacement-image"
+            if file is not None:
+                source_bytes = await _write_upload(file, staged_source, source_limit)
+                source_snapshot = {
+                    "mode": "upload",
+                    "filename": _safe_basename(file.filename, "source.mp4"),
+                    "bytes": source_bytes,
                 }
-                request_digest = creation_request_digest(
-                    generation_request_sha256,
-                    source_sha256,
-                    (
-                        replacement_receipt["sha256"]
-                        if replacement_receipt is not None
-                        else None
-                    ),
+            else:
+                source_bytes = await download_reference_url(
+                    normalized_reference_url,
+                    staged_source,
+                    max_bytes=source_limit,
+                    timeout_s=configured.request_timeout_s,
+                    resolver=reference_resolver,
+                    transport=reference_transport,
                 )
+                source_snapshot = {
+                    "mode": "link",
+                    "reference_url": normalized_reference_url,
+                }
+            source_sha256 = _sha256_file(staged_source)
+            source_identity = (
+                {
+                    "kind": "upload",
+                    "sha256": source_sha256,
+                    "bytes": source_bytes,
+                }
+                if file is not None
+                else {"kind": "url", "url": normalized_reference_url}
+            )
+
+            replacement_snapshot = None
+            replacement_receipt = None
+            if replacement_image is not None:
+                replacement_bytes = await _write_upload(
+                    replacement_image,
+                    staged_replacement,
+                    REPLACEMENT_MAX_BYTES,
+                )
+                replacement_sha256 = _sha256_file(staged_replacement)
+                replacement_snapshot = {
+                    "filename": _safe_basename(
+                        replacement_image.filename,
+                        "replacement-image",
+                    ),
+                    "bytes": replacement_bytes,
+                    "media_type": replacement_media_type,
+                }
+                replacement_receipt = {
+                    "sha256": replacement_sha256,
+                    "bytes": replacement_bytes,
+                }
+
+            generation_request_sha256 = canonical_json_sha256(effective_request)
+            input_receipt = {
+                "version": 1,
+                "client_request_id": normalized_client_request_id,
+                "generation_request_sha256": generation_request_sha256,
+                "source": {
+                    "sha256": source_sha256,
+                    "bytes": source_bytes,
+                },
+                "replacement_image": replacement_receipt,
+            }
+            request_digest = creation_request_digest(
+                generation_request_sha256,
+                source_sha256,
+                (
+                    replacement_receipt["sha256"]
+                    if replacement_receipt is not None
+                    else None
+                ),
+            )
+            yield {
+                "effective_request": effective_request,
+                "client_request_id": normalized_client_request_id,
+                "request_digest": request_digest,
+                "input_receipt": input_receipt,
+                "source_snapshot": source_snapshot,
+                "staged_source": staged_source,
+                "replacement_snapshot": replacement_snapshot,
+                "staged_replacement": (
+                    staged_replacement if replacement_image is not None else None
+                ),
+                "source_identity": source_identity,
+                "replacement_identity": replacement_receipt,
+            }
+
+    @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
+    async def create_conversation(
+        request: Request,
+        response: Response,
+        file: UploadFile | None = File(default=None),
+        reference_url: str | None = Form(default=None),
+        client_request_id: str | None = Form(default=None),
+        generation_request: str | None = Form(default=None),
+        replacement_image: UploadFile | None = File(default=None),
+    ):
+        await _validate_creation_form(request)
+        try:
+            async with staged_creation(
+                file=file,
+                reference_url=reference_url,
+                client_request_id=client_request_id,
+                generation_request=generation_request,
+                replacement_image=replacement_image,
+            ) as staged:
                 project_id, project, state, created = app.state.store.create_from_staging(
-                    effective_request,
-                    normalized_client_request_id,
-                    request_digest=request_digest,
-                    input_receipt=input_receipt,
-                    source_snapshot=source_snapshot,
-                    staged_source=staged_source,
-                    replacement_snapshot=replacement_snapshot,
-                    staged_replacement=(
-                        staged_replacement if replacement_image is not None else None
-                    ),
+                    staged["effective_request"],
+                    staged["client_request_id"],
+                    request_digest=staged["request_digest"],
+                    input_receipt=staged["input_receipt"],
+                    source_snapshot=staged["source_snapshot"],
+                    staged_source=staged["staged_source"],
+                    replacement_snapshot=staged["replacement_snapshot"],
+                    staged_replacement=staged["staged_replacement"],
                 )
+        except HTTPException:
+            raise
         except UploadTooLarge:
             raise _error(413, "upload_too_large", "上传文件超过大小限制") from None
         except ReferenceDownloadError as exc:
@@ -718,8 +816,8 @@ def create_app(
         log.write_json(attempt / "input.json", {
             "headers": dict(request.headers),
             "generation_request_raw": generation_request,
-            "generation_request": effective_request,
-            "client_request_id": normalized_client_request_id,
+            "generation_request": staged["effective_request"],
+            "client_request_id": staged["client_request_id"],
             "reference_url": reference_url,
             "file": {"filename": file.filename, "headers": dict(file.headers)} if file else None,
             "replacement_image": {"filename": replacement_image.filename, "headers": dict(replacement_image.headers)} if replacement_image else None,
@@ -727,9 +825,7 @@ def create_app(
         log.copy_media(attempt / "input-media", [source] + ([replacement_path] if replacement_image else []))
         log.write_json(attempt / "output.json", state)
         log.event("node_succeeded", node="http-create", scope="project", attempt=1)
-        task = asyncio.create_task(asyncio.to_thread(pipeline_entry, project_id))
-        app.state.tasks.add(task)
-        task.add_done_callback(app.state.tasks.discard)
+        start_pipeline(project_id)
         return state
 
     @app.get("/api/conversations/{project_id}", dependencies=[Depends(require_auth)])
@@ -891,6 +987,42 @@ def create_app(
         if not hmac.compare_digest(current_sha256, record["sha256"]):
             raise HTTPException(404)
         return FileResponse(path, media_type=record["media_type"])
+
+    if configured.public_api_enabled:
+        from app import public_api
+
+        def valid_generated_video(meta: dict[str, Any]) -> bool:
+            project_id = meta.get("id")
+            if (
+                meta.get("status") != "succeeded"
+                or meta.get("has_video") is not True
+                or not isinstance(project_id, str)
+            ):
+                return False
+            try:
+                project = app.state.store.path(project_id)
+            except (FileNotFoundError, OSError):
+                return False
+            return (project / "output" / "generated.mp4").is_file()
+
+        def progress_for(meta: dict[str, Any], has_video: bool) -> int | None:
+            if has_video:
+                return 100
+            progress = meta.get("project_progress")
+            percent = progress.get("percent") if isinstance(progress, dict) else None
+            if isinstance(percent, bool) or not isinstance(percent, int):
+                return None
+            return percent
+
+        public_api.install(
+            app,
+            configured,
+            store=app.state.store,
+            stage_creation=staged_creation,
+            start_pipeline=start_pipeline,
+            valid_generated_video=valid_generated_video,
+            progress_for=progress_for,
+        )
 
     web = Path(__file__).resolve().parents[1] / "web"
     app.mount("/", StaticFiles(directory=web, html=True), name="web")
