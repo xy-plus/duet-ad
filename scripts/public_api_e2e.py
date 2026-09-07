@@ -37,8 +37,8 @@ POLL_INTERVAL_S = 30
 CASES = {
     "dog": {
         "source": DUET_DATA / "3b4c6ff51d384e4aa82170dc76e56748/source.mp4",
-        "replacement": PROJECT_ROOT / "data/e2e-inputs/comb.jpg",
-        "replacement_instruction": "将视频中给狗梳毛的开结梳替换为图片中的宠物除毛梳",
+        "replacement": PROJECT_ROOT / "data/e2e-inputs/comb-clean.webp",
+        "replacement_instruction": "将视频中给狗梳毛的开结梳替换为图片中的木质气垫梳",
         "target_language": "中文",
         "dialogue_mode": "auto_rewrite",
     },
