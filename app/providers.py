@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
 import signal
 import shutil
+import ssl
 import stat
 import subprocess
 import tempfile
@@ -25,6 +27,25 @@ from app.config import Settings
 
 T = TypeVar("T")
 _MISSING = object()
+_LOGGER = logging.getLogger(__name__)
+# Bounded retry for transient network failures: first attempt + 2 retries,
+# backing off 2s then 5s.  Only transport errors and gateway statuses are
+# retried; 4xx and other definite answers are final on the first attempt.
+RETRY_BACKOFF_S = (2.0, 5.0)
+RETRYABLE_STATUSES = frozenset({502, 503, 504})
+_RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    # SSL EOF/handshake failures usually surface wrapped as the httpx classes
+    # above; keep the raw class so an unwrapped one is still retried.
+    ssl.SSLError,
+)
 _SECRET_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
 _ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _CODEX_TELEMETRY_RE = re.compile(
@@ -140,6 +161,16 @@ def _transport_record(request: httpx.Request, request_body: Any = _MISSING) -> d
     return {"request": _request_record(request, request_body), "response": None}
 
 
+def is_retryable_transport_error(exc: BaseException) -> bool:
+    return isinstance(exc, _RETRYABLE_TRANSPORT_ERRORS)
+
+
+def retry_sleep(seconds: float) -> None:
+    """Backoff seam between retries; tests replace it to avoid real sleeps."""
+
+    time.sleep(seconds)
+
+
 def _send(
     client: httpx.Client,
     method: str,
@@ -158,11 +189,60 @@ def _send(
     if content is not None:
         kwargs["content"] = content
     request = client.build_request(method, url, **kwargs)
-    try:
-        response = client.send(request)
-    except httpx.HTTPError as exc:
-        raise ProviderFailure(_transport_record(request, request_body), [], exc) from exc
-    return response, response_record(response, request_body=request_body)
+    max_attempts = len(RETRY_BACKOFF_S) + 1
+    attempts: list[dict[str, Any]] = []
+    for attempt_number in range(1, max_attempts + 1):
+        try:
+            response = client.send(request)
+        except _RETRYABLE_TRANSPORT_ERRORS as exc:
+            exchange = _transport_record(request, request_body)
+            exchange["attempt"] = attempt_number
+            exchange["error"] = {"type": type(exc).__name__, "message": str(exc)}
+            attempts.append(exchange)
+            if attempt_number < max_attempts:
+                _LOGGER.warning(
+                    "provider %s %s attempt %d/%d failed with %s: %s; retrying in %gs",
+                    method,
+                    url,
+                    attempt_number,
+                    max_attempts,
+                    type(exc).__name__,
+                    exc,
+                    RETRY_BACKOFF_S[attempt_number - 1],
+                )
+                retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
+                continue
+            failure = _transport_record(request, request_body)
+            failure["attempts"] = attempts
+            raise ProviderFailure(failure, [], exc) from exc
+        except httpx.HTTPError as exc:
+            exchange = _transport_record(request, request_body)
+            exchange["attempt"] = attempt_number
+            exchange["error"] = {"type": type(exc).__name__, "message": str(exc)}
+            attempts.append(exchange)
+            failure = _transport_record(request, request_body)
+            if len(attempts) > 1:
+                failure["attempts"] = attempts
+            raise ProviderFailure(failure, [], exc) from exc
+        exchange = response_record(response, request_body=request_body)
+        exchange["attempt"] = attempt_number
+        attempts.append(exchange)
+        if response.status_code in RETRYABLE_STATUSES and attempt_number < max_attempts:
+            _LOGGER.warning(
+                "provider %s %s attempt %d/%d returned HTTP %d; retrying in %gs",
+                method,
+                url,
+                attempt_number,
+                max_attempts,
+                response.status_code,
+                RETRY_BACKOFF_S[attempt_number - 1],
+            )
+            retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
+            continue
+        if len(attempts) > 1:
+            return response, {**exchange, "attempts": attempts}
+        return response, exchange
+    raise AssertionError("unreachable")
 
 
 def _ensure_success(

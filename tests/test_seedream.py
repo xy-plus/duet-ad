@@ -46,6 +46,11 @@ def _cause(exc: pytest.ExceptionInfo[ProviderFailure]) -> SeedreamError:
     return exc.value.cause
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(seedream, "retry_sleep", lambda _seconds: None)
+
+
 def _success_response() -> httpx.Response:
     return httpx.Response(
         200,
@@ -342,7 +347,11 @@ def test_transport_ambiguity_is_terminal_and_never_reposts(tmp_path: Path) -> No
     assert _cause(first).code == "submission_unknown"
     assert first.value.__cause__ is None
     assert first.value.__context__ is None
-    assert calls == 1
+    # Bounded retry: first attempt + 2 retries before declaring ambiguity.
+    assert calls == 3
+    assert [
+        entry["error"]["type"] for entry in first.value.record["attempts"]
+    ] == ["ReadTimeout"] * 3
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "submission_unknown"
 
     with pytest.raises(ProviderFailure) as repeated:
@@ -353,7 +362,7 @@ def test_transport_ambiguity_is_terminal_and_never_reposts(tmp_path: Path) -> No
             receipt_path=receipt_path,
         )
     assert _cause(repeated).code == "submission_unknown"
-    assert calls == 1
+    assert calls == 3
 
 
 def test_concurrent_call_observes_durable_claim_and_cannot_post_twice(
@@ -509,6 +518,10 @@ def test_ambiguous_http_status_is_unknown_and_never_reposts(
         )
     assert _cause(first).code == "submission_unknown"
     assert first.value.record["outcome"] == "submission_unknown"
+    # Gateway statuses are retried; every other ambiguous status is terminal
+    # after a single attempt.
+    expected_calls = 3 if status_code in {502, 503} else 1
+    assert calls == expected_calls
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["status"] == "submission_unknown"
 
     with pytest.raises(ProviderFailure) as repeated:
@@ -519,7 +532,7 @@ def test_ambiguous_http_status_is_unknown_and_never_reposts(
             receipt_path=receipt_path,
         )
     assert _cause(repeated).code == "submission_unknown"
-    assert calls == 1
+    assert calls == expected_calls
 
 
 def test_untrusted_response_header_values_are_not_persisted(tmp_path: Path) -> None:
@@ -695,7 +708,9 @@ def test_claim_without_receipt_is_ambiguous_and_never_posts(tmp_path: Path) -> N
             receipt_path=receipt_path,
         )
     assert _cause(repeated).code == "submission_unknown"
-    assert calls == 1
+    # The first generate used its bounded retries; the durable claim alone
+    # still forbids any further POST.
+    assert calls == 3
 
 
 def test_missing_key_and_invalid_input_do_not_create_paid_claim(tmp_path: Path) -> None:
@@ -989,3 +1004,68 @@ def test_replay_received_rejects_tampered_frozen_request_binding(
         )
     assert _cause(caught).code == "attempt_receipt_invalid"
     assert not destination.exists()
+
+
+def test_generate_retries_connect_error_then_succeeds(tmp_path: Path) -> None:
+    destination = tmp_path / "sheet.png"
+    receipt_path = tmp_path / "seedream-receipt.json"
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("ssl eof", request=request)
+        return _success_response()
+
+    result = SeedreamClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).generate(
+        prompt="one reference sheet",
+        images=[],
+        destination=destination,
+        receipt_path=receipt_path,
+    )
+
+    assert result.value == destination
+    assert destination.read_bytes() == _PNG
+    assert calls == 2
+    attempts = result.record["attempts"]
+    assert [entry["attempt"] for entry in attempts] == [1, 2]
+    assert attempts[0]["error"]["type"] == "ConnectError"
+    assert attempts[1]["status_code"] == 200
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "succeeded"
+
+
+def test_generate_retries_503_then_succeeds_with_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "sheet.png"
+    receipt_path = tmp_path / "seedream-receipt.json"
+    calls = 0
+    sleeps: list[float] = []
+    monkeypatch.setattr(seedream, "retry_sleep", sleeps.append)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, json={"error": {"code": "Unavailable"}})
+        return _success_response()
+
+    result = SeedreamClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).generate(
+        prompt="one reference sheet",
+        images=[],
+        destination=destination,
+        receipt_path=receipt_path,
+    )
+
+    assert result.value == destination
+    assert calls == 2
+    assert sleeps == [2.0]
+    assert [
+        entry.get("status_code") for entry in result.record["attempts"]
+    ] == [503, 200]

@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -18,7 +19,17 @@ import httpx
 import numpy as np
 
 from app.config import Settings
-from app.providers import ProviderFailure, ProviderResult
+from app.providers import (
+    RETRY_BACKOFF_S,
+    RETRYABLE_STATUSES,
+    ProviderFailure,
+    ProviderResult,
+    is_retryable_transport_error,
+    retry_sleep,
+)
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _SAFE_PROVIDER_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -1002,30 +1013,79 @@ class SeedreamClient:
         response: httpx.Response | None = None
         transport_error_type: str | None = None
         client: httpx.Client | None = None
+        send_attempts: list[dict[str, Any]] = []
+        max_send_attempts = len(RETRY_BACKOFF_S) + 1
         try:
             client = httpx.Client(
                 timeout=httpx.Timeout(self.settings.seedream_timeout_s),
                 transport=self.transport,
             )
-            response = client.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {self.settings.seedream_api_key}",
-                    "Content-Type": "application/json",
-                },
-                content=request_content,
-            )
-        except Exception as exc:
-            unknown_receipt = {
-                **submitting_receipt,
-                "status": "submission_unknown",
-                "failed_at_unix_ns": time.time_ns(),
-            }
-            try:
-                _atomic_json(receipt_path, unknown_receipt)
-            except OSError:
-                pass
-            transport_error_type = type(exc).__name__
+            for attempt_number in range(1, max_send_attempts + 1):
+                try:
+                    response = client.post(
+                        endpoint,
+                        headers={
+                            "Authorization": f"Bearer {self.settings.seedream_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        content=request_content,
+                    )
+                except Exception as exc:
+                    send_attempts.append(
+                        {
+                            "attempt": attempt_number,
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        }
+                    )
+                    if (
+                        is_retryable_transport_error(exc)
+                        and attempt_number < max_send_attempts
+                    ):
+                        _LOGGER.warning(
+                            "Seedream POST attempt %d/%d failed with %s: %s; retrying in %gs",
+                            attempt_number,
+                            max_send_attempts,
+                            type(exc).__name__,
+                            exc,
+                            RETRY_BACKOFF_S[attempt_number - 1],
+                        )
+                        retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
+                        continue
+                    unknown_receipt = {
+                        **submitting_receipt,
+                        "status": "submission_unknown",
+                        "failed_at_unix_ns": time.time_ns(),
+                    }
+                    try:
+                        _atomic_json(receipt_path, unknown_receipt)
+                    except OSError:
+                        pass
+                    transport_error_type = type(exc).__name__
+                else:
+                    send_attempts.append(
+                        {
+                            "attempt": attempt_number,
+                            "status_code": response.status_code,
+                        }
+                    )
+                    if (
+                        response.status_code in RETRYABLE_STATUSES
+                        and attempt_number < max_send_attempts
+                    ):
+                        _LOGGER.warning(
+                            "Seedream POST attempt %d/%d returned HTTP %d; retrying in %gs",
+                            attempt_number,
+                            max_send_attempts,
+                            response.status_code,
+                            RETRY_BACKOFF_S[attempt_number - 1],
+                        )
+                        retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
+                        response = None
+                        continue
+                break
         except BaseException:
             try:
                 _atomic_json(
@@ -1055,6 +1115,8 @@ class SeedreamClient:
                 status="submission_unknown",
             )
             record["transport_error_type"] = transport_error_type
+            if len(send_attempts) > 1:
+                record["attempts"] = send_attempts
             raise _failure(
                 record,
                 "submission_unknown",
@@ -1092,6 +1154,8 @@ class SeedreamClient:
                 status=terminal_status,
                 response=response_summary,
             )
+            if len(send_attempts) > 1:
+                record["attempts"] = send_attempts
             raise _failure(
                 record,
                 "provider_rejected" if safe_rejection else "submission_unknown",
@@ -1217,4 +1281,6 @@ class SeedreamClient:
             status="succeeded",
             response=response_summary,
         )
+        if len(send_attempts) > 1:
+            record["attempts"] = send_attempts
         return ProviderResult(destination, record, [destination])
