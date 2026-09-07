@@ -6,6 +6,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -35,6 +36,7 @@ from app.replacement_sheet import (
 from app.providers import (
     AutodlClient,
     CodexClient,
+    CodexProcessError,
     DeepSeekClient,
     MediaKitClient,
     PicsartClient,
@@ -47,6 +49,7 @@ from app.seedream import (
     SEEDREAM_OUTPUT_WIDTH,
     SeedreamClient,
     _validated_image_media_type,
+    reset_attempt as _seedream_reset_attempt,
 )
 from app.research_log import ResearchLog
 from app.store import ProjectStore
@@ -115,18 +118,25 @@ PICSART_GENERATION_MIN_DURATION_S = 5
 PICSART_GENERATION_MAX_DURATION_S = 15
 PICSART_RESOLUTIONS = frozenset({"480p", "768p"})
 PICSART_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
-# Provider-side fetch/validation failures (the provider could not pull our
-# hosted reference assets) are transient: resubmit the same frozen segment at
-# most this many extra times within the same run.
-PICSART_FETCH_RESUBMIT_MAX = 2
+# Provider-side fetch/validation failure markers classify why a terminal H3
+# task failure happened; every terminal failure is resubmitted under a fresh
+# run identity (a resubmit also means fresh asset URLs, sidestepping the
+# 24h provider asset TTL), so there is no resubmit cap.
 _PICSART_FETCH_FAILURE_MARKERS = (
     "failed to download",
     "unreachable",
     "validationerror",
 )
+# Face masking keeps H3 identity takeover working, so it retries a few times
+# before degrading to the unmasked reference (never blocking the render).
+FACE_MASK_MAX_ATTEMPTS = 3
 MUTED_ARTIFACT_NAMES = frozenset({
     "source-muted.mp4", "source-retargeted.mp4", "source-faces-masked.mp4",
 })
+
+
+class PicsartTaskHungError(RuntimeError):
+    """A submitted Picsart task stayed non-terminal past the hang limit."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +266,8 @@ class Pipeline:
         """
         last_error: Exception | None = None
         attempt = 0
+        moderation_fingerprint: str | None = None
+        moderation_streak = 0
         while True:
             attempt += 1
             directory = log.attempt_dir(node, scope, attempt)
@@ -342,6 +354,35 @@ class Pipeline:
             )
             if not should_retry:
                 break
+            if isinstance(last_error, ProviderFailure):
+                moderation_text = (
+                    json.dumps(
+                        last_error.record, ensure_ascii=False, default=str,
+                    )
+                    + str(last_error)
+                ).lower()
+                if any(
+                    marker in moderation_text
+                    for marker in self._NODE_FATAL_MARKERS
+                ):
+                    fingerprint = hashlib.sha256(
+                        moderation_text.encode("utf-8")
+                    ).hexdigest()[:16]
+                    moderation_streak = (
+                        moderation_streak + 1
+                        if fingerprint == moderation_fingerprint
+                        else 1
+                    )
+                    moderation_fingerprint = fingerprint
+                    if moderation_streak >= 5:
+                        log.event(
+                            "node_moderation_persistent",
+                            node=node,
+                            scope=scope,
+                            attempt=attempt,
+                            fingerprint=fingerprint,
+                            consecutive=moderation_streak,
+                        )
             delay = self._node_retry_delay(attempt)
             if delay:
                 log.event(
@@ -364,15 +405,19 @@ class Pipeline:
 
     @classmethod
     def _retryable_node_error(cls, exc: Exception) -> bool:
-        """Provider/network failures and transient model-output parse
-        failures retry; input and business rejections don't."""
+        """Provider, network, subprocess and transient model-output failures
+        retry; input and business validation errors don't.  Moderation
+        rejections also retry with backoff instead of failing the project."""
         if isinstance(exc, ProviderFailure):
-            text = (
-                json.dumps(exc.record, ensure_ascii=False, default=str).lower()
-                + str(exc).lower()
-            )
-            return not any(marker in text for marker in cls._NODE_FATAL_MARKERS)
-        if isinstance(exc, (TimeoutError, ConnectionError, json.JSONDecodeError)):
+            return True
+        if isinstance(exc, (
+            TimeoutError,
+            ConnectionError,
+            json.JSONDecodeError,
+            subprocess.TimeoutExpired,
+            media.CommandError,
+            CodexProcessError,
+        )):
             return True
         # Model-output validation failures ("... output is invalid") are
         # transient; other ValueError/MediaError cases (input validation,
@@ -564,6 +609,7 @@ class Pipeline:
             )
         except Exception as exc:
             log.event("pipeline_failed", error=str(exc))
+            code, message = self._failure_code(exc)
             current = self.store.read(project_id)
             percent = max(
                 1,
@@ -580,13 +626,29 @@ class Pipeline:
                 generation={
                     "status": "failed",
                     "stage": "pipeline_failed",
-                    "error": "pipeline_failed",
+                    "error": code,
                 },
                 error={
-                    "code": "pipeline_failed",
-                    "message": "流水线执行失败",
+                    "code": code,
+                    "message": message,
                 },
             )
+
+    @staticmethod
+    def _failure_code(exc: Exception) -> tuple[str, str]:
+        """Deterministic input/business failures surface an actionable code
+        instead of the generic pipeline_failed."""
+        if isinstance(exc, media.MediaError):
+            return str(exc), "输入视频不满足处理要求"
+        cause = exc.cause if isinstance(exc, ProviderFailure) else exc
+        if getattr(cause, "code", None) == "provider_rejected":
+            return "provider_rejected", "参考图未通过供应商审核"
+        if (
+            isinstance(exc, ProviderFailure)
+            and exc.record.get("outcome") == "rejected"
+        ):
+            return "picsart_submit_rejected", "视频提交未通过供应商审核"
+        return "pipeline_failed", "流水线执行失败"
 
     @staticmethod
     def _validated_effective_request(value: object) -> dict[str, Any]:
@@ -1205,7 +1267,6 @@ class Pipeline:
             ),
             output_media=lambda value: [value["canvas_path"]],
         )
-        prompt = inputs["prompt"]
         canvas = inputs["canvas_path"]
         prompt_path = directory / "prompt.txt"
         spec_path = directory / "spec.json"
@@ -1279,10 +1340,11 @@ class Pipeline:
 
         provider_output = directory / "provider-output.bin"
         receipt_path = directory / "seedream-receipt.json"
-        self._node(
+        self._seedream_generate_never_fail(
+            project_id,
+            project,
             log,
             "seedream-reference-submit",
-            "project",
             {
                 "model": self.settings.seedream_model,
                 "spec_sha256": spec["spec_sha256"],
@@ -1290,14 +1352,11 @@ class Pipeline:
                 "input_receipts": input_receipts,
             },
             seedream_inputs,
-            lambda: self.seedream.generate(
-                prompt=prompt,
-                images=seedream_inputs,
-                destination=provider_output,
-                receipt_path=receipt_path,
-            ),
-            output_media=lambda path: [path],
-            retry_if=lambda _exc: False,
+            prompt_path=prompt_path,
+            provider_output=provider_output,
+            receipt_path=receipt_path,
+            seedream_state=seedream_state,
+            sheet_bundle=prepared_bundle,
         )
 
         return self._finish_replacement_sheet(
@@ -1370,6 +1429,94 @@ class Pipeline:
         self.store.update(project_id, replacement_sheet=completed_bundle)
         return completed_bundle, final_path
 
+    _SEEDREAM_REGENERATABLE_CODES = frozenset({
+        "provider_rejected", "submission_unknown", "provider_protocol_error",
+    })
+
+    def _seedream_generate_never_fail(
+        self,
+        project_id: str,
+        project: Path,
+        log: ResearchLog,
+        node: str,
+        inputs_summary: dict[str, Any],
+        images: list[Path],
+        *,
+        prompt_path: Path,
+        provider_output: Path,
+        receipt_path: Path,
+        seedream_state: dict[str, Any],
+        sheet_bundle: dict[str, Any],
+    ) -> None:
+        """Submit the frozen Seedream sheet request without ever failing the
+        project: submission-unknown/protocol outcomes reset the attempt
+        artifacts and re-POST; content rejections additionally perturb the
+        prompt and re-freeze its receipt before re-POSTing."""
+        base_prompt = prompt_path.read_text(encoding="utf-8")
+        regenerations = 0
+        while True:
+            prompt = prompt_path.read_text(encoding="utf-8")
+            try:
+                self._node(
+                    log,
+                    node,
+                    "project",
+                    {**inputs_summary, "regeneration": regenerations},
+                    images,
+                    lambda prompt=prompt: self.seedream.generate(
+                        prompt=prompt,
+                        images=images,
+                        destination=provider_output,
+                        receipt_path=receipt_path,
+                    ),
+                    output_media=lambda path: [path],
+                    retry_if=lambda _exc: False,
+                )
+                return
+            except ProviderFailure as exc:
+                code = getattr(exc.cause, "code", None)
+                if code not in self._SEEDREAM_REGENERATABLE_CODES:
+                    raise
+                regenerations += 1
+                removed = _seedream_reset_attempt(receipt_path, provider_output)
+                if code == "provider_rejected":
+                    prompt_path.write_text(
+                        base_prompt
+                        + f"\n\nRegeneration {regenerations}: produce a fresh "
+                        "variation of the same specification.",
+                        encoding="utf-8",
+                    )
+                    seedream_state["prompt"] = self._project_artifact_receipt(
+                        project,
+                        prompt_path,
+                        "work/global-reference-sheet/prompt.txt",
+                    )
+                    seedream_state["request_sha256"] = self._json_sha256({
+                        "version": 1,
+                        "endpoint": seedream_state["endpoint"],
+                        "model": seedream_state["model"],
+                        "prompt_sha256": seedream_state["prompt"]["sha256"],
+                        "input_sha256": [
+                            receipt["sha256"]
+                            for receipt in seedream_state["inputs"]
+                        ],
+                        "size": SEEDREAM_OUTPUT_SIZE,
+                        "response_format": "b64_json",
+                        "watermark": False,
+                    })
+                    self.store.update(
+                        project_id, replacement_sheet=sheet_bundle,
+                    )
+                log.event(
+                    "seedream_submission_regenerated",
+                    node=node,
+                    reason=code,
+                    regeneration=regenerations,
+                    removed_artifacts=removed,
+                    error=str(exc),
+                )
+                self._retry_sleep(min(60.0 * regenerations, 1800.0))
+
     def _resume_replacement_sheet(
         self,
         project_id: str,
@@ -1393,7 +1540,9 @@ class Pipeline:
             if recovery_mode != "reuse":
                 raise ValueError("stored replacement sheet recovery mode is invalid")
             return frozen_sheet, validated_path
-        if status != "prepared" or recovery_mode not in {"generate", "replay"}:
+        if status != "prepared" or recovery_mode not in {
+            "generate", "replay", "regenerate",
+        }:
             raise ValueError("stored replacement sheet recovery mode is invalid")
         if self._validated_prepared_seedream_attempt(
             project, frozen_sheet,
@@ -1402,7 +1551,6 @@ class Pipeline:
 
         seedream = frozen_sheet["seedream"]
         prompt_path = project / seedream["prompt"]["path"]
-        prompt = prompt_path.read_text(encoding="utf-8")
         images = [
             project / receipt["path"]
             for receipt in seedream["inputs"]
@@ -1411,35 +1559,60 @@ class Pipeline:
         provider_output = directory / "provider-output.bin"
         receipt_path = directory / "seedream-receipt.json"
         if recovery_mode == "replay":
-            node = "seedream-reference-replay"
-            operation = lambda: self.seedream.replay_received(
-                destination=provider_output,
-                receipt_path=receipt_path,
+            self._node(
+                log,
+                "seedream-reference-replay",
+                "project",
+                {
+                    "model": seedream["model"],
+                    "endpoint": seedream["endpoint"],
+                    "request_sha256": seedream["request_sha256"],
+                    "spec_sha256": frozen_sheet["spec_sha256"],
+                    "input_receipts": seedream["inputs"],
+                },
+                images,
+                lambda: self.seedream.replay_received(
+                    destination=provider_output,
+                    receipt_path=receipt_path,
+                ),
+                output_media=lambda path: [path],
+                retry_if=lambda _exc: False,
             )
         else:
-            node = "seedream-reference-submit-resume"
-            operation = lambda: self.seedream.generate(
-                prompt=prompt,
-                images=images,
-                destination=provider_output,
+            if recovery_mode == "regenerate":
+                # A rejected/unknown terminal receipt cannot be replayed;
+                # downgrade it: drop the attempt artifacts and re-POST.
+                try:
+                    prior = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    prior = None
+                removed = _seedream_reset_attempt(receipt_path, provider_output)
+                log.event(
+                    "seedream_receipt_reset",
+                    prior_status=(
+                        prior.get("status") if isinstance(prior, dict) else None
+                    ),
+                    removed_artifacts=removed,
+                )
+            self._seedream_generate_never_fail(
+                project_id,
+                project,
+                log,
+                "seedream-reference-submit-resume",
+                {
+                    "model": seedream["model"],
+                    "endpoint": seedream["endpoint"],
+                    "request_sha256": seedream["request_sha256"],
+                    "spec_sha256": frozen_sheet["spec_sha256"],
+                    "input_receipts": seedream["inputs"],
+                },
+                images,
+                prompt_path=prompt_path,
+                provider_output=provider_output,
                 receipt_path=receipt_path,
+                seedream_state=seedream,
+                sheet_bundle=frozen_sheet,
             )
-        self._node(
-            log,
-            node,
-            "project",
-            {
-                "model": seedream["model"],
-                "endpoint": seedream["endpoint"],
-                "request_sha256": seedream["request_sha256"],
-                "spec_sha256": frozen_sheet["spec_sha256"],
-                "input_receipts": seedream["inputs"],
-            },
-            images,
-            operation,
-            output_media=lambda path: [path],
-            retry_if=lambda _exc: False,
-        )
         return self._finish_replacement_sheet(
             project_id,
             project,
@@ -2033,7 +2206,17 @@ class Pipeline:
             return
         full_track = project / "work" / "dialogue-audio" / "full-track.wav"
         if not full_track.is_file():
-            raise ValueError("assembled dialogue track is missing")
+            # Degrade: keep the stitched video with its generated audio
+            # instead of failing the whole project.
+            log.event(
+                "dialogue_track_missing_degraded",
+                output=final,
+                impact=(
+                    "assembled TTS dialogue track is missing; the stitched "
+                    "video keeps its generated audio"
+                ),
+            )
+            return
         self._node(
             log,
             "replace-audio-track",
@@ -3244,7 +3427,7 @@ class Pipeline:
         project: Path,
         replacement_sheet: dict[str, Any],
     ) -> str:
-        """Return generate/replay after a read-only paid-attempt audit."""
+        """Return generate/replay/regenerate after a read-only paid-attempt audit."""
 
         seedream = replacement_sheet.get("seedream")
         if not isinstance(seedream, dict):
@@ -3307,11 +3490,20 @@ class Pipeline:
             or receipt.get("request_sha256")
             != seedream.get("request_sha256")
             or receipt.get("status")
-            not in {"submitting", "response_received", "succeeded"}
+            not in {
+                "submitting", "response_received", "succeeded",
+                "rejected", "submission_unknown",
+            }
         ):
             raise ValueError(
                 "stored Seedream receipt does not match its frozen request"
             )
+
+        if receipt.get("status") in {"rejected", "submission_unknown"}:
+            # A terminally rejected/unknown attempt has no recoverable
+            # response; the caller resets its artifacts and re-POSTs the
+            # frozen request instead of blocking the resume paths.
+            return "regenerate"
 
         if claim_path.is_symlink() or not claim_path.is_file():
             raise ValueError("stored Seedream POST claim is missing")
@@ -4559,18 +4751,53 @@ class Pipeline:
                 lambda _value: [muted],
             )
             if self._segment_has_replaced_person(element_index, index):
-                # Mask every source face so H3 must take the face from its tile.
+                # Mask every source face so H3 must take the face from its
+                # tile.  Masking is load-bearing for identity takeover, so it
+                # retries a few times; persistent failures degrade to the
+                # unmasked reference instead of blocking the render.  Only a
+                # missing detection model (a configuration error) stays fatal.
                 masked = segment_dir / "source-faces-masked.mp4"
-                self._node(
-                    log,
-                    "mask-reference-faces",
-                    scope,
-                    {"source": muted, "output": masked},
-                    [muted],
-                    lambda: face_mask.mask_faces(muted, masked),
-                    lambda _value: [masked],
-                )
-                muted = masked
+                mask_failures = 0
+
+                def _mask_retry(exc: Exception) -> bool:
+                    nonlocal mask_failures
+                    mask_failures += 1
+                    if (
+                        isinstance(exc, face_mask.FaceMaskError)
+                        and "model is missing" in str(exc)
+                    ):
+                        return False
+                    return mask_failures < FACE_MASK_MAX_ATTEMPTS
+
+                try:
+                    self._node(
+                        log,
+                        "mask-reference-faces",
+                        scope,
+                        {"source": muted, "output": masked},
+                        [muted],
+                        lambda: face_mask.mask_faces(muted, masked),
+                        lambda _value: [masked],
+                        retry_if=_mask_retry,
+                    )
+                except Exception as exc:
+                    if (
+                        isinstance(exc, face_mask.FaceMaskError)
+                        and "model is missing" in str(exc)
+                    ):
+                        raise
+                    log.event(
+                        "face_mask_degraded",
+                        scope=scope,
+                        attempts=mask_failures,
+                        error=str(exc),
+                        impact=(
+                            "source faces stay visible in the reference "
+                            "video; H3 identity takeover is weakened"
+                        ),
+                    )
+                else:
+                    muted = masked
             return item, final_prompt, muted, fusion_input_sha256
         except Exception:
             item["status"] = "failed"
@@ -4872,11 +5099,12 @@ class Pipeline:
         try:
             current = prepared
             task_id = prepared.existing_task_id
-            fetch_resubmits = 0
+            resubmits = 0
             while True:
                 # Submit/poll node names carry the run identity, so every
                 # (re)submission keeps its own complete receipt/log chain.
                 submit_prefix = current.run_identity
+                task_started = time.monotonic()
                 if task_id is None:
                     task_id = self._node(
                         log,
@@ -4899,7 +5127,16 @@ class Pipeline:
                 def poll_once(
                     task_id: str = task_id,
                     current: PreparedPicsartRequest = current,
+                    task_started: float = task_started,
                 ) -> ProviderResult[str]:
+                    if (
+                        time.monotonic() - task_started
+                        > self.settings.picsart_task_hang_limit_s
+                    ):
+                        raise PicsartTaskHungError(
+                            f"Picsart task {task_id} stayed non-terminal past "
+                            f"{self.settings.picsart_task_hang_limit_s}s"
+                        )
                     try:
                         return self.picsart.poll(task_id)
                     except ProviderFailure as exc:
@@ -4918,29 +5155,49 @@ class Pipeline:
                         [],
                         poll_once,
                         retry_if=lambda exc: not (
-                            isinstance(exc, ProviderFailure)
-                            and self._poll_record_is_terminal_failure(exc.record)
+                            isinstance(exc, PicsartTaskHungError)
+                            or (
+                                isinstance(exc, ProviderFailure)
+                                and self._poll_record_is_terminal_failure(
+                                    exc.record
+                                )
+                            )
                         ),
                     )
-                except ProviderFailure as exc:
-                    if not (
-                        fetch_resubmits < PICSART_FETCH_RESUBMIT_MAX
-                        and self._poll_record_is_terminal_failure(exc.record)
-                        and self._poll_failure_is_asset_fetch(exc.record)
+                except (ProviderFailure, PicsartTaskHungError) as exc:
+                    hung = isinstance(exc, PicsartTaskHungError)
+                    if not hung and not self._poll_record_is_terminal_failure(
+                        exc.record
                     ):
                         raise
-                    # The provider failed to pull our hosted assets; resubmit
-                    # the same frozen segment under a fresh run identity.
-                    fetch_resubmits += 1
+                    if hung:
+                        self._mark_submission_task_failed(
+                            current.project_id, index, task_id,
+                        )
+                        reason = "task_hung"
+                        error_text = str(exc)
+                    else:
+                        reason = (
+                            "asset_fetch"
+                            if self._poll_failure_is_asset_fetch(exc.record)
+                            else "terminal_failure"
+                        )
+                        error_text = str(exc)
+                    # Any terminal task failure (or a task hung past the hang
+                    # limit) resubmits the same frozen segment under a fresh
+                    # run identity — fresh asset URLs included — with no cap.
+                    resubmits += 1
                     log.event(
-                        "picsart_asset_fetch_resubmit",
+                        "picsart_terminal_failure_resubmit",
                         segment_index=index,
-                        resubmit=fetch_resubmits,
+                        resubmit=resubmits,
                         failed_task_id=task_id,
+                        reason=reason,
+                        error=error_text,
                     )
                     current = replace(
                         prepared,
-                        run_identity=f"{node_prefix}-refetch-{fetch_resubmits:02d}",
+                        run_identity=f"{node_prefix}-resubmit-{resubmits:02d}",
                         existing_task_id=None,
                     )
                     self._begin_submission_batch([current])

@@ -1415,3 +1415,124 @@ def test_store_lock_permissions_and_restart_scan_fail_safe(tmp_path: Path):
     restarted = store.read(active_id)
     assert restarted["status"] == "failed"
     assert restarted["error"]["code"] == "process_restarted"
+
+
+def _running_project(store: ProjectStore, client_request_id: str) -> tuple[str, Path]:
+    project_id, project, _state = store.create({}, client_request_id)
+    store.update(
+        project_id,
+        status="running",
+        project_progress={"status": "running", "percent": 50, "stage": "stitch"},
+        generation={"status": "running", "stage": "stitch", "error": None},
+    )
+    return project_id, project
+
+
+def test_restart_downgrades_unproven_submission_started_receipts(tmp_path: Path):
+    store = ProjectStore(tmp_path / "projects", acquire_process_lock=False)
+    proven_id, proven_dir = _running_project(store, "proven-submit")
+    unproven_id, _unproven_dir = _running_project(store, "unproven-submit")
+    for project_id in (proven_id, unproven_id):
+        store.update(
+            project_id,
+            picsart_submission_receipts={
+                "version": 1,
+                "segments": {
+                    "1": [{
+                        "status": "submission_started",
+                        "run_identity": "picsart",
+                        "segment_index": 1,
+                    }],
+                },
+            },
+        )
+    # Only the proven project has submit-log evidence that the provider
+    # accepted the task.
+    evidence_dir = (
+        proven_dir / "logs" / "picsart-submit" / "segment-0001" / "attempt-1"
+    )
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "output.json").write_text(
+        json.dumps({
+            "provider_record": {"outcome": "accepted", "task_id": "task-1"},
+        }),
+        encoding="utf-8",
+    )
+
+    restarted = store.fail_incomplete_after_restart()
+
+    unproven = store.read(unproven_id)
+    assert unproven["status"] == "failed"
+    assert (
+        unproven["picsart_submission_receipts"]["segments"]["1"][0]["status"]
+        == "rejected"
+    )
+    proven = store.read(proven_id)
+    assert proven["status"] == "failed"
+    assert (
+        proven["picsart_submission_receipts"]["segments"]["1"][0]["status"]
+        == "submission_started"
+    )
+    by_project = {item["project_id"]: item for item in restarted}
+    assert by_project[unproven_id]["downgraded_receipts"] == [{
+        "segment_index": 1,
+        "run_identity": "picsart",
+    }]
+    assert by_project[proven_id]["downgraded_receipts"] == []
+
+
+def test_restart_auto_resumes_projects_that_pass_a_resume_gate(tmp_path: Path):
+    configured = settings(tmp_path)
+    store = ProjectStore(
+        configured.data_dir / "projects", acquire_process_lock=False,
+    )
+    project_id, project = _running_project(store, "auto-resume-after-restart")
+    pipelines: list[ResumablePipeline] = []
+    app = create_app(
+        configured,
+        pipeline_factory=lambda _settings, app_store, _register_asset: (
+            pipelines.append(ResumablePipeline(app_store)) or pipelines[-1]
+        ),
+    )
+
+    with TestClient(app) as client:
+        state = wait_for_status(client, project_id, "succeeded")
+
+    assert state["error"] is None
+    assert pipelines[0].validated == [project_id]
+    assert pipelines[0].resumed == [project_id]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "auto_resumed_after_restart" in trace
+    assert '"operation": "resume_r2v"' in trace
+
+
+def test_restart_auto_resume_stays_failed_with_guidance_when_gates_reject(
+    tmp_path: Path,
+):
+    class BlockedPipeline:
+        def validate_r2v_resume(self, _project_id: str) -> None:
+            raise ValueError("submission_unknown receipts need reconciliation")
+
+        def validate_pre_picsart_resume(self, _project_id: str) -> None:
+            raise ValueError("no reusable pre-Picsart artifacts")
+
+    configured = settings(tmp_path)
+    store = ProjectStore(
+        configured.data_dir / "projects", acquire_process_lock=False,
+    )
+    project_id, project = _running_project(store, "auto-resume-blocked")
+    app = create_app(
+        configured,
+        pipeline_factory=lambda _settings, _store, _register_asset: BlockedPipeline(),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/conversations/{project_id}", headers=AUTH)
+        assert response.status_code == 200
+        state = response.json()
+        assert state["status"] == "failed"
+        assert state["error"]["code"] == "process_restarted"
+
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "auto_resume_after_restart_blocked" in trace
+    assert "submission_unknown" in trace

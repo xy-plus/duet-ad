@@ -76,11 +76,11 @@ Picsart 使用 Advanced workflow `minimax/h3-max/reference-to-video`。提交地
 
 ## 重试、证据与付费边界
 
-普通节点每次尝试有独立的 `attempt-N` 证据目录，抛出可重试的自然执行错误后不限次数重试：第 2、3 次尝试立即重跑，第 4 次起按 1 分钟基准指数退避（封顶 30 分钟），直到成功；业务拒绝与输入错误立即失败不重试，也不根据生成质量触发重试。Seedream 生成 POST 与 Picsart submit 都是付费边界，不使用这条通用重试规则。Whisper 返回空 ASR，或 YAMNet 与 ASR 没有可重叠的 spoken 区间时，直接以空台词继续，不因内容为空再跑一次；翻译结果缺行或某行为空时回退对应源文，也不失败或重试。
+普通节点每次尝试有独立的 `attempt-N` 证据目录，抛出可重试的自然执行错误后不限次数重试：第 2、3 次尝试立即重跑，第 4 次起按 1 分钟基准指数退避（封顶 30 分钟），直到成功。可重试集合覆盖供应商/网络错误、subprocess 超时、ffmpeg 非零退出（`CommandError`）、Codex 进程错误（`CodexProcessError`）和瞬时模型输出解析错误；审核类拒绝（content policy/moderation 等 marker）同样退避重试而不是判败，同一错误指纹连续失败 5 次起每次记录 `node_moderation_persistent` 显著事件。输入校验和确定性业务不变量错误仍可失败，但失败时把具体错误码写入 `state.error.code` 供对外映射，不再是笼统的 `pipeline_failed`。打码节点连续失败达到阈值后降级为不打码继续（记 `face_mask_degraded`），只有检测模型缺失这类配置错误保持致命；终剪时整条台词音轨缺失降级为保留拼接视频（记 `dialogue_track_missing_degraded`）。Whisper 返回空 ASR，或 YAMNet 与 ASR 没有可重叠的 spoken 区间时，直接以空台词继续，不因内容为空再跑一次；翻译结果缺行或某行为空时回退对应源文，也不失败或重试。
 
-Seedream 在发出 POST 前原子持久化与 prompt、模型和输入图片哈希绑定的 receipt/claim。已存在成功响应时只物化同一结果；明确拒绝、协议错误或提交结果未知都不会自动再 POST，其中 `submission_unknown` 必须先人工对账。
+Seedream 在发出 POST 前原子持久化与 prompt、模型和输入图片哈希绑定的 receipt/claim。已存在成功响应时只物化同一结果；`submission_unknown`/协议错误自动清除本次尝试产物（记 `seedream_receipt_reset`/`seedream_submission_regenerated`）并重提同一冻结请求，内容拒绝（`provider_rejected`）在重提前对 prompt 做一次微小扰动并重新冻结回执。resume 路径上的 rejected/submission_unknown 回执走同一重置重提路径（recovery mode `regenerate`），不再锁死续跑。
 
-Picsart submit、poll、download 是三个节点。每次被允许的 submit 在 POST 前先原子冻结 `submission_started` 回执；取得 `taskId` 后立即写成 accepted 回执，再进入 poll。没有 task ID 的未知结果默认禁止 resume 再 POST，必须先对账；只有 submit 自身被供应商明确拒绝，或已有 task 的业务状态明确为 `FAILED`，才可标记为允许重提。poll 的传输错误和 HTTP 状态都不能证明 task 失败。取得 ID 后，poll 和 download 的失败只重试自身，不能回到 submit。
+Picsart submit、poll、download 是三个节点。每次被允许的 submit 在 POST 前先原子冻结 `submission_started` 回执；取得 `taskId` 后立即写成 accepted 回执，再进入 poll。task 终态失败（asset-fetch、审核类等所有 `FAILED`）一律换新 run identity 重提同一冻结请求（重提即新素材 URL，天然规避 24h TTL），次数不设上限，逐次记录 `picsart_terminal_failure_resubmit` 事件（含原因）；任务超过 `PICSART_TASK_HANG_LIMIT_S`（默认 6 小时）仍非终态时按同一路径重提（reason `task_hung`）。poll 的传输错误和 HTTP 状态都不能证明 task 失败；取得 ID 后，poll 和 download 的失败只重试自身，不能回到 submit。submit 自身的 `submission_unknown`（无 task ID）仍需人工对账后才允许 resume 再 POST；进程重启时，没有 accepted 提交日志佐证的 `submission_started` 回执自动降级为 rejected，满足续跑门禁的项目在服务启动时自动排队续跑（记 `auto_resumed_after_restart`），不满足的保持 failed 并在日志写明人工对账指引（记 `auto_resume_after_restart_blocked`）。
 
 供应商适配器把业务值与 provider record 分离。业务对象、raw/enhanced 索引和下游 prompt 不携带原始供应商请求；原始记录只进入对应 attempt 日志。二进制响应作为媒体证据保存，JSON 只记录状态、headers、长度和摘要，不把二进制误解码成文本。
 

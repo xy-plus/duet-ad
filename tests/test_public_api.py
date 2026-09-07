@@ -377,6 +377,23 @@ def test_pipeline_failure_is_terminal_and_releases_reservation(tmp_path, video_1
         (
             {
                 "status": "failed",
+                "error": {"code": "long_video_invalid_duration", "message": "x"},
+            },
+            "video_duration_invalid",
+        ),
+        (
+            {
+                "status": "failed",
+                "error": {
+                    "code": "long_video_no_safe_dialogue_boundary",
+                    "message": "x",
+                },
+            },
+            "video_duration_exceeds_h3_limit",
+        ),
+        (
+            {
+                "status": "failed",
                 "error": {"code": "pipeline_failed", "message": "x"},
                 "generation": {"status": "failed", "error": "picsart_submit_rejected"},
             },
