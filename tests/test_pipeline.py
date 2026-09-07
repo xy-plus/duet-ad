@@ -2953,9 +2953,9 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "facial identity" not in person_line
     assert "original haircut" not in person_line
     assert "source role, action, pose, position, and continuity" in person_line
-    assert "only explicitly stated gender, race" in person_line
-    assert "replace with a different identity" in person_line
-    assert "visibly change the face or visible body" in person_line
+    assert "keep only explicitly stated gender and age group" in person_line
+    assert "replace with a clearly different identity" in person_line
+    assert "must differ visibly from the source in at least two of" in person_line
     assert "when clothing is visible, change its design" in person_line
     assert "slightly different" not in person_line
 

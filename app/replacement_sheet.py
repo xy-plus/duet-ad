@@ -385,7 +385,11 @@ def _build_seedream_prompt(
             "head-and-shoulders face close-up portrait: front-facing, "
             "neutral expression, the face filling most of the cell, against "
             "a plain neutral background, so the new facial identity is "
-            "unmistakable. When only a partial person is indexed, show "
+            "unmistakable. The portrait's hairstyle (length, texture, color) "
+            "and face shape must follow the bound appearance description "
+            "exactly and must read as a clearly different person from any "
+            "source appearance; never drift toward the source identity. "
+            "When only a partial person is indexed, show "
             "exactly the named visible body portion instead. Show no props, "
             "held objects, other subjects, interactions, or environment."
         ),

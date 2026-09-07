@@ -4284,7 +4284,7 @@ class Pipeline:
                             else "generated variant"
                         )
                     line = (
-                        f"- {stable_id} | REPLACE | source: {source} | target: "
+                        f"- {stable_id} | REPLACE | target: "
                         f"{target} | reference: {reference_text} | preserve: "
                         f"{preserve_text}"
                     )
@@ -4318,11 +4318,13 @@ class Pipeline:
                         )
                     if isinstance(replacement, dict):
                         line += (
-                            " | person policy: replace with a different identity; "
-                            "visibly change the face or visible body; keep only "
-                            "explicitly stated gender, race, age group, overall style, "
-                            "and primary clothing color; when clothing is visible, "
-                            "change its design; do not infer unseen traits"
+                            " | person policy: replace with a clearly different "
+                            "identity; the new person must differ visibly from the "
+                            "source in at least two of: hair length, hair texture, "
+                            "hair color, face shape, facial hair or other prominent "
+                            "facial features; keep only explicitly stated gender "
+                            "and age group; when clothing is visible, change its "
+                            "design; do not infer unseen traits"
                         )
                 elif category == "scenes" and isinstance(replacement, dict):
                     line += (
