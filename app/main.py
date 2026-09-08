@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import hashlib
 import hmac
 import json
@@ -593,14 +594,29 @@ def create_app(
                 )
         except BaseException as exc:
             LOGGER.exception("unhandled background pipeline failure for project %s", project_id)
-            try:
-                app.state.store.mark_failed(
-                    project_id,
-                    code="pipeline_failed",
-                    message="后台任务执行失败",
-                )
-            except BaseException:
-                LOGGER.exception("could not persist background failure for project %s", project_id)
+            # ENOSPC also breaks the failure write itself; keep retrying on the
+            # node backoff schedule so the project never stays "running" after
+            # its worker died (fake-alive).
+            persist_attempt = 0
+            while True:
+                try:
+                    app.state.store.mark_failed(
+                        project_id,
+                        code="pipeline_failed",
+                        message="后台任务执行失败",
+                    )
+                    break
+                except OSError as persist_exc:
+                    if persist_exc.errno != errno.ENOSPC:
+                        LOGGER.exception("could not persist background failure for project %s", project_id)
+                        break
+                    persist_attempt += 1
+                    delay = 0.0 if persist_attempt < 3 else min(60.0 * 2 ** (persist_attempt - 3), 1800.0)
+                    if delay:
+                        time.sleep(delay)
+                except BaseException:
+                    LOGGER.exception("could not persist background failure for project %s", project_id)
+                    break
         finally:
             with app.state.pipeline_workers_lock:
                 app.state.pipeline_workers -= 1
