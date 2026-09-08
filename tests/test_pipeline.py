@@ -1589,7 +1589,11 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     )
 
     assert result_item["index"] == 1
-    assert result_prompt.startswith("FACE REPLACEMENT IS MANDATORY")
+    assert result_prompt.startswith("Video 1 uses solid gray blocks")
+    assert "FACE REPLACEMENT IS MANDATORY" in result_prompt
+    assert result_prompt.index("gray blocks") < result_prompt.index(
+        "FACE REPLACEMENT"
+    )
     assert "Preserve the source motion" in result_prompt
     assert result_muted == segment_dir / "source-faces-masked.mp4"
     assert len(fusion_input_sha256) == 64
@@ -1607,8 +1611,11 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert calls[0]["schema"]["additionalProperties"] is False
     assert calls[0]["images"] == []
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
-    assert prompt.startswith("FACE REPLACEMENT IS MANDATORY")
-    assert "Preserve the source motion" in prompt
+    assert prompt.startswith("Video 1 uses solid gray blocks")
+    assert "FACE REPLACEMENT IS MANDATORY" in prompt
+    assert prompt.index("gray blocks") < prompt.index(
+        "FACE REPLACEMENT IS MANDATORY"
+    )
     assert prompt.index("FACE REPLACEMENT IS MANDATORY") < prompt.index(
         "Preserve the source motion"
     )

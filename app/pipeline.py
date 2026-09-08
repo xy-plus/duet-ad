@@ -4770,11 +4770,12 @@ class Pipeline:
             processing = self._validated_effective_request(request)["processing"]
             face_block = ""
             sheet_reference = replacement_sheet.get("h3_image_reference")
-            if (
+            masks_faces = (
                 isinstance(sheet_reference, str)
-                and sheet_reference.strip()
+                and bool(sheet_reference.strip())
                 and self._segment_has_replaced_person(element_index, index)
-            ):
+            )
+            if masks_faces:
                 face_block = (
                     "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
                     "EVERYTHING ELSE. Every person in Video 1 must appear with "
@@ -4801,11 +4802,21 @@ class Pipeline:
                     "reproduce, translate, or re-render any source on-screen "
                     "text, watermark, or logo."
                 )
+            mask_block = ""
+            if masks_faces:
+                # 灰块说明放最前（primacy 效应下开头约束遵守度最高）；
+                # 保持简短，给 Agent 生成的长提示词留预算。
+                mask_block = (
+                    "Video 1 uses solid gray blocks as placeholders over the "
+                    "original faces: never draw or imitate any gray rectangle; "
+                    "render each blocked person fully from their tile in "
+                    f"{sheet_reference}, face and hair included.\n\n"
+                )
             dialogue = "\n".join(
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
                 for line in item["dialogue"]
             )
-            final_prompt = face_block + prompt + overlay_block + (
+            final_prompt = mask_block + face_block + prompt + overlay_block + (
                 "\n\nDialogue requirements: Speak the following lines naturally in "
                 "the target language. Do not speak the original-language dialogue. "
                 "Do not render captions or subtitles. Finish every line within the "
