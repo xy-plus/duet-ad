@@ -874,6 +874,20 @@ def _mediakit_result_url(body: Any) -> str:
     return result["image_url"]
 
 
+_MEDIAKIT_TASK_PENDING_STATUSES = frozenset(
+    {"PENDING", "QUEUED", "RUNNING", "PROCESSING", "CREATED"}
+)
+
+
+def _mediakit_task_result(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict) or body.get("success") is not True:
+        raise ValueError("MediaKit task query was not successful")
+    result = body.get("result")
+    if not isinstance(result, dict):
+        raise TypeError("MediaKit task query result must be an object")
+    return result
+
+
 class MediaKitClient:
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.settings = settings
@@ -974,6 +988,127 @@ class MediaKitClient:
             raise
         except Exception as exc:
             raise ProviderFailure(record, evidence_media, exc) from exc
+
+    def _mediakit_headers(self) -> dict[str, str]:
+        token = self.settings.mediakit_api_key
+        if not token:
+            raise ValueError("VOLC_MEDIAKIT_API_KEY must be set to a non-empty value")
+        return _headers(token)
+
+    def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
+        if not isinstance(video_url, str) or not video_url.strip():
+            raise ValueError("MediaKit video URL is invalid")
+        video_url = video_url.strip()
+        mode = self.settings.mediakit_video_erase_mode
+        endpoint = (
+            "erase-video-subtitle-pro"
+            if mode == "pro"
+            else "erase-video-subtitle"
+        )
+        body: dict[str, Any] = {"video_url": video_url, "mode": "Subtitle"}
+        if mode == "pro":
+            # The pro tier pins v5: faster and optimized against subtitle
+            # flicker on AIGC video after erasure.
+            body["model_version"] = "v5"
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                response, record = _send(
+                    client,
+                    "POST",
+                    f"{self.settings.mediakit_api_base}/tools/{endpoint}",
+                    headers=self._mediakit_headers(),
+                    json_body=body,
+                )
+            _ensure_success(response, record)
+            # Submit returns a flat {"success": true, "task_id": ...}; only
+            # the poll response wraps its payload in "result".
+            submit_body = _json_body(response)
+            if not isinstance(submit_body, dict) or submit_body.get("success") is not True:
+                raise ValueError("MediaKit task submit was not successful")
+            task_id = submit_body.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("MediaKit task submit response has no task_id")
+            record["outcome"] = "accepted"
+            record["task_id"] = task_id
+            return ProviderResult(task_id, record)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+    def poll_task(self, task_id: str) -> ProviderResult[str]:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("MediaKit task id is invalid")
+        task_id = task_id.strip()
+        record: dict[str, Any] = {"task_id": task_id, "polls": []}
+        poll_url = f"{self.settings.mediakit_api_base}/tasks/{task_id}"
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                while True:
+                    try:
+                        response, exchange = _send(
+                            client,
+                            "GET",
+                            poll_url,
+                            headers=self._mediakit_headers(),
+                        )
+                    except ProviderFailure as exc:
+                        record["polls"].append(exc.record)
+                        raise ProviderFailure(record, [], exc.cause) from exc.cause
+                    record["polls"].append(exchange)
+                    _ensure_success(response, record)
+                    # Task query is flat: {"success": true, "status": ...} with
+                    # "result": {"video_url": ...} only present once completed.
+                    task_body = _json_body(response)
+                    if (
+                        not isinstance(task_body, dict)
+                        or task_body.get("success") is not True
+                    ):
+                        raise ValueError("MediaKit task query was not successful")
+                    status = str(task_body.get("status") or "").upper()
+                    if status == "COMPLETED":
+                        result = _mediakit_task_result(task_body)
+                        video_url = result.get("video_url")
+                        if not isinstance(video_url, str) or not video_url:
+                            raise ValueError(
+                                "MediaKit completed task has no video_url"
+                            )
+                        return ProviderResult(video_url, record)
+                    if status not in _MEDIAKIT_TASK_PENDING_STATUSES:
+                        raise RuntimeError(
+                            "MediaKit task failed: "
+                            + json.dumps(task_body, ensure_ascii=False)
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"MediaKit task {task_id} timed out")
+                    time.sleep(self.settings.provider_poll_interval_s)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        record: dict[str, Any] | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+                follow_redirects=True,
+            ) as client:
+                response, record = _send(client, "GET", url)
+            if response.history:
+                record["redirects"] = [response_record(item) for item in response.history]
+            _ensure_success(response, record)
+            destination.write_bytes(response.content)
+            return ProviderResult(destination, record, [destination])
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
 
 class PicsartClient:
     WORKFLOW = "minimax/h3-max/reference-to-video"

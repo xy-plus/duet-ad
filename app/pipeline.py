@@ -506,6 +506,54 @@ class Pipeline:
                 raise ValueError("stored replacement image is outside the project")
         return source, replacement
 
+    def _erase_source_subtitles(
+        self,
+        project_id: str,
+        project: Path,
+        source: Path,
+        request: dict[str, Any],
+        log: ResearchLog,
+    ) -> Path:
+        """Erase burned-in subtitles from the source before any downstream use."""
+        processing = request.get("processing") if isinstance(request, dict) else None
+        if not (
+            isinstance(processing, dict)
+            and processing.get("remove_subtitle") is True
+        ):
+            return source
+        erased = project / "work" / "source-nosubs.mp4"
+
+        def operation() -> ProviderResult[Path]:
+            video_url = self.register_asset(project_id, source)
+            submitted = self.mediakit.submit_video_subtitle_erase(video_url)
+            record: dict[str, Any] = {
+                "submit": submitted.record,
+                "video_url": video_url,
+            }
+            polled = self.mediakit.poll_task(submitted.value)
+            record["poll"] = polled.record
+            downloaded = self.mediakit.download(polled.value, erased)
+            record["download"] = downloaded.record
+            return ProviderResult(
+                erased, record, list(downloaded.evidence_media),
+            )
+
+        self._progress(project_id, 3, "erase-source-subtitles")
+        self._node(
+            log,
+            "erase-source-subtitles",
+            "project",
+            {
+                "source": source,
+                "erase_mode": self.settings.mediakit_video_erase_mode,
+                "output": erased,
+            },
+            [source],
+            operation,
+            lambda value: [value],
+        )
+        return erased
+
     def run(self, project_id: str) -> None:
         project = self.store.path(project_id)
         log = ResearchLog(project)
@@ -526,6 +574,10 @@ class Pipeline:
             )
             duration_s = float(info["duration_s"])
             self.store.update(project_id, duration_s=duration_s, has_source=True)
+
+            source = self._erase_source_subtitles(
+                project_id, project, source, request, log,
+            )
 
             self._progress(project_id, 5, "source-4fps")
             source_frames = project / "work" / "source-4fps"

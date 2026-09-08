@@ -11,7 +11,8 @@
 项目级公共输入依次产生：
 
 1. 原视频精确解码帧轴、4 fps 分析帧与规范音频。
-2. YAMNet 声学分类和 Whisper 台词；自动台词只投影 spoken 行。
+2. 项目级视频字幕擦除（`remove_subtitle` 开关）：MediaKit 异步 `erase-video-subtitle-pro`（固定 `model_version=v5`）或标准版（`MEDIAKIT_VIDEO_ERASE_MODE=pro|standard`）抹掉烧录字幕，产出 `work/source-nosubs.mp4`；分段、抽帧、ASR 等下游全部改用擦除后的文件，失败 fail-closed。H3 prompt 的 overlay removal 声明保留为双保险。
+3. YAMNet 声学分类和 Whisper 台词；自动台词只投影 spoken 行。
 3. `ContentDetector(threshold=27)` 的精确镜头边界。
 4. 4–10 秒 scene-first 片段计划及逐段 exact-9。
 5. 可选 MediaKit 处理，先文本擦除、再图标擦除。

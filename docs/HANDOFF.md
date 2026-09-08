@@ -14,6 +14,7 @@
 
 ```text
 保存原视频和可选替换图
+  -> 项目级 MediaKit 视频字幕擦除（remove_subtitle 开关；pro 固定 v5 / standard 由 MEDIAKIT_VIDEO_ERASE_MODE 选择），产出 work/source-nosubs.mp4，下游一律改用擦除后文件
   -> 原视频 4 fps 解帧
   -> 视频视觉轴音频 / YAMNet / Whisper / spoken 台词
   -> ContentDetector(threshold=27)
