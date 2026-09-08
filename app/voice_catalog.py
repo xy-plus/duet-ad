@@ -93,8 +93,8 @@ def _canonical(value: object) -> bytes:
 
 
 def _non_empty_string(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError(f"voice catalog {field} must be a non-empty trimmed string")
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"voice catalog {field} must be a non-empty string")
     return value
 
 
@@ -104,7 +104,7 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
     if (
         not isinstance(raw, dict)
-        or set(raw) != {"schema", "version", "label_policy", "voices"}
+        or not {"schema", "version", "label_policy", "voices"} <= set(raw)
     ):
         raise ValueError("voice catalog root is invalid")
     if (
@@ -116,10 +116,10 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
     label_policy = raw["label_policy"]
     if (
         not isinstance(label_policy, dict)
-        or set(label_policy) != {"source_truth", "personality", "identity"}
+        or not {"source_truth", "personality", "identity"} <= set(label_policy)
         or any(
-            not isinstance(value, str) or not value or value != value.strip()
-            for value in label_policy.values()
+            not isinstance(label_policy[key], str) or not label_policy[key]
+            for key in ("source_truth", "personality", "identity")
         )
     ):
         raise ValueError("voice catalog label policy is invalid")
@@ -135,7 +135,7 @@ def load_voice_library(path: Path = VOICE_CATALOG_PATH) -> VoiceLibrary:
             "voice_id", "file", "sha256", "duration_s", "media_type",
             "source", "features",
         }
-        if not isinstance(value, dict) or set(value) != required_keys:
+        if not isinstance(value, dict) or not required_keys <= set(value):
             raise ValueError(f"voice catalog entry {index} is invalid")
         voice_id = _non_empty_string(value["voice_id"], "voice_id")
         if voice_id in ids:

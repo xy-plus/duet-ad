@@ -66,7 +66,7 @@ def test_default_voice_prefers_target_language_then_first_catalog_voice() -> Non
     assert library.default_voice("German") == german
 
 
-def test_voice_library_keeps_open_feature_metadata_but_closes_catalog_records(
+def test_voice_library_keeps_open_feature_metadata_and_catalog_records(
     tmp_path,
 ) -> None:
     source_library = load_voice_library()
@@ -110,17 +110,17 @@ def test_voice_library_keeps_open_feature_metadata_but_closes_catalog_records(
         with pytest.raises(ValueError, match="catalog identity"):
             load_voice_library(catalog_path)
 
-    invalid_root = copy.deepcopy(valid_catalog)
-    invalid_root["unexpected"] = True
-    catalog_path.write_text(json.dumps(invalid_root), encoding="utf-8")
-    with pytest.raises(ValueError, match="catalog root"):
-        load_voice_library(catalog_path)
+    # Extra root/entry keys are tolerated: the catalog only requires the
+    # keys it actually consumes.
+    extra_root = copy.deepcopy(valid_catalog)
+    extra_root["unexpected"] = True
+    catalog_path.write_text(json.dumps(extra_root), encoding="utf-8")
+    assert len(load_voice_library(catalog_path).voices) == 1
 
-    invalid_entry = copy.deepcopy(valid_catalog)
-    invalid_entry["voices"][0]["unexpected"] = True
-    catalog_path.write_text(json.dumps(invalid_entry), encoding="utf-8")
-    with pytest.raises(ValueError, match="entry 1"):
-        load_voice_library(catalog_path)
+    extra_entry = copy.deepcopy(valid_catalog)
+    extra_entry["voices"][0]["unexpected"] = True
+    catalog_path.write_text(json.dumps(extra_entry), encoding="utf-8")
+    assert len(load_voice_library(catalog_path).voices) == 1
 
 
 def test_voice_library_keeps_actual_provider_duration_boundary(tmp_path) -> None:

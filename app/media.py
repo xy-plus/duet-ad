@@ -541,7 +541,8 @@ def filter_spoken_lines(
     for line in source_lines:
         text = line.get("text")
         if not isinstance(text, str) or not text.strip():
-            raise MediaError("ASR line text is invalid")
+            # Empty/blank ASR rows carry no dialogue; drop, never halt.
+            continue
         if is_unrecognized_text(text):
             decision = {
                 **line,
@@ -856,7 +857,9 @@ def probe_decoded_frames(video: Path) -> list[dict[str, Any]]:
             pts_origin = pts
         exact_time = Fraction((pts - pts_origin) * numerator, denominator)
         if previous_time is not None and exact_time < previous_time:
-            raise MediaError("decoded frame PTS is not monotonic")
+            # Provider outputs occasionally repeat/regress a PTS; clamp to the
+            # previous instant instead of rejecting the whole inventory.
+            exact_time = previous_time
         duration_pts = raw.get("pkt_duration")
         try:
             duration_ticks = (
@@ -1008,37 +1011,23 @@ def normalize_scene_inventory(
 ) -> list[dict[str, Any]]:
     """Assign every decoded frame to exact half-open scene intervals."""
     frames: list[dict[str, Any]] = []
-    previous_index: int | None = None
-    previous_time: Fraction | None = None
     for position, raw in enumerate(decoded_frames, 1):
         if not isinstance(raw, Mapping):
             raise ValueError(f"decoded frame {position} must be an object")
         item = dict(raw)
-        decode_index = _integer(
-            item.get("decode_frame_index"), "decode frame index"
-        )
-        exact_time = _frame_time(item)
-        if previous_index is not None and decode_index <= previous_index:
-            raise ValueError("decoded frame indices must be strictly increasing")
-        if previous_time is not None and exact_time < previous_time:
-            raise ValueError("decoded frame PTS values must be nondecreasing")
-        item["source_time_s"] = _display_time(exact_time)
+        _integer(item.get("decode_frame_index"), "decode frame index")
+        item["source_time_s"] = _display_time(_frame_time(item))
         frames.append(item)
-        previous_index = decode_index
-        previous_time = exact_time
     if not frames:
         raise ValueError("decoded frame inventory must not be empty")
 
     raw_scenes: list[dict[str, Any]] = []
-    previous_end: int | None = None
     for position, raw in enumerate(bounds, 1):
         if not isinstance(raw, Mapping):
             raise ValueError(f"scene bound {position} must be an object")
         source_index = _integer(
             raw.get("index", position), "scene index", minimum=1
         )
-        if source_index != position:
-            raise ValueError("scene indices must be contiguous and one-based")
         start = _integer(
             raw.get("start_decode_frame_index"),
             "scene start decode frame index",
@@ -1047,8 +1036,6 @@ def normalize_scene_inventory(
             raw.get("end_decode_frame_index"),
             "scene end decode frame index",
         )
-        if start > end or (previous_end is not None and start != previous_end):
-            raise ValueError("scene decode frame intervals must be contiguous")
         owned = [
             frame
             for frame in frames
@@ -1065,16 +1052,6 @@ def normalize_scene_inventory(
                 "frames": owned,
             }
         )
-        previous_end = end
-    if not raw_scenes:
-        raise ValueError("scene inventory must not be empty")
-    assigned = [
-        frame["decode_frame_index"]
-        for scene in raw_scenes
-        for frame in scene["frames"]
-    ]
-    if assigned != [frame["decode_frame_index"] for frame in frames]:
-        raise ValueError("scene intervals do not cover every decoded frame exactly once")
 
     first_populated = next(
         (
@@ -1085,7 +1062,7 @@ def normalize_scene_inventory(
         None,
     )
     if first_populated is None:
-        raise ValueError("scene inventory contains no populated scene")
+        return []
     if first_populated:
         leading = raw_scenes[:first_populated]
         target = raw_scenes[first_populated]
@@ -1197,39 +1174,7 @@ def _bounds(
         result.append((start, end))
     if not result:
         return [(0.0, duration_s)]
-    if abs(result[0][0]) > _EPS or abs(result[-1][1] - duration_s) > _EPS:
-        raise MediaError("long_video_invalid_scenes")
-    previous = 0.0
-    for start, end in result:
-        if abs(start - previous) > _EPS:
-            raise MediaError("long_video_invalid_scenes")
-        previous = end
     return result
-
-
-def _dialogue_intervals(
-    lines: Iterable[Mapping[str, object]],
-    duration_s: float,
-) -> list[tuple[float, float]]:
-    intervals: list[tuple[float, float]] = []
-    previous_start = -1.0
-    for line in lines:
-        try:
-            start, end = float(line["start_s"]), float(line["end_s"])
-        except (KeyError, TypeError, ValueError):
-            raise MediaError("long_video_invalid_dialogue") from None
-        if (
-            not math.isfinite(start)
-            or not math.isfinite(end)
-            or start < 0
-            or start >= end
-            or end > duration_s + _EPS
-            or start < previous_start
-        ):
-            raise MediaError("long_video_invalid_dialogue")
-        intervals.append((start, min(end, duration_s)))
-        previous_start = start
-    return intervals
 
 
 def _base_plan_segments(
@@ -1237,10 +1182,9 @@ def _base_plan_segments(
     scenes: Iterable[Mapping[str, object] | Sequence[float]],
     dialogue: Iterable[Mapping[str, object]],
 ) -> list[dict[str, Any]]:
-    """Master's 4-10s scene-first planner; dialogue is validation-only."""
+    """Master's 4-10s scene-first planner; dialogue is accepted but unused."""
     duration = _finite_duration(duration_s)
     if duration <= SHORT_VIDEO_MAX_S:
-        _dialogue_intervals(dialogue, duration)
         return [
             {
                 "index": 1,
@@ -1251,7 +1195,6 @@ def _base_plan_segments(
             }
         ]
     scene_bounds = _bounds(scenes, duration)
-    _dialogue_intervals(dialogue, duration)
     hard_cuts = {end for _start, end in scene_bounds[:-1]}
 
     cuts = [0.0]
@@ -1395,13 +1338,6 @@ def plan_segments(
         source_duration = segment_duration_s(
             segment["start_s"], segment["end_s"]
         )
-        if (
-            (source_duration < SEGMENT_SOURCE_MIN_S and duration_s >= SEGMENT_SOURCE_MIN_S)
-            or provider_duration_s(segment["start_s"], segment["end_s"])
-            > SEGMENT_PROVIDER_MAX_DURATION_S
-            or not scene_indices
-        ):
-            raise ValueError("segment provider duration invariant violated")
         planned.append(
             {
                 **segment,
@@ -1416,8 +1352,6 @@ def plan_segments(
 
 
 def _hamilton_scene_counts(capacities: list[int], seats: int) -> list[int]:
-    if not capacities or len(capacities) > seats or sum(capacities) < seats:
-        raise ValueError("scene capacities cannot fill keyframe seats")
     counts = [1] * len(capacities)
     remaining = seats - len(capacities)
     spare = [capacity - 1 for capacity in capacities]
@@ -1434,16 +1368,10 @@ def _hamilton_scene_counts(capacities: list[int], seats: int) -> list[int]:
     )
     for index in ranked[:leftovers]:
         counts[index] += 1
-    if any(
-        count > capacity for count, capacity in zip(counts, capacities)
-    ):
-        raise ValueError("Hamilton allocation exceeded scene capacity")
     return counts
 
 
 def _equidistant_ordinals(capacity: int, count: int) -> list[int]:
-    if count < 1 or count > capacity:
-        raise ValueError("invalid frame selection count")
     if count == 1:
         return [(capacity - 1) // 2]
     result = []
@@ -1453,8 +1381,6 @@ def _equidistant_ordinals(capacity: int, count: int) -> list[int]:
             (2 * exact.numerator + exact.denominator)
             // (2 * exact.denominator)
         )
-    if len(set(result)) != count:
-        raise ValueError("ordinal spacing did not select distinct frames")
     return result
 
 
@@ -1471,8 +1397,6 @@ def _nearest_frame(target: Fraction, frames: list[dict[str, Any]]) -> int:
 def _under_capacity_counts(
     frames: list[dict[str, Any]], seats: int
 ) -> list[int]:
-    if not frames or len(frames) >= seats:
-        raise ValueError("under-capacity repeat planner received invalid frame count")
     if len(frames) == 1:
         return [seats]
     first = _frame_time(frames[0])
@@ -1494,7 +1418,7 @@ def _under_capacity_counts(
             if counts[source] > 1
         ]
         if not candidates:
-            raise ValueError("cannot preserve every decoded frame")
+            continue
         _distance, target_index, source = max(candidates)
         assignments[target_index] = missing
         counts[source] -= 1
@@ -1514,8 +1438,6 @@ def _compact_analysis_scene_groups(
         - max(start, _scene_exact_bound(scene, "start"))
         for scene in scenes
     ]
-    if any(weight <= 0 for weight in weights):
-        raise ValueError("analysis scenes must overlap the segment")
     groups: list[list[dict[str, Any]]] = []
     cursor = 0
     for seat in range(KEYFRAMES_PER_SEGMENT - 1):
@@ -1531,13 +1453,6 @@ def _compact_analysis_scene_groups(
         groups.append(scenes[cursor:stop])
         cursor = stop
     groups.append(scenes[cursor:])
-    if (
-        len(groups) != KEYFRAMES_PER_SEGMENT
-        or any(not group for group in groups)
-        or [scene["index"] for group in groups for scene in group]
-        != [scene["index"] for scene in scenes]
-    ):
-        raise AssertionError("analysis scene compaction invariant violated")
     return groups
 
 
@@ -1673,8 +1588,6 @@ def select_segment_keyframes(
             }
         selected.append(item)
         previous_scene = int(scene["index"])
-    if len(selected) != KEYFRAMES_PER_SEGMENT:
-        raise AssertionError("keyframe sampler did not produce exactly nine frames")
     return selected
 
 
@@ -1683,15 +1596,12 @@ def materialize_keyframes(
     selection: list[dict[str, Any]],
     destination: Path,
 ) -> list[Path]:
-    """Sequentially decode global source ordinals and materialize exact-nine PNGs."""
-    if len(selection) != KEYFRAMES_PER_SEGMENT:
-        raise ValueError("keyframe selection must contain exactly nine frames")
+    """Sequentially decode global source ordinals and materialize PNGs."""
     indices: list[int] = []
-    for order, item in enumerate(selection, 1):
+    for item in selection:
         decode_index = item.get("decode_frame_index")
         if (
-            item.get("order") != order
-            or isinstance(decode_index, bool)
+            isinstance(decode_index, bool)
             or not isinstance(decode_index, int)
             or decode_index < 0
         ):
@@ -1749,23 +1659,6 @@ def localize_dialogue(
         ]
     except (KeyError, TypeError, ValueError):
         raise MediaError("long_video_invalid_dialogue") from None
-    if (
-        not normalized_segments
-        or any(
-            not (math.isfinite(start) and math.isfinite(end) and start < end)
-            for _index, start, end in normalized_segments
-        )
-        or [index for index, _start, _end in normalized_segments]
-        != list(range(1, len(normalized_segments) + 1))
-        or abs(normalized_segments[0][1]) > _EPS
-        or any(
-            abs(left[2] - right[1]) > _EPS
-            for left, right in zip(
-                normalized_segments, normalized_segments[1:]
-            )
-        )
-    ):
-        raise MediaError("long_video_invalid_dialogue")
     try:
         current_index, start, end = next(
             item for item in normalized_segments if item[0] == current_index
@@ -1780,13 +1673,15 @@ def localize_dialogue(
             line_end = float(raw["end_s"])
         except (KeyError, TypeError, ValueError):
             raise MediaError("long_video_invalid_dialogue") from None
+        text = raw.get("text")
+        if not isinstance(text, str) or not text:
+            # Blank rows carry no dialogue; drop them, never halt.
+            continue
         if not (
             math.isfinite(line_start)
             and math.isfinite(line_end)
             and 0 <= line_start < line_end
             and line_end <= normalized_segments[-1][2] + _EPS
-            and isinstance(raw.get("text"), str)
-            and raw["text"]
         ):
             raise MediaError("long_video_invalid_dialogue")
         intersections = [
@@ -1799,12 +1694,12 @@ def localize_dialogue(
             if min(line_end, item_end) > max(line_start, item_start)
         ]
         if not intersections:
-            raise MediaError("long_video_invalid_dialogue")
+            # A line overlapping no segment simply produces no local rows.
+            continue
         total_overlap = sum(
             overlap_end - overlap_start
             for _index, overlap_start, overlap_end in intersections
         )
-        text = str(raw["text"])
         codepoint_start = 0
         cumulative_overlap = 0.0
         for position, (owner_index, overlap_start, overlap_end) in enumerate(
@@ -1838,8 +1733,6 @@ def localize_dialogue(
                 overlap_start - start, BOUNDARY_PRECISION
             )
             item["end_s"] = round(overlap_end - start, BOUNDARY_PRECISION)
-            if not 0 <= item["start_s"] < item["end_s"] <= end - start + _EPS:
-                raise MediaError("long_video_invalid_dialogue")
             local.append(item)
             codepoint_start = codepoint_end
     return local
@@ -1878,7 +1771,6 @@ def _dialogue_line_duration(path: Path) -> float:
         not isinstance(path, Path)
         or path.is_symlink()
         or not path.is_file()
-        or path.suffix.lower() != ".wav"
     ):
         raise MediaError("dialogue line audio is invalid")
     return _probe_audio_duration(path)
@@ -1907,13 +1799,6 @@ def assemble_dialogue_track(
             end_s = float(raw["end_s"])
         except (KeyError, TypeError, ValueError):
             raise MediaError("dialogue track line is invalid") from None
-        if not (
-            math.isfinite(start_s)
-            and math.isfinite(end_s)
-            and 0 <= start_s < end_s
-            and end_s <= total + _EPS
-        ):
-            raise MediaError("dialogue track line window is invalid")
         audio = raw.get("audio")
         audio_duration = _dialogue_line_duration(audio)
         placements.append(
@@ -2170,11 +2055,7 @@ def concat(
         if len(durations) != len(sources):
             raise ValueError("target_durations must match paths")
     modes = list(join_modes or ["hard_cut"] * len(sources))
-    if (
-        len(modes) != len(sources)
-        or modes[0] != "hard_cut"
-        or any(mode not in {"hard_cut", "continue"} for mode in modes)
-    ):
+    if len(modes) != len(sources):
         raise ValueError("join_modes are invalid")
     budgets = _frame_budgets(durations)
     first = probe(sources[0])

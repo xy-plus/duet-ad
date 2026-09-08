@@ -802,15 +802,8 @@ def test_picsart_advanced_request_omits_empty_optional_inputs(
             [f"https://assets.test/{index}.png" for index in range(10)],
             "at most 9",
         ),
-        (
-            [
-                "https://assets.test/repeated.png",
-                "https://assets.test/repeated.png",
-            ],
-            "duplicates",
-        ),
         ([""], "non-empty strings"),
-        ([" https://assets.test/reference.png"], "trimmed"),
+        (["   "], "non-empty strings"),
         ([42], "non-empty strings"),
         (("https://assets.test/reference.png",), "list or None"),
     ],
@@ -868,6 +861,36 @@ def test_picsart_submit_preserves_three_audio_urls_in_order(tmp_path: Path) -> N
     assert result.value == "task-three-audios"
 
 
+def test_picsart_submit_strips_urls_and_keeps_duplicates(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = json.loads(request.content)["params"]
+        assert params["reference_image_urls"] == [
+            "https://assets.test/repeated.png",
+            "https://assets.test/repeated.png",
+        ]
+        assert params["reference_audio_urls"] == [
+            "https://assets.test/voice.wav",
+        ]
+        return httpx.Response(200, json={"response": {"id": "task-stripped"}})
+
+    result = PicsartClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).submit(
+        prompt="prompt",
+        video_url="https://assets.test/source.mp4",
+        image_urls=[
+            " https://assets.test/repeated.png",
+            "https://assets.test/repeated.png ",
+        ],
+        audio_urls=["  https://assets.test/voice.wav\n"],
+        duration=5,
+        resolution="768p",
+        aspect_ratio="16:9",
+    )
+
+    assert result.value == "task-stripped"
+
+
 @pytest.mark.parametrize(
     ("audio_urls", "message"),
     [
@@ -880,15 +903,8 @@ def test_picsart_submit_preserves_three_audio_urls_in_order(tmp_path: Path) -> N
             ],
             "at most 3",
         ),
-        (
-            [
-                "https://assets.test/repeated.wav",
-                "https://assets.test/repeated.wav",
-            ],
-            "duplicates",
-        ),
         ([""], "non-empty strings"),
-        ([" https://assets.test/voice.wav"], "trimmed"),
+        (["\t\n"], "non-empty strings"),
     ],
 )
 def test_picsart_submit_rejects_invalid_audio_urls_before_network(

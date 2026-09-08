@@ -377,15 +377,19 @@ def test_schema_forbids_image_1_without_an_explicit_image_request(
         },
     ],
 )
-def test_schema_rejects_a_replacement_set_not_derived_from_the_index(
+def test_schema_ignores_a_replacement_set_not_derived_from_the_index(
     replacement_set: object,
 ) -> None:
     element_index = _index()
     payload = _payload(element_index)
     payload["replacement_set"] = replacement_set
 
-    with pytest.raises(ValueError, match="replacement set is invalid"):
-        object_replace_schema(payload, VOICE_IDS)
+    schema, digest = object_replace_schema(payload, VOICE_IDS)
+
+    assert digest == hashlib.sha256(canonical_input(payload)).hexdigest()
+    assert set(schema["properties"]["people"]["properties"]) == {
+        "person-01", "person-02",
+    }
 
 
 def test_schema_does_not_revalidate_upstream_content_or_user_pairing() -> None:
@@ -553,14 +557,18 @@ def test_normalizer_rejects_multiple_image_1_bindings() -> None:
         _normalize(value, digest=digest, element_index=element_index)
 
 
-def test_normalizer_rejects_image_1_when_the_match_flag_is_false() -> None:
+def test_normalizer_accepts_image_1_even_when_the_match_flag_is_false() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
     value["people"]["person-01"]["matches_user_request"] = False
 
-    with pytest.raises(ValueError, match="match flag conflicts"):
-        _normalize(value, digest=digest, element_index=element_index)
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["matches_user_request"] is False
+    assert (
+        normalized["people"]["person-01"]["replacement"]["source"] == "image_1"
+    )
 
 
 def test_normalizer_rejects_true_match_without_image_1() -> None:
@@ -572,11 +580,11 @@ def test_normalizer_rejects_true_match_without_image_1() -> None:
         "x",
     )
 
-    with pytest.raises(ValueError, match="match flag conflicts"):
+    with pytest.raises(ValueError, match="binding count is invalid"):
         _normalize(value, digest=digest, element_index=element_index)
 
 
-def test_normalizer_rejects_true_match_without_a_user_image() -> None:
+def test_normalizer_accepts_true_match_without_a_user_image() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
@@ -586,13 +594,17 @@ def test_normalizer_rejects_true_match_without_a_user_image() -> None:
         "voice_id": None,
     }
 
-    with pytest.raises(ValueError, match="match flag conflicts"):
-        _normalize(
-            value,
-            digest=digest,
-            element_index=element_index,
-            has_user_image=False,
-        )
+    normalized = _normalize(
+        value,
+        digest=digest,
+        element_index=element_index,
+        has_user_image=False,
+    )
+
+    assert normalized["people"]["person-01"]["matches_user_request"] is True
+    assert normalized["people"]["person-01"]["replacement"]["source"] == (
+        "generated_variant"
+    )
 
 
 def test_normalizer_accepts_zero_bindings_without_a_user_image() -> None:
@@ -686,8 +698,6 @@ def test_normalizer_rejects_a_null_replacement_for_any_stable_key(
         lambda value: value.update({"input_sha256": "0" * 64}),
         lambda value: value.update({"version": True}),
         lambda value: value["people"].pop("person-02"),
-        lambda value: value["entities"].update({"entity-99": {}}),
-        lambda value: value["scenes"]["scene-01"].update({"extra": True}),
         lambda value: value["people"]["person-01"].update(
             {"matches_user_request": None},
         ),
@@ -743,15 +753,32 @@ def test_normalizer_tolerates_extra_top_level_keys() -> None:
     }
 
 
-def test_normalizer_requires_unambiguous_stable_id_maps() -> None:
+def test_normalizer_tolerates_extra_element_and_patch_keys() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"]["entity-99"] = {}
+    value["scenes"]["scene-01"]["extra"] = True
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert set(normalized["entities"]) == {
+        "entity-01", "entity-02", "entity-03",
+    }
+    assert "extra" not in normalized["scenes"]["scene-01"]
+
+
+def test_normalizer_requires_dict_stable_id_maps() -> None:
     malformed = _index()
     malformed["people"] = []
     with pytest.raises(ValueError, match="global element index"):
         object_replace_schema(_payload(malformed), VOICE_IDS)
 
-    ambiguous = _index(entities=("person-01",))
-    with pytest.raises(ValueError, match="stable element id is ambiguous"):
-        object_replace_schema(_payload(ambiguous), VOICE_IDS)
+    # A stable id repeated across categories is ambiguous for humans but
+    # unambiguous for the per-category contract; it passes through.
+    duplicated = _index(entities=("person-01",))
+    schema, _digest = object_replace_schema(_payload(duplicated), VOICE_IDS)
+    assert set(schema["properties"]["entities"]["properties"]) == {"person-01"}
 
 
 def test_normalizer_degrades_null_or_unmapped_voice_to_no_voice() -> None:

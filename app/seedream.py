@@ -165,12 +165,6 @@ def _validated_image_media_type(payload: bytes) -> str:
     decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if decoded is None or decoded.size < 1:
         raise ValueError("image result cannot be fully decoded")
-    height, width = decoded.shape[:2]
-    if (width, height) != (SEEDREAM_OUTPUT_WIDTH, SEEDREAM_OUTPUT_HEIGHT):
-        raise ValueError(
-            "image result dimensions must be "
-            f"{SEEDREAM_OUTPUT_WIDTH}x{SEEDREAM_OUTPUT_HEIGHT}"
-        )
     return media_type
 
 
@@ -253,7 +247,7 @@ def _decode_response(response: httpx.Response) -> tuple[bytes, str]:
         data = body.get("data")
         if (
             not isinstance(data, list)
-            or len(data) != 1
+            or not data
             or not isinstance(data[0], dict)
         ):
             raise TypeError

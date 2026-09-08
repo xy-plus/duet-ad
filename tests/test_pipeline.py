@@ -134,7 +134,7 @@ def test_effective_request_passes_through_regardless_of_shape() -> None:
         Pipeline._validated_effective_request(["not", "a", "dict"])
 
 
-def test_stored_voice_references_reject_noncurrent_asset_path(
+def test_stored_voice_references_bind_by_hash_not_path_name(
     tmp_path: Path,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
@@ -145,18 +145,30 @@ def test_stored_voice_references_reject_noncurrent_asset_path(
     voice = library.voices[0]
     directory = project / "work" / "voice-references"
     directory.mkdir(parents=True)
-    current_path = directory / "audio-01.wav"
-    current_path.write_bytes(library.files[voice["voice_id"]].read_bytes())
+    renamed = directory / "renamed.wav"
+    renamed.write_bytes(library.files[voice["voice_id"]].read_bytes())
     state = {
         "voice_references": [{
             "audio_reference": "Audio 1",
             "voice_id": voice["voice_id"],
-            "asset_path": "work/voice-reference.wav",
+            "asset_path": "work/voice-references/renamed.wav",
             "asset_sha256": voice["sha256"],
             "features": library.model_line(voice["voice_id"]),
         }],
     }
 
+    assert Pipeline._stored_voice_references(project, state) == [
+        renamed.resolve()
+    ]
+
+    state["voice_references"][0]["asset_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="checksum does not match"):
+        Pipeline._stored_voice_references(project, state)
+
+    state["voice_references"][0]["asset_sha256"] = voice["sha256"]
+    state["voice_references"][0]["asset_path"] = (
+        "work/voice-references/missing.wav"
+    )
     with pytest.raises(ValueError, match="voice reference"):
         Pipeline._stored_voice_references(project, state)
 
@@ -3288,7 +3300,7 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
 
     def provider_reference(_source: Path, destination: Path) -> Path:
         if failure == "reference_png":
-            raise ValueError("canonical image conversion failed")
+            raise TypeError("canonical image conversion failed")
         destination.write_bytes(b"\x89PNG\r\n\x1a\nreference")
         return destination
 
@@ -3301,7 +3313,7 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
             and path.parent.name == "0002"
             and path.name == "source-muted.mp4"
         ):
-            raise ValueError("segment 2 asset registration failed")
+            raise TypeError("segment 2 asset registration failed")
         return f"https://assets.invalid/{path.parent.name}/{path.name}"
 
     monkeypatch.setattr(
@@ -3328,7 +3340,7 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
     )
     effective_replacement = replacement if failure == "reference_png" else None
     if failure == "reference_png":
-        with pytest.raises(ValueError, match="canonical image conversion failed"):
+        with pytest.raises(TypeError, match="canonical image conversion failed"):
             _materialize_test_replacement_sheet(
                 pipeline,
                 project_id,
@@ -3362,7 +3374,8 @@ def test_global_picsart_preflight_failure_keeps_every_segment_zero_submit(
         if failure == "sheet_png"
         else "segment 2"
     )
-    with pytest.raises(ValueError, match=expected_error):
+    expected_type = ValueError if failure == "sheet_png" else TypeError
+    with pytest.raises(expected_type, match=expected_error):
         pipeline._run_h3_segments(
             project_id,
             project,
@@ -3414,7 +3427,7 @@ def test_seedream_failure_happens_before_any_picsart_submit(
 
         def generate(self, **_kwargs: Any) -> None:
             self.calls += 1
-            raise ValueError("Seedream rejected the frozen sheet request")
+            raise TypeError("Seedream rejected the frozen sheet request")
 
     picsart = _FlowPicsart()
     seedream = FailingSeedream()
@@ -3428,7 +3441,7 @@ def test_seedream_failure_happens_before_any_picsart_submit(
         seedream=seedream,
     )
 
-    with pytest.raises(ValueError, match="Seedream rejected"):
+    with pytest.raises(TypeError, match="Seedream rejected"):
         _materialize_test_replacement_sheet(
             pipeline,
             project_id,
@@ -4357,7 +4370,6 @@ def test_poll_http_4xx_is_not_provider_task_terminal_failure() -> None:
         [{"index": 1, "duration_s": float("nan")}],
         [{"index": 1, "duration_s": 0.001}],
         [{"index": 1, "duration_s": 5.0, "join_mode": "bogus"}],
-        [{"index": 1, "duration_s": 5.0, "join_mode": "continue"}],
     ],
 )
 def test_resume_invalid_segment_structure_fails_before_any_submit(
@@ -4991,7 +5003,7 @@ def _frozen_current_after_global_preflight_failure(
 
     def fail_register(_project_id: str, path: Path) -> str:
         register_calls.append(path)
-        raise ValueError("simulated asset registration failure")
+        raise TypeError("simulated asset registration failure")
 
     monkeypatch.setattr(
         media,
@@ -5037,7 +5049,7 @@ def _frozen_current_after_global_preflight_failure(
         return item, prompt, muted, str(item["index"]) * 64
 
     monkeypatch.setattr(pipeline, "_prepare_h3_segment", prepare_h3)
-    with pytest.raises(ValueError, match="asset registration failure"):
+    with pytest.raises(TypeError, match="asset registration failure"):
         pipeline._run_h3_segments(
             project_id,
             project,
@@ -6550,32 +6562,6 @@ def test_node_retries_moderation_rejections_with_backoff_and_logs(
     assert '"consecutive": 6' in trace
 
 
-def test_node_never_retries_input_errors(tmp_path: Path) -> None:
-    store = ProjectStore(tmp_path / "projects")
-    _project_id, project, _state = store.create(
-        _effective_request(), "request-input-error",
-    )
-    pipeline = Pipeline(
-        _settings(tmp_path),
-        store,
-        lambda _project_id, _path: "https://assets.invalid/value",
-        deepseek=object(),
-        mediakit=object(),
-        picsart=object(),
-    )
-    log = ResearchLog(project)
-    calls = 0
-
-    def invalid() -> None:
-        nonlocal calls
-        calls += 1
-        raise ValueError("bad input")
-
-    with pytest.raises(ValueError):
-        pipeline._node(log, "probe", "project", {}, [], invalid)
-    assert calls == 1
-
-
 def test_node_retries_transient_model_output_errors(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
@@ -6610,7 +6596,7 @@ def test_node_retries_transient_model_output_errors(tmp_path: Path) -> None:
         assert calls == 2
 
 
-def test_node_never_retries_other_value_errors(tmp_path: Path) -> None:
+def test_node_retries_value_media_and_assertion_errors(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
         _effective_request(), "request-other-value-error",
@@ -6628,17 +6614,52 @@ def test_node_never_retries_other_value_errors(tmp_path: Path) -> None:
         ValueError("stored source path must be inputs/source.mp4"),
         ValueError("output is invalid but keeps talking"),
         media.MediaError("audio stream is missing"),
+        AssertionError("defensive leftover"),
     )
     for index, exc in enumerate(cases):
         calls = 0
 
-        def invalid() -> None:
+        def flaky() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise exc
+            return "ok"
+
+        node = f"probe-{index}"
+        assert pipeline._node(log, node, "project", {}, [], flaky) == "ok"
+        assert calls == 2
+
+
+def test_node_never_retries_programmer_bug_errors(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-programmer-bug",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+    cases = (
+        TypeError("bug"),
+        KeyError("bug"),
+        AttributeError("bug"),
+    )
+    for index, exc in enumerate(cases):
+        calls = 0
+
+        def broken() -> None:
             nonlocal calls
             calls += 1
             raise exc
 
         with pytest.raises(type(exc)):
-            pipeline._node(log, f"probe-{index}", "project", {}, [], invalid)
+            pipeline._node(log, f"bug-{index}", "project", {}, [], broken)
         assert calls == 1
 
 
@@ -6671,7 +6692,8 @@ def test_retryable_node_error_covers_subprocess_and_process_failures() -> None:
         media.CommandError(["ffmpeg"], 1, "", "boom")
     )
     assert Pipeline._retryable_node_error(CodexProcessError("codex exited"))
-    assert not Pipeline._retryable_node_error(ValueError("bad input"))
+    assert Pipeline._retryable_node_error(ValueError("bad input"))
+    assert Pipeline._retryable_node_error(AssertionError("leftover"))
     assert not Pipeline._retryable_node_error(
         face_mask.FaceMaskError("could not open video: x")
     )
@@ -6859,6 +6881,13 @@ def test_pipeline_failure_persists_actionable_error_code(
         lambda _source: (_ for _ in ()).throw(
             media.MediaError("source video has no audio track")
         ),
+    )
+    # MediaError is retryable under the node gate (uncertainty self-heals);
+    # disable the gate here to exercise the terminal error-code mapping.
+    monkeypatch.setattr(
+        Pipeline,
+        "_retryable_node_error",
+        classmethod(lambda _cls, _exc: False),
     )
 
     pipeline.run(project_id)

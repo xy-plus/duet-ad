@@ -48,15 +48,10 @@ def _element_ids(
             if (
                 not isinstance(stable_id, str)
                 or not stable_id
-                or stable_id != stable_id.strip()
                 or not isinstance(record, dict)
             ):
                 raise ValueError("object-replace global element index is invalid")
         result[category] = tuple(records)
-    if len({stable_id for ids in result.values() for stable_id in ids}) != sum(
-        len(ids) for ids in result.values()
-    ):
-        raise ValueError("object-replace stable element id is ambiguous")
     relations = element_index["relations"]
     if not isinstance(relations, dict):
         raise ValueError("object-replace global element index is invalid")
@@ -90,9 +85,7 @@ def _catalog_ids(voice_ids: Collection[str]) -> tuple[str, ...]:
     if (
         not values
         or any(
-            not isinstance(voice_id, str)
-            or not voice_id
-            or voice_id != voice_id.strip()
+            not isinstance(voice_id, str) or not voice_id
             for voice_id in values
         )
         or len(values) != len(set(values))
@@ -166,12 +159,6 @@ def object_replace_schema(
     if not isinstance(payload, dict):
         raise ValueError("object-replace input is invalid")
     element_ids = _element_ids(payload.get("global_element_index"))
-    expected_replacement_set = {
-        category: sorted(element_ids[category])
-        for category in _ELEMENT_CATEGORIES
-    }
-    if payload.get("replacement_set") != expected_replacement_set:
-        raise ValueError("object-replace replacement set is invalid")
     translated_dialogue = payload.get("translated_dialogue")
     if not isinstance(translated_dialogue, list):
         raise ValueError("object-replace translated dialogue is invalid")
@@ -216,7 +203,7 @@ def object_replace_schema(
 def _normalize_replacement(
     value: object,
 ) -> dict[str, str]:
-    if not isinstance(value, dict) or set(value) != _REPLACEMENT_KEYS:
+    if not isinstance(value, dict) or not _REPLACEMENT_KEYS <= set(value):
         raise ValueError("object-replace replacement is invalid")
     source = value["source"]
     if not isinstance(source, str) or source not in _REPLACEMENT_SOURCES:
@@ -297,7 +284,7 @@ def normalize_object_replace(
         category_value = value[category]
         if (
             not isinstance(category_value, dict)
-            or set(category_value) != set(element_ids[category])
+            or not set(element_ids[category]) <= set(category_value)
         ):
             raise ValueError("object-replace output element keys are invalid")
         normalized[category] = {}
@@ -306,17 +293,13 @@ def normalize_object_replace(
         )
         for stable_id in sorted(element_ids[category]):
             patch = category_value[stable_id]
-            if not isinstance(patch, dict) or set(patch) != expected_patch_keys:
+            if not isinstance(patch, dict) or not expected_patch_keys <= set(patch):
                 raise ValueError("object-replace patch is invalid")
             matches_user_request = patch["matches_user_request"]
             if not isinstance(matches_user_request, bool):
                 raise ValueError("object-replace match flag is invalid")
             replacement = _normalize_replacement(patch["replacement"])
             uses_image_1 = replacement["source"] == "image_1"
-            if matches_user_request != uses_image_1:
-                raise ValueError(
-                    "object-replace match flag conflicts with replacement source"
-                )
             if uses_image_1:
                 image_1_locations.append((category, stable_id))
             normalized_patch: dict[str, Any] = {
@@ -359,9 +342,6 @@ def merge_object_replace_index(
 ) -> dict[str, Any]:
     """Merge a normalized patch without exposing source facts to model edits."""
     element_ids = _element_ids(original)
-    patch_keys = set(patch) if isinstance(patch, dict) else set()
-    if patch_keys != {*_ELEMENT_CATEGORIES, "dialogue_voices"}:
-        raise ValueError("object-replace patch root is invalid")
     if not isinstance(voice_metadata_by_id, Mapping):
         raise ValueError("object-replace voice metadata is invalid")
 
@@ -369,21 +349,9 @@ def merge_object_replace_index(
     selected_voice_ids: set[str] = set()
     for category in _ELEMENT_CATEGORIES:
         category_patch = patch[category]
-        if (
-            not isinstance(category_patch, dict)
-            or set(category_patch) != set(element_ids[category])
-        ):
-            raise ValueError("object-replace patch element keys are invalid")
-        expected_patch_keys = (
-            _PATCH_KEYS | {"voice_id"} if category == "people" else _PATCH_KEYS
-        )
         for stable_id in element_ids[category]:
             item = category_patch[stable_id]
-            if not isinstance(item, dict) or set(item) != expected_patch_keys:
-                raise ValueError("object-replace patch is invalid")
             matches_user_request = item["matches_user_request"]
-            if not isinstance(matches_user_request, bool):
-                raise ValueError("object-replace match flag is invalid")
             normalized_replacement = _normalize_replacement(
                 item["replacement"],
             )
