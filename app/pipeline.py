@@ -431,12 +431,41 @@ class Pipeline:
         return isinstance(exc, OSError) and exc.errno == errno.ENOSPC
 
     @classmethod
+    def _has_deterministic_client_error(cls, value: Any) -> bool:
+        """True when any recorded exchange ended in a deterministic 4xx.
+
+        Deterministic means every client error except 408/429: re-issuing the
+        identical request cannot succeed, so retrying it forever only loops.
+        """
+        if isinstance(value, dict):
+            response = value.get("response")
+            if isinstance(response, dict):
+                status = response.get("status_code")
+                if (
+                    isinstance(status, int)
+                    and not isinstance(status, bool)
+                    and 400 <= status < 500
+                    and status not in {408, 429}
+                ):
+                    return True
+            return any(
+                cls._has_deterministic_client_error(item)
+                for item in value.values()
+            )
+        if isinstance(value, list):
+            return any(cls._has_deterministic_client_error(item) for item in value)
+        return False
+
+    @classmethod
     def _retryable_node_error(cls, exc: Exception) -> bool:
         """Provider, network, subprocess and transient model-output failures
         retry; input and business validation errors don't.  Moderation
         rejections also retry with backoff instead of failing the project."""
         if isinstance(exc, ProviderFailure):
-            return True
+            # A recorded deterministic 4xx (e.g. a provider rejecting a
+            # corrupt upload with HTTP 400) can never succeed on retry:
+            # fail fast instead of looping until the disk or quota dies.
+            return not cls._has_deterministic_client_error(exc.record)
         # A full disk (ENOSPC) is transient: the operator frees space and the
         # node must rerun, never kill the project.  Research-log writes are
         # best-effort, so the retry path itself survives the full disk.
@@ -698,9 +727,17 @@ class Pipeline:
         scope: str,
         artifacts: Iterable[Path] = (),
     ) -> Any:
-        """Last completed node output, only while its on-disk artifacts live."""
+        """Last completed node output, only while its on-disk artifacts live.
+
+        A 0-byte artifact (e.g. an ENOSPC-truncated write) counts as missing
+        so the node regenerates instead of passing empty bytes downstream."""
         for artifact in artifacts:
             if not artifact.exists():
+                return _NO_REUSABLE_OUTPUT
+            try:
+                if artifact.is_file() and artifact.stat().st_size == 0:
+                    return _NO_REUSABLE_OUTPUT
+            except OSError:
                 return _NO_REUSABLE_OUTPUT
         try:
             return self._completed_node_value(project, node, scope)
@@ -2553,12 +2590,18 @@ class Pipeline:
             scope = self._segment_scope(index)
             directory = project / "work" / "segments" / f"{index:04d}"
             selection_path = directory / "keyframe_selection.json"
-            if not selection_path.is_file():
+            if not (
+                selection_path.is_file() and selection_path.stat().st_size > 0
+            ):
                 raise FileNotFoundError("reusable keyframe selection is missing")
             selection = json.loads(selection_path.read_text(encoding="utf-8"))
             if not isinstance(selection, list):
                 raise ValueError("reusable keyframe selection is invalid")
-            if not (directory / "source.mp4").is_file():
+            segment_source_path = directory / "source.mp4"
+            if not (
+                segment_source_path.is_file()
+                and segment_source_path.stat().st_size > 0
+            ):
                 raise FileNotFoundError("reusable segment source is missing")
             if not isinstance(
                 self._completed_node_value(
@@ -4288,15 +4331,39 @@ class Pipeline:
         segment_frames = directory / "source-4fps"
         raw_dir = directory / "keyframes"
         if resume:
-            if not segment_source.is_file():
+            if not (
+                segment_source.is_file() and segment_source.stat().st_size > 0
+            ):
                 raise FileNotFoundError("reusable segment source is missing")
             segment_manifest = self._completed_node_value(
                 project, "segment-frames-4fps", scope,
             )
             if not isinstance(segment_manifest, dict):
                 raise TypeError("reusable segment manifest is invalid")
-            frames = sorted(raw_dir.glob("*.png"))
-            log.event("segment_preparation_reused", scope=scope)
+            frames = [
+                path
+                for path in sorted(raw_dir.glob("*.png"))
+                if media.is_decodable_image(path)
+            ]
+            if len(frames) != len(selection):
+                # Damaged/0-byte keyframes (e.g. ENOSPC mid-write) are not
+                # evidence of completion: regenerate them from the source.
+                log.event(
+                    "keyframe_artifacts_regenerated",
+                    scope=scope,
+                    reusable=len(frames),
+                )
+                frames = self._node(
+                    log,
+                    "keyframes-exact-nine",
+                    scope,
+                    {"source": source, "selection": selection, "count": 9},
+                    [source],
+                    lambda: media.materialize_keyframes(source, selection, raw_dir),
+                    lambda paths: list(paths),
+                )
+            else:
+                log.event("segment_preparation_reused", scope=scope)
         else:
             self._node(
                 log,
@@ -4355,7 +4422,7 @@ class Pipeline:
             authoritative_frames = []
             for order, frame in enumerate(frames, 1):
                 target = optimized / frame.name
-                if resume and target.is_file():
+                if resume and media.is_decodable_image(target):
                     authoritative_frames.append(target)
                     log.event(
                         "mediakit_artifact_reused",
@@ -4363,6 +4430,12 @@ class Pipeline:
                         output=target,
                     )
                     continue
+                if resume and target.exists():
+                    log.event(
+                        "mediakit_artifact_damaged",
+                        scope=f"{scope}-frame-{order:02d}",
+                        output=target,
+                    )
                 erase_source = frame
                 remaining_stages = stages
                 node = "mediakit-erase"
@@ -4372,9 +4445,15 @@ class Pipeline:
                         checkpoint = target.with_name(
                             f"{target.stem}.mediakit-stage-{completed:02d}{target.suffix}"
                         )
-                        if checkpoint.is_file():
+                        if media.is_decodable_image(checkpoint):
                             erase_source = checkpoint
                             remaining_stages = stages[completed:]
+                        elif checkpoint.exists():
+                            log.event(
+                                "mediakit_checkpoint_damaged",
+                                scope=f"{scope}-frame-{order:02d}",
+                                checkpoint=checkpoint,
+                            )
                 result = self._node(
                     log,
                     node,
@@ -4400,7 +4479,15 @@ class Pipeline:
                 proxies.append(media.half_resolution_png(frame, target))
             return proxies
 
-        reusable_proxies = sorted(proxy_dir.glob("*.png")) if resume else []
+        reusable_proxies = (
+            [
+                path
+                for path in sorted(proxy_dir.glob("*.png"))
+                if media.is_decodable_image(path)
+            ]
+            if resume
+            else []
+        )
         if len(reusable_proxies) == 9:
             analysis_frames = reusable_proxies
             log.event("analysis_proxies_reused", scope=scope)
