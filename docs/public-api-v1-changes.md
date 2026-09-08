@@ -13,6 +13,7 @@
 | `POST /video-generations` Body | 无 | 新增条件必填 `dialogue_brief`：`dialogue_mode=generate` 时必填且非空（最多 1,000 个 UTF-16 字符单元）；其余模式不允许提供 |
 | 台词生成行为 | 只支持翻译并自然改写原台词 | `auto_rewrite` 保持原行为；`generate` 按 `dialogue_brief` 描述自动生成全新口播台词 |
 | 幂等判重输入 | 不含台词参数 | 相同 `Idempotency-Key` 的输入指纹包含 `dialogue_mode`、`dialogue_brief`；台词参数不同视为不同输入，返回 `409 idempotency_key_reused` |
+| 任务定价 | 固定 1,000 积分/任务（`price_version=credits-fixed-1000-v1`） | 按原视频时长计费：向上取整秒数 × 60 积分（`price_version=credits-per-second-60-v1`）；`capabilities.pricing` 改为 `credits_per_second` + `billed_unit`；`Billing.quoted_credits` 等字段随任务时长变化，不再固定 1,000 |
 | 联调环境 | `https://8.166.140.227:3213` | `https://8.166.140.227:3211`（文档内所有示例 Host 统一为 3211） |
 
 ## 错误码

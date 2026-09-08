@@ -33,7 +33,7 @@ API Key 对应一个账户。这个账户拥有自己的任务和积分；不同
 
 ## 接入流程
 
-1. 查询积分，确认 `available_credits` 不少于 1,000。
+1. 查询积分，确认 `available_credits` 不少于任务报价：报价 = 原视频时长（秒，向上取整）× 60 积分。
 2. 创建任务，并保存返回的任务 `id`。
 3. 每隔 5～10 秒查询该任务。
 4. 状态变成 `succeeded` 后，使用 `result.video.content_url` 下载视频。
@@ -125,10 +125,10 @@ HTTP `200 OK`
   },
   "pricing": {
     "credits_per_cny": 100,
-    "job_price_credits": 1000,
-    "job_price_amount_minor": 1000,
+    "credits_per_second": 60,
+    "billed_unit": "source_video_second",
     "currency": "CNY",
-    "price_version": "credits-fixed-1000-v1"
+    "price_version": "credits-per-second-60-v1"
   },
   "polling": {
     "recommended_seconds": 5,
@@ -150,7 +150,7 @@ HTTP `200 OK`
 | `replacement_image` | object | 参考图格式、大小和说明文字限制 |
 | `target_language` | object | 目标语言的省略语义和长度限制 |
 | `dialogue` | object | 台词模式列表、默认模式和 `dialogue_brief` 的约束 |
-| `pricing` | object | 当前积分换算、任务价格和价格版本 |
+| `pricing` | object | 当前积分换算、按秒单价（60 积分/秒，按原视频时长向上取整计费）和价格版本 |
 | `polling` | object | 推荐轮询间隔和最大退避间隔，单位为秒 |
 
 ---
@@ -263,9 +263,9 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
   "billing": {
     "currency": "CNY",
     "credits_per_cny": 100,
-    "quoted_credits": 1000,
-    "quoted_amount_minor": 1000,
-    "price_version": "credits-fixed-1000-v1",
+    "quoted_credits": 2100,
+    "quoted_amount_minor": 2100,
+    "price_version": "credits-per-second-60-v1",
     "settlement_status": "pending",
     "settled_credits": null,
     "settled_amount_minor": null
@@ -328,12 +328,12 @@ HTTP `200 OK`，响应体为 Job 对象。任务仍在处理时，响应头包�
   "billing": {
     "currency": "CNY",
     "credits_per_cny": 100,
-    "quoted_credits": 1000,
-    "quoted_amount_minor": 1000,
-    "price_version": "credits-fixed-1000-v1",
+    "quoted_credits": 2100,
+    "quoted_amount_minor": 2100,
+    "price_version": "credits-per-second-60-v1",
     "settlement_status": "final",
-    "settled_credits": 1000,
-    "settled_amount_minor": 1000
+    "settled_credits": 2100,
+    "settled_amount_minor": 2100
   },
   "result": {
     "video": {
@@ -665,7 +665,7 @@ HTTP `200 OK`，响应体为 OpenAPI JSON，版本字段为 `1.0.0`，标题为 
 | `credits_per_cny` | integer | 否 | 当前固定为 `100` | 1 元对应的积分 |
 | `quoted_credits` | integer | 否 | 当前固定为 `1000` | 创建时冻结的报价积分 |
 | `quoted_amount_minor` | integer | 否 | 当前固定为 `1000` | 报价金额，单位为人民币分，即 10.00 元 |
-| `price_version` | string | 否 | 当前为 `credits-fixed-1000-v1` | 本任务冻结的价格版本 |
+| `price_version` | string | 否 | 当前为 `credits-per-second-60-v1` | 本任务冻结的价格版本 |
 | `settlement_status` | string | 否 | `pending`、`final` | 是否已经最终结算 |
 | `settled_credits` | integer | 是 | 成功为 `1000`，明确失败为 `0`，未结算为 `null` | 最终消费积分 |
 | `settled_amount_minor` | integer | 是 | 成功为 `1000`，明确失败为 `0`，未结算为 `null` | 最终金额，单位为人民币分 |
