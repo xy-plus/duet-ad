@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import hashlib
 import json
 import math
@@ -11,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 from app import media
@@ -72,6 +73,7 @@ DIALOGUE_WRITER_SKILL = (
 )
 SAME_AS_SOURCE_LANGUAGE = "与原视频相同"
 MASTER_EMPTY_ASR_SIGNAL = 51 / 256
+_NO_REUSABLE_OUTPUT: Any = object()
 TRANSLATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -424,12 +426,21 @@ class Pipeline:
         "审核",
     )
 
+    @staticmethod
+    def _is_enospc(exc: Exception) -> bool:
+        return isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+
     @classmethod
     def _retryable_node_error(cls, exc: Exception) -> bool:
         """Provider, network, subprocess and transient model-output failures
         retry; input and business validation errors don't.  Moderation
         rejections also retry with backoff instead of failing the project."""
         if isinstance(exc, ProviderFailure):
+            return True
+        # A full disk (ENOSPC) is transient: the operator frees space and the
+        # node must rerun, never kill the project.  Research-log writes are
+        # best-effort, so the retry path itself survives the full disk.
+        if cls._is_enospc(exc):
             return True
         if isinstance(exc, (
             TimeoutError,
@@ -513,6 +524,8 @@ class Pipeline:
         source: Path,
         request: dict[str, Any],
         log: ResearchLog,
+        *,
+        resume: bool = False,
     ) -> Path:
         """Erase burned-in subtitles from the source before any downstream use."""
         processing = request.get("processing") if isinstance(request, dict) else None
@@ -522,6 +535,17 @@ class Pipeline:
         ):
             return source
         erased = project / "work" / "source-nosubs.mp4"
+        if resume and erased.is_file():
+            reused = self._reusable_node_output(
+                project, "erase-source-subtitles", "project", [erased],
+            )
+            if reused is not _NO_REUSABLE_OUTPUT:
+                log.event(
+                    "node_output_reused",
+                    node="erase-source-subtitles",
+                    scope="project",
+                )
+                return erased
 
         def operation() -> ProviderResult[Path]:
             video_url = self.register_asset(project_id, source)
@@ -563,97 +587,11 @@ class Pipeline:
             state.get("effective_request")
         )
         try:
-            self._progress(project_id, 2, "probe")
-            info = self._node(
-                log,
-                "probe",
-                "project",
-                {"source": source},
-                [source],
-                lambda: media.probe(source),
-            )
-            duration_s = float(info["duration_s"])
-            self.store.update(project_id, duration_s=duration_s, has_source=True)
-
-            source = self._erase_source_subtitles(
-                project_id, project, source, request, log,
-            )
-
-            self._progress(project_id, 5, "source-4fps")
-            source_frames = project / "work" / "source-4fps"
-            source_manifest = self._node(
-                log,
-                "source-frames-4fps",
-                "project",
-                {"source": source, "fps": 4, "output": source_frames},
-                [source],
-                lambda: media.extract_frames_4fps(source, source_frames),
-                lambda value: self._manifest_media(source_frames, value),
-            )
-            duration_s = float(source_manifest.get("duration_seconds") or duration_s)
-            self.store.update(project_id, duration_s=duration_s)
-
-            yamnet, asr_lines, spoken_lines, voice_decisions = (
-                self._analyze_audio_dialogue(
-                    project_id,
-                    project,
-                    source,
-                    has_audio=bool(info.get("has_audio")),
-                    log=log,
+            source, segments, selections, spoken_lines = (
+                self._run_pre_segmentation(
+                    project_id, project, source, request, log,
                 )
             )
-            self.store.update(
-                project_id,
-                voice_lines=spoken_lines,
-                asr_voice_lines=asr_lines,
-                voice_decisions=voice_decisions,
-                vocal_analysis=yamnet,
-            )
-
-            self._progress(project_id, 18, "scene-detection")
-            scenes = self._node(
-                log,
-                "scene-detection",
-                "project",
-                {"source": source, "threshold": 27.0},
-                [source],
-                lambda: media.detect_scenes(source, duration_s),
-            )
-            segments = self._node(
-                log,
-                "segment-planning",
-                "project",
-                {
-                    "scenes": scenes,
-                    "duration_s": duration_s,
-                    "dialogue": spoken_lines,
-                    "provider_window_s": [4, 10],
-                },
-                [],
-                lambda: media.plan_segments(scenes, duration_s, spoken_lines),
-            )
-            self._validated_join_modes(segments)
-            selections: dict[int, list[dict[str, Any]]] = {}
-            for segment in segments:
-                index = int(segment["index"])
-                scope = self._segment_scope(index)
-                selections[index] = self._node(
-                    log,
-                    "keyframe-selection-exact-nine",
-                    scope,
-                    {"segment": segment, "scenes": scenes, "count": 9},
-                    [],
-                    lambda segment=segment: media.select_segment_keyframes(
-                        scenes, segment,
-                    ),
-                )
-            self.store.update(
-                project_id,
-                segment_count=len(segments),
-                scenes=scenes,
-                segments=segments,
-            )
-
             self._progress(project_id, 24, "video-maker", segments=segments)
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, len(segments)),
@@ -685,29 +623,221 @@ class Pipeline:
         except Exception as exc:
             log.event("pipeline_failed", error=str(exc))
             code, message = self._failure_code(exc)
-            current = self.store.read(project_id)
-            percent = max(
-                1,
-                int((current.get("project_progress") or {}).get("percent") or 1),
-            )
-            self.store.update(
+            self._persist_failure(
                 project_id,
-                status="failed",
-                project_progress={
-                    "status": "failed",
-                    "percent": min(percent, 99),
-                    "stage": "pipeline_failed",
-                },
-                generation={
-                    "status": "failed",
-                    "stage": "pipeline_failed",
-                    "error": code,
-                },
-                error={
-                    "code": code,
-                    "message": message,
-                },
+                log,
+                stage="pipeline_failed",
+                code=code,
+                message=message,
+                min_percent=1,
             )
+
+    def _persist_failure(
+        self,
+        project_id: str,
+        log: ResearchLog,
+        *,
+        stage: str,
+        code: str,
+        message: str,
+        min_percent: int,
+        extra_changes: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist the failed terminal state, retrying while the disk is full.
+
+        ENOSPC also breaks the state.json write itself; without a retry the
+        worker dies leaving status "running" (fake-alive).  Keep retrying on
+        the same backoff schedule as node retries so the terminal state lands
+        once the operator frees space.  Research-log writes are best-effort
+        and never raise, so this loop cannot be killed by its own logging."""
+        current = self.store.read(project_id)
+        percent = max(
+            min_percent,
+            int((current.get("project_progress") or {}).get("percent") or min_percent),
+        )
+        changes: dict[str, Any] = {
+            "status": "failed",
+            "project_progress": {
+                "status": "failed",
+                "percent": min(percent, 99),
+                "stage": stage,
+            },
+            "generation": {
+                "status": "failed",
+                "stage": stage,
+                "error": code,
+            },
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        }
+        if extra_changes:
+            changes.update(extra_changes)
+        attempt = 0
+        while True:
+            try:
+                self.store.update(project_id, **changes)
+                return
+            except OSError as exc:
+                if not self._is_enospc(exc):
+                    raise
+                attempt += 1
+                log.event(
+                    "failure_persist_enospc_retry",
+                    stage=stage,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                self._retry_sleep(self._node_retry_delay(attempt))
+
+    def _reusable_node_output(
+        self,
+        project: Path,
+        node: str,
+        scope: str,
+        artifacts: Iterable[Path] = (),
+    ) -> Any:
+        """Last completed node output, only while its on-disk artifacts live."""
+        for artifact in artifacts:
+            if not artifact.exists():
+                return _NO_REUSABLE_OUTPUT
+        try:
+            return self._completed_node_value(project, node, scope)
+        except (FileNotFoundError, OSError, ValueError):
+            return _NO_REUSABLE_OUTPUT
+
+    def _run_pre_segmentation(
+        self,
+        project_id: str,
+        project: Path,
+        source: Path,
+        request: dict[str, Any],
+        log: ResearchLog,
+        *,
+        resume: bool = False,
+    ) -> tuple[
+        Path,
+        list[dict[str, Any]],
+        dict[int, list[dict[str, Any]]],
+        list[dict[str, Any]],
+    ]:
+        """Run probe through keyframe selection.
+
+        With ``resume`` set, a node whose completed output and artifacts are
+        already on disk (source-nosubs.mp4, voice_lines.json, ...) is reused
+        instead of re-executed, so a project that died before segment
+        preparation continues where it stopped."""
+
+        def run_node(
+            node: str,
+            scope: str,
+            inputs: Any,
+            input_media: list[Path],
+            operation: Callable[[], Any],
+            output_media: Callable[[Any], list[Path]] | None = None,
+            *,
+            artifacts: Iterable[Path] = (),
+        ) -> Any:
+            if resume:
+                reused = self._reusable_node_output(project, node, scope, artifacts)
+                if reused is not _NO_REUSABLE_OUTPUT:
+                    log.event("node_output_reused", node=node, scope=scope)
+                    return reused
+            return self._node(
+                log, node, scope, inputs, input_media, operation, output_media,
+            )
+
+        self._progress(project_id, 2, "probe")
+        info = run_node(
+            "probe",
+            "project",
+            {"source": source},
+            [source],
+            lambda: media.probe(source),
+            artifacts=[source],
+        )
+        duration_s = float(info["duration_s"])
+        self.store.update(project_id, duration_s=duration_s, has_source=True)
+
+        source = self._erase_source_subtitles(
+            project_id, project, source, request, log, resume=resume,
+        )
+
+        self._progress(project_id, 5, "source-4fps")
+        source_frames = project / "work" / "source-4fps"
+        source_manifest = run_node(
+            "source-frames-4fps",
+            "project",
+            {"source": source, "fps": 4, "output": source_frames},
+            [source],
+            lambda: media.extract_frames_4fps(source, source_frames),
+            lambda value: self._manifest_media(source_frames, value),
+            artifacts=[source_frames],
+        )
+        duration_s = float(source_manifest.get("duration_seconds") or duration_s)
+        self.store.update(project_id, duration_s=duration_s)
+
+        yamnet, asr_lines, spoken_lines, voice_decisions = (
+            self._analyze_audio_dialogue(
+                project_id,
+                project,
+                source,
+                has_audio=bool(info.get("has_audio")),
+                log=log,
+                resume=resume,
+            )
+        )
+        self.store.update(
+            project_id,
+            voice_lines=spoken_lines,
+            asr_voice_lines=asr_lines,
+            voice_decisions=voice_decisions,
+            vocal_analysis=yamnet,
+        )
+
+        self._progress(project_id, 18, "scene-detection")
+        scenes = run_node(
+            "scene-detection",
+            "project",
+            {"source": source, "threshold": 27.0},
+            [source],
+            lambda: media.detect_scenes(source, duration_s),
+            artifacts=[source],
+        )
+        segments = run_node(
+            "segment-planning",
+            "project",
+            {
+                "scenes": scenes,
+                "duration_s": duration_s,
+                "dialogue": spoken_lines,
+                "provider_window_s": [4, 10],
+            },
+            [],
+            lambda: media.plan_segments(scenes, duration_s, spoken_lines),
+        )
+        self._validated_join_modes(segments)
+        selections: dict[int, list[dict[str, Any]]] = {}
+        for segment in segments:
+            index = int(segment["index"])
+            scope = self._segment_scope(index)
+            selections[index] = run_node(
+                "keyframe-selection-exact-nine",
+                scope,
+                {"segment": segment, "scenes": scenes, "count": 9},
+                [],
+                lambda segment=segment: media.select_segment_keyframes(
+                    scenes, segment,
+                ),
+            )
+        self.store.update(
+            project_id,
+            segment_count=len(segments),
+            scenes=scenes,
+            segments=segments,
+        )
+        return source, segments, selections, spoken_lines
 
     @staticmethod
     def _failure_code(exc: Exception) -> tuple[str, str]:
@@ -2338,6 +2468,22 @@ class Pipeline:
                 "project already has frozen H3 artifacts; use Picsart resume"
             )
         source, replacement = self._stored_input_paths(project, state)
+        if state.get("replacement_sheet") is None and (
+            not isinstance(state.get("segments"), list) or not state["segments"]
+        ):
+            # Died before segment planning finished (e.g. transient ENOSPC in
+            # whisper/mediakit): resume the pre-segmentation phase, reusing
+            # every node output already on disk, instead of blocking.
+            return (
+                project,
+                source,
+                replacement,
+                effective_request,
+                [],
+                {},
+                [],
+                {"early_resume": True},
+            )
         raw_segments = self._validated_stored_segments(
             state, missing_message="stored segments are missing",
         )
@@ -2530,8 +2676,9 @@ class Pipeline:
         ) = self._load_pre_picsart_resume(project_id)
         log = ResearchLog(project)
         log.event("pre_picsart_resume_started")
+        early_resume = checkpoint is not None and checkpoint.get("early_resume")
         try:
-            if checkpoint is not None:
+            if checkpoint is not None and not early_resume:
                 self._backfill_resume_voice_fallback(
                     project_id,
                     project,
@@ -2570,6 +2717,12 @@ class Pipeline:
                 )
                 log.event("pre_picsart_resume_succeeded")
                 return
+            if early_resume:
+                source, segments, selections, spoken_lines = (
+                    self._run_pre_segmentation(
+                        project_id, project, source, request, log, resume=True,
+                    )
+                )
             self._progress(
                 project_id, 24, "video-maker-resume", segments=segments,
             )
@@ -2586,7 +2739,7 @@ class Pipeline:
                         selections[int(segment["index"])],
                         request,
                         log,
-                        resume=True,
+                        resume=not early_resume,
                     )
                     for segment in segments
                 ]
@@ -2604,28 +2757,13 @@ class Pipeline:
             log.event("pre_picsart_resume_succeeded")
         except Exception as exc:
             log.event("pre_picsart_resume_failed", error=str(exc))
-            current = self.store.read(project_id)
-            percent = max(
-                24,
-                int((current.get("project_progress") or {}).get("percent") or 24),
-            )
-            self.store.update(
+            self._persist_failure(
                 project_id,
-                status="failed",
-                project_progress={
-                    "status": "failed",
-                    "percent": min(percent, 99),
-                    "stage": "pre_picsart_resume_failed",
-                },
-                generation={
-                    "status": "failed",
-                    "stage": "pre_picsart_resume_failed",
-                    "error": "pre_picsart_resume_failed",
-                },
-                error={
-                    "code": "pre_picsart_resume_failed",
-                    "message": "前置产物续跑失败",
-                },
+                log,
+                stage="pre_picsart_resume_failed",
+                code="pre_picsart_resume_failed",
+                message="前置产物续跑失败",
+                min_percent=24,
             )
 
     @staticmethod
@@ -3952,23 +4090,20 @@ class Pipeline:
             log.event("picsart_resume_succeeded", output=final)
         except Exception as exc:
             log.event("picsart_resume_failed", error=str(exc))
-            self.store.update(
+            self._persist_failure(
                 project_id,
-                status="failed",
-                project_progress={
-                    "status": "failed",
-                    "percent": 57,
-                    "stage": "picsart_resume_failed",
-                },
-                generation={
-                    "status": "failed",
-                    "stage": "picsart_resume_failed",
-                    "error": "picsart_resume_failed",
-                },
-                segments=[self._public_segment(item) for item in prepared],
-                error={
-                    "code": "picsart_resume_failed",
-                    "message": "Picsart 后续链路执行失败",
+                log,
+                stage="picsart_resume_failed",
+                code="picsart_resume_failed",
+                message="Picsart 后续链路执行失败",
+                min_percent=57,
+                extra_changes={
+                    "segments": [self._public_segment(item) for item in prepared],
+                    "project_progress": {
+                        "status": "failed",
+                        "percent": 57,
+                        "stage": "picsart_resume_failed",
+                    },
                 },
             )
 
@@ -3980,6 +4115,7 @@ class Pipeline:
         *,
         has_audio: bool,
         log: ResearchLog,
+        resume: bool = False,
     ) -> tuple[
         dict[str, Any],
         list[dict[str, Any]],
@@ -3988,13 +4124,32 @@ class Pipeline:
     ]:
         audio = project / "work" / "source.wav"
         asr_output = project / "work" / "voice_lines.json"
+
+        def run_node(
+            node: str,
+            inputs: Any,
+            input_media: list[Path],
+            operation: Callable[[], Any],
+            output_media: Callable[[Any], list[Path]] | None = None,
+            *,
+            artifacts: Iterable[Path] = (),
+        ) -> Any:
+            if resume:
+                reused = self._reusable_node_output(
+                    project, node, "project", artifacts,
+                )
+                if reused is not _NO_REUSABLE_OUTPUT:
+                    log.event("node_output_reused", node=node, scope="project")
+                    return reused
+            return self._node(
+                log, node, "project", inputs, input_media, operation, output_media,
+            )
+
         if not has_audio:
             reason = "source_has_no_audio"
             self._progress(project_id, 8, "audio")
-            self._node(
-                log,
+            run_node(
                 "extract-audio",
-                "project",
                 {
                     "source": source,
                     "output": audio,
@@ -4005,10 +4160,8 @@ class Pipeline:
                 lambda: self._skipped_result(None, reason),
             )
             self._progress(project_id, 11, "yamnet")
-            yamnet = self._node(
-                log,
+            yamnet = run_node(
                 "yamnet",
-                "project",
                 {"audio": None, "reason": reason},
                 [],
                 lambda: self._skipped_result(
@@ -4016,18 +4169,14 @@ class Pipeline:
                 ),
             )
             self._progress(project_id, 14, "whisper-asr")
-            asr_lines = self._node(
-                log,
+            asr_lines = run_node(
                 "whisper-asr",
-                "project",
                 {"audio": None, "reason": reason},
                 [],
                 lambda: self._skipped_result([], reason),
             )
-            spoken_lines, voice_decisions = self._node(
-                log,
+            spoken_lines, voice_decisions = run_node(
                 "spoken-dialogue-filter",
-                "project",
                 {"asr_lines": [], "yamnet": yamnet, "reason": reason},
                 [],
                 lambda: self._skipped_result(([], []), reason),
@@ -4035,24 +4184,22 @@ class Pipeline:
             return yamnet, asr_lines, spoken_lines, voice_decisions
 
         self._progress(project_id, 8, "audio")
-        self._node(
-            log,
+        run_node(
             "extract-audio",
-            "project",
             {"source": source, "output": audio, "timeline": "video-v0"},
             [source],
             lambda: media.extract_audio(source, audio),
             lambda _value: [audio],
+            artifacts=[audio],
         )
 
         self._progress(project_id, 11, "yamnet")
-        yamnet = self._node(
-            log,
+        yamnet = run_node(
             "yamnet",
-            "project",
             {"audio": audio, "model": self.settings.yamnet_model},
             [audio, self.settings.yamnet_model],
             lambda: media.yamnet_analyze(audio, self.settings.yamnet_model),
+            artifacts=[audio],
         )
 
         vocal_expected = self._yamnet_has_vocal_signal(yamnet)
@@ -4071,10 +4218,8 @@ class Pipeline:
             )
 
         self._progress(project_id, 14, "whisper-asr")
-        asr_lines = self._node(
-            log,
+        asr_lines = run_node(
             "whisper-asr",
-            "project",
             {
                 "audio": audio,
                 "cli": self.settings.asr_cli,
@@ -4083,6 +4228,7 @@ class Pipeline:
             },
             [audio, self.settings.asr_model],
             transcribe_once,
+            artifacts=[audio, asr_output],
         )
         if vocal_expected and not asr_lines:
             log.event(
@@ -4091,10 +4237,8 @@ class Pipeline:
                 scope="project",
                 attempts=1,
             )
-        spoken_lines, voice_decisions = self._node(
-            log,
+        spoken_lines, voice_decisions = run_node(
             "spoken-dialogue-filter",
-            "project",
             {"asr_lines": asr_lines, "yamnet": yamnet},
             [],
             lambda: media.filter_spoken_lines(asr_lines, yamnet),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import stat
@@ -7263,3 +7264,374 @@ def test_translation_and_dialogue_shape_validators() -> None:
         ValueError, match="dialogue generation output is invalid",
     ):
         _validate_dialogue_generation_shape({"lines": [{"segment_index": 1}]})
+
+
+def _enospc() -> OSError:
+    return OSError(errno.ENOSPC, "No space left on device")
+
+
+def test_enospc_node_failure_retries_and_survives_log_write_failures(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create(
+        _effective_request(), "request-enospc-node",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    log = ResearchLog(project)
+
+    assert pipeline._retryable_node_error(_enospc()) is True
+    assert pipeline._retryable_node_error(
+        OSError(errno.ENOENT, "No such file or directory")
+    ) is False
+
+    # A full disk also breaks research-log writes; the retry path must
+    # tolerate that instead of dying from its own logging.
+    def broken_write_bytes(*_args: Any, **_kwargs: Any) -> None:
+        raise _enospc()
+
+    monkeypatch.setattr(log, "_write_bytes", broken_write_bytes)
+    sleeps: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", sleeps.append)
+    calls = 0
+
+    def flaky() -> str:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            raise _enospc()
+        return "ok"
+
+    assert pipeline._node(log, "frames", "project", {}, [], flaky) == "ok"
+    # Attempts 2-3 rerun immediately; from attempt 4 on the wait backs off
+    # exponentially from one minute.
+    assert calls == 4
+    assert sleeps == [60.0]
+
+    other_calls = 0
+
+    def missing() -> None:
+        nonlocal other_calls
+        other_calls += 1
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+    with pytest.raises(OSError):
+        pipeline._node(log, "read", "project", {}, [], missing)
+    assert other_calls == 1
+
+
+def test_run_marks_failed_when_the_failure_write_hits_enospc(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "request-enospc-persist",
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    store.update(project_id, source_path="inputs/source.mp4", has_source=True)
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    monkeypatch.setattr(
+        media,
+        "probe",
+        lambda _source: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    original_write = ProjectStore.write
+    blocked = True
+
+    def flaky_write(self: ProjectStore, pid: str, value: dict[str, Any]) -> None:
+        nonlocal blocked
+        if blocked and value.get("status") == "failed":
+            blocked = False
+            raise _enospc()
+        return original_write(self, pid, value)
+
+    monkeypatch.setattr(ProjectStore, "write", flaky_write)
+
+    pipeline.run(project_id)
+
+    state = store.read(project_id)
+    assert state["status"] == "failed"
+    assert state["error"] == {
+        "code": "pipeline_failed",
+        "message": "流水线执行失败",
+    }
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "pipeline_failed" in trace
+    assert "failure_persist_enospc_retry" in trace
+
+
+def _write_completed_node_output(
+    project: Path, node: str, scope: str, value: Any, attempt: int = 1,
+) -> None:
+    directory = project / "logs" / node / scope / f"attempt-{attempt}"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "output.json").write_text(
+        json.dumps(value, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _failed_before_segmentation(
+    tmp_path: Path, client_request_id: str,
+) -> tuple[ProjectStore, str, Path, Pipeline]:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), client_request_id,
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    store.update(
+        project_id,
+        source_path="inputs/source.mp4",
+        has_source=True,
+        status="failed",
+        project_progress={
+            "status": "failed", "percent": 14, "stage": "pipeline_failed",
+        },
+        error={"code": "pipeline_failed", "message": "流水线执行失败"},
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    return store, project_id, project, pipeline
+
+
+def test_pre_picsart_resume_gate_accepts_death_before_segmentation(
+    tmp_path: Path,
+) -> None:
+    _store, project_id, _project, pipeline = _failed_before_segmentation(
+        tmp_path, "request-early-gate",
+    )
+
+    pipeline.validate_pre_picsart_resume(project_id)
+
+    *_, checkpoint = pipeline._load_pre_picsart_resume(project_id)
+    assert checkpoint == {"early_resume": True}
+
+
+def test_pre_segmentation_resume_reuses_on_disk_node_outputs(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store, project_id, project, pipeline = _failed_before_segmentation(
+        tmp_path, "request-early-reuse",
+    )
+    source = project / "inputs" / "source.mp4"
+    work = project / "work"
+    erased = work / "source-nosubs.mp4"
+    erased.write_bytes(b"erased")
+    (work / "source-4fps").mkdir()
+    audio = work / "source.wav"
+    audio.write_bytes(b"wav")
+    (work / "voice_lines.json").write_text("[]", encoding="utf-8")
+
+    spoken = [{"start_s": 0.0, "end_s": 1.0, "text": "hello"}]
+    _write_completed_node_output(
+        project, "probe", "project", {"duration_s": 8.0, "has_audio": True},
+    )
+    _write_completed_node_output(
+        project, "erase-source-subtitles", "project",
+        {"value": str(erased), "provider_record": {"outcome": "accepted"}},
+    )
+    _write_completed_node_output(
+        project, "source-frames-4fps", "project",
+        {"duration_seconds": 8.0, "frames": []},
+    )
+    _write_completed_node_output(project, "extract-audio", "project", None)
+    _write_completed_node_output(
+        project, "yamnet", "project", {"windows": [], "has_bgm": False},
+    )
+    _write_completed_node_output(
+        project, "whisper-asr", "project",
+        {"value": spoken, "provider_record": {"outcome": "accepted"}},
+    )
+    _write_completed_node_output(
+        project, "spoken-dialogue-filter", "project", [spoken, []],
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("a reused node must not re-execute")
+
+    monkeypatch.setattr(media, "probe", forbidden)
+    monkeypatch.setattr(media, "extract_frames_4fps", forbidden)
+    monkeypatch.setattr(media, "extract_audio", forbidden)
+    monkeypatch.setattr(media, "yamnet_analyze", forbidden)
+    monkeypatch.setattr(media, "transcribe", forbidden)
+    monkeypatch.setattr(media, "filter_spoken_lines", forbidden)
+
+    scenes = [{"start_s": 0.0, "end_s": 8.0}]
+    segments = [
+        {"index": 1, "start_s": 0.0, "duration_s": 8.0, "join_mode": "hard_cut"},
+    ]
+    selection = [{"frame": order} for order in range(9)]
+    monkeypatch.setattr(media, "detect_scenes", lambda _s, _d: scenes)
+    monkeypatch.setattr(media, "plan_segments", lambda _s, _d, _l: segments)
+    monkeypatch.setattr(
+        media, "select_segment_keyframes", lambda _s, _seg: selection,
+    )
+
+    log = ResearchLog(project)
+    out_source, out_segments, out_selections, out_spoken = (
+        pipeline._run_pre_segmentation(
+            project_id,
+            project,
+            source,
+            _effective_request(),
+            log,
+            resume=True,
+        )
+    )
+
+    assert out_source == erased
+    assert out_segments == segments
+    assert out_selections == {1: selection}
+    assert out_spoken == spoken
+    state = store.read(project_id)
+    assert state["segments"] == segments
+    assert state["voice_lines"] == spoken
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "node_output_reused" in trace
+
+
+def test_pre_segmentation_resume_reruns_a_node_whose_artifact_is_gone(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    _store, project_id, project, pipeline = _failed_before_segmentation(
+        tmp_path, "request-early-rerun",
+    )
+    source = project / "inputs" / "source.mp4"
+    work = project / "work"
+    erased = work / "source-nosubs.mp4"
+    erased.write_bytes(b"erased")
+    (work / "source-4fps").mkdir()
+    audio = work / "source.wav"
+    audio.write_bytes(b"wav")
+    # The worker died inside whisper (ENOSPC): every upstream node output is
+    # complete, but voice_lines.json never landed, so whisper must re-run.
+    _write_completed_node_output(
+        project, "probe", "project", {"duration_s": 8.0, "has_audio": True},
+    )
+    _write_completed_node_output(
+        project, "erase-source-subtitles", "project",
+        {"value": str(erased), "provider_record": {"outcome": "accepted"}},
+    )
+    _write_completed_node_output(
+        project, "source-frames-4fps", "project",
+        {"duration_seconds": 8.0, "frames": []},
+    )
+    _write_completed_node_output(project, "extract-audio", "project", None)
+    _write_completed_node_output(
+        project, "yamnet", "project", {"windows": [], "has_bgm": False},
+    )
+    _write_completed_node_output(
+        project, "whisper-asr", "project",
+        {"value": [{"text": "stale"}], "provider_record": {"outcome": "accepted"}},
+    )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("a node with live artifacts must be reused")
+
+    monkeypatch.setattr(media, "probe", forbidden)
+    monkeypatch.setattr(media, "extract_frames_4fps", forbidden)
+    monkeypatch.setattr(media, "extract_audio", forbidden)
+    monkeypatch.setattr(media, "yamnet_analyze", forbidden)
+
+    spoken = [{"start_s": 0.0, "end_s": 1.0, "text": "hello"}]
+
+    def fake_transcribe(
+        _audio: Path, output: Path, _cli: Any, _model: Any,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        output.write_text(json.dumps(spoken), encoding="utf-8")
+        return spoken, {"outcome": "accepted"}
+
+    monkeypatch.setattr(media, "transcribe", fake_transcribe)
+    monkeypatch.setattr(
+        media, "filter_spoken_lines", lambda _lines, _yamnet: (spoken, []),
+    )
+    scenes = [{"start_s": 0.0, "end_s": 8.0}]
+    segments = [
+        {"index": 1, "start_s": 0.0, "duration_s": 8.0, "join_mode": "hard_cut"},
+    ]
+    selection = [{"frame": order} for order in range(9)]
+    monkeypatch.setattr(media, "detect_scenes", lambda _s, _d: scenes)
+    monkeypatch.setattr(media, "plan_segments", lambda _s, _d, _l: segments)
+    monkeypatch.setattr(
+        media, "select_segment_keyframes", lambda _s, _seg: selection,
+    )
+
+    log = ResearchLog(project)
+    _src, out_segments, out_selections, out_spoken = (
+        pipeline._run_pre_segmentation(
+            project_id, project, source, _effective_request(), log, resume=True,
+        )
+    )
+
+    assert out_segments == segments
+    assert out_selections == {1: selection}
+    assert out_spoken == spoken
+
+
+def test_resume_pre_picsart_early_path_recovers_segments_without_segment_reuse(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    _store, project_id, project, pipeline = _failed_before_segmentation(
+        tmp_path, "request-early-flow",
+    )
+    source = project / "inputs" / "source.mp4"
+    segments = [
+        {"index": 1, "start_s": 0.0, "duration_s": 8.0, "join_mode": "hard_cut"},
+    ]
+    selections = {1: [{"frame": order} for order in range(9)]}
+    recorded: dict[str, Any] = {}
+
+    def fake_pre_segmentation(
+        _pid: str, _project: Path, src: Path, _request: dict[str, Any],
+        _log: ResearchLog, *, resume: bool = False,
+    ) -> tuple[Path, list[dict[str, Any]], dict[int, list[dict[str, Any]]], list[dict[str, Any]]]:
+        recorded["pre_segmentation_resume"] = resume
+        return src, segments, selections, []
+
+    def fake_prepare(
+        _pid: str, _project: Path, _src: Path, segment: dict[str, Any],
+        _selection: list[dict[str, Any]], _request: dict[str, Any],
+        _log: ResearchLog, *, resume: bool = False,
+    ) -> dict[str, Any]:
+        recorded.setdefault("segment_resume", []).append(resume)
+        return {**segment, "status": "prepared"}
+
+    def fake_continue(
+        _pid: str, _project: Path, prepared: list[dict[str, Any]],
+        _spoken: list[dict[str, Any]], _replacement: Any,
+        _request: dict[str, Any], _log: ResearchLog,
+    ) -> None:
+        recorded["prepared"] = prepared
+
+    monkeypatch.setattr(pipeline, "_run_pre_segmentation", fake_pre_segmentation)
+    monkeypatch.setattr(pipeline, "_prepare_segment", fake_prepare)
+    monkeypatch.setattr(pipeline, "_continue_after_prepared", fake_continue)
+
+    pipeline.resume_pre_picsart(project_id)
+
+    assert recorded["pre_segmentation_resume"] is True
+    assert recorded["segment_resume"] == [False]
+    assert [item["index"] for item in recorded["prepared"]] == [1]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "pre_picsart_resume_succeeded" in trace
