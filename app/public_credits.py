@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -20,8 +21,8 @@ from typing import Any, Iterator
 
 
 CREDITS_PER_CNY = 100
-JOB_PRICE_CREDITS = 1_000
-PRICE_VERSION = "credits-fixed-1000-v1"
+CREDITS_PER_SECOND = 60
+PRICE_VERSION = "credits-per-second-60-v1"
 _OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$")
 _JOB_RE = re.compile(r"^vg_([0-9a-f]{32})$")
 _ADJUSTMENT_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -234,14 +235,27 @@ def balance(data_dir: Path, owner_id: str) -> dict[str, int]:
         return _balance_unlocked(data_dir, owner_id)
 
 
-def reserve(data_dir: Path, owner_id: str, job_id: str) -> bool:
+def quote_credits(duration_s: float) -> int:
+    """按原视频时长报价：每开始一秒 60 积分。"""
+    if not math.isfinite(duration_s) or duration_s <= 0:
+        raise CreditError("invalid_duration")
+    return max(1, math.ceil(duration_s)) * CREDITS_PER_SECOND
+
+
+def reserve(data_dir: Path, owner_id: str, job_id: str, credits: int) -> bool:
+    if (
+        not isinstance(credits, int)
+        or isinstance(credits, bool)
+        or credits <= 0
+    ):
+        raise CreditError("invalid_credit_amount")
     event_id = f"job:{job_id}:reserve"
     with ledger_lock(data_dir):
         destination = _event_path(data_dir, owner_id, event_id)
         if destination.exists():
             return False
         current = _balance_unlocked(data_dir, owner_id)
-        if current["available"] < JOB_PRICE_CREDITS:
+        if current["available"] < credits:
             raise CreditError("insufficient_credits")
         return _create_event(
             data_dir,
@@ -250,7 +264,7 @@ def reserve(data_dir: Path, owner_id: str, job_id: str) -> bool:
                 "event_id": event_id,
                 "owner_id": owner_id,
                 "type": "reserve",
-                "credits": JOB_PRICE_CREDITS,
+                "credits": credits,
                 "job_id": job_id,
                 "created_at": _now(),
             },
@@ -264,8 +278,16 @@ def settle(data_dir: Path, owner_id: str, job_id: str, *, succeeded: bool) -> bo
     with ledger_lock(data_dir):
         if _event_path(data_dir, owner_id, f"job:{job_id}:{opposite}").exists():
             raise CreditError("credit_settlement_conflict")
-        if not _event_path(data_dir, owner_id, f"job:{job_id}:reserve").exists():
+        reserve_path = _event_path(data_dir, owner_id, f"job:{job_id}:reserve")
+        if not reserve_path.exists():
             raise CreditError("credit_reservation_missing")
+        try:
+            reserve_event = json.loads(reserve_path.read_text(encoding="utf-8"))
+            credits = reserve_event["credits"]
+            if not isinstance(credits, int) or isinstance(credits, bool) or credits <= 0:
+                raise TypeError
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+            raise CreditError("credit_ledger_corrupt") from None
         if _event_path(data_dir, owner_id, event_id).exists():
             return False
         return _create_event(
@@ -275,7 +297,7 @@ def settle(data_dir: Path, owner_id: str, job_id: str, *, succeeded: bool) -> bo
                 "event_id": event_id,
                 "owner_id": owner_id,
                 "type": terminal,
-                "credits": JOB_PRICE_CREDITS,
+                "credits": credits,
                 "job_id": job_id,
                 "created_at": _now(),
             },

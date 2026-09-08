@@ -43,7 +43,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
-from app import public_api_auth, public_artifacts, public_credits
+from app import media, public_api_auth, public_artifacts, public_credits
 from app.config import Settings
 from app.main import (
     DIALOGUE_BRIEF_MAX_CHARS,
@@ -138,9 +138,9 @@ class Parameters(BaseModel):
 class Billing(BaseModel):
     currency: Literal["CNY"] = "CNY"
     credits_per_cny: Literal[100] = 100
-    quoted_credits: Literal[1000] = 1000
-    quoted_amount_minor: Literal[1000] = 1000
-    price_version: Literal["credits-fixed-1000-v1"] = public_credits.PRICE_VERSION
+    quoted_credits: int
+    quoted_amount_minor: int
+    price_version: str
     settlement_status: Literal["pending", "final"]
     settled_credits: int | None
     settled_amount_minor: int | None
@@ -400,12 +400,28 @@ def _load_owned(
     return cid, meta
 
 
-def _billing(status: str) -> Billing:
+def _billing(status: str, receipt: Mapping[str, Any]) -> Billing:
+    quoted = receipt.get("quoted_credits")
+    if not isinstance(quoted, int) or isinstance(quoted, bool) or quoted <= 0:
+        raise PublicAPIError(503, "job_state_invalid", "任务状态不可用")
+    price_version = str(receipt.get("price_version") or public_credits.PRICE_VERSION)
     if status == "succeeded":
-        return Billing(settlement_status="final", settled_credits=1000, settled_amount_minor=1000)
+        return Billing(
+            quoted_credits=quoted, quoted_amount_minor=quoted,
+            price_version=price_version, settlement_status="final",
+            settled_credits=quoted, settled_amount_minor=quoted,
+        )
     if status == "failed":
-        return Billing(settlement_status="final", settled_credits=0, settled_amount_minor=0)
-    return Billing(settlement_status="pending", settled_credits=None, settled_amount_minor=None)
+        return Billing(
+            quoted_credits=quoted, quoted_amount_minor=quoted,
+            price_version=price_version, settlement_status="final",
+            settled_credits=0, settled_amount_minor=0,
+        )
+    return Billing(
+        quoted_credits=quoted, quoted_amount_minor=quoted,
+        price_version=price_version, settlement_status="pending",
+        settled_credits=None, settled_amount_minor=None,
+    )
 
 
 def _has_unknown_submission(meta: Mapping[str, Any]) -> bool:
@@ -599,7 +615,7 @@ def install(
                 status=status,
                 progress=Progress(percent=progress),
                 parameters=Parameters(**dict(parameters)),
-                billing=_billing(status),
+                billing=_billing(status, receipt),
                 result=result,
                 error=error,
                 created_at=str(meta.get("created_at")),
@@ -696,8 +712,8 @@ def install(
             },
             pricing={
                 "credits_per_cny": 100,
-                "job_price_credits": 1000,
-                "job_price_amount_minor": 1000,
+                "credits_per_second": 60,
+                "billed_unit": "source_video_second",
                 "currency": "CNY",
                 "price_version": public_credits.PRICE_VERSION,
             },
@@ -844,6 +860,17 @@ def install(
                     "source": staged["source_identity"],
                     "replacement_image": staged["replacement_identity"],
                 })
+                try:
+                    probed = media.probe(staged["staged_source"])
+                    quoted_credits = public_credits.quote_credits(
+                        float(probed["duration_s"])
+                    )
+                except (media.MediaError, public_credits.CreditError) as exc:
+                    raise PublicAPIError(
+                        422, "video_duration_invalid",
+                        "无法确认视频时长，请更换视频后重新创建任务",
+                        field="source_video",
+                    ) from None
 
                 def commit() -> tuple[str, dict[str, Any], bool]:
                     with public_create_lock:
@@ -873,7 +900,8 @@ def install(
                             project_id = uuid.uuid4().hex
                         job_id = f"vg_{project_id}"
                         public_credits.reserve(
-                            settings.data_dir, identity.owner_id, job_id
+                            settings.data_dir, identity.owner_id, job_id,
+                            quoted_credits,
                         )
                         receipt = {
                             "version": 1,
@@ -884,8 +912,8 @@ def install(
                             "request_sha256": request_sha256,
                             "parameters": dict(parameters),
                             "credits_per_cny": 100,
-                            "quoted_credits": 1000,
-                            "quoted_amount_minor": 1000,
+                            "quoted_credits": quoted_credits,
+                            "quoted_amount_minor": quoted_credits,
                             "currency": "CNY",
                             "price_version": public_credits.PRICE_VERSION,
                         }
@@ -909,7 +937,7 @@ def install(
             raise
         except public_credits.CreditError as exc:
             if exc.code == "insufficient_credits":
-                raise PublicAPIError(402, "insufficient_credits", "可用积分不足 1000") from None
+                raise PublicAPIError(402, "insufficient_credits", "可用积分不足") from None
             raise PublicAPIError(503, "billing_state_unavailable", "积分状态暂时不可用") from None
         except UploadTooLarge:
             raise PublicAPIError(413, "source_too_large", "原视频超过大小限制", field="source_video") from None

@@ -151,9 +151,9 @@ def test_create_reserves_credits_and_is_rotation_safe_idempotent(tmp_path, video
         assert body["billing"] == {
             "currency": "CNY",
             "credits_per_cny": 100,
-            "quoted_credits": 1000,
-            "quoted_amount_minor": 1000,
-            "price_version": "credits-fixed-1000-v1",
+            "quoted_credits": 60,
+            "quoted_amount_minor": 60,
+            "price_version": "credits-per-second-60-v1",
             "settlement_status": "pending",
             "settled_credits": None,
             "settled_amount_minor": None,
@@ -161,8 +161,8 @@ def test_create_reserves_credits_and_is_rotation_safe_idempotent(tmp_path, video
         assert created.headers["location"].endswith(body["id"])
         assert created.headers["retry-after"] == "5"
         balance = client.get("/api/v1/account/credits", headers=auth).json()
-        assert balance["available_credits"] == 4_000
-        assert balance["reserved_credits"] == 1_000
+        assert balance["available_credits"] == 4_940
+        assert balance["reserved_credits"] == 60
 
         rotated = public_api_auth.create_client_key(
             settings.public_api_clients_file, "partner_one", key_id="key00003"
@@ -175,8 +175,8 @@ def test_create_reserves_credits_and_is_rotation_safe_idempotent(tmp_path, video
         assert replay.status_code == 200
         assert replay.json()["id"] == body["id"]
         balance = client.get("/api/v1/account/credits", headers=auth).json()
-        assert balance["available_credits"] == 4_000
-        assert balance["reserved_credits"] == 1_000
+        assert balance["available_credits"] == 4_940
+        assert balance["reserved_credits"] == 60
 
         conflict = _create(
             client,
@@ -255,7 +255,7 @@ def test_concurrent_creates_cannot_overdraw_or_duplicate(tmp_path, video_1s):
     app.state.pipeline.release.set()
 
     second_settings, second_auth, _ = _public_setup(
-        tmp_path / "second", credits=1_000
+        tmp_path / "second", credits=100
     )
     second_app = create_app(second_settings, pipeline_factory=manual_factory)
     with TestClient(second_app) as client:
@@ -269,7 +269,7 @@ def test_concurrent_creates_cannot_overdraw_or_duplicate(tmp_path, video_1s):
         current = public_credits.balance(
             second_settings.data_dir, "partner_one"
         )
-        assert current == {"available": 0, "reserved": 1_000, "spent": 0}
+        assert current == {"available": 40, "reserved": 60, "spent": 0}
     second_app.state.pipeline.release.set()
 
 
@@ -322,8 +322,8 @@ def test_failure_releases_and_unknown_keeps_reservation(tmp_path, video_1s):
         assert unknown_view["error"]["code"] == "submission_outcome_unknown"
         assert unknown_view["billing"]["settlement_status"] == "pending"
         balance = client.get("/api/v1/account/credits", headers=auth).json()
-        assert balance["available_credits"] == 4_000
-        assert balance["reserved_credits"] == 1_000
+        assert balance["available_credits"] == 4_940
+        assert balance["reserved_credits"] == 60
     app.state.pipeline.release.set()
 
 
@@ -437,7 +437,7 @@ def test_success_captures_credits_and_content_supports_head_and_range(
         assert view.status_code == 200
         body = view.json()
         assert body["status"] == "succeeded"
-        assert body["billing"]["settled_credits"] == 1_000
+        assert body["billing"]["settled_credits"] == 60
         assert body["result"]["video"]["expires_at"] is None
 
         content_url = body["result"]["video"]["content_url"]
@@ -461,9 +461,9 @@ def test_success_captures_credits_and_content_supports_head_and_range(
         assert early.json()["error"]["code"] == "result_not_ready"
 
         balance = client.get("/api/v1/account/credits", headers=auth).json()
-        assert balance["available_credits"] == 3_000
-        assert balance["reserved_credits"] == 1_000
-        assert balance["spent_credits"] == 1_000
+        assert balance["available_credits"] == 4_880
+        assert balance["reserved_credits"] == 60
+        assert balance["spent_credits"] == 60
     app.state.pipeline.release.set()
 
 
@@ -628,7 +628,7 @@ def test_credit_transactions_list_reserve_and_adjustment(tmp_path, video_1s):
     rows = response.json()["data"]
     assert rows[0]["id"] == f"job:{created['id']}:reserve"
     assert rows[0]["type"] == "reserve"
-    assert rows[0]["credits"] == 1_000
+    assert rows[0]["credits"] == 60
     assert rows[0]["job_id"] == created["id"]
     assert any(
         row["type"] == "adjustment" and row["direction"] == "credit"
