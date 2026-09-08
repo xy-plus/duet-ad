@@ -4805,12 +4805,10 @@ class Pipeline:
             mask_block = ""
             if masks_faces:
                 # 灰块说明放最前（primacy 效应下开头约束遵守度最高）；
-                # 保持简短，给 Agent 生成的长提示词留预算。
+                # 压到 50 字符内，给 Agent 生成的长提示词留预算。
+                # 换脸要求由紧随其后的 FACE REPLACEMENT 块承载。
                 mask_block = (
-                    "Video 1 uses solid gray blocks as placeholders over the "
-                    "original faces: never draw or imitate any gray rectangle; "
-                    "render each blocked person fully from their tile in "
-                    f"{sheet_reference}, face and hair included.\n\n"
+                    "Gray blocks mask source faces; never draw them.\n\n"
                 )
             dialogue = "\n".join(
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
