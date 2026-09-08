@@ -728,61 +728,8 @@ class Pipeline:
 
     @staticmethod
     def _validated_effective_request(value: object) -> dict[str, Any]:
-        if not isinstance(value, dict) or set(value) != {
-            "version", "output", "processing", "dialogue",
-            "replacement_guidance", "fusion",
-        }:
-            raise ValueError("stored effective request is invalid")
-        output = value.get("output")
-        processing = value.get("processing")
-        dialogue = value.get("dialogue")
-        guidance = value.get("replacement_guidance")
-        fusion = value.get("fusion")
-        if (
-            type(value.get("version")) is not int
-            or value["version"] != 1
-            or not isinstance(output, dict)
-            or set(output) != {"aspect_ratio", "resolution", "fit_mode"}
-            or output.get("aspect_ratio") not in {"16:9", "9:16"}
-            or output.get("resolution") not in {"480p", "768p"}
-            or output.get("fit_mode") != "auto"
-            or not isinstance(processing, dict)
-            or set(processing) != {
-                "optimize_image", "remove_subtitle", "remove_logo",
-            }
-            or any(processing[key] is not True for key in processing)
-            or not isinstance(dialogue, dict)
-            or not isinstance(dialogue.get("target_language"), str)
-            or not dialogue["target_language"]
-            or dialogue["target_language"].strip()
-            != dialogue["target_language"]
-            or not isinstance(fusion, dict)
-            or set(fusion) != {"agent"}
-            or fusion.get("agent") not in {"codex", "deepseek"}
-        ):
-            raise ValueError("stored effective request is invalid")
-        dialogue_mode = dialogue.get("mode")
-        if dialogue_mode == "auto_rewrite":
-            dialogue_shape_valid = set(dialogue) == {"mode", "target_language"}
-        elif dialogue_mode == "generate":
-            dialogue_shape_valid = (
-                set(dialogue) == {"mode", "target_language", "brief"}
-                and isinstance(dialogue.get("brief"), str)
-                and bool(dialogue["brief"])
-                and dialogue["brief"].strip() == dialogue["brief"]
-            )
-        else:
-            dialogue_shape_valid = False
-        if not dialogue_shape_valid:
-            raise ValueError("stored effective request is invalid")
-        if guidance is not None and (
-            not isinstance(guidance, dict)
-            or set(guidance) != {"instruction", "image_field"}
-            or guidance.get("image_field") != "replacement_image"
-            or not isinstance(guidance.get("instruction"), str)
-            or not guidance["instruction"]
-            or guidance["instruction"].strip() != guidance["instruction"]
-        ):
+        # 中间层不做形态校验：是我们自己写下的状态，读到啥用啥。
+        if not isinstance(value, dict):
             raise ValueError("stored effective request is invalid")
         return value
 
@@ -1111,12 +1058,15 @@ class Pipeline:
             return None
         dialogue_voices = enhanced_element_index.get("dialogue_voices")
         people = enhanced_element_index.get("people")
-        if (
-            not isinstance(dialogue_voices, list)
-            or len(dialogue_voices) != len(translated_lines)
-            or not isinstance(people, dict)
-        ):
-            raise ValueError("enhanced index dialogue voices are invalid")
+        # 不做形态校验：音色归属缺失/不齐时按无归属处理，落到默认音色。
+        if not isinstance(dialogue_voices, list):
+            dialogue_voices = []
+        if len(dialogue_voices) < len(translated_lines):
+            dialogue_voices = dialogue_voices + [None] * (
+                len(translated_lines) - len(dialogue_voices)
+            )
+        if not isinstance(people, dict):
+            people = {}
         valid_voices = {
             path.resolve(strict=True) for path in voice_reference_paths
         }
@@ -1790,10 +1740,7 @@ class Pipeline:
 
     @staticmethod
     def _muted_artifact_name(muted: Path) -> str:
-        name = muted.name
-        if name not in MUTED_ARTIFACT_NAMES:
-            raise ValueError("prepared H3 muted artifact is invalid")
-        return name
+        return muted.name
 
     @staticmethod
     def _project_artifact_receipt(
@@ -1837,8 +1784,6 @@ class Pipeline:
         self._validated_join_modes([value[0] for value in sorted_h3_inputs])
         for item, final_prompt, muted, fusion_input_sha256 in sorted_h3_inputs:
             index = int(item["index"])
-            if str(final_prompt).strip() != final_prompt:
-                raise ValueError("prepared H3 prompt is not canonical")
             base = f"work/segments/{index:04d}"
             segments[str(index)] = {
                 "segment_index": index,
@@ -2332,16 +2277,7 @@ class Pipeline:
         raw_segments = state.get("segments")
         if not isinstance(raw_segments, list) or not raw_segments:
             raise ValueError(missing_message)
-        segment_count = state.get("segment_count")
-        if (
-            isinstance(segment_count, bool)
-            or not isinstance(segment_count, int)
-            or segment_count < 1
-            or segment_count != len(raw_segments)
-        ):
-            raise ValueError("stored segment count is invalid")
         segments: list[dict[str, Any]] = []
-        indices: list[int] = []
         for raw in raw_segments:
             if not isinstance(raw, dict):
                 raise TypeError("stored segment must be an object")
@@ -2359,12 +2295,7 @@ class Pipeline:
             join_mode = raw.get("join_mode")
             if join_mode not in {"hard_cut", "continue"}:
                 raise ValueError("stored segment join mode is invalid")
-            indices.append(index)
             segments.append(dict(raw))
-        if sorted(indices) != list(range(1, segment_count + 1)):
-            raise ValueError(
-                "stored segment indices must be unique and contiguous"
-            )
         segments.sort(key=lambda item: int(item["index"]))
         if segments[0]["join_mode"] != "hard_cut":
             raise ValueError("first stored segment must use a hard cut")
@@ -2477,12 +2408,10 @@ class Pipeline:
             if not selection_path.is_file():
                 raise FileNotFoundError("reusable keyframe selection is missing")
             selection = json.loads(selection_path.read_text(encoding="utf-8"))
-            if not isinstance(selection, list) or len(selection) != 9:
-                raise ValueError("reusable keyframe selection must contain 9 items")
+            if not isinstance(selection, list):
+                raise ValueError("reusable keyframe selection is invalid")
             if not (directory / "source.mp4").is_file():
                 raise FileNotFoundError("reusable segment source is missing")
-            if len(list((directory / "keyframes").glob("*.png"))) != 9:
-                raise ValueError("reusable segment must contain exactly 9 keyframes")
             if not isinstance(
                 self._completed_node_value(
                     project, "segment-frames-4fps", scope,
@@ -3274,11 +3203,7 @@ class Pipeline:
                 if isinstance(muted_receipt, dict)
                 else None
             )
-            if (
-                not isinstance(muted_path, str)
-                or muted_path
-                not in {f"{base}/{name}" for name in MUTED_ARTIFACT_NAMES}
-            ):
+            if not isinstance(muted_path, str):
                 raise ValueError("stored H3 artifact receipt fields are invalid")
             cls._validate_artifact_receipt(project, muted_receipt, muted_path)
             cls._validate_artifact_receipt(
@@ -4210,8 +4135,6 @@ class Pipeline:
             if not isinstance(segment_manifest, dict):
                 raise TypeError("reusable segment manifest is invalid")
             frames = sorted(raw_dir.glob("*.png"))
-            if len(frames) != 9:
-                raise ValueError("reusable segment must contain exactly 9 keyframes")
             log.event("segment_preparation_reused", scope=scope)
         else:
             self._node(
