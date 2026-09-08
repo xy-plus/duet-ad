@@ -186,6 +186,7 @@ function buildMinimalGenerationRequest(input, capability) {
   const dialogueBrief = String(input && input.dialogueBrief || "").trim();
   const hasReplacementImage = !!(input && input.hasReplacementImage);
   const replacementInstruction = String(input && input.replacementInstruction || "").trim();
+  const adaptationPrompt = String(input && input.adaptationPrompt || "").trim();
   if (!normalized.aspect_ratios.includes(aspectRatio)) throw new Error("请选择画幅");
   if (!normalized.resolutions.includes(resolution)) throw new Error("请选择清晰度");
   if (!targetLanguage) throw new Error("请填写目标语言");
@@ -193,6 +194,9 @@ function buildMinimalGenerationRequest(input, capability) {
   if (dialogueMode === "generate" && !dialogueBrief) throw new Error("请填写口播描述");
   if (dialogueBrief.length > normalized.dialogue.max_brief_chars) {
     throw new Error("口播描述超过长度限制");
+  }
+  if (adaptationPrompt.length > normalized.dialogue.max_brief_chars) {
+    throw new Error("总体改编提示词超过长度限制");
   }
   if (hasReplacementImage !== !!replacementInstruction) {
     throw new Error("参考图与替换说明需要一起提供");
@@ -222,6 +226,7 @@ function buildMinimalGenerationRequest(input, capability) {
       instruction: replacementInstruction,
       image_field: normalized.replacement_image_field,
     } : null,
+    adaptation_prompt: adaptationPrompt || null,
   };
 }
 
@@ -385,6 +390,8 @@ function projectComposerModel(detail, localDraft = null) {
       ? "" : dialogue.target_language.trim(),
     replacementInstruction: guidance && typeof guidance.instruction === "string"
       ? guidance.instruction : "",
+    adaptationPrompt: typeof request.adaptation_prompt === "string"
+      ? request.adaptation_prompt : "",
     source: input && input.source,
     replacementImage: input && input.replacement_image
       ? input.replacement_image
@@ -1614,6 +1621,7 @@ function prepareComposerForProjectLoad() {
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
   $("dialogue-brief").value = "";
+  $("adaptation-prompt").value = "";
   document.querySelectorAll(
     'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"], input[name="dialogue-write-mode"]'
   ).forEach((control) => { control.checked = false; });
@@ -1690,6 +1698,7 @@ function applyProjectComposer(detail) {
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
   $("dialogue-brief").value = "";
+  $("adaptation-prompt").value = "";
 
   if (!model) {
     if (preservedPreview) URL.revokeObjectURL(preservedPreview);
@@ -1717,6 +1726,7 @@ function applyProjectComposer(detail) {
   $("lang-input").value = model.targetLanguage;
   $("dialogue-brief").value = model.dialogueBrief;
   $("replacement-instruction").value = model.replacementInstruction;
+  $("adaptation-prompt").value = model.adaptationPrompt;
   setComposerError(null);
 
   if (model.source && model.source.mode === "upload") {
@@ -1770,6 +1780,7 @@ function resetComposerForNewProject() {
   resetReplacementImageDisplay();
   $("replacement-instruction").value = "";
   $("dialogue-brief").value = "";
+  $("adaptation-prompt").value = "";
   document.querySelector('input[name="source-mode"][value="link"]').checked = true;
   document.querySelector('input[name="aspect-ratio"][value="9:16"]').checked = true;
   document.querySelector('input[name="resolution"][value="768p"]').checked = true;
@@ -1797,6 +1808,7 @@ function setUploading(on) {
   $("replacement-image-input").disabled = controlsDisabled;
   $("replacement-remove").disabled = controlsDisabled;
   $("replacement-instruction").disabled = controlsDisabled;
+  $("adaptation-prompt").disabled = controlsDisabled;
   document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
     r.disabled = controlsDisabled;
   });
@@ -1879,6 +1891,7 @@ async function handleSend(event) {
       targetLanguage: selectedTargetLanguage(),
       hasReplacementImage: !!state.replacementImage,
       replacementInstruction: $("replacement-instruction").value,
+      adaptationPrompt: $("adaptation-prompt").value,
     }, capability);
   } catch (err) {
     setComposerError(err.message);
@@ -2031,6 +2044,11 @@ function bindEvents() {
     });
   });
   $("dialogue-brief").addEventListener("input", () => {
+    state.clientRequestId = newRequestId();
+    setComposerError(null);
+    updateSendBtn();
+  });
+  $("adaptation-prompt").addEventListener("input", () => {
     state.clientRequestId = newRequestId();
     setComposerError(null);
     updateSendBtn();

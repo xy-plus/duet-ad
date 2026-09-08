@@ -136,6 +136,7 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     assert re.findall(r'<textarea\b[^>]*\bid="([^"]+)"', visible) == [
         "dialogue-brief",
         "replacement-instruction",
+        "adaptation-prompt",
     ]
     assert 'name="voice-mode"' not in visible
     assert 'name="dialogue-mode"' not in visible
@@ -286,7 +287,9 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
         "request:contract.buildMinimalGenerationRequest(base,capability),"
         "injected:contract.buildMinimalGenerationRequest({...base,script:'用户注入台词'},capability),"
         "replacement:contract.buildMinimalGenerationRequest({...base,aspectRatio:'16:9',resolution:'480p',"
-        "hasReplacementImage:true,replacementInstruction:' 替换成参考产品 '},capability)}})()"
+        "hasReplacementImage:true,replacementInstruction:' 替换成参考产品 '},capability),"
+        "adapted:contract.buildMinimalGenerationRequest({...base,adaptationPrompt:' 赛博朋克霓虹 '},capability),"
+        "adaptedBlank:contract.buildMinimalGenerationRequest({...base,adaptationPrompt:'   '},capability)}})()"
     )
 
     request = {
@@ -306,6 +309,7 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
             "target_language": "日语",
         },
         "replacement_guidance": None,
+        "adaptation_prompt": None,
     }
     same_request = json.loads(json.dumps(request))
     same_request["dialogue"]["target_language"] = "与原视频相同"
@@ -329,6 +333,8 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
         "image_field": "replacement_image",
     }
     assert result["replacement"] == replacement
+    assert result["adapted"]["adaptation_prompt"] == "赛博朋克霓虹"
+    assert result["adaptedBlank"]["adaptation_prompt"] is None
     assert "script" not in json.dumps(result)
 
     request_builder = _function_source(
@@ -630,7 +636,8 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "replacement_guidance:{instruction:'替换成参考产品',image_field:'replacement_image'}};"
         "const local={request,input:contract.creationInputSnapshot({url:'https://media.example/source.mp4',"
         "replacementImage:{name:'product.png',size:321,type:'image/png'}})};"
-        "const restored=contract.projectComposerModel({effective_request:request,"
+        "const restored=contract.projectComposerModel({effective_request:{...request,"
+        "adaptation_prompt:'赛博朋克霓虹'},"
         "input_receipt:{replacement_image:{sha256:'a',bytes:321}}},local);"
         "const same=contract.projectComposerModel({effective_request:{...request,"
         "dialogue:{mode:'auto_rewrite',target_language:'与原视频相同'},replacement_guidance:null},"
@@ -653,6 +660,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "替换成参考产品",
+        "adaptationPrompt": "赛博朋克霓虹",
         "source": {"mode": "link", "reference_url": "https://media.example/source.mp4"},
         "replacementImage": {
             "filename": "product.png", "bytes": 321,
@@ -667,6 +675,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "same",
         "targetLanguage": "",
         "replacementInstruction": "",
+        "adaptationPrompt": "",
         "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
         "replacementImage": None,
     }
@@ -678,6 +687,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "",
+        "adaptationPrompt": "",
         "source": None,
         "replacementImage": None,
     }
@@ -689,6 +699,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "languageMode": "other",
         "targetLanguage": "日语",
         "replacementInstruction": "",
+        "adaptationPrompt": "",
         "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
         "replacementImage": None,
     }

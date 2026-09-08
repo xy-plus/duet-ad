@@ -78,6 +78,7 @@ _CREATE_FIELDS = {
     "replacement_instruction",
     "dialogue_mode",
     "dialogue_brief",
+    "adaptation_prompt",
 }
 _STRICT_LIMIT_RE = re.compile(r"^(?:[1-9]|[1-9][0-9]|100)$")
 _UNKNOWN_SUBMISSION_STATUSES = frozenset({"submission_started", "unknown"})
@@ -744,6 +745,7 @@ def install(
         replacement_instruction: Annotated[str | None, Form()] = None,
         dialogue_mode: Annotated[str | None, Form()] = None,
         dialogue_brief: Annotated[str | None, Form()] = None,
+        adaptation_prompt: Annotated[str | None, Form()] = None,
     ):
         limiter.check(identity.owner_id, "create", 10)
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -811,6 +813,14 @@ def install(
                 raise PublicAPIError(422, "dialogue_brief_too_long", "dialogue_brief 超过长度限制", field="dialogue_brief")
         elif raw_brief is not None:
             raise PublicAPIError(422, "invalid_dialogue_brief", "dialogue_brief 仅在 dialogue_mode=generate 时可用", field="dialogue_brief")
+        adaptation = None
+        raw_adaptation = form.get("adaptation_prompt", adaptation_prompt)
+        if raw_adaptation is not None:
+            if not isinstance(raw_adaptation, str):
+                raise PublicAPIError(422, "invalid_adaptation_prompt", "adaptation_prompt 无效", field="adaptation_prompt")
+            adaptation = raw_adaptation.strip() or None
+        if adaptation is not None and _utf16_code_units(adaptation) > DIALOGUE_BRIEF_MAX_CHARS:
+            raise PublicAPIError(422, "adaptation_prompt_too_long", "adaptation_prompt 超过长度限制", field="adaptation_prompt")
         generation_request = {
             "version": 1,
             "output": {"aspect_ratio": aspect_ratio, "resolution": resolution, "fit_mode": "auto"},
@@ -828,6 +838,7 @@ def install(
                 }
             ),
             "replacement_guidance": None if instruction is None else {"instruction": instruction, "image_field": "replacement_image"},
+            "adaptation_prompt": adaptation,
         }
         idem_digest = _idempotency_digest(identity.owner_id, idempotency_key)
         client_request_id = idem_digest[:32]
@@ -837,6 +848,7 @@ def install(
             "target_language": language,
             "dialogue_mode": mode,
             "dialogue_brief": brief,
+            "adaptation_prompt": adaptation,
             "replacement_instruction": instruction,
             "source_kind": "upload" if source_video is not None else "url",
             "source_url": normalized_url,

@@ -4271,6 +4271,7 @@ class Pipeline:
                 make_proxies,
                 lambda paths: list(paths),
             )
+        adaptation_prompt = request.get("adaptation_prompt")
         visual_payload = {
             "generation_config": generation_config,
             "segment": {
@@ -4288,6 +4289,8 @@ class Pipeline:
                 for order, path in enumerate(analysis_frames, 1)
             ],
         }
+        if adaptation_prompt:
+            visual_payload["user_adaptation"] = adaptation_prompt
         visual_path = directory / "visual_prompt.txt"
         visual_prompt = visual_path.read_text(encoding="utf-8").strip() if resume and visual_path.is_file() else ""
         if visual_prompt:
@@ -4302,7 +4305,13 @@ class Pipeline:
                 analysis_frames,
                 lambda: self.deepseek.complete_structured(
                     skill
-                    + "\n\n本次只执行逐段视觉分析；最终输出严格遵循本次注入的 JSON Schema。",
+                    + "\n\n本次只执行逐段视觉分析；最终输出严格遵循本次注入的 JSON Schema。"
+                    + (
+                        "\nWeave the overall adaptation intent expressed in "
+                        "payload.user_adaptation into this segment's visual prompt."
+                        if adaptation_prompt
+                        else ""
+                    ),
                     visual_payload,
                     VISUAL_PROMPT_SCHEMA,
                     analysis_frames,

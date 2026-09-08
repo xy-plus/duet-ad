@@ -248,6 +248,7 @@ def _parse_generation_request(
         <= set(value)
         <= {
             "version", "output", "processing", "dialogue", "replacement_guidance",
+            "adaptation_prompt",
         }
     ):
         raise _error(
@@ -349,6 +350,24 @@ def _parse_generation_request(
             "image_field": "replacement_image",
         }
 
+    adaptation_prompt = value.get("adaptation_prompt")
+    if adaptation_prompt is not None:
+        if not isinstance(adaptation_prompt, str):
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "adaptation_prompt 无效",
+            )
+        adaptation_prompt = adaptation_prompt.strip()
+        if not adaptation_prompt:
+            adaptation_prompt = None
+        elif _utf16_code_units(adaptation_prompt) > DIALOGUE_BRIEF_MAX_CHARS:
+            raise _error(
+                422,
+                "invalid_generation_request",
+                "adaptation_prompt 过长",
+            )
+
     # Fusion is injected only after the complete public request has passed the
     # closed v1 validator; clients cannot select or shadow the internal agent.
     return {
@@ -368,6 +387,7 @@ def _parse_generation_request(
             }
         ),
         "replacement_guidance": normalized_guidance,
+        "adaptation_prompt": adaptation_prompt,
         "fusion": {"agent": internal_fusion_agent},
     }
 

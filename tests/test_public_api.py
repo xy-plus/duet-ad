@@ -807,6 +807,73 @@ def test_create_generate_mode_maps_brief_into_generation_request(
     app.state.pipeline.release.set()
 
 
+def test_create_maps_adaptation_prompt_into_generation_request(
+    tmp_path, video_1s
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    with TestClient(app) as client:
+        created = _create(
+            client,
+            auth,
+            video_1s,
+            key="adaptation01",
+            adaptation_prompt=" 整片改成赛博朋克霓虹风格 ",
+        )
+        assert created.status_code == 201
+        pid = created.json()["id"][3:]
+        state = client.get(f"/api/conversations/{pid}", headers=AUTH).json()
+        blank = _create(
+            client,
+            auth,
+            video_1s,
+            key="adaptation02",
+            adaptation_prompt="   ",
+        )
+        assert blank.status_code == 201
+        blank_pid = blank.json()["id"][3:]
+        blank_state = client.get(
+            f"/api/conversations/{blank_pid}", headers=AUTH
+        ).json()
+
+    assert state["effective_request"]["adaptation_prompt"] == (
+        "整片改成赛博朋克霓虹风格"
+    )
+    assert blank_state["effective_request"]["adaptation_prompt"] is None
+    app.state.pipeline.release.set()
+
+
+@pytest.mark.parametrize(
+    ("data", "code", "field"),
+    [
+        (
+            {"adaptation_prompt": "长" * 1001},
+            "adaptation_prompt_too_long",
+            "adaptation_prompt",
+        ),
+        (
+            {"adaptation_prompt": "\U0001F600" * 501},
+            "adaptation_prompt_too_long",
+            "adaptation_prompt",
+        ),
+    ],
+)
+def test_adaptation_prompt_validation_is_strict_and_reserve_free(
+    tmp_path, video_1s, data, code, field
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    with TestClient(app) as client:
+        response = _create(client, auth, video_1s, key="adaptationx1", **data)
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == code
+    assert error["field"] == field
+    assert _store(app).list() == []
+    assert public_credits.balance(settings.data_dir, "partner_one")["reserved"] == 0
+
+
 @pytest.mark.parametrize(
     ("data", "code", "field"),
     [

@@ -218,6 +218,7 @@ Content-Disposition: form-data; name="replacement_instruction"
 | `target_language` | string | 否 | 与原视频相同 | 去除首尾空白后不能为空；最多 80 个 UTF-16 字符单元 | 对白目标语言，例如 `中文`、`English` |
 | `dialogue_mode` | string | 否 | `auto_rewrite` | `auto_rewrite`、`generate` | 台词模式；`auto_rewrite` 翻译并自然改写原台词，`generate` 按 `dialogue_brief` 描述自动生成台词 |
 | `dialogue_brief` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 口播台词的内容描述；`dialogue_mode` 为 `generate` 时必填，其余模式不允许提供 |
+| `adaptation_prompt` | string | 否 | 无 | 最多 1,000 个 UTF-16 字符单元；去除首尾空白后为空视为未提供 | 总体改编提示词：对整片某角度（如风格）的修改意图，融入逐段视觉生成 |
 | `replacement_image` | binary | 条件必填 | 无 | JPEG、PNG、WebP；最大 10 MiB | 主体替换参考图；必须与 `replacement_instruction` 同时提供 |
 | `replacement_instruction` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 描述如何使用参考图；必须与 `replacement_image` 同时提供 |
 
@@ -770,6 +771,8 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 | `422` | `invalid_dialogue_mode` | 台词模式不受支持 | 使用能力接口列出的模式 |
 | `422` | `invalid_dialogue_brief` | `generate` 模式缺少台词描述，或非 `generate` 模式携带了 `dialogue_brief` | 按模式规则提供或省略 |
 | `422` | `dialogue_brief_too_long` | 台词描述超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
+| `422` | `invalid_adaptation_prompt` | `adaptation_prompt` 不是字符串 | 提供字符串或省略字段 |
+| `422` | `adaptation_prompt_too_long` | 总体改编提示词超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
 | `422` | `replacement_instruction_too_long` | 替换说明超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
 | `422` | `invalid_source_video_url` | URL 不符合公网 HTTPS 规则或无法访问 | 修改 URL |
 | `422` | `invalid_create_request` | 包含未知或重复字段 | 只提交文档列出的字段一次 |

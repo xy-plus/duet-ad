@@ -206,6 +206,19 @@
             <p id="replacement-hint" class="field-hint">参考图与替换说明需要一起提供</p>
           </section>
 
+          <section class="setup-section optional-section" aria-labelledby="adaptation-title">
+            <div class="setup-heading">
+              <span class="setup-step is-optional">可选</span>
+              <div>
+                <h2 id="adaptation-title">总体改编提示词</h2>
+                <p>描述对整片某角度的改编意图，融入逐段视觉生成</p>
+              </div>
+            </div>
+            <label class="sr-only" for="adaptation-prompt">总体改编提示词</label>
+            <textarea id="adaptation-prompt" class="setup-textarea" rows="3" maxlength="1000"
+                      placeholder="例如：把整片改编成赛博朋克霓虹风格"></textarea>
+          </section>
+
           <p id="creation-service-status" class="creation-service-status" aria-live="polite">正在连接生成服务…</p>
           <button type="submit" id="send-btn" class="btn btn-primary create-video-button" disabled>开始生成</button>
           <div id="upload-progress" class="upload-progress" hidden>

@@ -885,6 +885,8 @@ def test_generation_request_accepts_only_the_closed_v1_shape(tmp_path: Path):
             }),
             json.dumps({**GENERATION_REQUEST, "dialogue": None}),
             json.dumps({**GENERATION_REQUEST, "dialogue": {}}),
+            json.dumps({**GENERATION_REQUEST, "adaptation_prompt": 123}),
+            json.dumps({**GENERATION_REQUEST, "adaptation_prompt": "长" * 1001}),
             json.dumps({
                 **GENERATION_REQUEST,
                 "dialogue": {"target_language": "日语", "brief": "介绍产品"},
@@ -981,6 +983,51 @@ def test_generation_request_accepts_generate_mode_with_brief(tmp_path: Path):
             "target_language": "日语",
             "brief": "用轻松口吻介绍新产品",
         }
+
+
+def test_generation_request_accepts_adaptation_prompt(tmp_path: Path):
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        adapted = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="adaptation-prompt",
+                generation_request=json.dumps({
+                    **GENERATION_REQUEST,
+                    "adaptation_prompt": " 整片改成赛博朋克霓虹风格 ",
+                }),
+            ),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
+        )
+        assert adapted.status_code == 201
+        assert adapted.json()["effective_request"]["adaptation_prompt"] == (
+            "整片改成赛博朋克霓虹风格"
+        )
+
+        blank = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(
+                client_request_id="adaptation-prompt-blank",
+                generation_request=json.dumps({
+                    **GENERATION_REQUEST,
+                    "adaptation_prompt": "   ",
+                }),
+            ),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
+        )
+        assert blank.status_code == 201
+        assert blank.json()["effective_request"]["adaptation_prompt"] is None
+
+        omitted = client.post(
+            "/api/conversations",
+            headers=AUTH,
+            data=create_payload(client_request_id="adaptation-prompt-omitted"),
+            files={"file": ("source.mp4", b"x", "video/mp4")},
+        )
+        assert omitted.status_code == 201
+        assert omitted.json()["effective_request"]["adaptation_prompt"] is None
 
 
 def test_generation_request_fills_dialogue_defaults_for_legacy_clients(tmp_path: Path):

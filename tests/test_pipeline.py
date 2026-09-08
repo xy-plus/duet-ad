@@ -968,6 +968,73 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
     )
 
 
+def test_video_maker_injects_user_adaptation_from_effective_request(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request()
+    request["adaptation_prompt"] = "整片改成赛博朋克霓虹风格"
+    project_id, project, _state = store.create(request, "adaptation-visual")
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    _install_fake_media(monkeypatch, [])
+
+    class _VisualDeepSeek:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def complete_structured(
+            self,
+            instruction: str,
+            payload: Any,
+            schema: dict[str, Any],
+            images: list[Path] | None = None,
+            validator: Any = None,
+        ) -> ProviderResult[dict[str, Any]]:
+            assert schema == VISUAL_PROMPT_SCHEMA
+            self.calls.append({"instruction": instruction, "payload": payload})
+            return ProviderResult(
+                {"prompt": "visual-1"}, {"response": {"api": "responses"}},
+            )
+
+    deepseek = _VisualDeepSeek()
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=deepseek,
+        mediakit=object(),
+        picsart=object(),
+    )
+    segment = {
+        "index": 1,
+        "start_s": 0.0,
+        "duration_s": 4.2,
+        "end_s": 4.2,
+        "join_mode": "hard_cut",
+    }
+    selection = [{} for _ in range(9)]
+    prepared = pipeline._prepare_segment(
+        project_id, project, source, segment, selection, request,
+        ResearchLog(project),
+    )
+    assert prepared["visual_prompt"] == "visual-1"
+    assert len(deepseek.calls) == 1
+    adapted_call = deepseek.calls[0]
+    assert adapted_call["payload"]["user_adaptation"] == "整片改成赛博朋克霓虹风格"
+    assert "payload.user_adaptation" in adapted_call["instruction"]
+
+    plain = pipeline._prepare_segment(
+        project_id, project, source, {**segment, "index": 2}, selection,
+        _effective_request(), ResearchLog(project),
+    )
+    assert plain["visual_prompt"] == "visual-1"
+    assert len(deepseek.calls) == 2
+    plain_call = deepseek.calls[1]
+    assert "user_adaptation" not in plain_call["payload"]
+    assert "payload.user_adaptation" not in plain_call["instruction"]
+
+
 def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
