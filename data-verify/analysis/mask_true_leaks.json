@@ -1,0 +1,85 @@
+{
+ "2be0b352e7874a8ba794ca3f11c4fa8b": {
+  "0001": {
+   "frames": 300,
+   "face_frames_src": 300,
+   "true_leaks": []
+  },
+  "0002": {
+   "frames": 257,
+   "face_frames_src": 218,
+   "true_leaks": []
+  },
+  "0003": {
+   "frames": 294,
+   "face_frames_src": 275,
+   "true_leaks": []
+  },
+  "0004": {
+   "frames": 252,
+   "face_frames_src": 230,
+   "true_leaks": []
+  }
+ },
+ "2be14a82063e41e59146936a54a86027": {
+  "0001": {
+   "frames": 249,
+   "face_frames_src": 249,
+   "true_leaks": []
+  },
+  "0002": {
+   "frames": 300,
+   "face_frames_src": 300,
+   "true_leaks": []
+  },
+  "0003": {
+   "frames": 147,
+   "face_frames_src": 147,
+   "true_leaks": []
+  },
+  "0004": {
+   "frames": 225,
+   "face_frames_src": 225,
+   "true_leaks": []
+  },
+  "0005": {
+   "frames": 120,
+   "face_frames_src": 120,
+   "true_leaks": []
+  }
+ },
+ "331ef2d132364e0b809a624cdb8fd25d": {
+  "0001": {
+   "frames": 300,
+   "face_frames_src": 300,
+   "true_leaks": []
+  },
+  "0002": {
+   "frames": 257,
+   "face_frames_src": 218,
+   "true_leaks": []
+  },
+  "0003": {
+   "frames": 294,
+   "face_frames_src": 275,
+   "true_leaks": []
+  },
+  "0004": {
+   "frames": 252,
+   "face_frames_src": 230,
+   "true_leaks": []
+  }
+ },
+ "80e34503b56f4f1cb8c11b7f1ea9e04e": {
+  "0001": {
+   "frames": 294,
+   "face_frames_src": 16,
+   "true_leaks": []
+  },
+  "0002": {
+   "frames": 214,
+   "face_frames_src": 84,
+   "true_leaks": []
+  }
+ }
+}
