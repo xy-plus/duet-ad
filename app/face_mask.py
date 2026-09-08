@@ -27,7 +27,8 @@ MODEL_PATH = (
 )
 SCORE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.3
-PAD_RATIO = 0.25  # expand each side of the face box by 25% of its width/height
+PAD_RATIO = 0.35  # expand top/sides of the face box by 35% of its width/height
+CHIN_PAD_RATIO = 0.5  # expand the bottom further: YuNet boxes end above the chin
 GRAY_FILL = (128, 128, 128)  # solid neutral gray (BGR) filling the face box
 
 
@@ -46,11 +47,12 @@ def _face_boxes(
         return boxes
     for face in faces:
         x, y, w, h = (float(v) for v in face[:4])
-        pad_x, pad_y = w * PAD_RATIO, h * PAD_RATIO
+        pad_x, pad_top = w * PAD_RATIO, h * PAD_RATIO
+        pad_bottom = h * CHIN_PAD_RATIO
         x0 = max(0, int(round(x - pad_x)))
-        y0 = max(0, int(round(y - pad_y)))
+        y0 = max(0, int(round(y - pad_top)))
         x1 = min(width, int(round(x + w + pad_x)))
-        y1 = min(height, int(round(y + h + pad_y)))
+        y1 = min(height, int(round(y + h + pad_bottom)))
         if x1 > x0 and y1 > y0:
             boxes.append((x0, y0, x1, y1))
     return boxes
