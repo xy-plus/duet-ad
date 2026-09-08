@@ -4823,7 +4823,8 @@ class Pipeline:
                     ],
                 ),
             )
-            processing = self._validated_effective_request(request)["processing"]
+            effective = self._validated_effective_request(request)
+            processing = effective["processing"]
             face_block = ""
             sheet_reference = replacement_sheet.get("h3_image_reference")
             masks_faces = (
@@ -4850,6 +4851,14 @@ class Pipeline:
                     "Gray blocks mask source faces; never draw them. "
                     "Replace them with the face provided below.\n\n"
                 )
+            adaptation_block = ""
+            if effective.get("adaptation_prompt"):
+                # 有整片改编提示词时，动作以融合后的提示词为准，不照搬参考视频；
+                # 紧跟灰块说明，保持在提示词头部区域。与是否打码无关。
+                adaptation_block = (
+                    "Motion and actions follow this prompt, not the "
+                    "reference video.\n\n"
+                )
             overlay_targets = []
             if processing["remove_subtitle"]:
                 overlay_targets.append(
@@ -4871,7 +4880,9 @@ class Pipeline:
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
                 for line in item["dialogue"]
             )
-            final_prompt = mask_block + face_block + prompt + overlay_block + (
+            final_prompt = (
+                mask_block + adaptation_block + face_block + prompt
+                + overlay_block + (
                 "\n\nDialogue requirements: Audio 1 is this segment's "
                 "pre-recorded dialogue speech track in the target language. "
                 "Every speaking person must lip-sync precisely to Audio 1: "
@@ -4882,6 +4893,7 @@ class Pipeline:
                 "padded time. The spoken lines in Audio 1 are:\n" + dialogue
                 if dialogue
                 else "\n\nDo not add captions, subtitles, or new dialogue."
+                )
             )
             segment_dir = item["source"].parent
             (segment_dir / "h3_prompt.txt").write_text(

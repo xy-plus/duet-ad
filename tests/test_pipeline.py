@@ -5534,6 +5534,45 @@ def test_h3_fusion_payload_carries_user_adaptation(
     assert fusion_payloads[0]["user_adaptation"] == "把整片改成水墨风格"
 
 
+def test_h3_final_prompt_motion_directive_follows_adaptation_prompt(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    # 有 adaptation_prompt 时，最终 H3 提示词头部（紧跟灰块说明）注入
+    # "动作以提示词为准" 指令；没有时完全不注入。
+    directive = "Motion and actions follow this prompt, not the reference video."
+    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls, _payloads = (
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    _item, adapted_prompt, _muted, _sha = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(adaptation_prompt="把整片改成水墨风格"),
+        ResearchLog(project),
+    )
+
+    assert adapted_prompt.startswith("Gray blocks mask source faces")
+    assert directive in adapted_prompt
+    assert adapted_prompt.index("Gray blocks") < adapted_prompt.index(directive)
+    assert adapted_prompt.index(directive) < adapted_prompt.index(
+        "FACE REPLACEMENT IS MANDATORY"
+    )
+
+    _item, plain_prompt, _muted, _sha = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert plain_prompt.startswith("Gray blocks mask source faces")
+    assert directive not in plain_prompt
+
+
 def _dialogue_audio_fixture(
     tmp_path: Path,
     monkeypatch: Any,
