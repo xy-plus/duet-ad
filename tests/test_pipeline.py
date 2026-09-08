@@ -170,6 +170,7 @@ class _FlowMediaKit:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.calls: list[list[str]] = []
+        self.video_erase_calls: list[str] = []
 
     def erase(
         self, source: Path, destination: Path, scenes: list[str],
@@ -181,6 +182,27 @@ class _FlowMediaKit:
             destination,
             {"stages": list(scenes), "raw": "mediakit-response"},
             [destination],
+        )
+
+    def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
+        with self.lock:
+            self.video_erase_calls.append(video_url)
+        return ProviderResult(
+            "mediakit-video-task",
+            {"outcome": "accepted", "task_id": "mediakit-video-task"},
+        )
+
+    def poll_task(self, task_id: str) -> ProviderResult[str]:
+        assert task_id == "mediakit-video-task"
+        return ProviderResult(
+            "https://result.invalid/erased.mp4", {"task_id": task_id},
+        )
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"erased-source")
+        return ProviderResult(
+            destination, {"request": {"url": url}}, [destination],
         )
 
 class _FlowSeedream:
@@ -1001,6 +1023,19 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert len(picsart.submits) == 2
     assert len(seedream.calls) == 1
     assert len(mediakit.calls) == 18
+    # The source's burned-in subtitles are erased once at project level and
+    # every downstream consumer switches to the erased file.
+    assert mediakit.video_erase_calls == [
+        "https://assets.invalid/inputs/source.mp4",
+    ]
+    assert (project / "work" / "source-nosubs.mp4").is_file()
+    cut_input = json.loads(
+        (
+            project / "logs" / "segment-cut" / "segment-0001"
+            / "attempt-1" / "input.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert cut_input["source"].endswith("work/source-nosubs.mp4")
     assert all(
         call == ["full_screen_text_erase", "full_screen_icon_erase"]
         for call in mediakit.calls
@@ -6286,6 +6321,125 @@ def test_h3_manifest_rejects_dialogue_track_mismatch(
 
     with pytest.raises(ValueError, match="dialogue track does not match"):
         pipeline.validate_r2v_resume(project_id)
+
+
+class _RejectMediaKitVideoErase:
+    def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("video subtitle erase must not run")
+
+
+def test_erase_source_subtitles_switch_off_is_a_complete_skip(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "erase-off",
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=_RejectMediaKitVideoErase(),
+        picsart=object(),
+    )
+    request = _effective_request()
+    request["processing"]["remove_subtitle"] = False
+
+    result = pipeline._erase_source_subtitles(
+        project_id, project, source, request, ResearchLog(project),
+    )
+
+    assert result == source
+    assert not (project / "work" / "source-nosubs.mp4").exists()
+    assert not (project / "logs" / "erase-source-subtitles").exists()
+
+
+def test_erase_source_subtitles_moderation_rejection_retries_until_success(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    class FlakyMediaKit:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def submit_video_subtitle_erase(self, *_args: Any, **_kwargs: Any) -> ProviderResult[str]:
+            self.calls += 1
+            if self.calls <= 5:
+                raise ProviderFailure(
+                    {"error": "content policy violation"},
+                    [],
+                    RuntimeError("mediakit content policy rejection"),
+                )
+            return ProviderResult(
+                "erase-task-1", {"outcome": "accepted", "task_id": "erase-task-1"},
+            )
+
+        def poll_task(self, task_id: str) -> ProviderResult[str]:
+            return ProviderResult(
+                "https://mediakit.invalid/erased.mp4", {"task_id": task_id},
+            )
+
+        def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+            destination.write_bytes(b"erased")
+            return ProviderResult(destination, {"request": {"url": url}}, [destination])
+
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "erase-fails",
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    mediakit = FlakyMediaKit()
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=mediakit,
+        picsart=object(),
+    )
+    delays: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", delays.append)
+
+    # Moderation rejections retry with backoff instead of failing closed.
+    result = pipeline._erase_source_subtitles(
+        project_id, project, source, _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert result == project / "work" / "source-nosubs.mp4"
+    assert result.read_bytes() == b"erased"
+    assert mediakit.calls == 6
+    assert delays == [60.0, 120.0, 240.0]
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "node_moderation_persistent" in trace
+    assert '"consecutive": 5' in trace
+
+
+def test_pre_picsart_resume_does_not_require_the_erased_source(
+    tmp_path: Path,
+) -> None:
+    # Projects frozen before the erase node existed carry no
+    # work/source-nosubs.mp4; resume must reuse frozen segment artifacts.
+    store, project_id, project, _sheet, _seedream = (
+        _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
+    )
+
+    assert not (project / "work" / "source-nosubs.mp4").exists()
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda *_args: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=_RejectMediaKitVideoErase(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+
+    pipeline.validate_pre_picsart_resume(project_id)
 
 
 class _FetchFailPicsart(_FlowPicsart):
