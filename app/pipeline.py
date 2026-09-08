@@ -4780,6 +4780,9 @@ class Pipeline:
                 "authoritative_constraints": self._fusion_authority_block(
                     element_index, index, replacement_sheet,
                 ),
+                "user_adaptation": self._validated_effective_request(
+                    request
+                ).get("adaptation_prompt"),
             }
             fusion_schema, fusion_input_sha256 = fusion_prompt_schema(
                 fusion_payload,

@@ -84,6 +84,7 @@ def _effective_request(
     brief: str | None = None,
     fusion_agent: str = "deepseek",
     replacement_instruction: str | None = None,
+    adaptation_prompt: str | None = None,
 ) -> dict[str, Any]:
     return {
         "version": 1,
@@ -117,6 +118,7 @@ def _effective_request(
             if replacement_instruction is not None
             else None
         ),
+        "adaptation_prompt": adaptation_prompt,
         "fusion": {"agent": fusion_agent},
     }
 
@@ -1251,6 +1253,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
             "h3_reference_images",
             "replacement_sheet",
             "authoritative_constraints",
+            "user_adaptation",
         }
         for call in fusion_calls
     )
@@ -1687,6 +1690,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
         "h3_image_reference": "Image 1",
         "tiles": replacement_sheet["spec"]["tiles"],
     }
+    assert calls[0]["payload"]["user_adaptation"] is None
     assert calls[0]["schema"]["additionalProperties"] is False
     assert calls[0]["images"] == []
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
@@ -5383,7 +5387,7 @@ def _prepare_h3_mask_fixture(
     monkeypatch: Any,
 ) -> tuple[
     Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
-    list[tuple[Path, Path]],
+    list[tuple[Path, Path]], list[dict[str, Any]],
 ]:
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
@@ -5430,15 +5434,18 @@ def _prepare_h3_mask_fixture(
         "dialogue": [],
     }
 
+    fusion_payloads: list[dict[str, Any]] = []
+
     class FakeFusion:
         def complete_structured(
             self,
             _instruction: str,
-            _payload: dict[str, Any],
+            payload: dict[str, Any],
             schema: dict[str, Any],
             _images: list[Path],
             validator: Any = None,
         ) -> ProviderResult[dict[str, Any]]:
+            fusion_payloads.append(payload)
             return ProviderResult({
                 "schema": FUSION_OUTPUT_NAME,
                 "version": 1,
@@ -5471,14 +5478,15 @@ def _prepare_h3_mask_fixture(
 
     monkeypatch.setattr(face_mask, "mask_faces", fake_mask_faces)
     return (
-        pipeline, project, item, enhanced_index, replacement_sheet, mask_calls,
+        pipeline, project, item, enhanced_index, replacement_sheet,
+        mask_calls, fusion_payloads,
     )
 
 
 def test_h3_segment_with_a_replaced_person_masks_faces(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls, fusion_payloads = (
         _prepare_h3_mask_fixture(tmp_path, monkeypatch)
     )
     segment_dir = project / "work" / "segments" / "0001"
@@ -5492,6 +5500,7 @@ def test_h3_segment_with_a_replaced_person_masks_faces(
         ResearchLog(project),
     )
 
+    assert fusion_payloads[0]["user_adaptation"] is None
     assert muted == segment_dir / "source-faces-masked.mp4"
     assert muted.read_bytes() == b"source-masked"
     assert mask_calls == [
@@ -5504,6 +5513,25 @@ def test_h3_segment_with_a_replaced_person_masks_faces(
         ).read_text(encoding="utf-8")
     )
     assert output == {"frames": 1, "frames_with_face": 1, "faces_total": 1}
+
+
+def test_h3_fusion_payload_carries_user_adaptation(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls, fusion_payloads = (
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(adaptation_prompt="把整片改成水墨风格"),
+        ResearchLog(project),
+    )
+
+    assert fusion_payloads[0]["user_adaptation"] == "把整片改成水墨风格"
 
 
 def _dialogue_audio_fixture(
@@ -6092,7 +6120,7 @@ def test_picsart_segment_uses_the_dialogue_slice_as_audio_1(
 def test_h3_segment_without_a_replaced_person_keeps_the_muted_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls, _payloads = (
         _prepare_h3_mask_fixture(tmp_path, monkeypatch)
     )
     # The replaced person never appears in segment 1.
@@ -6948,7 +6976,7 @@ def test_node_retries_subprocess_timeouts_until_success(tmp_path: Path) -> None:
 def test_face_mask_failure_degrades_to_unmasked_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls, _payloads = (
         _prepare_h3_mask_fixture(tmp_path, monkeypatch)
     )
 
@@ -6986,7 +7014,7 @@ def test_face_mask_failure_degrades_to_unmasked_reference(
 def test_face_mask_missing_model_stays_fatal(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls, _payloads = (
         _prepare_h3_mask_fixture(tmp_path, monkeypatch)
     )
     calls = 0
