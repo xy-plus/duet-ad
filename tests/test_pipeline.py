@@ -121,74 +121,17 @@ def _effective_request(
     }
 
 
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing_output",
-        "partial_output",
-        "missing_processing",
-        "disabled_processing",
-        "missing_dialogue",
-        "partial_dialogue",
-        "missing_fusion",
-        "extra_field",
-    ],
-)
-def test_effective_request_requires_the_complete_current_contract(
-    damage: str,
-) -> None:
+def test_effective_request_passes_through_regardless_of_shape() -> None:
+    # 中间层不做形态校验：自己写下的状态原样放行，消费点自行容错。
     request = _effective_request()
     assert Pipeline._validated_effective_request(request) is request
-    if damage == "missing_output":
-        request.pop("output")
-    elif damage == "partial_output":
-        request["output"].pop("fit_mode")
-    elif damage == "missing_processing":
-        request.pop("processing")
-    elif damage == "disabled_processing":
-        request["processing"]["optimize_image"] = False
-    elif damage == "missing_dialogue":
-        request.pop("dialogue")
-    elif damage == "partial_dialogue":
-        request["dialogue"].pop("mode")
-    elif damage == "missing_fusion":
-        request.pop("fusion")
-    else:
-        request["unsupported"] = True
-
-    with pytest.raises(ValueError, match="effective request"):
-        Pipeline._validated_effective_request(request)
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing_brief",
-        "empty_brief",
-        "blank_brief",
-        "unstripped_brief",
-        "extra_key",
-        "unknown_mode",
-    ],
-)
-def test_effective_request_generate_dialogue_shape(damage: str) -> None:
-    request = _effective_request(dialogue_mode="generate", brief="介绍产品")
+    request.pop("output")
+    request["processing"]["optimize_image"] = False
+    request["dialogue"] = {"mode": "manual"}
+    request["unsupported"] = True
     assert Pipeline._validated_effective_request(request) is request
-    if damage == "missing_brief":
-        request["dialogue"].pop("brief")
-    elif damage == "empty_brief":
-        request["dialogue"]["brief"] = ""
-    elif damage == "blank_brief":
-        request["dialogue"]["brief"] = "   "
-    elif damage == "unstripped_brief":
-        request["dialogue"]["brief"] = " 介绍产品"
-    elif damage == "extra_key":
-        request["dialogue"]["extra"] = True
-    else:
-        request["dialogue"]["mode"] = "manual"
-
     with pytest.raises(ValueError, match="effective request"):
-        Pipeline._validated_effective_request(request)
+        Pipeline._validated_effective_request(["not", "a", "dict"])
 
 
 def test_stored_voice_references_reject_noncurrent_asset_path(
