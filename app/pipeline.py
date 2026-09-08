@@ -4832,10 +4832,11 @@ class Pipeline:
             mask_block = ""
             if masks_faces:
                 # 灰块说明放最前（primacy 效应下开头约束遵守度最高）；
-                # 压到 50 字符内，给 Agent 生成的长提示词留预算。
+                # 压到最短（90 字符），给 Agent 生成的长提示词留预算。
                 # 换脸要求由紧随其后的 FACE REPLACEMENT 块承载。
                 mask_block = (
-                    "Gray blocks mask source faces; never draw them.\n\n"
+                    "Gray blocks mask source faces; never draw them. "
+                    "Replace them with the face provided below.\n\n"
                 )
             overlay_targets = []
             if processing["remove_subtitle"]:
