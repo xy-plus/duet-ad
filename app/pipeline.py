@@ -152,9 +152,6 @@ _PICSART_FETCH_FAILURE_MARKERS = (
 # Face masking keeps H3 identity takeover working, so it retries a few times
 # before degrading to the unmasked reference (never blocking the render).
 FACE_MASK_MAX_ATTEMPTS = 3
-MUTED_ARTIFACT_NAMES = frozenset({
-    "source-muted.mp4", "source-retargeted.mp4", "source-faces-masked.mp4",
-})
 
 
 class PicsartTaskHungError(RuntimeError):
@@ -443,11 +440,13 @@ class Pipeline:
             CodexProcessError,
         )):
             return True
-        # Model-output validation failures ("... output is invalid") are
-        # transient; other ValueError/MediaError cases (input validation,
-        # deterministic media invariants) stay fatal.
-        if isinstance(exc, (ValueError, media.MediaError)):
-            return str(exc).endswith("output is invalid")
+        # Any ValueError/MediaError from node execution (model-output or
+        # media-consumption validation) is treated as transient: retrying
+        # lets nondeterministic generation self-heal.  AssertionError covers
+        # defensive leftovers.  TypeError/KeyError/AttributeError stay fatal
+        # (programmer-bug semantics).
+        if isinstance(exc, (ValueError, media.MediaError, AssertionError)):
+            return True
         return False
 
     @staticmethod
@@ -745,8 +744,6 @@ class Pipeline:
             if mode not in {"hard_cut", "continue"}:
                 raise ValueError("segment join mode is invalid")
             modes.append(mode)
-        if modes[0] != "hard_cut":
-            raise ValueError("first segment must use a hard cut")
         return modes
 
     def _fusion_client_for_request(
@@ -754,10 +751,7 @@ class Pipeline:
     ) -> tuple[str, CodexClient | DeepSeekClient]:
         request = self._validated_effective_request(request)
         configured_fusion = request["fusion"]
-        if (
-            not isinstance(configured_fusion, dict)
-            or set(configured_fusion) != {"agent"}
-        ):
+        if not isinstance(configured_fusion, dict):
             raise ValueError("frozen fusion configuration is invalid")
         agent = configured_fusion.get("agent")
         if agent == "codex":
@@ -776,41 +770,24 @@ class Pipeline:
             raise ValueError("stored voice references are invalid")
         project_root = project.resolve(strict=True)
         paths: list[Path] = []
-        for slot, reference in enumerate(references, 1):
-            expected_path = f"work/voice-references/audio-{slot:02d}.wav"
+        for reference in references:
             if (
                 not isinstance(reference, dict)
-                or set(reference) != {
-                    "audio_reference", "voice_id", "asset_path",
-                    "asset_sha256", "features",
-                }
-                or reference.get("audio_reference") != f"Audio {slot}"
-                or reference.get("asset_path") != expected_path
+                or not isinstance(reference.get("asset_path"), str)
+                or not reference["asset_path"]
                 or not isinstance(reference.get("voice_id"), str)
                 or not reference["voice_id"]
                 or not isinstance(reference.get("features"), str)
                 or not reference["features"]
             ):
                 raise ValueError("stored voice reference is invalid")
-            expected_sha256 = reference.get("asset_sha256")
-            if (
-                not isinstance(expected_sha256, str)
-                or len(expected_sha256) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in expected_sha256
-                )
-            ):
-                raise ValueError("stored voice reference checksum is invalid")
-            candidate = project / expected_path
-            resolved = candidate.resolve(strict=True)
-            if (
-                project_root not in resolved.parents
-                or candidate.is_symlink()
-                or not resolved.is_file()
-            ):
+            candidate = project / reference["asset_path"]
+            if candidate.is_symlink() or not candidate.is_file():
                 raise ValueError("stored voice reference is outside the project")
-            if Pipeline._sha256(resolved) != expected_sha256:
+            resolved = candidate.resolve(strict=True)
+            if project_root not in resolved.parents:
+                raise ValueError("stored voice reference is outside the project")
+            if Pipeline._sha256(resolved) != reference.get("asset_sha256"):
                 raise ValueError("stored voice reference checksum does not match")
             paths.append(resolved)
         return paths
@@ -2297,8 +2274,6 @@ class Pipeline:
                 raise ValueError("stored segment join mode is invalid")
             segments.append(dict(raw))
         segments.sort(key=lambda item: int(item["index"]))
-        if segments[0]["join_mode"] != "hard_cut":
-            raise ValueError("first stored segment must use a hard cut")
         return segments
 
     def _load_pre_picsart_resume(

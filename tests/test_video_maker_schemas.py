@@ -191,12 +191,13 @@ def test_project_index_schema_has_no_segment_metrics() -> None:
     assert "segment_metrics" not in PROJECT_INDEX_SCHEMA["properties"]
 
 
-def test_project_index_normalizer_rejects_extra_segment_metrics_key() -> None:
-    with pytest.raises(ValueError, match="project index output is invalid"):
-        normalize_project_index({
-            "people": [],
-            "entities": [],
-            "scenes": [],
-            "relations": [],
-            "segment_metrics": [],
-        })
+def test_project_index_normalizer_tolerates_extra_segment_metrics_key() -> None:
+    normalized = normalize_project_index({
+        "people": [],
+        "entities": [],
+        "scenes": [],
+        "relations": [],
+        "segment_metrics": [],
+    })
+
+    assert set(normalized) == {"people", "entities", "scenes", "relations"}

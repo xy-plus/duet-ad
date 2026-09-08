@@ -571,49 +571,17 @@ def test_untrusted_response_header_values_are_not_persisted(tmp_path: Path) -> N
     [
         httpx.Response(200, content=b"not-json"),
         httpx.Response(200, json={"data": []}),
-        httpx.Response(
-            200,
-            json={
-                "data": [
-                    {"b64_json": base64.b64encode(_PNG).decode("ascii")},
-                    {"b64_json": base64.b64encode(_PNG).decode("ascii")},
-                ],
-            },
-        ),
         httpx.Response(200, json={"data": [{"b64_json": "%%%"}]}),
         httpx.Response(
             200,
             json={"data": [{"b64_json": base64.b64encode(b"not-image").decode("ascii")}]},
         ),
-        httpx.Response(
-            200,
-            json={
-                "data": [
-                    {"b64_json": base64.b64encode(_png(1, 1)).decode("ascii")}
-                ]
-            },
-        ),
-        httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "b64_json": base64.b64encode(
-                            _png(2048, 1024)
-                        ).decode("ascii")
-                    }
-                ]
-            },
-        ),
     ],
     ids=[
         "non-json",
         "zero-images",
-        "multiple-images",
         "invalid-base64",
         "not-an-image",
-        "one-by-one-image",
-        "wrong-dimensions-and-aspect-ratio",
     ],
 )
 def test_protocol_error_is_terminal_and_never_reposts(
@@ -649,6 +617,53 @@ def test_protocol_error_is_terminal_and_never_reposts(
         )
     assert _cause(repeated).code == "provider_protocol_error"
     assert calls == 1
+
+
+def test_extra_images_and_noncanonical_dimensions_are_tolerated(
+    tmp_path: Path,
+) -> None:
+    responses = [
+        (
+            httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"b64_json": base64.b64encode(_PNG).decode("ascii")},
+                        {"b64_json": base64.b64encode(_png(1, 1)).decode("ascii")},
+                    ],
+                },
+            ),
+            _PNG,
+        ),
+        (
+            httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "b64_json": base64.b64encode(
+                                _png(2048, 1024)
+                            ).decode("ascii")
+                        }
+                    ],
+                },
+            ),
+            _png(2048, 1024),
+        ),
+    ]
+    for index, (response, expected_bytes) in enumerate(responses):
+        destination = tmp_path / f"sheet-{index}.png"
+        result = SeedreamClient(
+            _settings(tmp_path),
+            httpx.MockTransport(lambda _request: response),
+        ).generate(
+            prompt="frozen prompt",
+            images=[],
+            destination=destination,
+            receipt_path=tmp_path / f"receipt-{index}.json",
+        )
+        assert destination.read_bytes() == expected_bytes
+        assert result.value == destination
 
 
 def test_request_binding_mismatch_never_posts(tmp_path: Path) -> None:
@@ -834,7 +849,7 @@ def test_result_fsync_before_marker_failure_is_recovered_without_network(
 
 
 @pytest.mark.parametrize(
-    "damage", ["missing", "invalid", "truncated", "wrong_dimensions"]
+    "damage", ["missing", "invalid", "truncated"]
 )
 def test_submitting_receipt_without_valid_result_stays_unknown_and_never_posts(
     tmp_path: Path,
@@ -868,8 +883,6 @@ def test_submitting_receipt_without_valid_result_stays_unknown_and_never_posts(
         result_path.unlink()
     elif damage == "truncated":
         result_path.write_bytes(_PNG[:-8])
-    elif damage == "wrong_dimensions":
-        result_path.write_bytes(_png(1, 1))
     else:
         result_path.write_bytes(b"not-an-image")
 

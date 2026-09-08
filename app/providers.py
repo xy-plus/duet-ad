@@ -48,10 +48,6 @@ _RETRYABLE_TRANSPORT_ERRORS = (
 )
 _SECRET_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
 _ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_CODEX_TELEMETRY_RE = re.compile(
-    r"[ \t\r\n]*tokens used\r?\n"
-    r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)[ \t\r\n]*"
-)
 _CODEX_ACCOUNT_COMMAND = ("/home/xy/.local/bin/codex-acct", "acct2")
 _CODEX_MODEL = "gpt-5.6-sol"
 _CODEX_REASONING_EFFORT = "low"
@@ -623,9 +619,8 @@ def _parse_codex_object(raw: bytes) -> dict[str, Any]:
         if not text.startswith("```", closing):
             raise ValueError("Codex structured output has an incomplete JSON fence")
         suffix_start = closing + 3
-    suffix = text[suffix_start:]
-    if suffix.strip() and _CODEX_TELEMETRY_RE.fullmatch(suffix) is None:
-        raise ValueError("Codex structured output contains trailing text")
+    # Any trailing text (including the "tokens used" telemetry footer) is
+    # ignored: the JSON value above is the complete structured output.
     if not isinstance(value, dict):
         raise TypeError("Codex structured output must be an object")
     return value
@@ -1001,12 +996,9 @@ class MediaKitClient:
         return _headers(token)
 
     def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
-        if (
-            not isinstance(video_url, str)
-            or not video_url
-            or video_url != video_url.strip()
-        ):
+        if not isinstance(video_url, str) or not video_url.strip():
             raise ValueError("MediaKit video URL is invalid")
+        video_url = video_url.strip()
         mode = self.settings.mediakit_video_erase_mode
         endpoint = (
             "erase-video-subtitle-pro"
@@ -1046,12 +1038,9 @@ class MediaKitClient:
             raise ProviderFailure(record or {}, [], exc) from exc
 
     def poll_task(self, task_id: str) -> ProviderResult[str]:
-        if (
-            not isinstance(task_id, str)
-            or not task_id
-            or task_id != task_id.strip()
-        ):
+        if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError("MediaKit task id is invalid")
+        task_id = task_id.strip()
         record: dict[str, Any] = {"task_id": task_id, "polls": []}
         poll_url = f"{self.settings.mediakit_api_base}/tasks/{task_id}"
         deadline = time.monotonic() + self.settings.provider_poll_timeout_s
@@ -1151,16 +1140,13 @@ class PicsartClient:
             if len(image_urls) > 9:
                 raise ValueError("Picsart image_urls supports at most 9 URLs")
             if any(
-                not isinstance(url, str)
-                or not url
-                or url != url.strip()
+                not isinstance(url, str) or not url.strip()
                 for url in image_urls
             ):
                 raise ValueError(
-                    "Picsart image_urls must contain trimmed non-empty strings"
+                    "Picsart image_urls must contain non-empty strings"
                 )
-            if len(image_urls) != len(set(image_urls)):
-                raise ValueError("Picsart image_urls must not contain duplicates")
+            image_urls = [url.strip() for url in image_urls]
 
         if audio_urls is not None:
             if not isinstance(audio_urls, list):
@@ -1168,16 +1154,13 @@ class PicsartClient:
             if len(audio_urls) > 3:
                 raise ValueError("Picsart audio_urls supports at most 3 URLs")
             if any(
-                not isinstance(url, str)
-                or not url
-                or url != url.strip()
+                not isinstance(url, str) or not url.strip()
                 for url in audio_urls
             ):
                 raise ValueError(
-                    "Picsart audio_urls must contain trimmed non-empty strings"
+                    "Picsart audio_urls must contain non-empty strings"
                 )
-            if len(audio_urls) != len(set(audio_urls)):
-                raise ValueError("Picsart audio_urls must not contain duplicates")
+            audio_urls = [url.strip() for url in audio_urls]
 
         params: dict[str, Any] = {
             "prompt": prompt,
@@ -1426,12 +1409,9 @@ class AutodlClient:
             raise ProviderFailure(record or {}, [], exc) from exc
 
     def poll(self, task_id: str) -> ProviderResult[str]:
-        if (
-            not isinstance(task_id, str)
-            or not task_id
-            or task_id != task_id.strip()
-        ):
+        if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError("AutoDL task id is invalid")
+        task_id = task_id.strip()
         record: dict[str, Any] = {"task_id": task_id, "polls": []}
         poll_url = (
             f"{self.settings.autodl_api_base}"

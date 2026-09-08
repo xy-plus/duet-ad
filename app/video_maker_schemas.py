@@ -131,7 +131,7 @@ def _index_records(
         raise ValueError("model output collection is invalid")
     indexed: list[tuple[str, dict[str, Any]]] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) != fields | {"key"}:
+        if not isinstance(item, dict) or not (fields | {"key"}) <= set(item):
             raise ValueError("model output record is invalid")
         key = item.get("key")
         if not isinstance(key, str):
@@ -142,9 +142,9 @@ def _index_records(
 
 def normalize_project_index(value: object) -> dict[str, Any]:
     """Mechanically replace invocation-local aliases with stable backend keys."""
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict) or not {
         "people", "entities", "scenes", "relations",
-    }:
+    } <= set(value):
         raise ValueError("project index output is invalid")
     element_fields = {
         "source_visual_description", "occurrences", "replaceable", "preserve",

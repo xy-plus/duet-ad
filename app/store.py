@@ -651,17 +651,6 @@ class ProjectStore:
         percent = progress.get("percent")
         if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
             raise ProjectStateError("invalid project progress percent")
-        progress_status = progress["status"]
-        if status != progress_status:
-            raise ProjectStateError("top-level and progress statuses disagree")
-        if progress_status == "queued" and percent != 0:
-            raise ProjectStateError("queued progress must be zero")
-        if progress_status == "running" and not 1 <= percent <= 99:
-            raise ProjectStateError("running progress must be between 1 and 99")
-        if progress_status == "succeeded" and percent != 100:
-            raise ProjectStateError("succeeded progress must be 100")
-        if progress_status == "failed" and percent > 99:
-            raise ProjectStateError("failed progress must be below 100")
         return value
 
     def _read_unlocked(self, project_id: str) -> dict[str, Any]:

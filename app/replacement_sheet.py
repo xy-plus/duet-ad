@@ -215,26 +215,19 @@ def validate_replacement_sheet_spec(
         raise ValueError("replacement sheet has no replacement tiles")
     if any(not isinstance(tile, Mapping) for tile in tiles):
         raise ValueError("replacement sheet spec tiles are invalid")
-    columns, rows = _grid_dimensions(len(tiles))
-    if spec.get("columns") != columns or spec.get("rows") != rows:
-        raise ValueError("replacement sheet v2 layout is invalid")
     stable_keys: set[str] = set()
-    for offset, tile in enumerate(tiles):
+    for tile in tiles:
         stable_key = tile.get("stable_key")
         appearance = tile.get("appearance_description")
         if (
-            set(tile) != _V2_TILE_KEYS
-            or tile.get("tile_id") != f"TILE_{offset + 1:02d}"
+            not _V2_TILE_KEYS <= set(tile)
             or tile.get("category") not in _ELEMENT_CATEGORIES
             or not isinstance(stable_key, str)
             or not stable_key
             or stable_key in stable_keys
-            or tile.get("row") != offset // columns + 1
-            or tile.get("column") != offset % columns + 1
             or tile.get("source") not in _REPLACEMENT_SOURCES
             or not isinstance(appearance, str)
             or not appearance.strip()
-            or appearance != appearance.strip()
         ):
             raise ValueError("replacement sheet v2 tile binding is invalid")
         stable_keys.add(stable_key)
