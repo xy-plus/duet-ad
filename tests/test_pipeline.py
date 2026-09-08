@@ -32,6 +32,7 @@ from app.pipeline import (
     REPLACEMENT_SHEET_VERSION,
     SAME_AS_SOURCE_LANGUAGE,
     TRANSLATION_SCHEMA,
+    _NO_REUSABLE_OUTPUT,
     _validate_dialogue_generation_shape,
     _validate_translation_shape,
 )
@@ -7769,3 +7770,232 @@ def test_resume_pre_picsart_early_path_recovers_segments_without_segment_reuse(
     assert [item["index"] for item in recorded["prepared"]] == [1]
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "pre_picsart_resume_succeeded" in trace
+
+
+def test_provider_4xx_failure_fails_fast_instead_of_retrying_forever(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, log = _node_pipeline(tmp_path, "request-provider-4xx")
+    sleeps: list[float] = []
+    monkeypatch.setattr(pipeline, "_retry_sleep", sleeps.append)
+
+    # Deterministic client errors cannot succeed on retry: no second attempt,
+    # whether the 4xx sits at the top level or nested inside a stage record.
+    for record in (
+        {"response": {"status_code": 400, "body": {"error": "bad image"}}},
+        {"stages": [{"erase": {"response": {"status_code": 422}}}]},
+    ):
+        calls = 0
+
+        def deterministic(record: dict[str, Any] = record) -> None:
+            nonlocal calls
+            calls += 1
+            raise ProviderFailure(record, [], RuntimeError("deterministic 4xx"))
+
+        with pytest.raises(ProviderFailure):
+            pipeline._node(log, "erase", "project", {}, [], deterministic)
+        assert calls == 1
+
+    # 408/429 and 5xx stay transient: they retry until success.
+    for status_code in (408, 429, 500, 503):
+        transient_calls = 0
+
+        def transient(status_code: int = status_code) -> str:
+            nonlocal transient_calls
+            transient_calls += 1
+            if transient_calls == 1:
+                raise ProviderFailure(
+                    {"response": {"status_code": status_code}},
+                    [],
+                    RuntimeError(f"HTTP {status_code}"),
+                )
+            return "ok"
+
+        assert (
+            pipeline._node(log, "poll", f"s{status_code}", {}, [], transient)
+            == "ok"
+        )
+        assert transient_calls == 2
+
+    assert sleeps == []
+    assert not Pipeline._retryable_node_error(
+        ProviderFailure(
+            {"response": {"status_code": 400}}, [], RuntimeError("bad request"),
+        )
+    )
+    assert Pipeline._retryable_node_error(
+        ProviderFailure(
+            {"response": {"status_code": 503}}, [], RuntimeError("unavailable"),
+        )
+    )
+    # Moderation-marker records without an HTTP status keep the deliberate
+    # backoff-retry self-heal behavior.
+    assert Pipeline._retryable_node_error(
+        ProviderFailure(
+            {"error": "content policy violation"},
+            [],
+            RuntimeError("content policy rejection"),
+        )
+    )
+
+
+class _RecordingMediaKit:
+    def __init__(self, payload: bytes) -> None:
+        self.calls: list[tuple[Path, Path, list[str]]] = []
+        self._payload = payload
+
+    def erase(
+        self, source: Path, destination: Path, stages: list[str],
+    ) -> ProviderResult[Path]:
+        self.calls.append((source, destination, list(stages)))
+        destination.write_bytes(self._payload)
+        return ProviderResult(destination, {"stages": []}, [destination])
+
+
+def _mediakit_resume_fixture(
+    tmp_path: Path,
+    client_request_id: str,
+    frame_five_checkpoint: bytes | None,
+) -> tuple[Pipeline, str, Path, Path, Path, _RecordingMediaKit, dict[str, Any]]:
+    """One prepared segment whose frame 5 mediakit output is missing, with
+    frame_five_checkpoint bytes (None = absent) left as its stage-01 file."""
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), client_request_id,
+    )
+    source = project / "inputs" / "source.mp4"
+    source.write_bytes(b"source")
+    index = 1
+    scope = f"segment-{index:04d}"
+    directory = project / "work" / "segments" / f"{index:04d}"
+    raw_dir = directory / "keyframes"
+    raw_dir.mkdir(parents=True)
+    (directory / "source.mp4").write_bytes(b"segment")
+    _write_completed_node_output(
+        project, "segment-frames-4fps", scope, {"duration_seconds": 5.0},
+    )
+    for order in range(1, 10):
+        (raw_dir / f"{order:02d}.png").write_bytes(_TEST_PNG)
+    optimized = directory / "optimized-keyframes"
+    optimized.mkdir()
+    for order in (1, 2, 3, 4, 6, 7, 8, 9):
+        (optimized / f"{order:02d}.png").write_bytes(_TEST_PNG)
+    if frame_five_checkpoint is not None:
+        (optimized / "05.mediakit-stage-01.png").write_bytes(frame_five_checkpoint)
+    proxies = directory / "analysis-keyframes"
+    proxies.mkdir()
+    for order in range(1, 10):
+        (proxies / f"{order:02d}.png").write_bytes(_TEST_PNG)
+    (directory / "visual_prompt.txt").write_text("视觉提示", encoding="utf-8")
+    mediakit = _RecordingMediaKit(_TEST_PNG)
+    pipeline = Pipeline(
+        _settings(tmp_path, enable_mediakit=True),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=mediakit,
+        picsart=object(),
+    )
+    segment = {
+        "index": index, "start_s": 0.0, "duration_s": 5.0,
+        "join_mode": "hard_cut",
+    }
+    selection = [{"decode_frame_index": order} for order in range(9)]
+    return (
+        pipeline, project_id, project, source, raw_dir, mediakit,
+        {"segment": segment, "selection": selection},
+    )
+
+
+def test_mediakit_resume_regenerates_a_zero_byte_stage_checkpoint(
+    tmp_path: Path,
+) -> None:
+    (
+        pipeline, project_id, project, source, raw_dir, mediakit, extra,
+    ) = _mediakit_resume_fixture(
+        tmp_path, "request-mediakit-zero-byte", b"",
+    )
+    log = ResearchLog(project)
+
+    result = pipeline._prepare_segment(
+        project_id,
+        project,
+        source,
+        extra["segment"],
+        extra["selection"],
+        _effective_request(),
+        log,
+        resume=True,
+    )
+
+    # The 0-byte stage checkpoint is not completion evidence: frame 5
+    # restarts from the raw keyframe with both erase stages.
+    target = project / "work" / "segments" / "0001" / "optimized-keyframes" / "05.png"
+    assert mediakit.calls == [
+        (raw_dir / "05.png", target, ["full_screen_text_erase", "full_screen_icon_erase"]),
+    ]
+    assert result["keyframe_paths"][4] == target
+    assert target.read_bytes() == _TEST_PNG
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "mediakit_checkpoint_damaged" in trace
+
+
+def test_mediakit_resume_still_reuses_a_decodable_stage_checkpoint(
+    tmp_path: Path,
+) -> None:
+    (
+        pipeline, project_id, project, source, _raw_dir, mediakit, extra,
+    ) = _mediakit_resume_fixture(
+        tmp_path, "request-mediakit-valid-checkpoint", _TEST_PNG,
+    )
+    log = ResearchLog(project)
+
+    pipeline._prepare_segment(
+        project_id,
+        project,
+        source,
+        extra["segment"],
+        extra["selection"],
+        _effective_request(),
+        log,
+        resume=True,
+    )
+
+    checkpoint = (
+        project / "work" / "segments" / "0001"
+        / "optimized-keyframes" / "05.mediakit-stage-01.png"
+    )
+    target = checkpoint.with_name("05.png")
+    assert mediakit.calls == [(checkpoint, target, ["full_screen_icon_erase"])]
+
+
+def test_reusable_node_output_treats_zero_byte_artifacts_as_missing(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    _project_id, project, _state = store.create({}, "request-zero-byte-node")
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    artifact = project / "work" / "source.wav"
+    artifact.write_bytes(b"")
+    _write_completed_node_output(project, "extract-audio", "project", None)
+
+    assert (
+        pipeline._reusable_node_output(
+            project, "extract-audio", "project", [artifact],
+        )
+        is _NO_REUSABLE_OUTPUT
+    )
+    artifact.write_bytes(b"wav")
+    assert (
+        pipeline._reusable_node_output(
+            project, "extract-audio", "project", [artifact],
+        )
+        is None
+    )

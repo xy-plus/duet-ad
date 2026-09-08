@@ -736,6 +736,21 @@ def _normalize_analysis_image_bounds(image: np.ndarray) -> np.ndarray:
     return _pad_analysis_image_ratio(resized)
 
 
+def is_decodable_image(path: Path) -> bool:
+    """True only when the file holds non-empty, decodable image bytes.
+
+    Existence-based resume reuse must treat 0-byte/corrupt files (e.g. an
+    ENOSPC-truncated write) as missing instead of passing them downstream."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    if not data:
+        return False
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return image is not None and image.size > 0
+
+
 def half_resolution_png(source: Path, destination: Path) -> Path:
     """Write Master's deterministic bounded half-resolution PNG proxy."""
     data = source.read_bytes()
