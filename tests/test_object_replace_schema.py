@@ -118,7 +118,7 @@ def test_planning_context_freezes_all_keys_and_removes_only_item_hints() -> None
 
 def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> None:
     skill = (
-        Path("/home/xy/duet-ad1-h3-max-r2v/skills/object-replace/SKILL.md")
+        Path("/home/xy/duet-ad1-h3-max-r2v-identity/skills/object-replace/SKILL.md")
         .read_text(encoding="utf-8")
     )
 
@@ -132,11 +132,14 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "同类但不同实例",
         "所有可见实体都必须替换",
         "同一个 stable key 在不同图片、不同分段",
-        "必须且只能把 Image 1 约束到文字要求唯一语义对应的一个既有 stable key",
+        "必须把 Image 1 约束到用户语义要求覆盖的一个或多个既有 stable key",
+        "不得只任选一个",
+        "不按关键词机械决定数量",
+        "共享参考图不等于这些对象是同一实体",
         "这两个字段必须双向一致",
         "没有 Image 1 或用户替换要求为空时",
-        "不得把参考图背景或无关对象扩散到其他 stable key",
-        "其他必换 key 仍各自使用 `generated_variant`",
+        "不得将绑定自动传播到无关对象、持有者、背景或仅有关联的组件",
+        "其余必换 key 仍各自使用 `generated_variant`",
         "缺失或 `null` 属于结构不完整",
         "后端不对描述做审美判断",
         "stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点",
@@ -147,7 +150,7 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "不得出现持有者、操作者、配套对象、被作用对象",
         "必须排除索引人物、动物、可移动实体、前景商品",
         "不得决定、声明或重排 TILE",
-        "其他 stable key 的新形象不得继承 Image 1",
+        "未绑定的其他 stable key 不得继承 Image 1",
     ):
         assert rule in skill
     for obsolete_or_specific_rule in (
@@ -156,18 +159,22 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "手、手臂",
         "虎斑猫",
         "梳毛工具",
+        "必须且只能把 Image 1",
     ):
         assert obsolete_or_specific_rule not in skill
 
 
 def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None:
     skill = Path(
-        "/home/xy/duet-ad1-h3-max-r2v/skills/h3-max-r2v-prompt/SKILL.md"
+        "/home/xy/duet-ad1-h3-max-r2v-identity/skills/h3-max-r2v-prompt/SKILL.md"
     ).read_text(encoding="utf-8")
 
     assert "只服从 `authoritative_constraints` 编译出的安全不变量" in skill
     assert "不得用 raw `preserve` 恢复源身份或外观" in skill
     assert "同时遵守对象的 `preserve`" not in skill
+    assert "至少一个有效用户图绑定" in skill
+    assert "所有对应 stable key" in skill
+    assert "唯一绑定" not in skill
 
 
 def _output(
@@ -544,7 +551,7 @@ def test_normalizer_rejects_zero_image_1_bindings_for_a_nonblank_request() -> No
         _normalize(value, digest=digest, element_index=element_index)
 
 
-def test_normalizer_rejects_multiple_image_1_bindings() -> None:
+def test_normalizer_accepts_multiple_image_1_bindings() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
@@ -553,8 +560,19 @@ def test_normalizer_rejects_multiple_image_1_bindings() -> None:
         "replacement": _replacement("image_1", "entity-01"),
     }
 
-    with pytest.raises(ValueError, match="binding count is invalid"):
-        _normalize(value, digest=digest, element_index=element_index)
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["replacement"]["source"] == "image_1"
+    assert normalized["entities"]["entity-01"]["replacement"]["source"] == "image_1"
+    original = copy.deepcopy(element_index)
+    merged = merge_object_replace_index(element_index, normalized, {})
+    assert element_index == original
+    assert merged["relations"] == original["relations"]
+    for category in ("people", "entities", "scenes"):
+        assert set(merged[category]) == set(original[category])
+        for stable_id in original[category]:
+            assert merged[category][stable_id]["occurrences"] == original[category][stable_id]["occurrences"]
+            assert merged[category][stable_id]["replacement"]["source"] == normalized[category][stable_id]["replacement"]["source"]
 
 
 def test_normalizer_accepts_image_1_even_when_the_match_flag_is_false() -> None:
