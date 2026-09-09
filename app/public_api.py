@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import fcntl
 import ipaddress
@@ -15,6 +16,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -37,13 +39,13 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
-from app import media, public_api_auth, public_artifacts, public_credits
+from app import media, public_api_auth, public_artifacts, public_credits, public_quotes
 from app.config import Settings
 from app.main import (
     DIALOGUE_BRIEF_MAX_CHARS,
@@ -176,6 +178,30 @@ class Job(BaseModel):
     created_at: str
     updated_at: str
     poll_after_seconds: int = 5
+
+
+class Quote(BaseModel):
+    quote_id: str
+    status: Literal["quoted", "confirmed", "expired"]
+    duration_seconds: float
+    billable_seconds: int
+    estimated_credits: int
+    credits_per_second: int = 60
+    price_version: str
+    expires_at: str
+    job_id: str | None = None
+
+
+class ConfirmQuote(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm: StrictBool
+
+    @field_validator("confirm")
+    @classmethod
+    def must_confirm(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("confirm must be true")
+        return value
 
 
 class CreditBalance(BaseModel):
@@ -484,6 +510,152 @@ def install(
     bearer = HTTPBearer(auto_error=False)
     limiter = _RateLimiter()
     public_create_lock = threading.Lock()
+    quotes = public_quotes.QuoteStore(store.root)
+    dispatched_quotes: set[str] = set()
+
+    def commit_creation(staged, identity, client_request_id, idem_digest,
+                        request_sha256, parameters, quoted_credits,
+                        price_version=None, quote_id=None):
+        # Both immediate creation and quote confirmation use the same receipt,
+        # balance gate and durable project claim. Never reuse an orphan reserve.
+        with public_create_lock:
+            existing_id = store.lookup_claim(client_request_id)
+            if existing_id is not None:
+                try:
+                    existing = store.read(existing_id)
+                except (FileNotFoundError, OSError, ProjectStateError) as exc:
+                    raise PublicAPIError(503, "job_state_invalid", "任务状态不可用") from exc
+                receipt = _public_receipt(existing)
+                if (receipt is None or receipt.get("owner_id") != identity.owner_id
+                        or receipt.get("request_sha256") != request_sha256):
+                    raise PublicAPIError(409, "idempotency_key_reused",
+                                         "Idempotency-Key 已绑定到不同输入", field="Idempotency-Key")
+                return existing_id, existing, False
+            project_id = uuid.uuid4().hex
+            while store.path(project_id).exists():
+                project_id = uuid.uuid4().hex
+            job_id = f"vg_{project_id}"
+            public_credits.reserve(settings.data_dir, identity.owner_id, job_id, quoted_credits)
+            receipt = {
+                "version": 1, "job_id": job_id, "owner_id": identity.owner_id,
+                "creator_key_id": identity.key_id, "idempotency_digest": idem_digest,
+                "request_sha256": request_sha256, "parameters": dict(parameters),
+                "credits_per_cny": 100, "quoted_credits": quoted_credits,
+                "quoted_amount_minor": quoted_credits, "currency": "CNY",
+                "price_version": price_version or public_credits.PRICE_VERSION,
+            }
+            if quote_id is not None:
+                receipt["quote_id"] = quote_id
+            new_id, _project, state, created = store.create_from_staging(
+                staged["effective_request"], client_request_id,
+                request_digest=staged["request_digest"],
+                input_receipt=staged["input_receipt"], source_snapshot=staged["source_snapshot"],
+                staged_source=staged["staged_source"],
+                replacement_snapshot=staged["replacement_snapshot"],
+                staged_replacement=staged["staged_replacement"],
+                project_id=project_id, extra_state={"_public_api": receipt},
+            )
+            assert created and new_id == project_id
+            return new_id, state, True
+
+    def never_started(state):
+        receipt = _public_receipt(state)
+        return (receipt is not None and isinstance(receipt.get("quote_id"), str)
+                and state.get("project_progress", {}).get("stage") == "queued"
+                and state.get("project_progress", {}).get("percent") == 0
+                and not state.get("picsart_submission_receipts")
+                and not state.get("seedream_submission_receipts")
+                and not state.get("segments") and not state.get("has_video"))
+
+    def bound_quote(state):
+        receipt = _public_receipt(state)
+        if receipt is None:
+            return False
+        record = quotes.read(receipt["quote_id"], receipt["owner_id"])
+        return (record["request_sha256"] == receipt["request_sha256"]
+                and store.lookup_claim(record["client_request_id"]) == state["id"])
+
+    def dispatch_quote(project_id, state):
+        # Synchronous on the event loop: concurrent confirmations cannot both
+        # schedule a worker while its durable status is still queued.
+        if (project_id not in dispatched_quotes and state.get("status") == "queued"
+                and never_started(state)):
+            start_pipeline(project_id)
+            dispatched_quotes.add(project_id)
+
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def quote_lifespan(application):
+        # The existing restart recovery handles interrupted pipeline nodes.
+        # A quote published before dispatch has no nodes to resume yet.
+        pending = []
+        for state in store.list():
+            if state.get("status") != "queued" or not never_started(state):
+                continue
+            try:
+                work = store.path(state["id"]) / "work"
+                if bound_quote(state) and (not work.exists() or not any(work.iterdir())):
+                    pending.append(state["id"])
+            except (OSError, ValueError, KeyError, TypeError):
+                _LOGGER.warning("Could not inspect pending quote dispatch")
+        async with original_lifespan(application) as lifespan_state:
+            for project_id in pending:
+                try:
+                    state = store.read(project_id)
+                    error = state.get("error") or {}
+                    if (state.get("status") == "failed"
+                            and error.get("code") == "process_restarted"):
+                        store.update(
+                            project_id, status="queued", error=None,
+                            project_progress={"status": "queued", "stage": "queued", "percent": 0},
+                            generation={"status": "queued", "stage": "upstream", "error": None},
+                        )
+                        state = store.read(project_id)
+                    dispatch_quote(project_id, state)
+                except Exception:
+                    _LOGGER.exception("Pending quote recovery failed")
+            async def sweep_quotes():
+                def sweep():
+                    with quotes.lock():
+                        quotes.cleanup()
+                while True:
+                    try:
+                        await run_in_threadpool(sweep)
+                    except Exception:
+                        _LOGGER.exception("Quote media cleanup failed")
+                    await asyncio.sleep(60)
+            housekeeping = asyncio.create_task(sweep_quotes())
+            try:
+                yield lifespan_state
+            finally:
+                housekeeping.cancel()
+                try:
+                    await housekeeping
+                except asyncio.CancelledError:
+                    pass
+
+    app.router.lifespan_context = quote_lifespan
+
+    def quote_view(record):
+        project_id = store.lookup_claim(record["client_request_id"])
+        if project_id:
+            state = store.read(project_id)
+            receipt = _public_receipt(state)
+            if (receipt is None or receipt.get("owner_id") != record["owner_id"]
+                    or receipt.get("request_sha256") != record["request_sha256"]):
+                raise PublicAPIError(503, "job_state_invalid", "任务状态不可用")
+        return Quote(
+            quote_id=record["quote_id"],
+            status="confirmed" if project_id else (
+                "expired" if record["expires_epoch"] <= time.time() else "quoted"),
+            duration_seconds=record["duration_seconds"],
+            billable_seconds=record["estimated_credits"] // record["credits_per_second"],
+            estimated_credits=record["estimated_credits"],
+            credits_per_second=record["credits_per_second"],
+            price_version=record["price_version"], expires_at=record["expires_at"],
+            job_id=f"vg_{project_id}" if project_id else None,
+        )
 
     async def principal(
         credentials: HTTPAuthorizationCredentials | None = Security(bearer),
@@ -712,7 +884,7 @@ def install(
             },
             pricing={
                 "credits_per_cny": 100,
-                "credits_per_second": 60,
+                "credits_per_second": public_credits.CREDITS_PER_SECOND,
                 "billed_unit": "source_video_second",
                 "currency": "CNY",
                 "price_version": public_credits.PRICE_VERSION,
@@ -720,6 +892,12 @@ def install(
             polling={"recommended_seconds": 5, "maximum_backoff_seconds": 10},
         )
 
+    @router.post(
+        "/video-generations/quotes",
+        response_model=Quote,
+        status_code=201,
+        dependencies=[Depends(no_query), Depends(require_multipart), Depends(validate_create_parameters)],
+    )
     @router.post(
         "/video-generations",
         response_model=Job,
@@ -829,7 +1007,9 @@ def install(
             ),
             "replacement_guidance": None if instruction is None else {"instruction": instruction, "image_field": "replacement_image"},
         }
-        idem_digest = _idempotency_digest(identity.owner_id, idempotency_key)
+        is_quote = request.url.path.endswith("/quotes")
+        idem_digest = _idempotency_digest(
+            identity.owner_id, ("quote:" if is_quote else "") + idempotency_key)
         client_request_id = idem_digest[:32]
         descriptor = {
             "aspect_ratio": aspect_ratio,
@@ -848,6 +1028,41 @@ def install(
             "replacement_image": replacement_image is not None,
         }
         try:
+            existing_quote = None
+            if is_quote:
+                def lookup_quote():
+                    with quotes.lock():
+                        try:
+                            return quotes.read(f"vq_{client_request_id}", identity.owner_id)
+                        except FileNotFoundError:
+                            return None
+                existing_quote = await run_in_threadpool(lookup_quote)
+                if existing_quote is not None:
+                    if existing_quote["request_descriptor"] != descriptor:
+                        raise PublicAPIError(409, "idempotency_key_reused",
+                                             "Idempotency-Key 已绑定到不同输入", field="Idempotency-Key")
+                    if normalized_url:
+                        # A lost response must remain recoverable after the URL
+                        # expires. Its original media was already frozen.
+                        replacement_identity = None
+                        if replacement_image is not None:
+                            digest = hashlib.sha256()
+                            size = 0
+                            while chunk := await replacement_image.read(1024 * 1024):
+                                size += len(chunk)
+                                if size > REPLACEMENT_MAX_BYTES:
+                                    raise PublicAPIError(413, "source_too_large", "参考图超过大小限制")
+                                digest.update(chunk)
+                            await replacement_image.seek(0)
+                            replacement_identity = {"bytes": size, "sha256": digest.hexdigest()}
+                        if replacement_identity != existing_quote["staged"]["replacement_identity"]:
+                            raise PublicAPIError(409, "idempotency_key_reused",
+                                                 "Idempotency-Key 已绑定到不同输入", field="Idempotency-Key")
+                        quotation = await run_in_threadpool(quote_view, existing_quote)
+                        response.status_code = 200
+                        response.headers["Location"] = f"/api/v1/video-generations/quotes/{quotation.quote_id}"
+                        response.headers["Cache-Control"] = "private, no-store"
+                        return quotation
             async with stage_creation(
                 file=source_video,
                 reference_url=normalized_url,
@@ -860,11 +1075,23 @@ def install(
                     "source": staged["source_identity"],
                     "replacement_image": staged["replacement_identity"],
                 })
+                if existing_quote is not None:
+                    if existing_quote["request_sha256"] != request_sha256:
+                        raise PublicAPIError(409, "idempotency_key_reused",
+                                             "Idempotency-Key 已绑定到不同输入", field="Idempotency-Key")
+                    quotation = await run_in_threadpool(quote_view, existing_quote)
+                    response.status_code = 200
+                    response.headers["Location"] = f"/api/v1/video-generations/quotes/{quotation.quote_id}"
+                    response.headers["Cache-Control"] = "private, no-store"
+                    return quotation
                 try:
                     probed = media.probe(staged["staged_source"])
                     quoted_credits = public_credits.quote_credits(
                         float(probed["duration_s"])
                     )
+                    if is_quote and float(probed["duration_s"]) > 300:
+                        raise PublicAPIError(422, "video_duration_invalid",
+                                             "原视频时长超过 300 秒，请裁剪后重新报价", field="source_video")
                 except (media.MediaError, public_credits.CreditError) as exc:
                     raise PublicAPIError(
                         422, "video_duration_invalid",
@@ -872,67 +1099,37 @@ def install(
                         field="source_video",
                     ) from None
 
-                def commit() -> tuple[str, dict[str, Any], bool]:
-                    with public_create_lock:
-                        existing_id = store.lookup_claim(client_request_id)
-                        if existing_id is not None:
+                if is_quote:
+                    def save_quote():
+                        with quotes.lock():
+                            quotes.cleanup()
+                            quote_id = f"vq_{client_request_id}"
                             try:
-                                existing = store.read(existing_id)
-                            except (FileNotFoundError, OSError, ProjectStateError) as exc:
-                                raise PublicAPIError(
-                                    503, "job_state_invalid", "任务状态不可用"
-                                ) from exc
-                            existing_receipt = _public_receipt(existing)
-                            if (
-                                existing_receipt is None
-                                or existing_receipt.get("owner_id") != identity.owner_id
-                                or existing_receipt.get("request_sha256") != request_sha256
-                            ):
-                                raise PublicAPIError(
-                                    409,
-                                    "idempotency_key_reused",
-                                    "Idempotency-Key 已绑定到不同输入",
-                                    field="Idempotency-Key",
+                                record = quotes.read(quote_id, identity.owner_id)
+                            except FileNotFoundError:
+                                record = quotes.create(
+                                    quote_id, staged, owner_id=identity.owner_id,
+                                    client_request_id=client_request_id, idem_digest=idem_digest,
+                                    request_sha256=request_sha256, parameters=parameters,
+                                    request_descriptor=descriptor,
+                                    duration_seconds=float(probed["duration_s"]),
+                                    estimated_credits=quoted_credits,
+                                    credits_per_second=public_credits.CREDITS_PER_SECOND,
+                                    price_version=public_credits.PRICE_VERSION,
                                 )
-                            return existing_id, existing, False
-                        project_id = uuid.uuid4().hex
-                        while store.path(project_id).exists():
-                            project_id = uuid.uuid4().hex
-                        job_id = f"vg_{project_id}"
-                        public_credits.reserve(
-                            settings.data_dir, identity.owner_id, job_id,
-                            quoted_credits,
-                        )
-                        receipt = {
-                            "version": 1,
-                            "job_id": job_id,
-                            "owner_id": identity.owner_id,
-                            "creator_key_id": identity.key_id,
-                            "idempotency_digest": idem_digest,
-                            "request_sha256": request_sha256,
-                            "parameters": dict(parameters),
-                            "credits_per_cny": 100,
-                            "quoted_credits": quoted_credits,
-                            "quoted_amount_minor": quoted_credits,
-                            "currency": "CNY",
-                            "price_version": public_credits.PRICE_VERSION,
-                        }
-                        new_id, _project, state, created = store.create_from_staging(
-                            staged["effective_request"],
-                            client_request_id,
-                            request_digest=staged["request_digest"],
-                            input_receipt=staged["input_receipt"],
-                            source_snapshot=staged["source_snapshot"],
-                            staged_source=staged["staged_source"],
-                            replacement_snapshot=staged["replacement_snapshot"],
-                            staged_replacement=staged["staged_replacement"],
-                            project_id=project_id,
-                            extra_state={"_public_api": receipt},
-                        )
-                        assert created and new_id == project_id
-                        return new_id, state, True
-
-                project_id, state, created = await run_in_threadpool(commit)
+                                return quote_view(record), True
+                            if record["request_sha256"] != request_sha256:
+                                raise PublicAPIError(409, "idempotency_key_reused",
+                                                     "Idempotency-Key 已绑定到不同输入", field="Idempotency-Key")
+                            return quote_view(record), False
+                    quotation, created = await run_in_threadpool(save_quote)
+                    response.status_code = 201 if created else 200
+                    response.headers["Location"] = f"/api/v1/video-generations/quotes/{quotation.quote_id}"
+                    response.headers["Cache-Control"] = "private, no-store"
+                    return quotation
+                project_id, state, created = await run_in_threadpool(
+                    commit_creation, staged, identity, client_request_id,
+                    idem_digest, request_sha256, parameters, quoted_credits)
         except PublicAPIError:
             raise
         except public_credits.CreditError as exc:
@@ -955,6 +1152,8 @@ def install(
             ) from None
         except IdempotencyIndexUnavailable:
             raise PublicAPIError(503, "creation_failed", "任务创建暂时失败，请稍后重试") from None
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PublicAPIError(503, "creation_failed", "任务创建暂时失败，请稍后重试") from None
         except StarletteHTTPException as exc:
             detail = exc.detail
             code = detail.get("code") if isinstance(detail, Mapping) else None
@@ -968,6 +1167,105 @@ def install(
             ) from None
         if created:
             start_pipeline(project_id)
+        job_id = f"vg_{project_id}"
+        job, _ = await run_in_threadpool(project, identity.owner_id, job_id)
+        response.status_code = 201 if created else 200
+        response.headers["Location"] = f"/api/v1/video-generations/{job_id}"
+        response.headers["Retry-After"] = "5"
+        response.headers["Cache-Control"] = "private, no-store"
+        return job
+
+    def read_quote(quote_id, identity):
+        try:
+            return quotes.read(quote_id, identity.owner_id)
+        except FileNotFoundError:
+            raise PublicAPIError(404, "quote_not_found", "报价不存在") from None
+
+    @router.get(
+        "/video-generations/quotes/{quote_id}", response_model=Quote,
+        dependencies=[Depends(no_query)],
+    )
+    async def get_quote(quote_id: str, response: Response,
+                        identity: public_api_auth.Principal = Depends(principal)):
+        limiter.check(identity.owner_id, "read", 120)
+        def read():
+            with quotes.lock():
+                record = read_quote(quote_id, identity)
+                quotes.cleanup()
+                return quote_view(record)
+        try:
+            result = await run_in_threadpool(read)
+        except PublicAPIError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PublicAPIError(503, "quote_state_unavailable", "报价暂时不可用") from None
+        response.headers["Cache-Control"] = "private, no-store"
+        return result
+
+    @router.post(
+        "/video-generations/quotes/{quote_id}/confirm", response_model=Job,
+        status_code=201, dependencies=[Depends(no_query)],
+        openapi_extra={"requestBody": {"required": True, "content": {
+            "application/json": {"schema": ConfirmQuote.model_json_schema()}}}},
+    )
+    async def confirm_quote(quote_id: str, request: Request, response: Response,
+                            identity: public_api_auth.Principal = Depends(principal)):
+        limiter.check(identity.owner_id, "create", 10)
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise PublicAPIError(415, "unsupported_media_type", "确认请求必须使用 application/json")
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate field")
+                result[key] = value
+            return result
+        try:
+            raw_body = bytearray()
+            async for chunk in request.stream():
+                if len(raw_body) + len(chunk) > 1024:
+                    raise ValueError("oversized confirmation")
+                raw_body.extend(chunk)
+            body = json.loads(raw_body, object_pairs_hook=unique_object)
+            ConfirmQuote.model_validate(body)
+        except (ValueError, UnicodeDecodeError):
+            raise PublicAPIError(422, "invalid_confirm_request", "请求正文必须为 {\"confirm\":true}") from None
+        def confirm():
+            with quotes.lock():
+                record = read_quote(quote_id, identity)
+                args = (identity, record["client_request_id"], record["idem_digest"],
+                        record["request_sha256"], record["parameters"], record["estimated_credits"],
+                        record["price_version"], record["quote_id"])
+                # Publication is authoritative, even after expiry or a lost HTTP
+                # response. No mutable quote status is needed to recover it.
+                if store.lookup_claim(record["client_request_id"]) is not None:
+                    return commit_creation(None, *args)
+                if record["expires_epoch"] <= time.time():
+                    quotes.discard_media(record)
+                    raise PublicAPIError(410, "quote_expired", "报价已过期，请重新报价")
+                with quotes.staged_copy(record) as staged:
+                    result = commit_creation(staged, *args)
+                # Reclaim payload best-effort only after durable publication.
+                try:
+                    quotes.discard_media(record)
+                except OSError:
+                    _LOGGER.warning("Could not reclaim confirmed quotation media")
+                return result
+        try:
+            project_id, state, created = await run_in_threadpool(confirm)
+        except PublicAPIError:
+            raise
+        except public_credits.CreditError as exc:
+            if exc.code == "insufficient_credits":
+                raise PublicAPIError(402, "insufficient_credits", "可用积分不足") from None
+            raise PublicAPIError(503, "billing_state_unavailable", "积分状态暂时不可用") from None
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PublicAPIError(503, "quote_state_unavailable", "报价暂时不可用") from None
+        try:
+            dispatch_quote(project_id, state)
+        except Exception:
+            _LOGGER.exception("Quote dispatch failed; confirmation can retry")
+            raise PublicAPIError(503, "quote_state_unavailable", "报价暂时不可用") from None
         job_id = f"vg_{project_id}"
         job, _ = await run_in_threadpool(project, identity.owner_id, job_id)
         response.status_code = 201 if created else 200
@@ -1149,7 +1447,7 @@ def install(
         await no_query(request)
         return get_openapi(
             title="Duet Video Generation API",
-            version="1.0.0",
+            version="1.2.0",
             description="Asynchronous server-to-server video generation API.",
             routes=router.routes,
         )
