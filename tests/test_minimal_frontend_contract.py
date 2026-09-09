@@ -19,6 +19,7 @@ def _capability(**overrides):
         "aspect_ratios": ["16:9", "9:16"],
         "resolutions": ["480p", "768p"],
         "defaults": {
+            "add_subtitles": False,
             "fit_mode": "auto",
             "optimize_image": True,
             "remove_subtitle": True,
@@ -306,6 +307,7 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
             "target_language": "日语",
         },
         "replacement_guidance": None,
+        "add_subtitles": False,
     }
     same_request = json.loads(json.dumps(request))
     same_request["dialogue"]["target_language"] = "与原视频相同"
@@ -335,6 +337,31 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
         APP_JS.read_text(encoding="utf-8"), "buildMinimalGenerationRequest"
     )
     assert "script" not in request_builder.lower()
+
+
+def test_subtitle_toggle_is_sent_in_actual_multipart_and_restored():
+    source = APP_JS.read_text(encoding="utf-8")
+    upload = _function_source(source, "uploadConversation")
+    result = _run_contract(
+        "(async()=>{const capability=" + json.dumps(_capability()) + ";"
+        "const state={token:'test'};let sent;"
+        "class XMLHttpRequest {constructor(){this.upload={addEventListener(){}};this.status=201;}"
+        "open(){}setRequestHeader(){}addEventListener(name,fn){if(name==='load')this.loaded=fn;}"
+        "send(fd){sent=JSON.parse(fd.get('generation_request'));this.loaded();}};"
+        + upload + ";const base={aspectRatio:'9:16',resolution:'480p',targetLanguage:'日语'};"
+        "const values=[];for(const addSubtitles of [false,true,false]){"
+        "const request=contract.buildMinimalGenerationRequest({...base,addSubtitles},capability);"
+        "await uploadConversation({url:'https://example.com/v.mp4',requestId:'subtitle-test',"
+        "generationRequest:request,capability},()=>{});"
+        "values.push([sent.add_subtitles,contract.projectComposerModel({effective_request:sent},null).addSubtitles]);}"
+        "return values;})()"
+    )
+    assert result == [[False, False], [True, True], [False, False]]
+    attrs = _tag_attrs(INDEX_HTML.read_text(encoding="utf-8"), "input", "add-subtitles")
+    assert 'type="checkbox"' in attrs and "checked" not in attrs
+    assert 'addSubtitles: $("add-subtitles").checked' in source
+    assert '$("add-subtitles").checked = false' in _function_source(source, "resetComposerForNewProject")
+    assert '$("add-subtitles").checked' not in _function_source(source, "loadMinimalCreationCapability")
 
 
 def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair():
@@ -646,6 +673,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "return {restored,same,historical,generate,invalid}})()"
     )
     assert result["restored"] == {
+        "addSubtitles": False,
         "aspectRatio": "16:9",
         "resolution": "480p",
         "dialogueMode": "auto_rewrite",
@@ -660,6 +688,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         },
     }
     assert result["same"] == {
+        "addSubtitles": False,
         "aspectRatio": "16:9",
         "resolution": "480p",
         "dialogueMode": "auto_rewrite",
@@ -671,6 +700,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "replacementImage": None,
     }
     assert result["historical"] == {
+        "addSubtitles": False,
         "aspectRatio": "16:9",
         "resolution": "480p",
         "dialogueMode": "auto_rewrite",
@@ -682,6 +712,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "replacementImage": None,
     }
     assert result["generate"] == {
+        "addSubtitles": False,
         "aspectRatio": "16:9",
         "resolution": "480p",
         "dialogueMode": "generate",

@@ -39,6 +39,56 @@ REPLACEMENT_GUIDANCE = {
 }
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
+def test_subtitles_json_rejects_non_boolean(value):
+    from fastapi import HTTPException
+    from app.main import _parse_generation_request
+    with pytest.raises(HTTPException) as error:
+        _parse_generation_request(json.dumps({**GENERATION_REQUEST, "add_subtitles": value}), "internal")
+    assert error.value.status_code == 422
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_subtitles_json_normalization_and_legacy_default(value):
+    from app.main import _parse_generation_request
+    assert _parse_generation_request(json.dumps({**GENERATION_REQUEST, "add_subtitles": value}), "internal")["add_subtitles"] is value
+    assert _parse_generation_request(json.dumps(GENERATION_REQUEST), "internal")["add_subtitles"] is False
+
+
+def test_subtitle_fingerprint_preserves_legacy_and_binds_enabled():
+    from app.store import generation_request_sha256
+    legacy = canonical_json_sha256(GENERATION_REQUEST)
+    assert generation_request_sha256(GENERATION_REQUEST) == legacy
+    assert generation_request_sha256({**GENERATION_REQUEST, "add_subtitles": False}) == legacy
+    assert generation_request_sha256({**GENERATION_REQUEST, "add_subtitles": True}) != legacy
+
+
+def test_internal_legacy_project_replays_with_subtitles_off(tmp_path, monkeypatch):
+    import importlib
+    main_module = importlib.import_module("app.main")
+    parser = main_module._parse_generation_request
+    def legacy_parser(*args):
+        value = parser(*args)
+        value.pop("add_subtitles", None)
+        return value
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        with monkeypatch.context() as legacy:
+            legacy.setattr(main_module, "_parse_generation_request", legacy_parser)
+            created = client.post("/api/conversations", headers=AUTH,
+                                  data=create_payload(client_request_id="legacy-subtitles"),
+                                  files={"file": ("source.mp4", b"x", "video/mp4")})
+        assert created.status_code == 201
+        assert "add_subtitles" not in created.json()["effective_request"]
+        for enabled, status in [(False, 200), (True, 409)]:
+            replay = client.post("/api/conversations", headers=AUTH,
+                                 data=create_payload(client_request_id="legacy-subtitles", generation_request=json.dumps({**GENERATION_REQUEST, "add_subtitles": enabled})),
+                                 files={"file": ("source.mp4", b"x", "video/mp4")})
+            assert replay.status_code == status
+            if not enabled:
+                assert replay.json()["id"] == created.json()["id"]
+
+
 class SuccessfulPipeline:
     def __init__(self, store: ProjectStore) -> None:
         self.store = store

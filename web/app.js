@@ -129,7 +129,8 @@ function normalizeMinimalCreationCapability(payload) {
       || capability.aspect_ratios.join("|") !== GENERATION_ASPECT_RATIOS.join("|")
       || !Array.isArray(capability.resolutions)
       || capability.resolutions.join("|") !== GENERATION_RESOLUTIONS.join("|")
-      || !hasExactKeys(defaults, ["fit_mode", "optimize_image", "remove_subtitle", "remove_logo"])
+      || !hasExactKeys(defaults, ["fit_mode", "optimize_image", "remove_subtitle", "remove_logo", "add_subtitles"])
+      || defaults.add_subtitles !== false
       || defaults.fit_mode !== "auto"
       || defaults.optimize_image !== true
       || defaults.remove_subtitle !== true
@@ -222,6 +223,7 @@ function buildMinimalGenerationRequest(input, capability) {
       instruction: replacementInstruction,
       image_field: normalized.replacement_image_field,
     } : null,
+    add_subtitles: !!(input && input.addSubtitles === true),
   };
 }
 
@@ -377,6 +379,7 @@ function projectComposerModel(detail, localDraft = null) {
     aspectRatio: output.aspect_ratio,
     resolution: output.resolution,
     dialogueMode: dialogue.mode === "generate" ? "generate" : "auto_rewrite",
+    addSubtitles: request.add_subtitles === true,
     dialogueBrief: dialogue.mode === "generate" && typeof dialogue.brief === "string"
       ? dialogue.brief : "",
     languageMode: dialogue.target_language.trim() === SAME_AS_SOURCE_LANGUAGE
@@ -1609,6 +1612,7 @@ function showUnavailableSource(message) {
 }
 
 function prepareComposerForProjectLoad() {
+  $("add-subtitles").checked = false;
   state.viewingSubmittedConfig = true;
   showUnavailableSource("正在加载项目配置…");
   resetReplacementImageDisplay();
@@ -1668,6 +1672,7 @@ function creationInputReplacementPreviewPath(conversationId, previewUrl, origin 
 }
 
 function applyProjectComposer(detail) {
+  $("add-subtitles").checked = false;
   const memoryDraft = state.composerDrafts[detail.id] || null;
   const localDraft = memoryDraft || storedComposerDraft(detail.id);
   const model = projectComposerModel(detail, localDraft);
@@ -1717,6 +1722,7 @@ function applyProjectComposer(detail) {
   $("lang-input").value = model.targetLanguage;
   $("dialogue-brief").value = model.dialogueBrief;
   $("replacement-instruction").value = model.replacementInstruction;
+  $("add-subtitles").checked = model.addSubtitles;
   setComposerError(null);
 
   if (model.source && model.source.mode === "upload") {
@@ -1761,6 +1767,7 @@ function applyProjectComposer(detail) {
 }
 
 function resetComposerForNewProject() {
+  $("add-subtitles").checked = false;
   state.viewingSubmittedConfig = false;
   state.file = null;
   $("file-input").value = "";
@@ -1788,6 +1795,7 @@ function resetComposerForNewProject() {
 function setUploading(on) {
   state.uploading = on;
   const controlsDisabled = on || state.viewingSubmittedConfig;
+  $("add-subtitles").disabled = controlsDisabled;
   $("composer-toggle").disabled = on;
   $("attach-btn").disabled = controlsDisabled;
   $("file-input").disabled = controlsDisabled;
@@ -1879,6 +1887,7 @@ async function handleSend(event) {
       targetLanguage: selectedTargetLanguage(),
       hasReplacementImage: !!state.replacementImage,
       replacementInstruction: $("replacement-instruction").value,
+      addSubtitles: $("add-subtitles").checked,
     }, capability);
   } catch (err) {
     setComposerError(err.message);
@@ -2029,6 +2038,10 @@ function bindEvents() {
       updateSendBtn();
       if (control.value === "generate" && control.checked) $("dialogue-brief").focus();
     });
+  });
+  $("add-subtitles").addEventListener("change", () => {
+    state.clientRequestId = newRequestId();
+    setComposerError(null);
   });
   $("dialogue-brief").addEventListener("input", () => {
     state.clientRequestId = newRequestId();

@@ -80,6 +80,7 @@ _CREATE_FIELDS = {
     "replacement_instruction",
     "dialogue_mode",
     "dialogue_brief",
+    "add_subtitles",
 }
 _STRICT_LIMIT_RE = re.compile(r"^(?:[1-9]|[1-9][0-9]|100)$")
 _UNKNOWN_SUBMISSION_STATUSES = frozenset({"submission_started", "unknown"})
@@ -135,6 +136,7 @@ class Parameters(BaseModel):
     resolution: Literal["768p", "480p"]
     target_language: str | None
     replacement_image: bool
+    add_subtitles: bool = False
 
 
 class Billing(BaseModel):
@@ -231,7 +233,7 @@ class Capabilities(BaseModel):
     version: Literal["v1"] = "v1"
     endpoint: Literal["/api/v1/video-generations"] = "/api/v1/video-generations"
     encoding: Literal["multipart/form-data"] = "multipart/form-data"
-    defaults: dict[str, str | None]
+    defaults: dict[str, str | bool | None]
     allowed_output_combinations: list[dict[str, str]]
     source_video: dict[str, Any]
     replacement_image: dict[str, Any]
@@ -850,6 +852,7 @@ def install(
                 "resolution": "768p",
                 "target_language": None,
                 "dialogue_mode": "auto_rewrite",
+                "add_subtitles": False,
             },
             allowed_output_combinations=[
                 {"aspect_ratio": aspect, "resolution": resolution}
@@ -922,6 +925,7 @@ def install(
         replacement_instruction: Annotated[str | None, Form()] = None,
         dialogue_mode: Annotated[str | None, Form()] = None,
         dialogue_brief: Annotated[str | None, Form()] = None,
+        add_subtitles: Annotated[bool, Form()] = False,
     ):
         limiter.check(identity.owner_id, "create", 10)
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1006,6 +1010,7 @@ def install(
                 }
             ),
             "replacement_guidance": None if instruction is None else {"instruction": instruction, "image_field": "replacement_image"},
+            "add_subtitles": add_subtitles,
         }
         is_quote = request.url.path.endswith("/quotes")
         idem_digest = _idempotency_digest(
@@ -1017,6 +1022,7 @@ def install(
             "target_language": language,
             "dialogue_mode": mode,
             "dialogue_brief": brief,
+            "add_subtitles": add_subtitles,
             "replacement_instruction": instruction,
             "source_kind": "upload" if source_video is not None else "url",
             "source_url": normalized_url,
@@ -1026,7 +1032,11 @@ def install(
             "resolution": resolution,
             "target_language": language,
             "replacement_image": replacement_image is not None,
+            "add_subtitles": add_subtitles,
         }
+        # Preserve pre-subtitle idempotency hashes for the unchanged default.
+        if not add_subtitles:
+            descriptor.pop("add_subtitles")
         try:
             existing_quote = None
             if is_quote:

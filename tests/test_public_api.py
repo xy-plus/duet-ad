@@ -19,6 +19,74 @@ TOKEN = "test-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
+def test_subtitles_form_freezes_boolean_and_binds_idempotency(tmp_path, video_1s):
+    settings, auth, _ = _public_setup(tmp_path)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    try:
+        with TestClient(app) as client:
+            capability = client.get("/api/v1/video-generations/capabilities", headers=auth).json()
+            assert capability["defaults"]["add_subtitles"] is False
+            created = _create(client, auth, video_1s, key="subtitle01", add_subtitles="true")
+            assert created.status_code == 201
+            assert created.json()["parameters"]["add_subtitles"] is True
+            pid = created.json()["id"][3:]
+            state = client.get(f"/api/conversations/{pid}", headers=AUTH).json()
+            assert state["effective_request"]["add_subtitles"] is True
+            replay = _create(client, auth, video_1s, key="subtitle01", add_subtitles="1")
+            assert replay.status_code == 200
+            changed = _create(client, auth, video_1s, key="subtitle01", add_subtitles="false")
+            assert changed.status_code == 409
+            default = _create(client, auth, video_1s, key="subtitle02")
+            assert default.status_code == 201
+            assert default.json()["parameters"]["add_subtitles"] is False
+            false_replay = _create(client, auth, video_1s, key="subtitle02", add_subtitles="false")
+            assert false_replay.status_code == 200
+            invalid = _create(client, auth, video_1s, key="subtitle03", add_subtitles="maybe")
+            assert invalid.status_code == 422
+            assert len(app.state.store.list()) == 2
+    finally:
+        app.state.pipeline.release.set()
+
+
+def test_legacy_public_parameters_default_subtitles_off():
+    assert public_api.Parameters(aspect_ratio="9:16", resolution="768p", target_language=None, replacement_image=False).add_subtitles is False
+
+
+def test_pre_subtitle_persisted_job_replays_after_upgrade(tmp_path, video_1s, monkeypatch):
+    import importlib
+    main_module = importlib.import_module("app.main")
+    old_parser = main_module._parse_generation_request
+    old_hash = public_api.canonical_json_sha256
+    def legacy_parser(*args):
+        value = old_parser(*args)
+        value.pop("add_subtitles", None)
+        return value
+    def legacy_hash(value):
+        value = {**value, "request": {key: item for key, item in value["request"].items() if key != "add_subtitles"}}
+        return old_hash(value)
+    settings, auth, _ = _public_setup(tmp_path)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    try:
+        with TestClient(app) as client:
+            with monkeypatch.context() as old_code:
+                old_code.setattr(main_module, "_parse_generation_request", legacy_parser)
+                old_code.setattr(public_api, "canonical_json_sha256", legacy_hash)
+                created = _create(client, auth, video_1s, key="legacy-subtitle")
+            assert created.status_code == 201
+            pid = created.json()["id"][3:]
+            stored = app.state.store.read(pid)
+            assert "add_subtitles" not in stored["effective_request"]
+            receipt = dict(stored["_public_api"])
+            receipt["parameters"].pop("add_subtitles", None)
+            app.state.store.update(pid, _public_api=receipt)
+            replay = _create(client, auth, video_1s, key="legacy-subtitle", add_subtitles="false")
+            assert replay.status_code == 200
+            assert replay.json()["id"] == created.json()["id"]
+            assert replay.json()["parameters"]["add_subtitles"] is False
+    finally:
+        app.state.pipeline.release.set()
+
+
 class ManualPipeline:
     """Leaves every project queued until the test releases it."""
 
@@ -143,6 +211,7 @@ def test_create_reserves_credits_and_is_rotation_safe_idempotent(tmp_path, video
         body = created.json()
         assert body["status"] == "queued"
         assert body["parameters"] == {
+            "add_subtitles": False,
             "aspect_ratio": "9:16",
             "resolution": "768p",
             "target_language": None,

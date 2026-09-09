@@ -998,6 +998,22 @@ input, textarea { font-family: inherit; }
 
 .translation-fields[hidden] { display: none; }
 
+.subtitle-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.subtitle-option input {
+  appearance: auto;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+.subtitle-option input:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+.subtitle-option:has(input:disabled) { opacity: 0.6; cursor: default; }
 .dialogue-brief-fields { margin: 0 0 10px; }
 
 .dialogue-brief-fields[hidden] { display: none; }

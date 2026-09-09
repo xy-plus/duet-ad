@@ -34,8 +34,8 @@ from app.store import (
     IdempotencyIndexUnavailable,
     ProjectStateError,
     ProjectStore,
-    canonical_json_sha256,
     creation_request_digest,
+    generation_request_sha256 as hash_generation_request,
 )
 
 
@@ -79,7 +79,7 @@ CAPABILITY = {
         "replacement_image_field": "replacement_image",
         "aspect_ratios": ["16:9", "9:16"],
         "resolutions": ["480p", "768p"],
-        "defaults": {"fit_mode": "auto", "optimize_image": True, "remove_subtitle": True, "remove_logo": True},
+        "defaults": {"fit_mode": "auto", "optimize_image": True, "remove_subtitle": True, "remove_logo": True, "add_subtitles": False},
         "dialogue": {
             "modes": ["auto_rewrite", "generate"],
             "mode": "auto_rewrite",
@@ -258,6 +258,9 @@ def _parse_generation_request(
         )
     if type(value["version"]) is not int or value["version"] != 1:
         raise _error(422, "invalid_generation_request", "generation_request.version 必须为 1")
+    add_subtitles = value.get("add_subtitles", False)
+    if type(add_subtitles) is not bool:
+        raise _error(422, "invalid_generation_request", "generation_request.add_subtitles 必须为布尔值")
 
     output = value["output"]
     if (
@@ -369,6 +372,7 @@ def _parse_generation_request(
             }
         ),
         "replacement_guidance": normalized_guidance,
+        "add_subtitles": add_subtitles,
         "fusion": {"agent": internal_fusion_agent},
     }
 
@@ -803,7 +807,7 @@ def create_app(
                     "bytes": replacement_bytes,
                 }
 
-            generation_request_sha256 = canonical_json_sha256(effective_request)
+            generation_request_sha256 = hash_generation_request(effective_request)
             input_receipt = {
                 "version": 1,
                 "client_request_id": normalized_client_request_id,

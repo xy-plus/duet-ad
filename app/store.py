@@ -38,6 +38,15 @@ class IdempotencyIndexUnavailable(RuntimeError):
     """The durable create claim cannot be trusted, so creation must fail closed."""
 
 
+def generation_request_sha256(value: Any) -> str:
+    """The optional off switch preserves the fingerprint of legacy requests."""
+    if isinstance(value, dict):
+        value = dict(value)
+        if value.get("add_subtitles") is False:
+            value.pop("add_subtitles")
+    return canonical_json_sha256(value)
+
+
 def canonical_json_sha256(value: Any) -> str:
     payload = json.dumps(
         value,
@@ -333,7 +342,7 @@ class ProjectStore:
             raise IdempotencyIndexUnavailable(
                 "idempotency claim and project receipt disagree"
             )
-        if canonical_json_sha256(state.get("effective_request")) != receipt.get(
+        if generation_request_sha256(state.get("effective_request")) != receipt.get(
             "generation_request_sha256"
         ):
             raise IdempotencyIndexUnavailable(
@@ -439,7 +448,7 @@ class ProjectStore:
         )
         if receipt_digest != request_digest:
             raise ValueError("request digest does not match input receipt")
-        if canonical_json_sha256(effective_request) != input_receipt.get(
+        if generation_request_sha256(effective_request) != input_receipt.get(
             "generation_request_sha256"
         ):
             raise ValueError("effective request does not match input receipt")

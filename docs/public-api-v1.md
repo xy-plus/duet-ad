@@ -96,7 +96,8 @@ HTTP `200 OK`
     "aspect_ratio": "9:16",
     "resolution": "768p",
     "target_language": null,
-    "dialogue_mode": "auto_rewrite"
+    "dialogue_mode": "auto_rewrite",
+    "add_subtitles": false
   },
   "allowed_output_combinations": [
     {"aspect_ratio": "9:16", "resolution": "768p"},
@@ -351,6 +352,7 @@ Content-Disposition: form-data; name="replacement_instruction"
 | `aspect_ratio` | string | 否 | `9:16` | `9:16`、`16:9` | 输出画幅 |
 | `resolution` | string | 否 | `768p` | `768p`、`480p` | 输出清晰度 |
 | `target_language` | string | 否 | 与原视频相同 | 去除首尾空白后不能为空；最多 80 个 UTF-16 字符单元 | 对白目标语言，例如 `中文`、`English` |
+| `add_subtitles` | boolean | 否 | `false` | `true`、`false` | 在最终成片上叠加台词字幕；参数随任务冻结，幂等重试必须保持一致 |
 | `dialogue_mode` | string | 否 | `auto_rewrite` | `auto_rewrite`、`generate` | 台词模式；`auto_rewrite` 翻译并自然改写原台词，`generate` 按 `dialogue_brief` 描述自动生成台词 |
 | `dialogue_brief` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 口播台词的内容描述；`dialogue_mode` 为 `generate` 时必填，其余模式不允许提供 |
 | `replacement_image` | binary | 条件必填 | 无 | JPEG、PNG、WebP；最大 10 MiB | 主体替换参考图；必须与 `replacement_instruction` 同时提供 |
@@ -791,6 +793,7 @@ HTTP `200 OK`，响应体为 OpenAPI JSON，标题为 `Duet Video Generation API
 | `resolution` | string | 否 | `768p`、`480p` | 输出清晰度 |
 | `target_language` | string | 是 | 用户提交的语言；`null` 表示沿用原语言 | 目标语言 |
 | `replacement_image` | boolean | 否 | `true`、`false` | 本任务是否使用了参考图 |
+| `add_subtitles` | boolean | 否 | `true`、`false` | 本任务是否叠加台词字幕；历史任务默认 `false` |
 
 ### `billing`
 
