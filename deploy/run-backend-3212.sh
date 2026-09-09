@@ -10,6 +10,8 @@ source /home/xy/.config/claude/deepseek.env
 source /home/xy/duet-ad1-h3-max-r2v/.env
 set +a
 
+# Production data stays in the release tree; only the code runs from this
+# pinned online worktree (pre-adaptation-prompt version, ms/grayblock-explainer).
 export DATA_DIR=/home/xy/duet-ad1-h3-max-r2v-release/data
 export PUBLIC_API_ENABLED=1
 export PUBLIC_API_CLIENTS_FILE=/home/xy/.config/duet-ad1-h3-r2v/public-api-clients.json
