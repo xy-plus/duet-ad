@@ -2,7 +2,7 @@
 
 Duet API 用于提交视频生成任务，并在任务完成后返回最终视频和费用。
 
-发布状态：本文的 `1.2.0` 报价与确认接口为已定设计、待上线合同，供接入方提前适配；新增接口尚未在 3211 发布。现有 `1.1.0` 直接创建、查询、下载和账户接口维持已上线行为。下文新增接口的 URL 为计划上线地址，具体启用时间另行通知。
+本合同版本 `1.2.0` 新增报价与确认接口，支持先展示预计积分、用户确认后再执行。原有直接创建、查询、下载和账户接口保持兼容。
 
 视频生成通常需要数分钟，因此接口采用异步模式：创建任务后立即返回任务 ID；接入方使用任务 ID 查询状态；成功后再下载视频。
 
@@ -10,7 +10,7 @@ Duet API 用于提交视频生成任务，并在任务完成后返回最终视�
 
 | 项目 | 值 |
 |---|---|
-| 合同版本 | `1.2.0`（报价与确认待上线） |
+| 合同版本 | `1.2.0` |
 | 文档更新日期 | `2026-09-09` |
 | 联调环境 | `https://8.166.140.227:3211` |
 | API 前缀 | `/api/v1` |
@@ -46,19 +46,19 @@ API Key 对应一个账户。这个账户拥有自己的任务和积分；不同
 
 ## 接口一览
 
-| 方法 | 路径 | 用途 | 发布状态 |
+| 方法 | 路径 | 用途 | 版本变化 |
 |---|---|---|---|
-| `GET` | `/api/v1/video-generations/capabilities` | 查询当前参数限制和价格 | 已上线 |
-| `POST` | `/api/v1/video-generations/quotes` | 校验并保存输入，读取时长和预计积分 | 待上线 |
-| `GET` | `/api/v1/video-generations/quotes/{quote_id}` | 查询报价及其确认状态 | 待上线 |
-| `POST` | `/api/v1/video-generations/quotes/{quote_id}/confirm` | 用户确认报价后创建异步任务 | 待上线 |
-| `POST` | `/api/v1/video-generations` | 创建异步生成任务 | 已上线 |
-| `GET` | `/api/v1/video-generations/{job_id}` | 查询任务状态、结果和费用 | 已上线 |
-| `GET` | `/api/v1/video-generations/{job_id}/content` | 下载视频，支持单段 Range | 已上线 |
-| `HEAD` | `/api/v1/video-generations/{job_id}/content` | 读取视频元数据，不下载正文 | 已上线 |
-| `GET` | `/api/v1/account/credits` | 查询积分余额 | 已上线 |
-| `GET` | `/api/v1/account/credit-transactions` | 查询积分流水 | 已上线 |
-| `GET` | `/api/v1/openapi.json` | 获取公共 API 的 OpenAPI 描述 | 已上线；新增路径待发布 |
+| `GET` | `/api/v1/video-generations/capabilities` | 查询当前参数限制和价格 | 保持兼容 |
+| `POST` | `/api/v1/video-generations/quotes` | 校验并保存输入，读取时长和预计积分 | 1.2.0 新增 |
+| `GET` | `/api/v1/video-generations/quotes/{quote_id}` | 查询报价及其确认状态 | 1.2.0 新增 |
+| `POST` | `/api/v1/video-generations/quotes/{quote_id}/confirm` | 用户确认报价后创建异步任务 | 1.2.0 新增 |
+| `POST` | `/api/v1/video-generations` | 创建异步生成任务 | 保持兼容 |
+| `GET` | `/api/v1/video-generations/{job_id}` | 查询任务状态、结果和费用 | 保持兼容 |
+| `GET` | `/api/v1/video-generations/{job_id}/content` | 下载视频，支持单段 Range | 保持兼容 |
+| `HEAD` | `/api/v1/video-generations/{job_id}/content` | 读取视频元数据，不下载正文 | 保持兼容 |
+| `GET` | `/api/v1/account/credits` | 查询积分余额 | 保持兼容 |
+| `GET` | `/api/v1/account/credit-transactions` | 查询积分流水 | 保持兼容 |
+| `GET` | `/api/v1/openapi.json` | 获取公共 API 的 OpenAPI 描述 | 1.2.0 加入报价与确认路径 |
 
 ---
 
@@ -162,7 +162,7 @@ HTTP `200 OK`
 
 ---
 
-## 创建报价（待上线）
+## 创建报价
 
 ```http
 POST /api/v1/video-generations/quotes
@@ -229,7 +229,7 @@ curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes'
 
 有效期内按该报价冻结的价格执行：确认所得 Job 的 `billing.quoted_credits` 等于 `estimated_credits`，`billing.price_version` 等于报价的 `price_version`。期间能力接口的价格变化仅影响新报价，不改变已创建报价。
 
-## 查询报价（待上线）
+## 查询报价
 
 ```http
 GET /api/v1/video-generations/quotes/vq_0123456789abcdef0123456789abcdef
@@ -246,7 +246,7 @@ curl 'https://8.166.140.227:3211/api/v1/video-generations/quotes/vq_0123456789ab
   --header 'Authorization: Bearer YOUR_API_KEY'
 ```
 
-## 确认报价并执行（待上线）
+## 确认报价并执行
 
 ```bash
 curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes/vq_0123456789abcdef0123456789abcdef/confirm' \
@@ -754,7 +754,7 @@ Accept: application/json
 
 ### 成功响应
 
-HTTP `200 OK`，响应体为 OpenAPI JSON，标题为 `Duet Video Generation API`。现网描述的版本字段为 `1.0.0`；计划随报价接口上线将 `info.version` 对齐为 `1.2.0`，并加入新增路径。上线前不要用现网 OpenAPI 是否包含报价接口来判断本设计合同的字段。
+HTTP `200 OK`，响应体为 OpenAPI JSON，标题为 `Duet Video Generation API`，`info.version` 为 `1.2.0`，包含报价与确认路径。
 
 ---
 
@@ -936,7 +936,7 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 
 | 类型 | 限制 |
 |---|---:|
-| 创建任务；待上线的创建报价和确认报价也共享此配额 | 每分钟最多 10 次 |
+| 创建任务、创建报价和确认报价共享此配额 | 每分钟最多 10 次 |
 | 查询类请求 | 每分钟最多 120 次 |
 | 视频下载 | 同时最多 2 个连接 |
 

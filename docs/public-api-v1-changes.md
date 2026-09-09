@@ -2,16 +2,16 @@
 
 ## 1.1.0 → 1.2.0（2026-09-09）
 
-本节为已定设计、待上线合同，供客户提前适配；新增接口尚未在 3211 发布，启用时间另行通知。现有 1.1.0 接口继续可用。
+本节说明 1.2.0 新增接口与客户适配方式。现有 1.1.0 接口保持兼容。
 
-拟新增可选的“报价 → 用户确认 → 执行”流程，生成管线和旧的直接创建接口保持原有行为。
+本版本新增可选的“报价 → 用户确认 → 执行”流程，生成管线和旧的直接创建接口保持原有行为。
 
 ### 客户最少需要改什么
 
 | 流程 | 调用顺序 |
 |---|---|
 | 原流程，继续支持 | 上传文件或提交 URL → `POST /api/v1/video-generations` → 获得 Job → 轮询与下载 |
-| 新流程，待上线 | 上传文件或提交 URL → `POST /api/v1/video-generations/quotes` → 展示预计积分 → 用户同意 → `POST /api/v1/video-generations/quotes/{quote_id}/confirm` → 获得 Job → 原有轮询与下载 |
+| 新流程，1.2.0 新增 | 上传文件或提交 URL → `POST /api/v1/video-generations/quotes` → 展示预计积分 → 用户同意 → `POST /api/v1/video-generations/quotes/{quote_id}/confirm` → 获得 Job → 原有轮询与下载 |
 
 不需要“执行前确认积分”的接入方无需修改现有调用。接入新流程只需调整以下四处：
 
@@ -34,9 +34,9 @@
 | 查询报价 | 无 | `GET /api/v1/video-generations/quotes/{quote_id}` 返回 Quote；确认后 `job_id` 指向已创建任务 |
 | 任务轮询与下载 | 使用 Job 的 `id` | 无变化；报价的 `confirmed` 仅代表已建任务，不能视为 Job 的 `succeeded` |
 
-### 最小请求示例（待上线）
+### 最小请求示例
 
-计划地址为 `https://8.166.140.227:3211`。示例 API Key 和 ID 均为占位值。报价请求示例使用 URL；上传文件时，将 `source_video_url` 字段替换为 `source_video` 文件字段即可，完整限制见主合同。
+接口地址为 `https://8.166.140.227:3211`。示例 API Key 和 ID 均为占位值。报价请求示例使用 URL；上传文件时，将 `source_video_url` 字段替换为 `source_video` 文件字段即可，完整限制见主合同。
 
 ```bash
 curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes' \
