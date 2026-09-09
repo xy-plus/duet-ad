@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from app import media
 from app import face_mask
 from app import subtitles
+from app import person_identity
 from app.config import Settings
 from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
 from app.object_replace_schema import (
@@ -623,24 +624,9 @@ class Pipeline:
                 )
             )
             self._progress(project_id, 24, "video-maker", segments=segments)
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(segments)),
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        self._prepare_segment,
-                        project_id,
-                        project,
-                        source,
-                        segment,
-                        selections[int(segment["index"])],
-                        request,
-                        log,
-                    )
-                    for segment in segments
-                ]
-                prepared = [future.result() for future in futures]
-            prepared.sort(key=lambda item: int(item["index"]))
+            prepared = self._prepare_project_segments(
+                project_id, project, source, segments, selections, request, log,
+            )
             self._continue_after_prepared(
                 project_id,
                 project,
@@ -2198,9 +2184,11 @@ class Pipeline:
             json.dumps(index_request, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        identity_evidence = index_request.get("person_identity")
+        normalize_index = lambda value: normalize_project_index(value, identity_evidence)
         index_schema = project_index_schema([
             segment["segment_index"] for segment in index_request["segments"]
-        ])
+        ], identity_evidence)
         self._progress(project_id, 50, "video-maker-project-index")
         skill = VIDEO_SKILL.read_text(encoding="utf-8")
         element_index = self._node(
@@ -2215,13 +2203,19 @@ class Pipeline:
                     "\n\n严格执行项目级索引阶段；像素帧是视觉事实的唯一依据；"
                     "segments[].visual_prompt 只用于汇总逐段已发现对象并检查跨段覆盖，"
                     "不得用它替代或推翻像素证据；最终填写本次注入的 Schema。"
+                    "\n若有 person_identity：这是固定算法输出的人物身份辅助证据，"
+                    "请按 observations 的原图 bbox、segment_index、frame_order 对应像素中的人物，"
+                    "填写 canonical_id 和 identity_observation_ids；已确认同一 canonical_id"
+                    "不得拆成不同身份。canonical_id 为空只表示不确定，不表示另一人。"
+                    "不同 canonical_id 也不证明一定是不同人，仍可按视觉证据合并。"
+                    "source_time_s 是原视频时间；intervals 是采样支持区间，不保证区间内每帧可见。"
                 ),
                 index_request,
                 index_schema,
                 index_images,
-                validator=normalize_project_index,
+                validator=normalize_index,
             ),
-            transform=normalize_project_index,
+            transform=normalize_index,
         )
         element_path = project / "work" / "element_index.json"
         element_path.write_text(
@@ -2821,25 +2815,10 @@ class Pipeline:
             self._progress(
                 project_id, 24, "video-maker-resume", segments=segments,
             )
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, len(segments)),
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        self._prepare_segment,
-                        project_id,
-                        project,
-                        source,
-                        segment,
-                        selections[int(segment["index"])],
-                        request,
-                        log,
-                        resume=not early_resume,
-                    )
-                    for segment in segments
-                ]
-                prepared = [future.result() for future in futures]
-            prepared.sort(key=lambda item: int(item["index"]))
+            prepared = self._prepare_project_segments(
+                project_id, project, source, segments, selections, request, log,
+                resume=not early_resume,
+            )
             self._continue_after_prepared(
                 project_id,
                 project,
@@ -4363,7 +4342,120 @@ class Pipeline:
             return value
         raise FileNotFoundError(f"completed node output is missing: {node}/{scope}")
 
-    def _prepare_segment(
+    def _prepare_segment(self, project_id, project, source, segment, selection,
+                         request, log, *, resume=False):
+        """Single-segment compatibility helper; project runs use the barrier below."""
+        material = self._prepare_segment_materials(
+            project_id, project, source, segment, selection, request, log,
+            resume=resume,
+        )
+        return self._analyze_prepared_segment(
+            project, material, request, log, resume=resume,
+        )
+
+    def _prepare_project_segments(
+        self, project_id, project, source, segments, selections, request, log,
+        *, resume=False,
+    ):
+        # All original frames must exist before any vision-agent request starts.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(segments)),
+        ) as pool:
+            futures = [pool.submit(
+                self._prepare_segment_materials,
+                project_id, project, source, segment,
+                selections[int(segment["index"])], request, log, resume=resume,
+            ) for segment in segments]
+            materials = [future.result() for future in futures]
+        identity = self._person_identity_prepass(project, source, materials, log)
+        for item in materials:
+            item["person_identity"] = {
+                **identity,
+                "observations": [
+                    observation for observation in identity.get("observations", [])
+                    if observation.get("segment_index") == int(item["index"])
+                ],
+            }
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(materials)),
+        ) as pool:
+            futures = [pool.submit(
+                self._analyze_prepared_segment, project, item, request, log,
+                resume=resume,
+            ) for item in materials]
+            prepared = [future.result() for future in futures]
+        return sorted(prepared, key=lambda item: int(item["index"]))
+
+    def _person_identity_prepass(self, project, source, materials, log):
+        source_dir = project / "work" / "source-4fps"
+        manifest_path = source_dir / "manifest.json"
+        frames = []
+        scenes = self.store.read(project.name).get("scenes", [])
+        def source_scene(time_s):
+            for scene in scenes:
+                if float(scene["start_s"]) <= time_s < float(scene["end_s"]):
+                    return f"SCENE_{int(scene['index']):02d}"
+            return "SCENE_UNKNOWN"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            frames.extend({
+                "path": str((source_dir / entry["file"]).resolve()),
+                "source_time_s": entry["time_seconds"],
+                "scene_id": source_scene(float(entry["time_seconds"])),
+                "segment_index": None,
+                "frame_order": entry.get("index"),
+                "kind": "source",
+            } for entry in manifest.get("frames", []))
+        for item in sorted(materials, key=lambda item: int(item["index"])):
+            for order, (path, selection) in enumerate(zip(
+                item["raw_keyframe_paths"], item["keyframe_selection"], strict=True,
+            ), 1):
+                frames.append({
+                    **selection,
+                    "path": str(path.resolve()),
+                    "source_time_s": selection.get("source_time_s", 0),
+                    "scene_id": selection.get("source_scene_id"),
+                    "segment_index": int(item["index"]),
+                    "frame_order": order,
+                    "kind": "keyframe",
+                })
+        binding = {
+            "source_sha256": self._sha256(source),
+            "frames_sha256": self._json_sha256([
+                {**entry, "sha256": self._sha256(Path(entry["path"]))}
+                for entry in frames
+            ]),
+            "configuration": person_identity.identity_configuration_fingerprint(),
+        }
+        sidecar = project / "work" / "person_identity.json"
+        if sidecar.is_file():
+            try:
+                cached = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                cached = {}
+            if (cached.get("input_binding") == binding
+                    and (cached.get("status") == "complete"
+                         or (cached.get("status") == "skipped"
+                             and cached.get("reason") ==
+                             "person_identity_model_unavailable_or_invalid"))):
+                log.event("person_identity_prepass_reused", status=cached["status"])
+                return cached
+        result = self._node(
+            log, "person-identity-prepass", "project", binding,
+            [Path(entry["path"]) for entry in frames],
+            lambda: person_identity.analyze_person_identity(frames, source=binding),
+            retry_if=lambda _exc: False,
+        )
+        result = {**result, "input_binding": binding}
+        sidecar.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        log.event("person_identity_prepass_completed", status=result["status"],
+                  reason=result.get("reason"))
+        return result
+
+    def _prepare_segment_materials(
         self,
         project_id: str,
         project: Path,
@@ -4555,23 +4647,48 @@ class Pipeline:
                 make_proxies,
                 lambda paths: list(paths),
             )
+        return {
+            **segment,
+            "source": segment_source,
+            "keyframe_paths": authoritative_frames,
+            "raw_keyframe_paths": frames,
+            "keyframe_selection": selection,
+            "analysis_paths": analysis_frames,
+            "segment_manifest": segment_manifest,
+        }
+
+    def _analyze_prepared_segment(
+        self, project: Path, segment: dict[str, Any], request: dict[str, Any],
+        log: ResearchLog, *, resume: bool = False,
+    ) -> dict[str, Any]:
+        index = int(segment["index"])
+        scope = self._segment_scope(index)
+        directory = project / "work" / "segments" / f"{index:04d}"
+        analysis_frames = segment["analysis_paths"]
+        selection = segment.get("keyframe_selection", [])
         visual_payload = {
-            "generation_config": generation_config,
+            "generation_config": self._generation_config(request),
             "segment": {
                 key: value
                 for key, value in segment.items()
-                if key not in {"visual_prompt", "dialogue"}
+                if key not in {"visual_prompt", "dialogue", "source",
+                               "keyframe_paths", "raw_keyframe_paths",
+                               "analysis_paths", "segment_manifest",
+                               "person_identity", "keyframe_selection"}
             },
-            "manifest": segment_manifest,
+            "manifest": segment["segment_manifest"],
             "frames": [
                 {
                     "frame_order": order,
                     "path": path.relative_to(project).as_posix(),
                     "sha256": self._sha256(path),
+                    **(selection[order - 1] if order <= len(selection) else {}),
                 }
                 for order, path in enumerate(analysis_frames, 1)
             ],
         }
+        if "person_identity" in segment:
+            visual_payload["person_identity"] = segment["person_identity"]
         visual_path = directory / "visual_prompt.txt"
         visual_prompt = visual_path.read_text(encoding="utf-8").strip() if resume and visual_path.is_file() else ""
         if visual_prompt:
@@ -4586,7 +4703,12 @@ class Pipeline:
                 analysis_frames,
                 lambda: self.deepseek.complete_structured(
                     skill
-                    + "\n\n本次只执行逐段视觉分析；最终输出严格遵循本次注入的 JSON Schema。",
+                    + "\n\n本次只执行逐段视觉分析；最终输出严格遵循本次注入的 JSON Schema。"
+                    + ("\n如果提供 person_identity，请按原视频 source_time_s、frame_order 和"
+                       "原图 bbox 将确认的 canonical_id 对应到人物；同一 ID 是同一人，"
+                       "衣帽变化不能将其拆开。未确认不表示不同人；区间仅是采样支持。"
+                       "不同 ID 也不是不同人的证明。"
+                       if "person_identity" in segment else ""),
                     visual_payload,
                     VISUAL_PROMPT_SCHEMA,
                     analysis_frames,
@@ -4597,9 +4719,6 @@ class Pipeline:
             visual_path.write_text(visual_prompt, encoding="utf-8")
         return {
             **segment,
-            "source": segment_source,
-            "keyframe_paths": authoritative_frames,
-            "analysis_paths": analysis_frames,
             "visual_prompt": visual_prompt,
             "status": "running",
         }
@@ -4772,6 +4891,8 @@ class Pipeline:
             frames = []
             for order, path in enumerate(item["analysis_paths"], 1):
                 frames.append({
+                    **(item.get("keyframe_selection", [])[order - 1]
+                       if order <= len(item.get("keyframe_selection", [])) else {}),
                     "frame_order": order,
                     "path": path.relative_to(project).as_posix(),
                     "sha256": Pipeline._sha256(path),
@@ -4782,11 +4903,20 @@ class Pipeline:
                 "visual_prompt": item["visual_prompt"],
                 "frames": frames,
             })
-        return {
+        payload = {
             "phase": "project_index",
             "generation_config": generation_config,
             "segments": segments,
-        }, images
+        }
+        evidence = [item.get("person_identity") for item in prepared
+                    if isinstance(item.get("person_identity"), dict)]
+        if evidence:
+            payload["person_identity"] = {
+                **evidence[0],
+                "observations": [observation for item in evidence
+                                 for observation in item.get("observations", [])],
+            }
+        return payload, images
 
     @staticmethod
     def _one_line(value: object, fallback: str = "unspecified") -> str:

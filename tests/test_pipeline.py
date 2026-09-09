@@ -611,7 +611,7 @@ class _FlowDeepSeek:
         segment_indices = [
             segment["segment_index"] for segment in payload["segments"]
         ]
-        assert schema == project_index_schema(segment_indices)
+        assert schema == project_index_schema(segment_indices, payload.get("person_identity"))
         with self.lock:
             self.events.append("project-index")
             self.common_ready = True
@@ -1231,7 +1231,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
             range(1, 10)
         )
         assert all(
-            set(frame) == {"frame_order", "path", "sha256"}
+            {"frame_order", "path", "sha256"} <= set(frame)
             for frame in segment["frames"]
         )
         for frame in segment["frames"]:
@@ -1247,7 +1247,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for call in fusion_calls
     )
     assert set(raw_index) == {
-        "people", "entities", "scenes", "relations",
+        "people", "entities", "scenes", "relations", "identity_resolution",
     }
     assert list(raw_index["people"]) == [
         "person-01", "person-02", "person-03",
@@ -7626,7 +7626,12 @@ def test_resume_pre_picsart_early_path_recovers_segments_without_segment_reuse(
         recorded["prepared"] = prepared
 
     monkeypatch.setattr(pipeline, "_run_pre_segmentation", fake_pre_segmentation)
-    monkeypatch.setattr(pipeline, "_prepare_segment", fake_prepare)
+    monkeypatch.setattr(pipeline, "_prepare_segment_materials", fake_prepare)
+    monkeypatch.setattr(pipeline, "_person_identity_prepass", lambda *args: {
+        "status": "skipped", "reason": "test_without_models",
+        "persons": [], "observations": [],
+    })
+    monkeypatch.setattr(pipeline, "_analyze_prepared_segment", lambda _project, item, *_args, **_kwargs: item)
     monkeypatch.setattr(pipeline, "_continue_after_prepared", fake_continue)
 
     pipeline.resume_pre_picsart(project_id)
