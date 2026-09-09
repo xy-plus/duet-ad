@@ -321,6 +321,10 @@ def main() -> None:
         help="absolute historical projects directory (read-only source)",
     )
     parser.add_argument(
+        "--boundary-fixtures-root", type=Path,
+        help="absolute previously harvested fixtures root for immutable failure snapshots",
+    )
+    parser.add_argument(
         "--include-round2",
         action="store_true",
         help="also harvest round2 in-flight projects (read-only)",
@@ -335,6 +339,11 @@ def main() -> None:
     if not args.projects_root.is_absolute() or not args.projects_root.is_dir():
         parser.error("--projects-root must be an existing absolute directory")
     PROJECTS_ROOT = args.projects_root.resolve()
+    if args.boundary_fixtures_root is not None and (
+        not args.boundary_fixtures_root.is_absolute()
+        or not args.boundary_fixtures_root.is_dir()
+    ):
+        parser.error("--boundary-fixtures-root must be an existing absolute directory")
 
     project_ids = list(args.projects or DEFAULT_PROJECTS)
     if args.include_round2:
@@ -355,6 +364,29 @@ def main() -> None:
     }
     for project_id in project_ids:
         harvest_project(project_id, blobs, manifest)
+    if args.boundary_fixtures_root is not None:
+        historical_manifest = args.boundary_fixtures_root / "manifest.json"
+        historical = json.loads(historical_manifest.read_text(encoding="utf-8"))
+        present = {(entry["project"], entry["node"]) for entry in manifest["entries"]}
+        for entry in historical["entries"]:
+            if (entry.get("subset") != "boundary"
+                    or entry.get("node") != "state-snapshot"
+                    or entry.get("project") not in project_ids
+                    or (entry["project"], "state-snapshot") in present):
+                continue
+            source_snapshot = (args.boundary_fixtures_root / "boundary"
+                               / entry["project"] / "state-snapshot.json")
+            payload = source_snapshot.read_bytes()
+            if _sha256_bytes(payload) != entry["input_sha256"]:
+                raise ValueError("historical boundary snapshot does not match its manifest")
+            destination = FIXTURES_ROOT / "boundary" / entry["project"] / "state-snapshot.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            manifest["entries"].append({
+                **entry,
+                "historical_fixture_source": str(source_snapshot.resolve()),
+                "historical_manifest_sha256": _sha256_file(historical_manifest),
+            })
     FIXTURES_ROOT.mkdir(parents=True, exist_ok=True)
     (FIXTURES_ROOT / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",

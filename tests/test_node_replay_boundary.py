@@ -28,7 +28,7 @@ def _state_snapshot() -> dict:
         FIXTURES_ROOT / "boundary" / BOUNDARY_PROJECT / "state-snapshot.json"
     )
     if not path.is_file():
-        pytest.skip(
+        pytest.fail(
             "boundary state snapshot missing; run "
             "scripts/harvest_node_fixtures.py"
         )
