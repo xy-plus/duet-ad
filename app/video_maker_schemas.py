@@ -53,6 +53,7 @@ _RELATION_FRAME = _object({
 
 def _project_index_schema(
     segment_index_schema: dict[str, Any],
+    identity_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     element_occurrence = _object({
         "segment_index": dict(segment_index_schema),
@@ -78,8 +79,20 @@ def _project_index_schema(
         "preserve": _TEXTS,
         "replace_together": _BOOL,
     })
+    person = element
+    if identity_evidence is not None:
+        observations = _identity_observations(identity_evidence)
+        canonical_ids = sorted({obs["canonical_id"] for obs in observations.values()})
+        person = _object({
+            **element["properties"],
+            "canonical_id": {"type": ["string", "null"], "enum": [*canonical_ids, None]},
+            "identity_observation_ids": _array(
+                {"type": "string", "enum": list(observations)} if observations else _TEXT,
+                maximum=None if observations else 0,
+            ),
+        })
     return _object({
-        "people": _array(element),
+        "people": _array(person),
         "entities": _array(element),
         "scenes": _array(element),
         "relations": _array(relation),
@@ -92,7 +105,10 @@ def _project_index_schema(
 PROJECT_INDEX_SCHEMA = _project_index_schema(_INT1)
 
 
-def project_index_schema(segment_indices: Sequence[int]) -> dict[str, Any]:
+def project_index_schema(
+    segment_indices: Sequence[int],
+    identity_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Bind project-index occurrences to the exact input segment identities."""
     indices = list(segment_indices)
     if (
@@ -106,7 +122,7 @@ def project_index_schema(segment_indices: Sequence[int]) -> dict[str, Any]:
         or len(indices) != len(set(indices))
     ):
         raise ValueError("project-index segment identities are invalid")
-    return _project_index_schema({"type": "integer", "enum": indices})
+    return _project_index_schema({"type": "integer", "enum": indices}, identity_evidence)
 
 
 def normalize_visual_prompt(value: object) -> str:
@@ -140,7 +156,104 @@ def _index_records(
     return indexed
 
 
-def normalize_project_index(value: object) -> dict[str, Any]:
+def _identity_observations(evidence: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Only backend-confirmed observations of actual model input frames qualify."""
+    if evidence.get("status") != "complete":
+        return {}
+    persons = {
+        person["canonical_id"]: set(person.get("observation_ids", []))
+        for person in evidence.get("persons", [])
+        if isinstance(person, dict) and isinstance(person.get("canonical_id"), str)
+    }
+    result = {}
+    duplicates = set()
+    for obs in evidence.get("observations", []):
+        if not isinstance(obs, dict) or obs.get("kind") != "keyframe":
+            continue
+        oid, cid = obs.get("observation_id"), obs.get("canonical_id")
+        if not isinstance(oid, str) or not isinstance(cid, str):
+            continue
+        if oid in result:
+            duplicates.add(oid)
+        if oid not in persons.get(cid, set()):
+            continue
+        if any(type(obs.get(field)) is not int or obs[field] < 1
+               for field in ("segment_index", "frame_order")):
+            continue
+        result[oid] = obs
+    return {oid: obs for oid, obs in result.items() if oid not in duplicates}
+
+
+def _person_identity(
+    person: Mapping[str, Any], observations: Mapping[str, Mapping[str, Any]],
+    occupied_frames: Mapping[tuple[int, int], int],
+    observation_claimants: Mapping[str, int],
+) -> tuple[str | None, list[str], str]:
+    cid, ids = person.get("canonical_id"), person.get("identity_observation_ids")
+    unclaimed = cid is None and not ids
+    if not unclaimed and (not isinstance(cid, str) or not isinstance(ids, list) or not ids):
+        return None, [], "invalid_claim"
+    if not unclaimed and any(not isinstance(oid, str) or oid not in observations for oid in ids):
+        return None, [], "unknown_observation"
+    if not unclaimed and any(observations[oid]["canonical_id"] != cid for oid in ids):
+        return None, [], "conflicting_identity"
+    if not unclaimed and any(observation_claimants.get(oid, 0) > 1 for oid in ids):
+        return None, [], "shared_observation_claim"
+    claimed_frames = set()
+    occurrences = person.get("occurrences")
+    if not isinstance(occurrences, list):
+        return None, [], "invalid_occurrences"
+    for occurrence in occurrences:
+        if not isinstance(occurrence, dict):
+            return None, [], "invalid_occurrences"
+        segment, frames = occurrence.get("segment_index"), occurrence.get("frame_orders")
+        if type(segment) is not int or not isinstance(frames, list):
+            return None, [], "invalid_occurrences"
+        if any(type(frame) is not int for frame in frames):
+            return None, [], "invalid_occurrences"
+        claimed_frames.update((segment, frame) for frame in frames)
+    candidates: dict[tuple[int, int], list[str]] = {}
+    for oid, observation in observations.items():
+        frame = (observation["segment_index"], observation["frame_order"])
+        if frame in claimed_frames:
+            candidates.setdefault(frame, []).append(oid)
+    exclusive_ids = [oids[0] for frame, oids in candidates.items()
+                     if len(oids) == 1 and occupied_frames.get(frame) == 1]
+    exclusive_cids = {observations[oid]["canonical_id"] for oid in exclusive_ids}
+    if unclaimed:
+        # Canonical IDs already passed the CV prepass's multi-observation
+        # confirmation; a single unambiguous model keyframe may bind one entry.
+        if exclusive_ids and len(exclusive_cids) == 1:
+            return next(iter(exclusive_cids)), exclusive_ids, "recovered_single_person_frames"
+        return None, [], "unclaimed_conflict" if len(exclusive_cids) > 1 else "unclaimed"
+    if exclusive_cids - {cid}:
+        return None, [], "conflicting_occurrence_identity"
+    observed_frames = {
+        (observations[oid]["segment_index"], observations[oid]["frame_order"])
+        for oid in ids
+    }
+    if not claimed_frames or not observed_frames <= claimed_frames:
+        return None, [], "occurrence_coverage_mismatch"
+    return cid, list(dict.fromkeys(ids)), "confirmed"
+
+
+def _merge_person(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    descriptions = [target["source_visual_description"], source["source_visual_description"]]
+    target["source_visual_description"] = "\n".join(dict.fromkeys(descriptions))
+    for field in ("preserve", "replaceable", "identity_observation_ids"):
+        target[field] = list(dict.fromkeys([*target[field], *source[field]]))
+    frames: dict[int, set[int]] = {}
+    for occurrence in [*target["occurrences"], *source["occurrences"]]:
+        frames.setdefault(occurrence["segment_index"], set()).update(occurrence["frame_orders"])
+    target["occurrences"] = [
+        {"segment_index": segment, "frame_orders": sorted(orders)}
+        for segment, orders in sorted(frames.items())
+    ]
+
+
+def normalize_project_index(
+    value: object, identity_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Mechanically replace invocation-local aliases with stable backend keys."""
     if not isinstance(value, dict) or not {
         "people", "entities", "scenes", "relations",
@@ -160,6 +273,24 @@ def normalize_project_index(value: object) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
     alias_candidates: dict[str, list[str]] = {}
+    observations = _identity_observations(identity_evidence) if identity_evidence is not None else {}
+    canonical_keys: dict[str, str] = {}
+    identity_audit = []
+    occupied_frames: dict[tuple[int, int], int] = {}
+    observation_claimants: dict[str, int] = {}
+    if identity_evidence is not None:
+        for person in value["people"]:
+            claimed_ids = person.get("identity_observation_ids")
+            if isinstance(claimed_ids, list):
+                for oid in {item for item in claimed_ids if isinstance(item, str)}:
+                    observation_claimants[oid] = observation_claimants.get(oid, 0) + 1
+            frames = set()
+            for occurrence in person.get("occurrences", []):
+                if isinstance(occurrence, dict) and type(occurrence.get("segment_index")) is int:
+                    frames.update((occurrence["segment_index"], frame)
+                                  for frame in occurrence.get("frame_orders", []) if type(frame) is int)
+            for frame in frames:
+                occupied_frames[frame] = occupied_frames.get(frame, 0) + 1
     for category, prefix in (
         ("people", "person"),
         ("entities", "entity"),
@@ -168,13 +299,28 @@ def normalize_project_index(value: object) -> dict[str, Any]:
         result[category] = {}
         for index, (local_key, record) in enumerate(discovered[category], 1):
             stable_key = f"{prefix}-{index:02d}"
-            result[category][stable_key] = record
+            canonical_id = None
+            if category == "people" and identity_evidence is not None:
+                canonical_id, observation_ids, reason = _person_identity(
+                    value[category][index - 1], observations, occupied_frames, observation_claimants,
+                )
+                record = {**record, "canonical_id": canonical_id,
+                          "identity_observation_ids": observation_ids}
+                stable_key = canonical_keys.get(canonical_id, stable_key)
+                identity_audit.append({"input_index": index, "input_key": local_key,
+                                       "output_key": stable_key, "reason": reason})
+            if canonical_id is not None and canonical_id in canonical_keys:
+                _merge_person(result[category][stable_key], record)
+            else:
+                result[category][stable_key] = record
+                if canonical_id is not None:
+                    canonical_keys[canonical_id] = stable_key
             alias_candidates.setdefault(local_key, []).append(stable_key)
 
     aliases = {
         local_key: candidates[0]
         for local_key, candidates in alias_candidates.items()
-        if len(candidates) == 1
+        if len(set(candidates)) == 1
     }
     result["relations"] = {}
     for index, (_local_key, record) in enumerate(discovered["relations"], 1):
@@ -187,4 +333,6 @@ def normalize_project_index(value: object) -> dict[str, Any]:
                 record["object_key"], f"unresolved:{record['object_key']}",
             ),
         }
+    if identity_evidence is not None:
+        result["identity_resolution"] = identity_audit
     return result
