@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from app import media
 from app import face_mask
+from app import subtitles
 from app.config import Settings
 from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
 from app.object_replace_schema import (
@@ -2383,6 +2384,7 @@ class Pipeline:
             lambda _value: [final],
         )
         self._replace_dialogue_audio_track(project, prepared, final, log)
+        self._add_subtitles(project_id, project, final, request, log)
         self.store.update(
             project_id,
             status="succeeded",
@@ -2437,6 +2439,56 @@ class Pipeline:
             [final, full_track],
             lambda: media.replace_audio_track(final, full_track, final),
             lambda _value: [final],
+        )
+
+    def _add_subtitles(
+        self,
+        project_id: str,
+        project: Path,
+        final: Path,
+        request: dict[str, Any],
+        log: ResearchLog,
+    ) -> None:
+        """Burn the frozen TTS dialogue only after the final audio replacement."""
+        if not request.get("add_subtitles", False):
+            return
+        self._progress(project_id, 98, "subtitles")
+        lines = self.store.read(project_id).get("translated_voice_lines")
+        directory = project / "work" / "dialogue-audio"
+        clean = final.with_name("generated-clean.mp4")
+        rendered = final.with_name("generated-subtitled.mp4")
+
+        def render() -> dict[str, Any]:
+            if not isinstance(lines, list) or any(
+                not isinstance(line, dict) for line in lines
+            ):
+                raise ValueError("字幕需要有效的已冻结台词 translated_voice_lines")
+            if not lines:
+                log.event("subtitles_skipped", reason="no_dialogue")
+                return {"status": "skipped", "reason": "no_dialogue"}
+            tracks = [directory / f"line-{index:04d}.wav"
+                      for index in range(1, len(lines) + 1)]
+            for audio in [directory / "full-track.wav", *tracks]:
+                if not audio.is_file() or audio.stat().st_size == 0:
+                    raise ValueError(
+                        f"字幕无法按实际配音对齐：缺少 TTS 音频 {audio.name}；"
+                        "请恢复原配音产物后续跑"
+                    )
+            cues = subtitles.build_subtitle_cues(
+                lines, tracks, media.probe(final)["duration_s"],
+            )
+            # Every resume re-stitches provider segments before entering here;
+            # retain the clean, dubbed result and atomically publish only success.
+            shutil.copyfile(final, clean)
+            result = subtitles.burn_subtitles(clean, cues, rendered)
+            os.replace(rendered, final)
+            return {**result, "cues": cues}
+
+        self._node(
+            log, "subtitles", "project",
+            {"voice_lines": lines, "video": final, "output": final},
+            [], render, lambda _value: [final],
+            retry_if=lambda _exc: False,
         )
 
     @staticmethod
@@ -4109,6 +4161,7 @@ class Pipeline:
                 lambda _value: [final],
             )
             self._replace_dialogue_audio_track(project, prepared, final, log)
+            self._add_subtitles(project_id, project, final, request, log)
             self.store.update(
                 project_id,
                 status="succeeded",
