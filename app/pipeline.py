@@ -4991,7 +4991,7 @@ class Pipeline:
             if replacement_sheet.get("user_image_present") is True:
                 lines.append(
                     "The user reference image is Image 2. It already shaped its "
-                    "bound tile during sheet creation and adds no further "
+                    "bound tiles during sheet creation and adds no further "
                     "constraint; never copy from Image 2 directly."
                 )
         replaced_ids: set[str] = set()

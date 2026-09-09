@@ -19,6 +19,7 @@ from app.replacement_sheet import (
     replacement_sheet_spec_sha256,
     validate_replacement_sheet_spec,
 )
+from app.pipeline import Pipeline
 
 
 def _replacement(
@@ -328,6 +329,46 @@ def test_materialize_rejects_missing_user_image_for_bound_tile(
             project / "work/replacement-sheet",
             spec,
         )
+
+
+def test_multiple_keys_share_reference_without_merging_tiles_or_relations(tmp_path: Path) -> None:
+    shared = "small blue plush bear with cream muzzle and round ears"
+    enhanced = {
+        "people": {},
+        "entities": {
+            "entity-01": _replacement(shared, source="image_1", target="bear held in left hand"),
+            "entity-02": _replacement(shared, source="image_1", target="bear displayed on shelf"),
+            "entity-03": _replacement("matte steel comb"),
+        },
+        "scenes": {},
+        "relations": {},
+    }
+    for record in enhanced["entities"].values():
+        record["occurrences"] = [{"segment_index": 1, "frame_orders": [1]}]
+    spec = build_replacement_sheet_spec(enhanced)
+    validate_replacement_sheet_spec(spec)
+    assert [tile["stable_key"] for tile in spec["tiles"]] == ["entity-01", "entity-02", "entity-03"]
+    assert [tile["source"] for tile in spec["tiles"]] == ["image_1", "image_1", "generated_variant"]
+    assert len({tile["tile_id"] for tile in spec["tiles"]}) == 3
+    result = materialize_replacement_sheet_inputs(tmp_path / "sheet", spec, user_image_present=True)
+    prompt = result["prompt"]
+    for tile in spec["tiles"][:2]:
+        assert f'stable_key="{tile["stable_key"]}" | SOURCE="image_1" | APPEARANCE="{shared}"' in prompt
+    assert "Multiple distinct stable keys may share the user-reference appearance" in prompt
+    assert "SOURCE=generated_variant must ignore it completely" in prompt
+    assert "bear held in left hand" not in prompt
+    assert "bear displayed on shelf" not in prompt
+    assert enhanced["entities"]["entity-01"]["replacement"]["target_visual_description"] != enhanced["entities"]["entity-02"]["replacement"]["target_visual_description"]
+    authority = Pipeline._fusion_authority_block(enhanced, 1, {
+        "spec": spec, "h3_image_reference": "Image 1", "user_image_present": True,
+    })
+    for tile in spec["tiles"]:
+        line = next(line for line in authority.splitlines() if line.startswith(f'- {tile["stable_key"]} | REPLACE'))
+        assert f'Image 1, {tile["tile_id"]}' in line
+        assert ("designed from the user image Image 2" in line) == (tile["source"] == "image_1")
+    assert "bear held in left hand" in authority
+    assert "bear displayed on shelf" in authority
+    assert Pipeline._enhanced_index_uses_user_image(enhanced)
 
 
 def test_materialize_skips_empty_spec_for_caller_control(tmp_path: Path) -> None:

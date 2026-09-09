@@ -352,6 +352,15 @@ def _build_seedream_prompt(
                 "exactly image_1. Tiles with SOURCE=generated_variant must "
                 "ignore it completely."
             ),
+            (
+                "Multiple distinct stable keys may share the user-reference "
+                "appearance. For image_1 tiles referring to the same reference "
+                "subject, keep that subject's intrinsic appearance consistent "
+                "across cells; do not invent a different color, design, or "
+                "identity for each key. Each key still occupies its own cell "
+                "with only its own isolated subject; never merge cells or "
+                "copy the reference background or unrelated subjects."
+            ),
         ])
     else:
         lines.extend([
