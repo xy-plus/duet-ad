@@ -455,8 +455,7 @@ def create_app(
                     return JSONResponse(
                         status_code=400,
                         content={
-                            "detail": {
-                                "code": "invalid_content_length",
+                            "detail": {                                "code": "invalid_content_length",
                                 "message": "Content-Length 无效",
                             }
                         },
@@ -1134,6 +1133,17 @@ def create_app(
         )
 
     web = Path(__file__).resolve().parents[1] / "web"
+
+    @app.middleware("http")
+    async def disable_static_browser_cache(request: Request, call_next):
+        # Static assets are served straight from the working tree, so a stale
+        # browser copy can pair a new frontend with an old backend (or the
+        # reverse after a downgrade). Never let browsers cache them.
+        response = await call_next(request)
+        if not request.url.path.startswith("/api"):
+            response.headers["Cache-Control"] = "private, no-store"
+        return response
+
     app.mount("/", StaticFiles(directory=web, html=True), name="web")
     return app
 
