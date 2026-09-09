@@ -1,4 +1,7 @@
+import itertools
+
 import numpy as np
+import pytest
 
 from app.person_identity import analyze_person_identity, group_observations
 
@@ -101,3 +104,60 @@ def test_intervals_stop_at_scene_cut_even_for_adjacent_samples():
     result = group_observations(rows)
     assert len(result["persons"]) == 1
     assert result["persons"][0]["intervals"] == [{"start_s":0.,"end_s":.5},{"start_s":.75,"end_s":1.25}]
+
+
+def track_rows(index, vector=(1., 0., 0.), *, scene=None):
+    return [observation(f"track-{index}-{frame}", index*4+frame*.25,
+                        scene=index if scene is None else scene, vector=vector)
+            for frame in range(3)]
+
+
+@pytest.mark.parametrize("count", [3, 6])
+def test_many_identical_noncooccurring_tracks_are_one_identity(count):
+    rows = [row for index in range(count) for row in track_rows(index)]
+    result = group_observations(rows)
+    assert len(result["persons"]) == 1
+    assert len(result["persons"][0]["observation_ids"]) == count*3
+    assert len(result["persons"][0]["intervals"]) == count
+
+
+def test_six_consistent_multiview_tracks_do_not_compete_with_each_other():
+    rows = [row for index, angle in enumerate([0., .12, .23, .34, .45, .56])
+            for row in track_rows(index, (np.cos(angle), np.sin(angle), 0.))]
+    assert len(group_observations(rows)["persons"]) == 1
+
+
+def test_same_scene_reappearance_keeps_one_identity_and_disjoint_intervals():
+    rows = [row for index in range(3) for row in track_rows(index, scene=1)]
+    result = group_observations(rows)
+    assert len(result["persons"]) == 1
+    assert len(result["persons"][0]["intervals"]) == 3
+
+
+def test_weak_bridge_does_not_merge_incompatible_endpoints():
+    # A-B and B-C exceed .363; A-C is negative. Do not infer transitivity.
+    rows = [row for index, angle in enumerate([0., .9, 1.8])
+            for row in track_rows(index, (np.cos(angle), np.sin(angle), 0.))]
+    assert len(group_observations(rows)["persons"]) == 3
+
+
+def test_two_independent_identity_groups_both_merge():
+    rows = [row for index in range(6)
+            for row in track_rows(index, (1.,0.,0.) if index < 3 else (0.,1.,0.))]
+    result = group_observations(rows)
+    assert len(result["persons"]) == 2
+    assert sorted(len(person["observation_ids"]) for person in result["persons"]) == [9,9]
+
+
+def test_low_similarity_outsider_does_not_block_clear_group_match():
+    rows = track_rows(0)+track_rows(1, (.9,np.sqrt(1-.9**2),0.))
+    rows += track_rows(2, (.35,0.,np.sqrt(1-.35**2)))
+    assert len(group_observations(rows)["persons"]) == 2
+
+
+def test_identity_groups_are_invariant_to_input_track_order():
+    tracks = [track_rows(index) for index in range(3)]
+    expected = group_observations([row for track in tracks for row in track])["persons"]
+    for permutation in itertools.permutations(tracks):
+        rows = [row for track in permutation for row in reversed(track)]
+        assert group_observations(rows)["persons"] == expected

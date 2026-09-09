@@ -26,7 +26,7 @@ PARAMETERS = {"sample_gap_s": .251, "track_gap_s": .501,
 
 def model_fingerprints() -> dict[str, Any]:
     model = Path(os.environ.get("PERSON_IDENTITY_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
-    return {"algorithm": "yunet-sface-track-medoid-v1", "opencv": cv2.__version__,
+    return {"algorithm": "yunet-sface-compatible-track-groups-v2", "opencv": cv2.__version__,
             "recognizer_sha256": _sha(model), "detector_sha256": _sha(face_mask.MODEL_PATH),
             "detection_threshold": face_mask.SCORE_THRESHOLD, "parameters": dict(PARAMETERS)}
 
@@ -84,6 +84,58 @@ def _conflict(first: list[dict], second: list[dict]) -> bool:
     return any(a["source_time_s"] == b["source_time_s"] for a in first for b in second)
 
 
+def _merge_compatible_tracks(tracks: list[list[dict]]) -> list[list[dict]]:
+    """Merge whole compatible candidate groups, never a chain of weak links.
+
+    Every original track retains its multi-frame template for pairwise checks.
+    Multiple matching fragments can be one identity, so only candidates outside
+    the group compete for the ambiguity margin. Conflicting/incomplete groups
+    keep their local tracks; this is not evidence of distinct people.
+    """
+    supported = [track for track in tracks if _template(track)]
+    count = len(supported)
+    scores = np.full((count, count), -1.)
+    neighbours: list[set[int]] = [set() for _ in supported]
+    for i in range(count):
+        for j in range(i+1, count):
+            scores[i, j] = scores[j, i] = _match(supported[i], supported[j])
+            # Include visually plausible co-occurring rivals in the candidate
+            # group so cannot-link vetoes indirect merges through a third track.
+            if scores[i, j] >= PARAMETERS["identity_cosine"]:
+                neighbours[i].add(j)
+                neighbours[j].add(i)
+    remaining = set(range(count))
+    merged = []
+    while remaining:
+        component, pending = set(), [min(remaining)]
+        while pending:
+            index = pending.pop()
+            if index not in component:
+                component.add(index)
+                pending.extend(sorted(neighbours[index]-component))
+        remaining.difference_update(component)
+        indices = sorted(component)
+        compatible = len(indices) > 1 and all(
+            scores[i, j] >= PARAMETERS["identity_cosine"]
+            and not _conflict(supported[i], supported[j])
+            for position, i in enumerate(indices) for j in indices[position+1:]
+        )
+        if compatible:
+            outsiders = set(range(count))-component
+            # Do not hide a runner-up just below the absolute identity cutoff.
+            # Example: .38 inside versus .35 outside remains ambiguous at .05.
+            compatible = all(
+                max(scores[i, j] for j in indices if j != i)-scores[i, rival]
+                >= PARAMETERS["ambiguity_margin"]
+                for i in indices for rival in outsiders
+            )
+        if compatible:
+            merged.append([obs for i in indices for obs in supported[i]])
+        else:
+            merged.extend(supported[i] for i in indices)
+    return merged
+
+
 def group_observations(observations: list[dict]) -> dict[str, list]:
     """Pure association rules; inputs contain normalized in-memory features."""
     tracks: list[list[dict]] = []
@@ -108,27 +160,7 @@ def group_observations(observations: list[dict]) -> dict[str, list]:
         else:
             tracks.append([obs])
 
-    # Mutual unambiguous template matches only; co-occurrence is a hard veto.
-    while True:
-        rankings = {}
-        for i, track in enumerate(tracks):
-            choices = [(_match(track, other), j) for j, other in enumerate(tracks)
-                       if i != j and not _conflict(track, other)]
-            rankings[i] = sorted(choices, reverse=True)
-        pairs = []
-        for i, choices in rankings.items():
-            if not choices or choices[0][0] < PARAMETERS["identity_cosine"] or (len(choices) > 1 and choices[0][0]-choices[1][0] < PARAMETERS["ambiguity_margin"]):
-                continue
-            score, j = choices[0]
-            other = rankings[j]
-            if other and other[0][1] == i and (len(other) == 1 or other[0][0]-other[1][0] >= PARAMETERS["ambiguity_margin"]):
-                pairs.append((score, min(i,j), max(i,j)))
-        if not pairs:
-            break
-        _, i, j = max(pairs)
-        tracks[i].extend(tracks.pop(j))
-
-    supported = [t for t in tracks if _template(t)]
+    supported = _merge_compatible_tracks(tracks)
     if source:
         # Independently detected exact keyframes map by feature AND nearby box,
         # never by frame order/time alone. A frame permits one face per identity.
