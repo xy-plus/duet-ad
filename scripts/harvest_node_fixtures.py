@@ -314,7 +314,12 @@ def harvest_project(
 
 
 def main() -> None:
+    global PROJECTS_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--projects-root", type=Path, default=PROJECTS_ROOT,
+        help="absolute historical projects directory (read-only source)",
+    )
     parser.add_argument(
         "--include-round2",
         action="store_true",
@@ -327,6 +332,9 @@ def main() -> None:
         help="explicit project ids (default: the five historical projects)",
     )
     args = parser.parse_args()
+    if not args.projects_root.is_absolute() or not args.projects_root.is_dir():
+        parser.error("--projects-root must be an existing absolute directory")
+    PROJECTS_ROOT = args.projects_root.resolve()
 
     project_ids = list(args.projects or DEFAULT_PROJECTS)
     if args.include_round2:
