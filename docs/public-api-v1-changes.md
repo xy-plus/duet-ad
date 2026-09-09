@@ -1,4 +1,31 @@
-# 对外 API v1 文档差异清单（1.0.0 → 1.1.0）
+# 对外 API v1 文档差异清单
+
+## 1.1.0 → 1.2.0（2026-09-09）
+
+本节为已定设计、待上线合同，供客户提前适配；新增接口尚未在 3211 发布，启用时间另行通知。现有 1.1.0 接口继续可用。
+
+拟新增可选的“报价 → 用户确认 → 执行”流程，生成管线和旧的直接创建接口保持原有行为。
+
+| 接口/行为 | 1.1.0 | 1.2.0 |
+|---|---|---|
+| `POST /api/v1/video-generations/quotes` | 无 | 使用与直接创建相同的 multipart 输入和必填 `Idempotency-Key`，接收文件或下载 URL、读取时长、保存媒体和参数；首次 `201`，同 Key 同输入重放 `200`，不同输入 `409 idempotency_key_reused` |
+| 报价内容 | 只能在创建任务后读取任务报价 | 返回 `quote_id`、`status`、`duration_seconds`、`billable_seconds`、`estimated_credits`、`credits_per_second`、`price_version`、`expires_at`、`job_id` |
+| `GET /api/v1/video-generations/quotes/{quote_id}` | 无 | 查询报价和确认状态；状态为 `quoted`、`confirmed` 或 `expired`；已确认时返回原 `job_id` |
+| `POST /api/v1/video-generations/quotes/{quote_id}/confirm` | 无 | 严格 JSON `{"confirm":true}`；复用已保存的媒体和参数，检查余额后冻结积分并提交到原有生成流程；不重新上传、下载 URL 或接收客户端价格 |
+| 确认幂等 | 无 | 报价 ID 本身保证幂等，无需幂等头；首次 `201`，重复确认 `200`，均返回同一 Job，不重复冻结或生成 |
+| 报价积分影响 | 无独立报价流程 | 报价阶段不创建任务、不生成、不冻结、不扣积分；不要求余额足够，不保证确认时余额足够 |
+| 有效期与账户隔离 | 无 | 待确认报价有效期 24 小时；确认过期报价返回 `410 quote_expired`；跨账户或不存在返回 `404 quote_not_found`；已确认报价过期后仍可查询和重放确认 |
+| 锁价 | 无独立报价 | 有效期内沿用报价积分和价格版本；后续价格变化仅影响新报价，不保证未来余额 |
+| 确认格式错误 | 无 | 非 JSON 返回 `415 unsupported_media_type`；JSON 损坏、重复字段、非严格 `{"confirm":true}` 返回 `422 invalid_confirm_request`，使用现有错误响应格式 |
+| 报价状态暂不可用 | 无 | 查询/确认返回 `503 quote_state_unavailable`；保留原报价 ID 重试 |
+| 请求频率 | 创建 10 次/分钟，查询 120 次/分钟 | 报价、确认与直接创建共享账户每分钟 10 次；报价查询共享查询额度；超限沿用 `429 rate_limit_exceeded` 与 `Retry-After` |
+| 直接创建与生成流程 | 创建即执行 | 保留兼容行为；旧调用不被强制改为两阶段 |
+
+计费算法没有改变：`ceil(原视频时长秒数) × 60`，例如 `24.37 → 25 → 1500` 积分。此次同步修正文档中遗留的“固定 1,000 积分”和“余额不足 1,000”的旧说明，包括 Job billing 字段、余额说明与结算规则。
+
+接入方应持久化报价 ID，向用户展示时长、计费秒数、预计积分及有效期。确认超时应重试原报价，不能创建替代任务；未确认报价过期后需要用新 Key 重新报价并取得用户同意。报价 Key 重放不延长有效期；已确认或过期时仍返回原报价的当前状态。确认返回 Job 的 `id`，报价查询字段为 `job_id`，二者指向同一任务；报价 `confirmed` 不代表生成成功。
+
+## 1.0.0 → 1.1.0（历史记录）
 
 对比基准：旧文档 `docs/public-api-v1.md` 合同版本 `1.0.0`（2026-09-04，duet-ad1 仓库已发布版本）；
 新文档合同版本 `1.1.0`（2026-09-08），逐条以当前实现 `app/public_api.py`、`app/main.py`、`app/public_credits.py` 核实。
@@ -36,7 +63,7 @@
 
 - 鉴权方式（HTTP Bearer API Key）与 `Idempotency-Key` 规则；
 - `GET /video-generations/{job_id}`、`GET/HEAD .../content`、下载 Range 与并发限制；
-- `GET /account/credits`、`GET /account/credit-transactions` 及全部积分与结算规则（1,000 积分/任务、reserve/capture/release）；
+- `GET /account/credits`、`GET /account/credit-transactions` 的结构及 reserve/capture/release 结算机制（单任务报价算法的变化见上表）；
 - Job 对象结构、`status` 状态机（含 `submission_unknown` 语义）和任务级错误码表；
 - 请求频率限制（创建 10 次/分钟、查询 120 次/分钟、下载并发 2）；
 - `/api/v1/openapi.json`。

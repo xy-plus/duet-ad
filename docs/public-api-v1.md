@@ -2,14 +2,16 @@
 
 Duet API 用于提交视频生成任务，并在任务完成后返回最终视频和费用。
 
+发布状态：本文的 `1.2.0` 报价与确认接口为已定设计、待上线合同，供接入方提前适配；新增接口尚未在 3211 发布。现有 `1.1.0` 直接创建、查询、下载和账户接口维持已上线行为。下文新增接口的 URL 为计划上线地址，具体启用时间另行通知。
+
 视频生成通常需要数分钟，因此接口采用异步模式：创建任务后立即返回任务 ID；接入方使用任务 ID 查询状态；成功后再下载视频。
 
 ## 基本信息
 
 | 项目 | 值 |
 |---|---|
-| 合同版本 | `1.1.0` |
-| 文档更新日期 | `2026-09-08` |
+| 合同版本 | `1.2.0`（报价与确认待上线） |
+| 文档更新日期 | `2026-09-09` |
 | 联调环境 | `https://8.166.140.227:3211` |
 | API 前缀 | `/api/v1` |
 | 鉴权 | HTTP Bearer API Key |
@@ -33,25 +35,30 @@ API Key 对应一个账户。这个账户拥有自己的任务和积分；不同
 
 ## 接入流程
 
-1. 查询积分，确认 `available_credits` 不少于任务报价：报价 = 原视频时长（秒，向上取整）× 60 积分。
-2. 创建任务，并保存返回的任务 `id`。
-3. 每隔 5～10 秒查询该任务。
-4. 状态变成 `succeeded` 后，使用 `result.video.content_url` 下载视频。
+1. 上传原视频或提交 URL 到报价接口，由服务端读取时长并返回预计积分；此时不启动生成、不冻结或扣除积分。
+2. 将 `duration_seconds`、`billable_seconds`、`estimated_credits` 和 `expires_at` 展示给用户。报价 = 原视频时长（秒，向上取整）× 60 积分，例如 24.37 秒按 25 秒计算，共 1,500 积分。
+3. 用户同意后确认该报价，保存返回的任务 `id`；确认时才检查余额、冻结积分并进入原有生成流程。
+4. 每隔 5～10 秒查询该任务；状态变成 `succeeded` 后，使用 `result.video.content_url` 下载视频。
+
+报价有效期为 24 小时，不保证确认时账户仍有足够余额。用户不接受时无需确认或调用取消接口，报价会自动过期，也不会产生生成费用。旧的直接创建接口仍保留，调用它会立即执行，不经过用户确认。
 
 创建请求如果遇到网络超时，必须使用原来的 `Idempotency-Key` 和完全相同的输入重试。不要直接换新 Key，否则可能创建两个收费任务。
 
 ## 接口一览
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| `GET` | `/api/v1/video-generations/capabilities` | 查询当前参数限制和价格 |
-| `POST` | `/api/v1/video-generations` | 创建异步生成任务 |
-| `GET` | `/api/v1/video-generations/{job_id}` | 查询任务状态、结果和费用 |
-| `GET` | `/api/v1/video-generations/{job_id}/content` | 下载视频，支持单段 Range |
-| `HEAD` | `/api/v1/video-generations/{job_id}/content` | 读取视频元数据，不下载正文 |
-| `GET` | `/api/v1/account/credits` | 查询积分余额 |
-| `GET` | `/api/v1/account/credit-transactions` | 查询积分流水 |
-| `GET` | `/api/v1/openapi.json` | 获取公共 API 的 OpenAPI 描述 |
+| 方法 | 路径 | 用途 | 发布状态 |
+|---|---|---|---|
+| `GET` | `/api/v1/video-generations/capabilities` | 查询当前参数限制和价格 | 已上线 |
+| `POST` | `/api/v1/video-generations/quotes` | 校验并保存输入，读取时长和预计积分 | 待上线 |
+| `GET` | `/api/v1/video-generations/quotes/{quote_id}` | 查询报价及其确认状态 | 待上线 |
+| `POST` | `/api/v1/video-generations/quotes/{quote_id}/confirm` | 用户确认报价后创建异步任务 | 待上线 |
+| `POST` | `/api/v1/video-generations` | 创建异步生成任务 | 已上线 |
+| `GET` | `/api/v1/video-generations/{job_id}` | 查询任务状态、结果和费用 | 已上线 |
+| `GET` | `/api/v1/video-generations/{job_id}/content` | 下载视频，支持单段 Range | 已上线 |
+| `HEAD` | `/api/v1/video-generations/{job_id}/content` | 读取视频元数据，不下载正文 | 已上线 |
+| `GET` | `/api/v1/account/credits` | 查询积分余额 | 已上线 |
+| `GET` | `/api/v1/account/credit-transactions` | 查询积分流水 | 已上线 |
+| `GET` | `/api/v1/openapi.json` | 获取公共 API 的 OpenAPI 描述 | 已上线；新增路径待发布 |
 
 ---
 
@@ -155,9 +162,137 @@ HTTP `200 OK`
 
 ---
 
+## 创建报价（待上线）
+
+```http
+POST /api/v1/video-generations/quotes
+Host: 8.166.140.227:3211
+Authorization: Bearer YOUR_API_KEY
+Idempotency-Key: quote_order_20260909_000001
+Content-Type: multipart/form-data
+```
+
+请求的 multipart 字段、输入限制和鉴权与下文“创建视频生成任务”完全相同，`Idempotency-Key` 必填。必须提交本次计划生成所需的完整输入：视频文件或 URL，以及需要的语言、画幅、清晰度、台词和替换参数。
+
+服务端下载或接收视频、读取实际时长，并保存本次媒体与生成参数；不创建生成任务、不调用生成模型，也不产生 `reserve`、`capture` 或 `release` 积分流水。客户端无需事先知道视频时长。确认会复用报价保存的输入，不重新下载 URL 或重新上传文件；修改任何输入需要重新报价。
+
+报价不占用生成任务的执行并发槽位，余额不足也可以取得报价。
+
+上传文件示例（文件路径替换为实际绝对路径）：
+
+```bash
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Idempotency-Key: quote_order_20260909_000001' \
+  --form 'source_video=@/home/xy/api-input/source.mp4' \
+  --form 'target_language=中文'
+```
+
+URL 示例：
+
+```bash
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Idempotency-Key: quote_order_20260909_000002' \
+  --form 'source_video_url=https://media.example.com/source.mp4'
+```
+
+首次成功返回 `201 Created`，相同 Key 和相同输入的重放返回 `200 OK` 和原报价的当前状态，不延长有效期；已确认或过期时也不会自动创建新报价。同一 Key 配不同输入返回 `409 idempotency_key_reused`。需要新报价时使用新 Key。报价与旧直接创建接口的 Key 独立判重；不要把同一业务同时提交到两个流程。本接口没有 Query 参数。
+
+```json
+{
+  "quote_id": "vq_0123456789abcdef0123456789abcdef",
+  "status": "quoted",
+  "duration_seconds": 24.37,
+  "billable_seconds": 25,
+  "estimated_credits": 1500,
+  "credits_per_second": 60,
+  "price_version": "credits-per-second-60-v1",
+  "expires_at": "2026-09-10T08:00:00+00:00",
+  "job_id": null
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `quote_id` | string | `vq_` 加 32 位小写十六进制字符；查询和确认时原样使用 |
+| `status` | string | `quoted` 待确认、`confirmed` 已创建任务、`expired` 未确认且已过期 |
+| `duration_seconds` | number | 服务端读取的原视频实际时长，单位为秒 |
+| `billable_seconds` | integer | 原视频时长向上取整后的计费秒数 |
+| `estimated_credits` | integer | 本报价预计消费积分，即 `billable_seconds × credits_per_second` |
+| `credits_per_second` | integer | 本报价每计费秒积分，当前为 `60` |
+| `price_version` | string | 本报价冻结的价格版本 |
+| `expires_at` | string | ISO 8601 UTC 截止时间；有效期从报价创建开始计算，共 24 小时 |
+| `job_id` | string 或 null | 确认创建的任务 ID；未确认时为 `null` |
+
+时长和价格均由服务端计算，客户端不能提交或覆盖 `duration_seconds`、`billable_seconds`、`estimated_credits`、单价或价格版本。
+
+有效期内按该报价冻结的价格执行：确认所得 Job 的 `billing.quoted_credits` 等于 `estimated_credits`，`billing.price_version` 等于报价的 `price_version`。期间能力接口的价格变化仅影响新报价，不改变已创建报价。
+
+## 查询报价（待上线）
+
+```http
+GET /api/v1/video-generations/quotes/vq_0123456789abcdef0123456789abcdef
+Host: 8.166.140.227:3211
+Authorization: Bearer YOUR_API_KEY
+```
+
+返回 `200 OK` 和上面的报价对象，不需要 Query 或 Body 参数。只有报价所属账户可访问；不存在或属于其他账户均返回 `404 quote_not_found`。未确认报价过期后返回 `status: "expired"`；已确认报价即使超过原截止时间，仍返回 `confirmed` 和原 `job_id`。
+
+报价的 `confirmed` 只表示已创建任务，不代表视频已生成成功；生成结果必须继续查询 Job 的 `status`。
+
+```bash
+curl 'https://8.166.140.227:3211/api/v1/video-generations/quotes/vq_0123456789abcdef0123456789abcdef' \
+  --header 'Authorization: Bearer YOUR_API_KEY'
+```
+
+## 确认报价并执行（待上线）
+
+```bash
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes/vq_0123456789abcdef0123456789abcdef/confirm' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data '{"confirm":true}'
+```
+
+路径携带报价 ID，JSON Body 必须严格为 `{"confirm":true}`。不重新提交媒体、参数或价格，也不需要 `Idempotency-Key`，不接受 Query 参数。只有用户同意预计积分后才调用此接口；`false`、字符串 `"true"`、缺失确认或额外字段不是有效确认。
+
+首次确认成功返回 `201 Created` 和下文的 Job 对象，此时才检查当前余额、冻结报价积分并提交到原有生成流程。同一报价重复确认返回 `200 OK` 和原 Job；并发确认或网络超时后的重试不会重复创建、冻结积分或生成。已成功确认后，即使超过原报价截止时间，重复确认仍返回原 Job。
+
+| HTTP | 错误码 | 处理 |
+|---:|---|---|
+| `402` | `insufficient_credits` | 当前余额不足以支付报价；充值后在报价有效期内确认原报价 |
+| `404` | `quote_not_found` | 报价不存在或不属于当前账户；检查报价 ID 和 API Key |
+| `410` | `quote_expired` | 未确认报价已过期；使用新 Key 重新报价并取得用户同意 |
+| `415` | `unsupported_media_type` | 确认请求必须使用 `Content-Type: application/json` |
+| `422` | `invalid_confirm_request` | JSON 损坏、重复字段，或 Body 不严格等于 `{"confirm":true}`；修正后重试原报价 |
+| `429` | `rate_limit_exceeded` | 按 `Retry-After` 等待后重试原报价 |
+| `503` | `quote_state_unavailable` | 报价状态暂不可读或不可用；保留原报价 ID，稍后查询或重试 |
+
+确认连接失败或超时后，继续确认同一个 `quote_id`，或先查询该报价获取 `job_id`；不要换报价或改走直接创建接口。收到 `429` 时按 `Retry-After` 等待后重试原报价；收到 `503` 时保留原报价 ID 重试或查询状态。任务一旦创建，其状态、查询、下载与成功扣费/失败释放规则均沿用现有 API。
+
+示例中的报价 ID 应替换为报价接口返回的 `quote_id`。确认后使用响应中的任务 `id` 轮询：
+
+```bash
+curl 'https://8.166.140.227:3211/api/v1/video-generations/vg_0123456789abcdef0123456789abcdef' \
+  --header 'Authorization: Bearer YOUR_API_KEY'
+```
+
+每次间隔 5～10 秒；仅在 `succeeded` 后使用返回的 `content_url` 下载：
+
+```bash
+curl 'https://8.166.140.227:3211/api/v1/video-generations/vg_0123456789abcdef0123456789abcdef/content' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --output '/home/xy/api-output/final-video.mp4'
+```
+
+下载目录应预先存在，文件路径需替换为实际绝对路径。
+
+---
+
 ## 创建视频生成任务
 
-创建一个异步任务。接口在完成输入校验和积分冻结后立即返回，不会等待视频生成完成。
+创建一个异步任务。此旧接口保留直接执行行为，不等待用户确认报价。接口在完成输入校验和积分冻结后立即返回，不会等待视频生成完成；需要先展示积分的接入方应使用前述报价和确认接口。
 
 ```http
 POST /api/v1/video-generations HTTP/1.1
@@ -412,7 +547,7 @@ HTTP `200 OK`
 | `reserved_credits` | integer | 否 | 已被进行中任务冻结的积分，最小为 `0` |
 | `spent_credits` | integer | 否 | 历史累计消费积分，最小为 `0` |
 
-余额不足 1,000 积分时，创建任务返回 `402 insufficient_credits`，不会创建任务。
+可用余额不足本次报价积分时，直接创建或确认报价返回 `402 insufficient_credits`，不会创建任务。仅创建报价不要求余额足够，也不会冻结积分。
 
 ---
 
@@ -454,7 +589,7 @@ HTTP `200 OK`
     {
       "id": "job:vg_0123456789abcdef0123456789abcdef:capture",
       "type": "capture",
-      "credits": 1000,
+      "credits": 2100,
       "direction": null,
       "job_id": "vg_0123456789abcdef0123456789abcdef",
       "reason": null,
@@ -619,7 +754,7 @@ Accept: application/json
 
 ### 成功响应
 
-HTTP `200 OK`，响应体为 OpenAPI JSON，版本字段为 `1.0.0`，标题为 `Duet Video Generation API`。
+HTTP `200 OK`，响应体为 OpenAPI JSON，标题为 `Duet Video Generation API`。现网描述的版本字段为 `1.0.0`；计划随报价接口上线将 `info.version` 对齐为 `1.2.0`，并加入新增路径。上线前不要用现网 OpenAPI 是否包含报价接口来判断本设计合同的字段。
 
 ---
 
@@ -663,12 +798,12 @@ HTTP `200 OK`，响应体为 OpenAPI JSON，版本字段为 `1.0.0`，标题为 
 |---|---|---:|---|---|
 | `currency` | string | 否 | 当前固定为 `CNY` | 结算币种 |
 | `credits_per_cny` | integer | 否 | 当前固定为 `100` | 1 元对应的积分 |
-| `quoted_credits` | integer | 否 | 当前固定为 `1000` | 创建时冻结的报价积分 |
-| `quoted_amount_minor` | integer | 否 | 当前固定为 `1000` | 报价金额，单位为人民币分，即 10.00 元 |
+| `quoted_credits` | integer | 否 | 计费秒数 × 60 | 创建时冻结的报价积分 |
+| `quoted_amount_minor` | integer | 否 | 当前与报价积分数值相同 | 报价金额，单位为人民币分 |
 | `price_version` | string | 否 | 当前为 `credits-per-second-60-v1` | 本任务冻结的价格版本 |
 | `settlement_status` | string | 否 | `pending`、`final` | 是否已经最终结算 |
-| `settled_credits` | integer | 是 | 成功为 `1000`，明确失败为 `0`，未结算为 `null` | 最终消费积分 |
-| `settled_amount_minor` | integer | 是 | 成功为 `1000`，明确失败为 `0`，未结算为 `null` | 最终金额，单位为人民币分 |
+| `settled_credits` | integer | 是 | 成功为 `quoted_credits`，明确失败为 `0`，未结算为 `null` | 最终消费积分 |
+| `settled_amount_minor` | integer | 是 | 成功为 `quoted_amount_minor`，明确失败为 `0`，未结算为 `null` | 最终金额，单位为人民币分 |
 
 ### `result.video`
 
@@ -705,7 +840,8 @@ HTTP `200 OK`，响应体为 OpenAPI JSON，版本字段为 `1.0.0`，标题为 
 ## 积分与结算规则
 
 - 100 积分 = 1 元。
-- 每个任务报价 1,000 积分，即 10 元。
+- 每个任务报价为原视频时长向上取整秒数 × 60 积分；24.37 秒按 25 秒计算，为 1,500 积分，即 15 元。
+- 创建报价只保存媒体、参数和报价；不冻结积分、不启动生成。报价有效期 24 小时，确认时重新检查可用余额。
 - 创建任务时先从可用积分转入冻结积分。
 - 成功后，冻结积分转为已消费积分。
 - 明确失败后，冻结积分退回可用积分，最终消费为 0。
@@ -749,7 +885,9 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 | `400` | `invalid_multipart` | multipart 边界缺失或正文损坏 | 让 HTTP 客户端重新生成 multipart 请求 |
 | `400` | `invalid_content_length` | 创建请求的 Content-Length 无效 | 让 HTTP 客户端生成合法请求头后重试 |
 | `401` | `invalid_api_key` | API Key 无效或已停用 | 检查鉴权信息或联系支持 |
-| `402` | `insufficient_credits` | 可用积分少于 1,000 | 充值后使用原 Key 和原输入重试 |
+| `402` | `insufficient_credits` | 可用积分少于本次报价 | 充值后确认仍有效的原报价；直接创建则使用原 Key 和原输入重试 |
+| `404` | `quote_not_found` | 报价不存在或不属于当前账户 | 检查报价 ID 和 API Key |
+| `410` | `quote_expired` | 未确认报价已过期 | 用新 Key 重新报价并取得用户同意 |
 | `404` | `job_not_found` | 任务不存在或不属于当前账户 | 检查任务 ID和所用 API Key |
 | `404` | `endpoint_not_found` | 请求路径不是 v1 接口 | 修正请求路径 |
 | `405` | `method_not_allowed` | HTTP 方法不受支持 | 按 `Allow` 响应头改用正确方法 |
@@ -759,7 +897,8 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 | `413` | `request_too_large` | 整个 HTTP 请求正文超过网关限制 | 减小上传文件后重试 |
 | `415` | `unsupported_source_media_type` | 视频文件格式不支持 | 使用 MP4、MOV 或 WebM |
 | `415` | `unsupported_replacement_media_type` | 参考图声明的媒体类型不受支持 | 使用 JPEG、PNG 或 WebP |
-| `415` | `unsupported_content_type` | 创建请求不是 `multipart/form-data` | 使用 multipart 并让客户端生成 boundary |
+| `415` | `unsupported_content_type` | 直接创建或报价请求不是 multipart | 使用 `multipart/form-data` 并让客户端生成 boundary |
+| `415` | `unsupported_media_type` | 确认报价请求不是 JSON | 使用 `Content-Type: application/json` |
 | `416` | `invalid_range` | Range 格式或范围无效 | 改为合法的单一字节范围 |
 | `422` | `source_exactly_one_required` | 视频上传和 URL 没有正确二选一 | 只提供一个来源 |
 | `422` | `replacement_pair_required` | 参考图和说明没有成对提供 | 两个字段同时提供或同时省略 |
@@ -775,16 +914,19 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 | `422` | `invalid_create_request` | 包含未知或重复字段 | 只提交文档列出的字段一次 |
 | `422` | `invalid_generation_request` | 生成参数组合无效 | 根据能力接口重新提交参数 |
 | `422` | `invalid_request` | 请求字段类型或结构不符合 v1 合同 | 按字段定义修正请求 |
+| `422` | `invalid_confirm_request` | 确认 JSON 损坏、重复字段或不严格等于 `{"confirm":true}` | 修正后确认原报价 |
+| `422` | `video_duration_invalid` | 报价无法取得合法时长，或时长超过 300 秒 | 更换或裁剪视频后使用新 Key 报价 |
 | `422` | `invalid_limit` | 流水 `limit` 不在 1～100 | 修改查询参数 |
 | `422` | `invalid_query_parameters` | 接口收到未知或重复 Query 参数 | 只提交该接口文档列出的参数一次 |
 | `429` | `rate_limit_exceeded` | 请求频率过高 | 按 `Retry-After` 等待 |
 | `429` | `download_limit_exceeded` | 同账户下载并发超过 2 | 按 `Retry-After` 等待 |
 | `503` | `api_key_registry_unavailable` | API Key 注册表暂时不可用 | 保留原请求，稍后重试 |
 | `503` | `result_temporarily_unavailable` | 成片正在校验或暂时不可读 | 稍后查询原任务 |
-| `503` | `billing_state_unavailable` | 积分状态暂时不可用 | 保留原 Key，稍后重试或联系支持 |
+| `503` | `billing_state_unavailable` | 积分状态暂时不可用 | 确认流程保留原 quote_id；直接创建保留原 Key，稍后重试或联系支持 |
 | `503` | `job_state_invalid` | 任务公开状态暂时不可用 | 继续查询原任务；持续发生时提供 `request_id` 联系支持 |
 | `503` | `download_state_unavailable` | 下载并发状态暂时不可用 | 稍后重试下载 |
-| `503` | `creation_failed` | 创建阶段发生未分类内部错误 | 保留原 Key 和原输入，稍后重试 |
+| `503` | `creation_failed` | 创建阶段发生未分类内部错误 | 确认流程保留原 quote_id；直接创建或报价保留原 Key 和原输入，稍后重试 |
+| `503` | `quote_state_unavailable` | 报价查询或确认所需状态暂不可用 | 保留原 quote_id，稍后查询或重试确认 |
 
 所有公共 API 响应都会携带 `X-Request-ID`。建议接入方记录它，但不要记录 `Authorization` 请求头或完整 API Key。
 
@@ -794,7 +936,7 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 
 | 类型 | 限制 |
 |---|---:|
-| 创建任务 | 每分钟最多 10 次 |
+| 创建任务；待上线的创建报价和确认报价也共享此配额 | 每分钟最多 10 次 |
 | 查询类请求 | 每分钟最多 120 次 |
 | 视频下载 | 同时最多 2 个连接 |
 
@@ -803,13 +945,21 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 ## 推荐的客户端逻辑
 
 ```text
-生成一个与业务订单绑定的 Idempotency-Key
+生成一个与本次报价绑定的 Idempotency-Key
 
-创建任务
+创建报价（上传文件或提交 URL，以及完整生成参数）
   如果连接失败或超时：
-    使用相同 Key 和相同输入重试创建
+    使用相同 Key 和相同输入重试报价
   如果返回 201 或 200：
-    保存 job_id
+    保存 quote_id，展示时长、计费秒数、预计积分、有效期
+
+用户不同意：不确认，结束
+用户同意：确认同一个 quote_id，Body 为 {"confirm": true}
+  如果连接失败或超时：重试确认同一个 quote_id
+  如果 402：充值后在有效期内确认原报价
+  如果 410：重新报价，再取得用户同意
+  如果 201 或 200：
+    保存 job_id = 响应的 id（Job 字段）；查询报价时对应字段为 job_id
 
 循环查询同一个 job_id
   queued / running：等待 poll_after_seconds 后继续
@@ -826,6 +976,8 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 
 - API Key 只保存在服务端密钥系统中；
 - 每个业务生成操作都有稳定且唯一的 `Idempotency-Key`；
+- 报价流程已展示预计积分，且仅在用户同意后确认；
+- 已持久化报价 ID，确认重试始终使用同一报价 ID；
 - 网络超时会使用原 Key 和原输入重试；
 - 已持久化创建响应中的任务 ID；
 - 轮询间隔不短于 5 秒；
