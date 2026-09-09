@@ -25,7 +25,7 @@ MODEL_PATH = (
     Path(__file__).resolve().parents[1]
     / "models" / "face_detection_yunet_2023mar.onnx"
 )
-SCORE_THRESHOLD = 0.6
+SCORE_THRESHOLD = 0.73
 NMS_THRESHOLD = 0.3
 PAD_RATIO = 0.45  # expand the sides of the face box by 45% of its width
 HAIR_PAD_RATIO = 0.75  # expand the top further: hair sits above the YuNet box
