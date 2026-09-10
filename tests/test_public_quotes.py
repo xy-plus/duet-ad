@@ -114,6 +114,41 @@ def test_quote_probes_rounds_and_freezes_without_starting(quote_env, quote_video
     assert_idle(app, settings)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_quote_subtitles_are_frozen_through_confirmation(quote_env, quote_video, enabled):
+    app, client, auth, settings = quote_env
+    quoted = quote(client, auth, quote_video, add_subtitles=str(enabled).lower())
+    assert quoted.status_code == 201, quoted.text
+    quote_id = quoted.json()["quote_id"]
+    frozen = json.loads(record_path(settings, quote_id).read_text())
+    assert frozen["staged"]["effective_request"]["add_subtitles"] is enabled
+    assert_idle(app, settings)
+    created = confirm(client, auth, quote_id)
+    assert created.status_code == 201, created.text
+    assert created.json()["parameters"]["add_subtitles"] is enabled
+    project_id = created.json()["id"].removeprefix("vg_")
+    assert app.state.store.read(project_id)["effective_request"]["add_subtitles"] is enabled
+    assert app.state.pipeline.started.wait(2)
+    duplicate = confirm(client, auth, quote_id)
+    assert duplicate.status_code == 200
+    assert duplicate.json()["id"] == created.json()["id"]
+    assert app.state.pipeline.calls == [project_id]
+
+
+def test_quote_omitted_subtitles_and_false_preserve_default_idempotency(quote_env, quote_video):
+    app, client, auth, settings = quote_env
+    original = quote(client, auth, quote_video)
+    assert original.status_code == 201
+    frozen = json.loads(record_path(settings, original.json()["quote_id"]).read_text())
+    assert frozen["staged"]["effective_request"]["add_subtitles"] is False
+    repeated = quote(client, auth, quote_video, add_subtitles="false")
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["quote_id"] == original.json()["quote_id"]
+    changed = quote(client, auth, quote_video, add_subtitles="true")
+    assert changed.status_code == 409, changed.text
+    assert_idle(app, settings)
+
+
 def test_confirm_uses_frozen_url_bytes_and_price(quote_env, quote_video, monkeypatch):
     app, client, auth, settings = quote_env
     calls = []
