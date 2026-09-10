@@ -264,6 +264,81 @@ def test_project_index_normalizer_keeps_target_references_without_source_facts()
 
 
 @pytest.mark.parametrize(
+    ("first_target_ids", "second_target_ids", "expected_target_ids"),
+    [
+        (["image_1"], ["image_2"], ["image_2", "image_1"]),
+        (None, ["image_2"], ["image_2"]),
+    ],
+)
+def test_project_index_identity_merge_unions_target_reference_ids_in_input_order(
+    first_target_ids: list[str] | None,
+    second_target_ids: list[str] | None,
+    expected_target_ids: list[str],
+) -> None:
+    first = {
+        **_element(
+            "person-a",
+            occurrences=[{"segment_index": 1, "frame_orders": [1]}],
+        ),
+        "canonical_id": "person-cv-001",
+        "identity_observation_ids": ["face-a"],
+    }
+    second = {
+        **_element(
+            "person-b",
+            occurrences=[{"segment_index": 2, "frame_orders": [1]}],
+        ),
+        "canonical_id": "person-cv-001",
+        "identity_observation_ids": ["face-b"],
+    }
+    if first_target_ids is not None:
+        first["target_reference_image_ids"] = first_target_ids
+    if second_target_ids is not None:
+        second["target_reference_image_ids"] = second_target_ids
+    evidence = {
+        "status": "complete",
+        "persons": [{
+            "canonical_id": "person-cv-001",
+            "observation_ids": ["face-a", "face-b"],
+        }],
+        "observations": [
+            {
+                "observation_id": "face-a",
+                "canonical_id": "person-cv-001",
+                "kind": "keyframe",
+                "segment_index": 1,
+                "frame_order": 1,
+            },
+            {
+                "observation_id": "face-b",
+                "canonical_id": "person-cv-001",
+                "kind": "keyframe",
+                "segment_index": 2,
+                "frame_order": 1,
+            },
+        ],
+    }
+
+    normalized = normalize_project_index(
+        {
+            "people": [first, second],
+            "entities": [],
+            "scenes": [],
+            "relations": [],
+        },
+        evidence,
+        reference_image_ids=["image_2", "image_1", "image_3"],
+    )
+
+    person = normalized["people"]["person-01"]
+    assert person["target_reference_image_ids"] == expected_target_ids
+    assert person["occurrences"] == [
+        {"segment_index": 1, "frame_orders": [1]},
+        {"segment_index": 2, "frame_orders": [1]},
+    ]
+
+
+@pytest.mark.parametrize(
     "target_reference_image_ids",
     [["image_1", "image_1"], ["unknown-image"]],
 )

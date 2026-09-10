@@ -295,7 +295,12 @@ def _person_identity(
     return cid, list(dict.fromkeys(ids)), "confirmed"
 
 
-def _merge_person(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+def _merge_person(
+    target: dict[str, Any],
+    source: Mapping[str, Any],
+    *,
+    reference_image_ids: Sequence[str] | None = None,
+) -> None:
     descriptions = [target["source_visual_description"], source["source_visual_description"]]
     target["source_visual_description"] = "\n".join(dict.fromkeys(descriptions))
     for field in ("preserve", "replaceable", "identity_observation_ids"):
@@ -307,6 +312,17 @@ def _merge_person(target: dict[str, Any], source: Mapping[str, Any]) -> None:
         {"segment_index": segment, "frame_orders": sorted(orders)}
         for segment, orders in sorted(frames.items())
     ]
+    if reference_image_ids:
+        referenced = {
+            *target.get("target_reference_image_ids", []),
+            *source.get("target_reference_image_ids", []),
+        }
+        if referenced:
+            target["target_reference_image_ids"] = [
+                reference_id
+                for reference_id in reference_image_ids
+                if reference_id in referenced
+            ]
 
 
 def normalize_project_index(
@@ -396,7 +412,11 @@ def normalize_project_index(
                 identity_audit.append({"input_index": index, "input_key": local_key,
                                        "output_key": stable_key, "reason": reason})
             if canonical_id is not None and canonical_id in canonical_keys:
-                _merge_person(result[category][stable_key], record)
+                _merge_person(
+                    result[category][stable_key],
+                    record,
+                    reference_image_ids=allowed_reference_image_ids,
+                )
             else:
                 result[category][stable_key] = record
                 if canonical_id is not None:
