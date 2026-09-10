@@ -80,10 +80,9 @@ def test_absent_image_or_instruction_still_requires_zero_bindings(has_image, ins
         normalize_object_replace(output, **kwargs)
 
 
-def test_explicit_request_requires_at_least_one_and_single_binding_still_works():
+def test_explicit_request_allows_zero_and_single_binding_still_works():
     _, _, output, kwargs = fixture()
-    with pytest.raises(ValueError, match="binding count"):
-        normalize_object_replace(output, **kwargs)
+    assert normalize_object_replace(output, **kwargs)["entities"] == output["entities"]
     bind(output, "entity-01")
     assert normalize_object_replace(output, **kwargs)["entities"] == output["entities"]
 

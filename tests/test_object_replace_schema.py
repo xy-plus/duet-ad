@@ -358,9 +358,6 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
 
     expected_reference_ids = {
         "type": "array",
-        "minItems": 1,
-        "maxItems": 4,
-        "uniqueItems": True,
         "items": {
             "type": "string",
             "enum": ["image_1", "image_2", "image_3", "image_4"],
@@ -381,9 +378,34 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
             assert image_branch["properties"]["replacement"]["properties"][
                 "reference_image_ids"
             ] == expected_reference_ids
-            assert "reference_image_ids" not in generated_branch["properties"][
-                "replacement"
-            ]["properties"]
+            assert generated_branch["properties"]["replacement"]["properties"]["reference_image_ids"] == expected_reference_ids
+
+
+@pytest.mark.parametrize("source, references, expected", [
+    ("image_1", [], None),
+    ("image_1", ["image_2", "image_1", "image_2"], ["image_2", "image_1"]),
+    ("generated_variant", [], None),
+    ("generated_variant", ["image_1", "image_1"], None),
+])
+def test_model_reference_redundancy_is_normalized_before_sheet(source, references, expected):
+    from app.replacement_sheet import build_replacement_sheet_spec, validate_replacement_sheet_spec
+
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    for key in ("person-01",):
+        value["people"][key]["replacement"].update(source=source, reference_image_ids=references)
+        value["people"][key]["matches_user_request"] = source == "image_1"
+    normalized = _normalize(value, digest=digest, element_index=element_index, reference_image_ids=["image_1", "image_2"])
+    replacement = normalized["people"]["person-01"]["replacement"]
+    assert replacement.get("reference_image_ids") == expected
+    assert ("reference_image_ids" in replacement) == (expected is not None)
+    assert value["people"]["person-01"]["replacement"]["reference_image_ids"] == references
+    enhanced = merge_object_replace_index(element_index, normalized, {})
+    spec = build_replacement_sheet_spec(enhanced)
+    validate_replacement_sheet_spec(spec)
+    tile = next(tile for tile in spec["tiles"] if tile["stable_key"] == "person-01")
+    assert tile.get("reference_image_ids") == expected
 
 
 def test_normalizer_preserves_multiple_user_reference_ids_per_stable_key() -> None:
@@ -448,11 +470,11 @@ def test_normalizer_keeps_legacy_image_binding_without_reference_ids() -> None:
     [
         {
             **_replacement("generated_variant", "entity-01"),
-            "reference_image_ids": ["image_1"],
+            "reference_image_ids": ["image_9"],
         },
         {
             **_replacement("image_1", "entity-01"),
-            "reference_image_ids": ["image_1", "image_1"],
+            "reference_image_ids": ["image_3"],
         },
         {
             **_replacement("image_1", "entity-01"),

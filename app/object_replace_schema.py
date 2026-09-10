@@ -146,9 +146,6 @@ def _replacement_object(
     if reference_image_ids is not None:
         properties["reference_image_ids"] = {
             "type": "array",
-            "minItems": 1,
-            "maxItems": len(reference_image_ids),
-            "uniqueItems": True,
             "items": {"type": "string", "enum": list(reference_image_ids)},
         }
     return {
@@ -173,7 +170,7 @@ def _replacement_schema(
     replacement = _replacement_object(
         sources=replacement_sources,
         reference_image_ids=(
-            reference_image_ids if allow_user_image_binding else None
+            reference_image_ids if reference_image_ids else None
         ),
     )
     patch_properties: dict[str, dict[str, Any]] = {
@@ -210,6 +207,7 @@ def _replacement_schema(
         }
         generated_patch_properties["replacement"] = _replacement_object(
             sources={"generated_variant"},
+            reference_image_ids=reference_image_ids,
         )
         patch_schema["anyOf"] = [
             _closed_object(image_patch_properties),
@@ -294,14 +292,22 @@ def _normalize_replacement(
     }
     if "reference_image_ids" not in value:
         return normalized
-    if source != "image_1":
-        raise ValueError("object-replace replacement reference IDs are invalid")
-    reference_image_ids = _reference_image_ids(value["reference_image_ids"])
+    # Normalize redundant model output only; configured IDs and frozen sheet
+    # receipts keep their strict validators and original hashes.
+    model_reference_ids = value["reference_image_ids"]
+    if isinstance(model_reference_ids, list) and all(
+        isinstance(item, str) for item in model_reference_ids
+    ):
+        model_reference_ids = list(dict.fromkeys(model_reference_ids))
+    reference_image_ids = _reference_image_ids(model_reference_ids, allow_empty=True)
+    if not reference_image_ids:
+        return normalized
     if allowed_reference_image_ids is not None:
-        allowed = set(_reference_image_ids(allowed_reference_image_ids))
+        allowed = set(_reference_image_ids(allowed_reference_image_ids, allow_empty=True))
         if not set(reference_image_ids) <= allowed:
             raise ValueError("object-replace replacement reference IDs are invalid")
-    normalized["reference_image_ids"] = list(reference_image_ids)
+    if source == "image_1":
+        normalized["reference_image_ids"] = list(reference_image_ids)
     return normalized
 
 

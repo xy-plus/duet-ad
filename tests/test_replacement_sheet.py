@@ -462,7 +462,8 @@ def test_materialize_rejects_reference_image_beyond_supplied_count(
         )
 
 
-def test_validation_rejects_tampered_reference_image_ids() -> None:
+@pytest.mark.parametrize("references", [["image_5"], [], ["image_1", "image_1"]])
+def test_validation_rejects_tampered_reference_image_ids(references) -> None:
     spec = build_replacement_sheet_spec(
         {
             "people": {},
@@ -477,7 +478,7 @@ def test_validation_rejects_tampered_reference_image_ids() -> None:
             "relations": {},
         },
     )
-    spec["tiles"][0]["reference_image_ids"] = ["image_5"]
+    spec["tiles"][0]["reference_image_ids"] = references
     spec["spec_sha256"] = replacement_sheet_spec_sha256(spec)
 
     with pytest.raises(ValueError, match="v2 tile binding"):

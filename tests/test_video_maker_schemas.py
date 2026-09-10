@@ -202,9 +202,7 @@ def test_project_index_schema_binds_optional_target_reference_ids() -> None:
             "type": "string",
             "enum": ["image_1", "image_2", "image_3", "image_4"],
         },
-        "minItems": 1,
-        "maxItems": 4,
-        "uniqueItems": True,
+        "minItems": 0,
     }
 
     for category in ("people", "entities", "scenes"):
@@ -340,7 +338,7 @@ def test_project_index_identity_merge_unions_target_reference_ids_in_input_order
 
 @pytest.mark.parametrize(
     "target_reference_image_ids",
-    [["image_1", "image_1"], ["unknown-image"]],
+    [["image_3"], ["unknown-image"]],
 )
 def test_project_index_normalizer_rejects_invalid_target_reference_ids(
     target_reference_image_ids: list[str],
@@ -360,6 +358,21 @@ def test_project_index_normalizer_rejects_invalid_target_reference_ids(
             value,
             reference_image_ids=["image_1", "image_2"],
         )
+
+
+@pytest.mark.parametrize("references, expected", [
+    ([], None),
+    (["image_2", "image_1", "image_2"], ["image_2", "image_1"]),
+])
+def test_project_index_normalizes_only_redundant_model_reference_ids(references, expected):
+    record = {**_element("local"), "target_reference_image_ids": references}
+    value = {"people": [record], "entities": [], "scenes": [], "relations": []}
+    normalized = normalize_project_index(value, reference_image_ids=["image_1", "image_2"])
+    person = normalized["people"]["person-01"]
+    assert person.get("target_reference_image_ids") == expected
+    assert ("target_reference_image_ids" in person) == (expected is not None)
+    assert person["occurrences"] == record["occurrences"]
+    assert record["target_reference_image_ids"] == references
 
 
 def test_project_index_normalizer_drops_target_references_for_legacy_calls() -> None:

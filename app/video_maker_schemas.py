@@ -91,10 +91,7 @@ def _project_index_schema(
     if reference_image_ids:
         element_properties["target_reference_image_ids"] = _array(
             {"type": "string", "enum": list(reference_image_ids)},
-            minimum=1,
-            maximum=len(reference_image_ids),
         )
-        element_properties["target_reference_image_ids"]["uniqueItems"] = True
     element = _object(
         element_properties,
         required=(
@@ -362,9 +359,15 @@ def normalize_project_index(
             for _key, record in discovered[category]:
                 if "target_reference_image_ids" not in record:
                     continue
-                target_reference_image_ids = _reference_image_ids(
-                    record["target_reference_image_ids"],
-                )
+                model_reference_ids = record["target_reference_image_ids"]
+                if isinstance(model_reference_ids, list) and all(
+                    isinstance(item, str) for item in model_reference_ids
+                ):
+                    model_reference_ids = list(dict.fromkeys(model_reference_ids))
+                target_reference_image_ids = _reference_image_ids(model_reference_ids)
+                if target_reference_image_ids == ():
+                    record.pop("target_reference_image_ids")
+                    continue
                 if not set(target_reference_image_ids) <= allowed:
                     raise ValueError(
                         "project-index target reference image IDs are invalid",
