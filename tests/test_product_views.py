@@ -193,3 +193,63 @@ def test_legacy_frozen_three_by_one_is_not_redrawn_or_rewritten(tmp_path,monkeyp
     monkeypatch.setattr(Image,"open",lambda *_args,**_kwargs: pytest.fail("must not redraw frozen provider inputs"))
     assert product_views.compose_product_views(tmp_path,paths) == output
     assert (output.read_bytes(),output.stat().st_mtime_ns,manifest_path.read_bytes()) == before
+
+
+@pytest.mark.parametrize("background", [(255,255,255),(252,252,252)])
+def test_trim_uniform_near_white_border_and_keep_internal_white(background):
+    image = Image.new("RGB",(300,200),background)
+    image.paste((30,40,50),(50,30,250,170))
+    image.paste((255,255,255),(110,70,190,130))
+    cropped,bbox = product_views._trim_white_border(image,Image.new("L",image.size,255))
+    assert bbox == (48,28,252,172)
+    assert cropped.getpixel((150-bbox[0],100-bbox[1])) == (255,255,255)
+    assert cropped.getpixel((50-bbox[0],30-bbox[1])) == (30,40,50)
+    assert cropped.getpixel((249-bbox[0],169-bbox[1])) == (30,40,50)
+
+
+@pytest.mark.parametrize("kind", ["pure_white","low_contrast","white_product_logo","invisible_white_product_logo","colored_background","sparse_dark_subject"])
+def test_ambiguous_or_nonwhite_background_uses_full_image(kind):
+    image = Image.new("RGB",(300,200),"white")
+    if kind == "low_contrast":
+        image.paste((249,249,249),(30,20,270,180))
+    elif kind == "white_product_logo":
+        image.paste((248,248,248),(30,20,270,180))
+        image.paste((10,10,10),(140,90,160,110))
+    elif kind == "invisible_white_product_logo":
+        image.paste((10,10,10),(140,90,160,110))
+    elif kind == "colored_background":
+        image.paste((20,80,160),(0,0,300,200))
+        image.paste((10,10,10),(30,20,270,180))
+    elif kind == "sparse_dark_subject":
+        image.paste((10,10,10),(130,80,170,120))
+    cropped,bbox = product_views._trim_white_border(image,Image.new("L",image.size,255))
+    assert bbox == (0,0,300,200)
+    assert cropped.tobytes() == image.tobytes()
+
+
+@pytest.mark.parametrize("opaque_subject", [True,False])
+def test_alpha_support_preserves_white_subject_or_falls_back_when_empty(opaque_subject):
+    image = Image.new("RGB",(300,200),"white")
+    alpha = Image.new("L",image.size,0)
+    if opaque_subject:
+        alpha.paste(255,(50,30,250,170))
+    cropped,bbox = product_views._trim_white_border(image,alpha)
+    assert bbox == ((48,28,252,172) if opaque_subject else (0,0,300,200))
+    assert cropped.getextrema() == ((255,255),(255,255),(255,255))
+
+
+@pytest.mark.parametrize("count", [2,3,4])
+def test_trim_then_fit_enlarges_product_and_keeps_h3_ratio(tmp_path,count):
+    paths = sources(tmp_path,count,size=(300,200))
+    for path in paths:
+        image = Image.new("RGB",(300,200),"white")
+        image.paste((30,40,50),(50,30,250,170))
+        image.save(path,format="PNG")
+    output = product_views.compose_product_views(tmp_path,paths)
+    manifest = product_views.frozen_product_views(tmp_path)
+    with Image.open(output) as image:
+        assert .4 <= image.width/image.height <= 2.5
+    for view in manifest["layout"]["views"]:
+        assert view["source_size"] == [300,200]
+        assert view["source_crop_bbox"] == [48,28,252,172]
+        assert view["image_bbox"][2] / 204 > 744/300
