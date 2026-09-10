@@ -94,6 +94,18 @@ class QuoteStore:
                 with destination.open("rb") as handle:
                     os.fsync(handle.fileno())
                 frozen[key] = name
+        if "staged_replacements" in staged:
+            names = []
+            for index, path in enumerate(staged["staged_replacements"], 1):
+                name = "replacement" if index == 1 else f"replacement-{index}"
+                if index > 1:
+                    destination = media_directory / name
+                    os.replace(path, destination)
+                    os.chmod(destination, 0o600)
+                    with destination.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                names.append(name)
+            frozen["staged_replacements"] = names
         descriptor = os.open(media_directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(descriptor)
@@ -133,6 +145,27 @@ class QuoteStore:
                 if destination.stat().st_size != receipt["bytes"] or digest != receipt["sha256"]:
                     raise ValueError("staged media changed")
                 staged[key] = destination
+            if "staged_replacements" in staged:
+                from app.store import replacement_receipts
+                receipts = replacement_receipts(staged["input_receipt"])
+                names = staged["staged_replacements"]
+                expected_names = ["replacement" if index == 1 else f"replacement-{index}" for index in range(1, len(receipts) + 1)]
+                if names != expected_names:
+                    raise ValueError("invalid staged replacement list")
+                copies = []
+                for index, (name, receipt) in enumerate(zip(names, receipts), 1):
+                    destination = attempt / name
+                    if index > 1:
+                        source = directory / "media" / name
+                        if source.is_symlink() or not source.is_file():
+                            raise ValueError("invalid staged media")
+                        shutil.copyfile(source, destination)
+                        with destination.open("rb") as handle:
+                            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                        if destination.stat().st_size != receipt["bytes"] or digest != receipt["sha256"]:
+                            raise ValueError("staged media changed")
+                    copies.append(destination)
+                staged["staged_replacements"] = copies
             yield staged
         finally:
             try:

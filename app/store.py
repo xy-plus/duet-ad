@@ -84,6 +84,33 @@ def creation_request_digest(
     )
 
 
+def replacement_receipts(receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    """Ordered original references, with the v1 first-image projection intact."""
+    first = receipt.get("replacement_image")
+    values = receipt.get("replacement_images", [] if first is None else [first])
+    if not isinstance(values, list) or len(values) > 4 or (values[0] if values else None) != first:
+        raise ValueError("invalid replacement image receipts")
+    for item in values:
+        if (not isinstance(item, dict) or set(item) != {"sha256", "bytes"}
+                or not isinstance(item["sha256"], str)
+                or SHA256_RE.fullmatch(item["sha256"]) is None
+                or type(item["bytes"]) is not int or item["bytes"] < 0):
+            raise ValueError("invalid replacement image receipt")
+    return values
+
+
+def replacement_receipt_digest(receipt: dict[str, Any]) -> str | None:
+    values = replacement_receipts(receipt)
+    if len(values) < 2:
+        return values[0]["sha256"] if values else None
+    return canonical_json_sha256([item["sha256"] for item in values])
+
+
+def replacement_input_paths(count: int) -> list[str]:
+    return ["inputs/replacement-image" if index == 1 else f"inputs/replacement-image-{index}"
+            for index in range(1, count + 1)]
+
+
 class ProjectStore:
     """Atomic, single-process filesystem storage for research projects.
 
@@ -159,15 +186,15 @@ class ProjectStore:
     ) -> str:
         if (
             not isinstance(receipt, dict)
-            or set(receipt) != {
+            or set(receipt) != ({
                 "version",
                 "client_request_id",
                 "generation_request_sha256",
                 "source",
                 "replacement_image",
-            }
+            } | ({"replacement_images"} if receipt.get("version") == 2 else set()))
             or type(receipt.get("version")) is not int
-            or receipt.get("version") != 1
+            or receipt.get("version") not in (1, 2)
         ):
             raise IdempotencyIndexUnavailable("project input receipt is missing or invalid")
         if receipt.get("client_request_id") != client_request_id:
@@ -204,10 +231,13 @@ class ProjectStore:
         else:
             raise IdempotencyIndexUnavailable("project replacement receipt is invalid")
         try:
+            values = replacement_receipts(receipt)
+            if receipt["version"] == 2 and len(values) < 2:
+                raise ValueError("multi-image receipt requires multiple images")
             return creation_request_digest(
                 generation_digest,
                 source_digest,
-                replacement_digest,
+                replacement_receipt_digest(receipt),
             )
         except ValueError as exc:
             raise IdempotencyIndexUnavailable(
@@ -392,6 +422,18 @@ class ProjectStore:
                 raise IdempotencyIndexUnavailable(
                     "claimed project replacement image does not match its receipt"
                 )
+        receipts = replacement_receipts(receipt)
+        if "replacement_image_paths" in state or len(receipts) > 1:
+            if state.get("replacement_image_paths") != replacement_input_paths(len(receipts)):
+                raise IdempotencyIndexUnavailable("claimed replacement image list is inconsistent")
+            for relative, expected in zip(state["replacement_image_paths"], receipts):
+                try:
+                    path = self.resolve_project_file(project_id, project / relative)
+                    size, digest = self._file_receipt(path)
+                except (FileNotFoundError, OSError) as exc:
+                    raise IdempotencyIndexUnavailable("claimed replacement image is unreadable") from exc
+                if size != expected["bytes"] or digest != expected["sha256"]:
+                    raise IdempotencyIndexUnavailable("claimed replacement image does not match receipt")
         return project, state
 
     def lookup_claim(self, client_request_id: str) -> str | None:
@@ -414,6 +456,8 @@ class ProjectStore:
         staged_source: Path,
         replacement_snapshot: dict[str, Any] | None,
         staged_replacement: Path | None,
+        replacement_snapshots: list[dict[str, Any]] | None = None,
+        staged_replacements: list[Path] | None = None,
         project_id: str | None = None,
         extra_state: dict[str, Any] | None = None,
     ) -> tuple[str, Path, dict[str, Any], bool]:
@@ -492,6 +536,25 @@ class ProjectStore:
             ):
                 raise ValueError("staged replacement image does not match input receipt")
 
+        receipts = replacement_receipts(input_receipt)
+        snapshots = replacement_snapshots if replacement_snapshots is not None else (
+            [replacement_snapshot] if replacement_snapshot is not None else [])
+        paths = staged_replacements if staged_replacements is not None else (
+            [staged_replacement] if staged_replacement is not None else [])
+        if len(paths) != len(receipts) or len(snapshots) != len(receipts):
+            raise ValueError("replacement input count does not match receipt")
+        if (paths[0] if paths else None) != staged_replacement or (snapshots[0] if snapshots else None) != replacement_snapshot:
+            raise ValueError("replacement projection does not match image list")
+        resolved_replacements = []
+        for path, expected in zip(paths, receipts):
+            resolved = path.resolve(strict=True)
+            if self.root not in resolved.parents or not resolved.is_file():
+                raise ValueError("staged replacement must be a file inside the store")
+            size, digest = self._file_receipt(resolved)
+            if size != expected["bytes"] or digest != expected["sha256"]:
+                raise ValueError("staged replacement does not match receipt")
+            resolved_replacements.append(resolved)
+
         with self._lock:
             index = self._read_idempotency_index_unlocked()
             key_digest = hashlib.sha256(client_request_id.encode("utf-8")).hexdigest()
@@ -532,10 +595,11 @@ class ProjectStore:
             source = input_dir / "source.mp4"
             os.replace(staged_source_resolved, source)
             os.chmod(source, 0o600)
-            replacement_path = input_dir / "replacement-image"
-            if staged_replacement_resolved is not None:
-                os.replace(staged_replacement_resolved, replacement_path)
-                os.chmod(replacement_path, 0o600)
+            image_paths = replacement_input_paths(len(receipts))
+            for staged_path, relative in zip(resolved_replacements, image_paths):
+                destination = project / relative
+                os.replace(staged_path, destination)
+                os.chmod(destination, 0o600)
             self._fsync_directory(input_dir)
 
             now = utcnow()
@@ -549,6 +613,10 @@ class ProjectStore:
                 if replacement_snapshot is not None
                 else None
             )
+            replacement_creations = [
+                {**snapshot, "preview_url": f"/api/conversations/{project_id}/creation-input/replacement-images/{index}"}
+                for index, snapshot in enumerate(snapshots, 1)
+            ]
             state = {
                 "schema": PROJECT_STATE_SCHEMA,
                 "version": PROJECT_STATE_VERSION,
@@ -569,6 +637,7 @@ class ProjectStore:
                 "replacement_image_path": (
                     "inputs/replacement-image" if replacement_snapshot is not None else None
                 ),
+                "replacement_image_paths": image_paths,
                 "project_progress": {
                     "status": "queued",
                     "percent": 0,
@@ -583,6 +652,7 @@ class ProjectStore:
                     "version": 1,
                     "source": source_snapshot,
                     "replacement_image": replacement_creation,
+                    "replacement_images": replacement_creations,
                 },
                 "error": None,
             }

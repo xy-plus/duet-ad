@@ -318,7 +318,7 @@ def test_creation_request_rejects_oversized_declared_body_before_parsing(tmp_pat
             headers={
                 **AUTH,
                 "Content-Type": "application/octet-stream",
-                "Content-Length": str(16 * 1024 * 1024),
+                "Content-Length": str(64 * 1024 * 1024),
             },
             content=b"",
         )
@@ -446,7 +446,7 @@ def test_create_uses_exact_recovery_shape_fixed_paths_and_four_public_statuses(t
         body = response.json()
         project_id = body["id"]
         assert body["status"] == "queued"
-        assert set(body["creation_input"]) == {"version", "source", "replacement_image"}
+        assert set(body["creation_input"]) == {"version", "source", "replacement_image", "replacement_images"}
         assert body["creation_input"] == {
             "version": 1,
             "source": {"mode": "upload", "filename": "clip.mp4", "bytes": len(b"source-video")},
@@ -456,6 +456,12 @@ def test_create_uses_exact_recovery_shape_fixed_paths_and_four_public_statuses(t
                 "media_type": "image/png",
                 "preview_url": f"/api/conversations/{project_id}/creation-input/replacement-image",
             },
+            "replacement_images": [{
+                "filename": "product.png",
+                "bytes": len(b"replacement"),
+                "media_type": "image/png",
+                "preview_url": f"/api/conversations/{project_id}/creation-input/replacement-images/1",
+            }],
         }
 
         project = app.state.store.path(project_id)
@@ -1224,6 +1230,7 @@ def test_reference_url_create_uses_injected_pinned_transport_without_network(tmp
             "version": 1,
             "source": {"mode": "link", "reference_url": "https://media.example/video.mp4"},
             "replacement_image": None,
+            "replacement_images": [],
         }
         project = app.state.store.path(response.json()["id"])
         assert (project / "inputs" / "source.mp4").read_bytes() == b"remote-video"

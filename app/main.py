@@ -35,6 +35,7 @@ from app.store import (
     ProjectStateError,
     ProjectStore,
     creation_request_digest,
+    replacement_receipt_digest,
     generation_request_sha256 as hash_generation_request,
 )
 
@@ -42,6 +43,7 @@ from app.store import (
 LOGGER = logging.getLogger(__name__)
 MIB = 1024 * 1024
 REPLACEMENT_MAX_BYTES = 10 * MIB
+REPLACEMENT_MAX_IMAGES = 4
 CLIENT_REQUEST_ID_MAX_CHARS = 64
 TARGET_LANGUAGE_MAX_CHARS = 80
 REPLACEMENT_INSTRUCTION_MAX_CHARS = 1000
@@ -95,6 +97,7 @@ CAPABILITY = {
             "supported": True,
             "accept": ["image/jpeg", "image/png", "image/webp"],
             "max_bytes": REPLACEMENT_MAX_BYTES,
+            "max_images": REPLACEMENT_MAX_IMAGES,
             "max_instruction_chars": REPLACEMENT_INSTRUCTION_MAX_CHARS,
         },
     }
@@ -228,7 +231,7 @@ async def _validate_creation_form(request: Request) -> None:
         if field not in CREATION_FORM_FIELDS:
             raise _error(422, "invalid_creation_form", f"不支持的创建字段: {field}")
         counts[field] = counts.get(field, 0) + 1
-        if counts[field] > 1:
+        if counts[field] > (REPLACEMENT_MAX_IMAGES if field == "replacement_image" else 1):
             raise _error(422, "invalid_creation_form", f"创建字段不能重复: {field}")
 
 
@@ -447,7 +450,7 @@ def create_app(
                     )
                 request_limit = (
                     configured.max_upload_mb * MIB
-                    + REPLACEMENT_MAX_BYTES
+                    + REPLACEMENT_MAX_BYTES * REPLACEMENT_MAX_IMAGES
                     + CREATION_REQUEST_OVERHEAD_BYTES
                 )
                 if declared_length > request_limit:
@@ -498,7 +501,7 @@ def create_app(
                         return public_error(400, "invalid_content_length", "Content-Length 无效")
                     request_limit = (
                         configured.max_upload_mb * MIB
-                        + REPLACEMENT_MAX_BYTES
+                        + REPLACEMENT_MAX_BYTES * REPLACEMENT_MAX_IMAGES
                         + CREATION_REQUEST_OVERHEAD_BYTES
                     )
                     if declared_length > request_limit:
@@ -517,10 +520,12 @@ def create_app(
         media_type = mimetypes.guess_type(owned_path.name)[0]
         if owned_path.suffix.lower() == ".wav":
             media_type = "audio/wav"
-        if state.get("replacement_image_path") == "inputs/replacement-image":
-            replacement_path = app.state.store.path(project_id) / "inputs" / "replacement-image"
+        creation = state.get("creation_input") or {}
+        image_paths = state.get("replacement_image_paths", [state["replacement_image_path"]] if state.get("replacement_image_path") else [])
+        snapshots = creation.get("replacement_images", [creation.get("replacement_image") or {}])
+        for relative, snapshot in zip(image_paths, snapshots):
+            replacement_path = app.state.store.path(project_id) / relative
             if owned_path == replacement_path.resolve(strict=True):
-                snapshot = (state.get("creation_input") or {}).get("replacement_image") or {}
                 declared_type = snapshot.get("media_type")
                 if declared_type in REPLACEMENT_MEDIA_TYPES:
                     media_type = declared_type
@@ -710,6 +715,7 @@ def create_app(
         client_request_id: str | None,
         generation_request: str | None,
         replacement_image: UploadFile | None,
+        replacement_images: list[UploadFile] | None = None,
     ):
         """Validate and stage a creation request, yielding commit inputs.
 
@@ -729,6 +735,10 @@ def create_app(
                 "source_exactly_one_required",
                 "file 与 reference_url 必须且只能提供一个",
             )
+        images = replacement_images if replacement_images is not None else ([replacement_image] if replacement_image is not None else [])
+        if len(images) > REPLACEMENT_MAX_IMAGES:
+            raise _error(422, "invalid_creation_form", "最多提供 4 张参考图")
+        replacement_image = images[0] if images else None
         has_replacement_guidance = effective_request["replacement_guidance"] is not None
         if (replacement_image is not None) != has_replacement_guidance:
             raise _error(
@@ -740,12 +750,15 @@ def create_app(
         source_limit = configured.max_upload_mb * MIB
         if file is not None:
             _declared_upload_size(file, source_limit, "源视频超过大小限制")
-        replacement_media_type = None
-        if replacement_image is not None:
-            _declared_upload_size(replacement_image, REPLACEMENT_MAX_BYTES, "替换图片超过大小限制")
-            replacement_media_type = (replacement_image.content_type or "").split(";", 1)[0].strip().lower()
-            if replacement_media_type not in REPLACEMENT_MEDIA_TYPES:
+        media_types = []
+        for image in images:
+            if not hasattr(image, "read") or not hasattr(image, "filename"):
+                raise _error(422, "invalid_creation_form", "参考图必须为上传文件")
+            _declared_upload_size(image, REPLACEMENT_MAX_BYTES, "替换图片超过大小限制")
+            media_type = (image.content_type or "").split(";", 1)[0].strip().lower()
+            if media_type not in REPLACEMENT_MEDIA_TYPES:
                 raise _error(415, "unsupported_replacement_image", "替换图片类型不受支持")
+            media_types.append(media_type)
 
         with tempfile.TemporaryDirectory(
             prefix=".create-staging-",
@@ -788,25 +801,32 @@ def create_app(
 
             replacement_snapshot = None
             replacement_receipt = None
-            if replacement_image is not None:
+            replacement_snapshots = []
+            image_receipts = []
+            staged_replacements = []
+            for index, (image, media_type) in enumerate(zip(images, media_types), 1):
+                image_path = staging / ("replacement-image" if index == 1 else f"replacement-image-{index}")
                 replacement_bytes = await _write_upload(
-                    replacement_image,
-                    staged_replacement,
+                    image,
+                    image_path,
                     REPLACEMENT_MAX_BYTES,
                 )
-                replacement_sha256 = _sha256_file(staged_replacement)
-                replacement_snapshot = {
+                replacement_sha256 = _sha256_file(image_path)
+                replacement_snapshots.append({
                     "filename": _safe_basename(
-                        replacement_image.filename,
+                        image.filename,
                         "replacement-image",
                     ),
                     "bytes": replacement_bytes,
-                    "media_type": replacement_media_type,
-                }
-                replacement_receipt = {
+                    "media_type": media_type,
+                })
+                image_receipts.append({
                     "sha256": replacement_sha256,
                     "bytes": replacement_bytes,
-                }
+                })
+                staged_replacements.append(image_path)
+            replacement_snapshot = replacement_snapshots[0] if images else None
+            replacement_receipt = image_receipts[0] if images else None
 
             generation_request_sha256 = hash_generation_request(effective_request)
             input_receipt = {
@@ -819,14 +839,12 @@ def create_app(
                 },
                 "replacement_image": replacement_receipt,
             }
+            if len(images) > 1:
+                input_receipt.update(version=2, replacement_images=image_receipts)
             request_digest = creation_request_digest(
                 generation_request_sha256,
                 source_sha256,
-                (
-                    replacement_receipt["sha256"]
-                    if replacement_receipt is not None
-                    else None
-                ),
+                replacement_receipt_digest(input_receipt),
             )
             yield {
                 "effective_request": effective_request,
@@ -836,11 +854,13 @@ def create_app(
                 "source_snapshot": source_snapshot,
                 "staged_source": staged_source,
                 "replacement_snapshot": replacement_snapshot,
+                "replacement_snapshots": replacement_snapshots,
+                "staged_replacements": staged_replacements,
                 "staged_replacement": (
                     staged_replacement if replacement_image is not None else None
                 ),
                 "source_identity": source_identity,
-                "replacement_identity": replacement_receipt,
+                "replacement_identity": image_receipts if len(images) > 1 else replacement_receipt,
             }
 
     @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
@@ -851,9 +871,11 @@ def create_app(
         reference_url: str | None = Form(default=None),
         client_request_id: str | None = Form(default=None),
         generation_request: str | None = Form(default=None),
-        replacement_image: UploadFile | None = File(default=None),
+        replacement_image: list[UploadFile] | None = File(default=None),
     ):
         await _validate_creation_form(request)
+        replacement_images = (await request.form()).getlist("replacement_image")
+        replacement_image = replacement_images[0] if replacement_images else None
         try:
             async with staged_creation(
                 file=file,
@@ -861,6 +883,7 @@ def create_app(
                 client_request_id=client_request_id,
                 generation_request=generation_request,
                 replacement_image=replacement_image,
+                replacement_images=replacement_images,
             ) as staged:
                 project_id, project, state, created = app.state.store.create_from_staging(
                     staged["effective_request"],
@@ -871,6 +894,8 @@ def create_app(
                     staged_source=staged["staged_source"],
                     replacement_snapshot=staged["replacement_snapshot"],
                     staged_replacement=staged["staged_replacement"],
+                    replacement_snapshots=staged["replacement_snapshots"],
+                    staged_replacements=staged["staged_replacements"],
                 )
         except HTTPException:
             raise
@@ -915,7 +940,7 @@ def create_app(
             "file": {"filename": file.filename, "headers": dict(file.headers)} if file else None,
             "replacement_image": {"filename": replacement_image.filename, "headers": dict(replacement_image.headers)} if replacement_image else None,
         })
-        log.copy_media(attempt / "input-media", [source] + ([replacement_path] if replacement_image else []))
+        log.copy_media(attempt / "input-media", [source] + [project / path for path in state["replacement_image_paths"]])
         log.write_json(attempt / "output.json", state)
         log.event("node_succeeded", node="http-create", scope="project", attempt=1)
         start_pipeline(project_id)
@@ -1031,6 +1056,21 @@ def create_app(
         snapshot = (state.get("creation_input") or {}).get("replacement_image") or {}
         media_type = snapshot.get("media_type") if snapshot.get("media_type") in REPLACEMENT_MEDIA_TYPES else "application/octet-stream"
         return FileResponse(path, media_type=media_type)
+
+    @app.get("/api/conversations/{project_id}/creation-input/replacement-images/{index}", dependencies=[Depends(require_auth)])
+    async def replacement_at(project_id: str, index: int, request: Request):
+        store = _store(request)
+        state = _read_project(store, project_id)
+        paths = state.get("replacement_image_paths", [state["replacement_image_path"]] if state.get("replacement_image_path") else [])
+        snapshots = (state.get("creation_input") or {}).get("replacement_images", [(state.get("creation_input") or {}).get("replacement_image") or {}])
+        if not 1 <= index <= len(paths) or index > len(snapshots):
+            raise _error(404, "file_not_found", "参考图不存在")
+        expected = "inputs/replacement-image" if index == 1 else f"inputs/replacement-image-{index}"
+        if paths[index - 1] != expected:
+            raise _error(404, "file_not_found", "参考图不存在")
+        path = _project_file(store, project_id, expected)
+        media_type = snapshots[index - 1].get("media_type")
+        return FileResponse(path, media_type=media_type if media_type in REPLACEMENT_MEDIA_TYPES else "application/octet-stream")
 
     @app.get("/api/conversations/{project_id}/files/{relative:path}", dependencies=[Depends(require_auth)])
     async def project_file(project_id: str, relative: str, request: Request):

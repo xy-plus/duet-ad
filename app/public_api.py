@@ -51,6 +51,7 @@ from app.main import (
     DIALOGUE_BRIEF_MAX_CHARS,
     REPLACEMENT_INSTRUCTION_MAX_CHARS,
     REPLACEMENT_MAX_BYTES,
+    REPLACEMENT_MAX_IMAGES,
     REPLACEMENT_MEDIA_TYPES,
     TARGET_LANGUAGE_MAX_CHARS,
     UploadTooLarge,
@@ -556,6 +557,8 @@ def install(
                 staged_source=staged["staged_source"],
                 replacement_snapshot=staged["replacement_snapshot"],
                 staged_replacement=staged["staged_replacement"],
+                replacement_snapshots=staged.get("replacement_snapshots"),
+                staged_replacements=staged.get("staged_replacements"),
                 project_id=project_id, extra_state={"_public_api": receipt},
             )
             assert created and new_id == project_id
@@ -871,6 +874,7 @@ def install(
                 "paired_with": "replacement_instruction",
                 "media_types": sorted(REPLACEMENT_MEDIA_TYPES),
                 "max_bytes": REPLACEMENT_MAX_BYTES,
+                "max_images": REPLACEMENT_MAX_IMAGES,
                 "max_instruction_chars": REPLACEMENT_INSTRUCTION_MAX_CHARS,
             },
             target_language={
@@ -922,7 +926,7 @@ def install(
         aspect_ratio: Annotated[Literal["9:16", "16:9"], Form()] = "9:16",
         resolution: Annotated[Literal["768p", "480p"], Form()] = "768p",
         target_language: Annotated[str | None, Form()] = None,
-        replacement_image: Annotated[UploadFile | None, File()] = None,
+        replacement_image: Annotated[list[UploadFile] | None, File()] = None,
         replacement_instruction: Annotated[str | None, Form()] = None,
         dialogue_mode: Annotated[str | None, Form()] = None,
         dialogue_brief: Annotated[str | None, Form()] = None,
@@ -933,8 +937,15 @@ def install(
         if not isinstance(idempotency_key, str) or _IDEMPOTENCY_RE.fullmatch(idempotency_key) is None:
             raise PublicAPIError(400, "invalid_idempotency_key", "Idempotency-Key 格式无效", field="Idempotency-Key")
         form = await request.form()
-        if set(form) - _CREATE_FIELDS or any(len(form.getlist(key)) != 1 for key in form):
+        if set(form) - _CREATE_FIELDS or any(
+            not 1 <= len(form.getlist(key)) <= (REPLACEMENT_MAX_IMAGES if key == "replacement_image" else 1)
+            for key in form
+        ):
             raise PublicAPIError(422, "invalid_create_request", "请求包含未知或重复字段")
+        replacement_images = form.getlist("replacement_image")
+        replacement_image = replacement_images[0] if replacement_images else None
+        if any(not hasattr(image, "read") or not hasattr(image, "filename") for image in replacement_images):
+            raise PublicAPIError(422, "invalid_create_request", "参考图必须为上传文件")
         raw_url = form.get("source_video_url")
         if raw_url is not None and not isinstance(raw_url, str):
             raise PublicAPIError(422, "invalid_source_video_url", "视频链接无效", field="source_video_url")
@@ -1055,17 +1066,19 @@ def install(
                     if normalized_url:
                         # A lost response must remain recoverable after the URL
                         # expires. Its original media was already frozen.
-                        replacement_identity = None
-                        if replacement_image is not None:
+                        replacement_identities = []
+                        for image in replacement_images:
                             digest = hashlib.sha256()
                             size = 0
-                            while chunk := await replacement_image.read(1024 * 1024):
+                            while chunk := await image.read(1024 * 1024):
                                 size += len(chunk)
                                 if size > REPLACEMENT_MAX_BYTES:
                                     raise PublicAPIError(413, "source_too_large", "参考图超过大小限制")
                                 digest.update(chunk)
-                            await replacement_image.seek(0)
-                            replacement_identity = {"bytes": size, "sha256": digest.hexdigest()}
+                            await image.seek(0)
+                            replacement_identities.append({"bytes": size, "sha256": digest.hexdigest()})
+                        replacement_identity = (replacement_identities if len(replacement_identities) > 1
+                                                else replacement_identities[0] if replacement_identities else None)
                         if replacement_identity != existing_quote["staged"]["replacement_identity"]:
                             raise PublicAPIError(409, "idempotency_key_reused",
                                                  "Idempotency-Key 已绑定到不同输入", field="Idempotency-Key")
@@ -1080,6 +1093,7 @@ def install(
                 client_request_id=client_request_id,
                 generation_request=json.dumps(generation_request, ensure_ascii=False),
                 replacement_image=replacement_image,
+                replacement_images=replacement_images,
             ) as staged:
                 request_sha256 = canonical_json_sha256({
                     "request": descriptor,

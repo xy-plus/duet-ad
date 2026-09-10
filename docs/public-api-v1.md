@@ -118,6 +118,7 @@ HTTP `200 OK`
     "paired_with": "replacement_instruction",
     "media_types": ["image/jpeg", "image/png", "image/webp"],
     "max_bytes": 10485760,
+    "max_images": 4,
     "max_instruction_chars": 1000
   },
   "target_language": {
@@ -360,10 +361,12 @@ Content-Disposition: form-data; name="replacement_instruction"
 | `add_subtitles` | boolean | 否 | `false` | multipart 文本 `true`、`false` | 在最终成片上叠加台词字幕；参数随任务冻结，幂等重试必须保持一致 |
 | `dialogue_mode` | string | 否 | `auto_rewrite` | `auto_rewrite`、`generate` | 台词模式；`auto_rewrite` 翻译并自然改写原台词，`generate` 按 `dialogue_brief` 描述自动生成台词 |
 | `dialogue_brief` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 口播台词的内容描述；`dialogue_mode` 为 `generate` 时必填，其余模式不允许提供 |
-| `replacement_image` | binary | 条件必填 | 无 | JPEG、PNG、WebP；最大 10 MiB | 主体替换参考图；必须与 `replacement_instruction` 同时提供 |
+| `replacement_image` | binary，可重复 | 条件必填 | 无 | 1–4 张 JPEG、PNG、WebP，每张最大 10 MiB；按 multipart 出现顺序编号 | 参考图，不预设图片类型或用途；必须与 `replacement_instruction` 同时提供，单图客户端无需变更 |
 | `replacement_instruction` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 描述如何使用参考图；必须与 `replacement_image` 同时提供 |
 
-本接口没有 Path 或 Query 参数。未知字段、重复字段、同时提供两个视频来源或只提供参考图组合中的一个字段，都会返回 `422`。
+本接口没有 Path 或 Query 参数。仅 `replacement_image` 允许重复 1–4 次；其他未知或重复字段、超过 4 张图、同时提供两个视频来源或只提供参考图组合中的一个字段，都会返回 `422`。不使用参考图时同时省略图片和说明。
+
+多图按上传顺序称为图 1、图 2、图 3、图 4，说明文字可引用这些编号。报价冻结全部图片的原始字节和顺序；相同幂等键更换任一图片、数量、顺序或说明均返回 `409`。确认仍只发送 `{"confirm":true}`，不能临时换图。上传与 URL 视频来源均遵守相同规则，URL 报价重放无需重新访问已经冻结的视频链接。视频积分仍按原视频时长计算，不因图片数量改变。
 
 普通中文、英文和数字通常各占 1 个 UTF-16 字符单元；部分 Emoji 占 2 个。
 
