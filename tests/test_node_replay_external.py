@@ -24,6 +24,8 @@ from app.pipeline import (
     DIALOGUE_GENERATION_SCHEMA,
     TRANSLATION_SCHEMA,
     VIDEO_SKILL,
+    OBJECT_REPLACE_SKILL,
+    R2V_SKILL,
     Pipeline,
     SAME_AS_SOURCE_LANGUAGE,
     _validate_dialogue_generation_shape,
@@ -40,6 +42,8 @@ from node_replay_support import (
     Fixture,
     node_fixtures,
     sha256_file,
+    current_sheet_replay,
+    current_skill_replay,
 )
 
 
@@ -219,7 +223,7 @@ def test_object_replace(
     ]
     user_reference = fixture.media[0] if payload["has_user_image"] else None
     result = pipeline_instance.deepseek.complete_structured(
-        fixture.input["skill"],
+        current_skill_replay(fixture, OBJECT_REPLACE_SKILL, tmp_path / "current-request"),
         payload,
         fixture.input["output_schema"],
         [user_reference] if user_reference is not None else [],
@@ -274,7 +278,7 @@ def test_object_replace(
     _params("h3-max-r2v-prompt"),
     ids=_ids(_params("h3-max-r2v-prompt")),
 )
-def test_h3_max_r2v_prompt(fixture: Fixture, deepseek_client) -> None:
+def test_h3_max_r2v_prompt(fixture: Fixture, deepseek_client, tmp_path: Path) -> None:
     payload = fixture.input
     if payload["agent"] != "deepseek":
         pytest.skip(f"fusion agent {payload['agent']!r} is not replayed")
@@ -291,7 +295,8 @@ def test_h3_max_r2v_prompt(fixture: Fixture, deepseek_client) -> None:
         )
 
     result = deepseek_client.complete_structured(
-        payload["skill"], payload["payload"], payload["output_schema"], [],
+        current_skill_replay(fixture, R2V_SKILL, tmp_path / "current-request"),
+        payload["payload"], payload["output_schema"], [],
         validator=validate,
     )
     # The node's transform is the downstream (Picsart submit) gate.
@@ -318,11 +323,10 @@ def test_seedream_reference_submit(
 ) -> None:
     payload = fixture.input
     prompt_path = fixture.directory / "extras" / "prompt.txt"
-    if not prompt_path.is_file():
-        pytest.skip("historical prompt.txt was not harvested")
-    prompt = prompt_path.read_text(encoding="utf-8")
+    assert prompt_path.is_file(), "required historical prompt.txt was not harvested"
+    historical_prompt = prompt_path.read_text(encoding="utf-8")
     assert (
-        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        hashlib.sha256(historical_prompt.encode("utf-8")).hexdigest()
         == payload["prompt_sha256"]
     )
     images = fixture.media
@@ -330,6 +334,8 @@ def test_seedream_reference_submit(
     assert len(images) == len(receipts)
     for image, receipt in zip(images, receipts):
         assert sha256_file(image) == receipt["sha256"]
+    current = current_sheet_replay(fixture, tmp_path / "current-sheet")
+    prompt = current["prompt"]
     result = seedream_client.generate(
         prompt=prompt,
         images=images,

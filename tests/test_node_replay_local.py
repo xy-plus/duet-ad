@@ -32,6 +32,7 @@ from node_replay_support import (
     node_fixtures,
     sha256_file,
     sibling_fixture,
+    current_sheet_replay,
 )
 
 
@@ -411,9 +412,7 @@ def test_replacement_sheet_inputs(fixture: Fixture, tmp_path: Path) -> None:
     # The node's own schema gate.
     validate_replacement_sheet_spec(spec, allow_empty=False)
     directory = tmp_path / "sheet"
-    result = materialize_replacement_sheet_inputs(
-        directory, spec, user_image_present=_user_image_present(fixture),
-    )
+    result = current_sheet_replay(fixture, directory)
     assert result["spec_sha256"] == spec["spec_sha256"]
     canvas = Path(result["canvas_path"])
     assert canvas.is_file()
@@ -424,10 +423,8 @@ def test_replacement_sheet_inputs(fixture: Fixture, tmp_path: Path) -> None:
     if seedream is not None:
         receipts = seedream.input["input_receipts"]
         assert sha256_file(canvas) == receipts[0]["sha256"]
-        assert (
-            hashlib.sha256(result["prompt"].encode("utf-8")).hexdigest()
-            == seedream.input["prompt_sha256"]
-        )
+        # Historical prompt/receipt SHA is verified in current_sheet_replay;
+        # current prompt uses this version's instructions with the same spec.
 
 
 @pytest.mark.parametrize(

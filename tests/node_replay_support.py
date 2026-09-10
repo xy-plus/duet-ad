@@ -146,3 +146,81 @@ def sibling_fixture(
     return Fixture(
         project=fixture.project, node=node, scope=scope, directory=directory,
     )
+
+
+def verify_historical_fixture(fixture: Fixture) -> None:
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    entries = [entry for entry in manifest["entries"]
+               if entry["subset"] == fixture.subset and entry["project"] == fixture.project
+               and entry["node"] == fixture.node and entry["scope"] == fixture.scope]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert sha256_file(fixture.directory / "input.json") == entry["input_sha256"]
+    if entry.get("output_sha256"):
+        assert sha256_file(fixture.directory / "output.json") == entry["output_sha256"]
+    expected_media = {item["name"]: item for item in entry.get("media", [])}
+    actual_media = {path.name: path for path in fixture.media}
+    assert set(actual_media) == set(expected_media)
+    for name, path in actual_media.items():
+        assert path.stat().st_size == expected_media[name]["size_bytes"]
+        assert sha256_file(path) == expected_media[name]["sha256"]
+
+
+def current_skill_replay(fixture: Fixture, skill_path: Path, directory: Path) -> str:
+    verify_historical_fixture(fixture)
+    skill = skill_path.read_text(encoding="utf-8")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "current-skill.md").write_text(skill, encoding="utf-8")
+    (directory / "skill-provenance.json").write_text(json.dumps({
+        "source_fixture": str(fixture.directory),
+        "historical_input_sha256": sha256_file(fixture.directory / "input.json"),
+        "current_skill_source": str(skill_path),
+        "current_skill_sha256": hashlib.sha256(skill.encode()).hexdigest(),
+    }, indent=2), encoding="utf-8")
+    return skill
+
+
+def current_sheet_replay(fixture: Fixture, directory: Path) -> dict[str, Any]:
+    """Verify the frozen receipt, then build this version's prompt from its real spec.
+
+    Historical artifacts remain immutable. The replay is a new invocation of
+    the current node, not a resume of the historical paid request.
+    """
+    from app.replacement_sheet import materialize_replacement_sheet_inputs
+
+    inputs = sibling_fixture(fixture, "replacement-sheet-inputs")
+    seedream = sibling_fixture(fixture, "seedream-reference-submit")
+    assert inputs is not None and seedream is not None
+    verify_historical_fixture(inputs)
+    verify_historical_fixture(seedream)
+    historical_prompt = (seedream.directory / "extras" / "prompt.txt").read_bytes()
+    old_sha = hashlib.sha256(historical_prompt).hexdigest()
+    assert old_sha == seedream.input["prompt_sha256"]
+    assert hashlib.sha256(inputs.expected_output["prompt"].encode()).hexdigest() == old_sha
+    receipts = seedream.input["input_receipts"]
+    assert len(seedream.media) == len(receipts)
+    for path, receipt in zip(seedream.media, receipts):
+        assert sha256_file(path) == receipt["sha256"]
+    spec = inputs.input["spec"]
+    result = materialize_replacement_sheet_inputs(
+        directory, spec, user_image_present=len(receipts) > 1,
+    )
+    assert result["spec_sha256"] == spec["spec_sha256"]
+    assert sha256_file(Path(result["canvas_path"])) == receipts[0]["sha256"]
+    # Bind every current tile to the same immutable source spec; no entity or
+    # appearance may disappear while the node's global instruction evolves.
+    for tile in spec["tiles"]:
+        binding = (
+            f'stable_key={json.dumps(tile["stable_key"], ensure_ascii=False)} | '
+            f'SOURCE={json.dumps(tile["source"], ensure_ascii=False)} | '
+            f'APPEARANCE={json.dumps(tile["appearance_description"], ensure_ascii=False)}'
+        )
+        assert binding in result["prompt"]
+    (directory / "replay-provenance.json").write_text(json.dumps({
+        "historical_prompt_sha256": old_sha,
+        "current_prompt_sha256": hashlib.sha256(result["prompt"].encode()).hexdigest(),
+        "historical_inputs_sha256": sha256_file(inputs.directory / "input.json"),
+        "source_spec_sha256": spec["spec_sha256"],
+        "source_fixture": str(inputs.directory),
+    }, indent=2), encoding="utf-8")
+    return result
