@@ -101,7 +101,10 @@ async def _approved_target(url: str, resolver: Resolver) -> ApprovedTarget:
         raise _invalid("视频链接无法解析") from exc
     if not addresses:
         raise _invalid("视频链接无法解析")
-    if any(not address.is_global or address.is_multicast for address in addresses):
+    # Pin only a safe candidate; an unusable sibling DNS answer need not
+    # invalidate the public addresses returned for the same hostname.
+    addresses = [address for address in addresses if address.is_global and not address.is_multicast]
+    if not addresses:
         raise ReferenceDownloadError(
             "reference_url_forbidden",
             "视频链接不能指向内部或非公网网络",
