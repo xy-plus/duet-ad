@@ -1044,6 +1044,7 @@ input, textarea { font-family: inherit; }
 
 .replacement-inputs { display: grid; gap: 8px; }
 .reference-image-button { width: fit-content; padding: 0 13px; }
+.reference-image-list { display: grid; gap: 6px; }
 
 .reference-image-chip {
   display: flex;

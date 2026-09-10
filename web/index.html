@@ -199,14 +199,8 @@
               </div>
             </div>
             <div class="replacement-inputs">
-              <button type="button" id="replacement-select" class="reference-image-button">上传参考图</button>
-              <div id="replacement-chip" class="reference-image-chip" hidden>
-                <img id="replacement-preview" alt="已选参考图预览">
-                <span id="replacement-name"></span>
-                <button type="button" id="replacement-remove" class="icon-btn icon-btn-sm" aria-label="移除参考图">
-                  <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
-                </button>
-              </div>
+              <button type="button" id="replacement-select" class="reference-image-button">上传参考图（最多 4 张）</button>
+              <div id="replacement-image-list" class="reference-image-list" aria-live="polite" hidden></div>
               <label class="sr-only" for="replacement-instruction">替换说明</label>
               <textarea id="replacement-instruction" class="setup-textarea" rows="3" maxlength="1000"
                         placeholder="例如：把画面中的白色水杯替换成参考图中的产品杯"></textarea>
@@ -227,7 +221,7 @@
   </main>
 
   <input type="file" id="file-input" accept="video/*" hidden>
-  <input type="file" id="replacement-image-input" accept="image/jpeg,image/png,image/webp" hidden>
+  <input type="file" id="replacement-image-input" accept="image/jpeg,image/png,image/webp" multiple hidden>
 </div>
 
 <script src="app.js"></script>

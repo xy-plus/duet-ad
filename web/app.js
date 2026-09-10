@@ -32,8 +32,8 @@ const state = {
   currentId: null,
   detail: null,        // 当前会话详情
   file: null,          // composer 已选文件
-  replacementImage: null,
-  replacementPreviewURL: null,
+  replacementImages: [],
+  replacementPreviewURLs: [],
   replacementPreviewOwnerId: null,
   clientRequestId: null, // 幂等键：内容变更/成功才轮换，失败重试复用
   uploading: false,
@@ -48,7 +48,7 @@ const state = {
   minimalCreationCapabilityLoaded: false,
   composerDrafts: {}, // cid → 本页提交的可序列化创建输入
   viewingSubmittedConfig: false, // 当前配置属于既有项目，仅展示；新建项目后才允许再次提交
-  submittedReplacement: null, // 当前展示的是已提交参考图元数据，而非可再次提交的 File
+  submittedReplacements: [], // 当前展示的是已提交参考图元数据，而非可再次提交的 File
   detailSig: null,     // 当前已渲染详情的状态签名：轮询比对，签名不变不碰 DOM（根治轮询闪烁）
 };
 
@@ -146,10 +146,13 @@ function normalizeMinimalCreationCapability(payload) {
       || !hasExactKeys(dialogue.default, ["mode", "target_language"])
       || dialogue.default.mode !== "auto_rewrite"
       || dialogue.default.target_language !== SAME_AS_SOURCE_LANGUAGE
-      || !replacement || replacement.supported !== true
+      || !replacement || !hasExactKeys(replacement, [
+        "supported", "accept", "max_bytes", "max_images", "max_instruction_chars",
+      ]) || replacement.supported !== true
       || !Array.isArray(replacement.accept)
       || replacement.accept.join("|") !== REPLACEMENT_IMAGE_TYPES.join("|")
       || !Number.isInteger(replacement.max_bytes) || replacement.max_bytes < 1
+      || replacement.max_images !== 4
       || !Number.isInteger(replacement.max_instruction_chars)
       || replacement.max_instruction_chars < 1) return null;
   return {
@@ -172,6 +175,7 @@ function normalizeMinimalCreationCapability(payload) {
     replacement: {
       accept: replacement.accept.slice(),
       max_bytes: replacement.max_bytes,
+      max_images: replacement.max_images,
       max_instruction_chars: replacement.max_instruction_chars,
     },
   };
@@ -185,7 +189,9 @@ function buildMinimalGenerationRequest(input, capability) {
   const targetLanguage = String(input && input.targetLanguage || "").trim();
   const dialogueMode = input && input.dialogueMode === "generate" ? "generate" : "auto_rewrite";
   const dialogueBrief = String(input && input.dialogueBrief || "").trim();
-  const hasReplacementImage = !!(input && input.hasReplacementImage);
+  const replacementImageCount = Number.isInteger(input && input.replacementImageCount)
+    ? input.replacementImageCount : (input && input.hasReplacementImage ? 1 : 0);
+  const hasReplacementImage = replacementImageCount > 0;
   const replacementInstruction = String(input && input.replacementInstruction || "").trim();
   if (!normalized.aspect_ratios.includes(aspectRatio)) throw new Error("请选择画幅");
   if (!normalized.resolutions.includes(resolution)) throw new Error("请选择清晰度");
@@ -194,6 +200,9 @@ function buildMinimalGenerationRequest(input, capability) {
   if (dialogueMode === "generate" && !dialogueBrief) throw new Error("请填写口播描述");
   if (dialogueBrief.length > normalized.dialogue.max_brief_chars) {
     throw new Error("口播描述超过长度限制");
+  }
+  if (replacementImageCount < 0 || replacementImageCount > normalized.replacement.max_images) {
+    throw new Error("参考图数量超出限制");
   }
   if (hasReplacementImage !== !!replacementInstruction) {
     throw new Error("参考图与替换说明需要一起提供");
@@ -227,7 +236,17 @@ function buildMinimalGenerationRequest(input, capability) {
   };
 }
 
-function creationInputSnapshot({ file = null, url = "", replacementImage = null } = {}) {
+function replacementImageSnapshot(image) {
+  return {
+    filename: String(image.name || "参考图"),
+    bytes: Number.isFinite(image.size) ? image.size : null,
+    media_type: String(image.type || ""),
+  };
+}
+
+function creationInputSnapshot({
+  file = null, url = "", replacementImage = null, replacementImages = null,
+} = {}) {
   const source = file ? {
     mode: "upload",
     filename: String(file.name || "原视频"),
@@ -236,14 +255,15 @@ function creationInputSnapshot({ file = null, url = "", replacementImage = null 
     mode: "link",
     reference_url: String(url || ""),
   };
+  const images = Array.isArray(replacementImages)
+    ? replacementImages.slice() : replacementImage ? [replacementImage] : [];
+  const imageSnapshots = images.map(replacementImageSnapshot);
   return {
     version: 1,
     source,
-    replacement_image: replacementImage ? {
-      filename: String(replacementImage.name || "参考图"),
-      bytes: Number.isFinite(replacementImage.size) ? replacementImage.size : null,
-      media_type: String(replacementImage.type || ""),
-    } : null,
+    // 保留首图投影，以便旧任务、旧客户端和单图 API 调用保持兼容。
+    replacement_image: imageSnapshots[0] || null,
+    replacement_images: imageSnapshots,
   };
 }
 
@@ -274,9 +294,8 @@ function normalizeCreationInputSnapshot(value, { allowLocalPreview = false } = {
   } else {
     return null;
   }
-  const rawReplacement = value.replacement_image;
-  let replacementImage = null;
-  if (rawReplacement !== null) {
+  const normalizeReplacement = (rawReplacement) => {
+    if (rawReplacement === null) return null;
     const previewURL = rawReplacement && rawReplacement.preview_url;
     if (!rawReplacement || typeof rawReplacement !== "object" || Array.isArray(rawReplacement)
         || typeof rawReplacement.filename !== "string" || !rawReplacement.filename.trim()
@@ -288,15 +307,36 @@ function normalizeCreationInputSnapshot(value, { allowLocalPreview = false } = {
           : !REPLACEMENT_IMAGE_TYPES.includes(rawReplacement.media_type))
         || (allowLocalPreview
           ? previewURL !== undefined && typeof previewURL !== "string"
-          : typeof previewURL !== "string" || !previewURL.trim())) return null;
-    replacementImage = {
+          : typeof previewURL !== "string" || !previewURL.trim())) return undefined;
+    return {
       filename: rawReplacement.filename.trim(),
       bytes: rawReplacement.bytes,
       media_type: rawReplacement.media_type,
       preview_url: typeof previewURL === "string" ? previewURL.trim() : "",
     };
+  };
+  const replacementImage = normalizeReplacement(value.replacement_image);
+  if (replacementImage === undefined) return null;
+  const hasReplacementImages = Object.prototype.hasOwnProperty.call(value, "replacement_images");
+  let replacementImages = replacementImage ? [replacementImage] : [];
+  if (hasReplacementImages) {
+    if (!Array.isArray(value.replacement_images)
+        || value.replacement_images.length > 4
+        || (!!replacementImage) !== (value.replacement_images.length > 0)) return null;
+    replacementImages = value.replacement_images.map(normalizeReplacement);
+    if (replacementImages.some((image) => !image)) return null;
+    const first = replacementImages[0] || null;
+    if (!!first !== !!replacementImage
+        || (first && (first.filename !== replacementImage.filename
+          || first.bytes !== replacementImage.bytes
+          || first.media_type !== replacementImage.media_type))) return null;
   }
-  return { version: MINIMAL_CREATION_VERSION, source, replacement_image: replacementImage };
+  return {
+    version: MINIMAL_CREATION_VERSION,
+    source,
+    replacement_image: replacementImage,
+    replacement_images: replacementImages,
+  };
 }
 
 function resolveCreationInputSnapshot(response, localInput = null) {
@@ -323,7 +363,7 @@ function rememberSubmittedComposer(conversationId, request, inputs, response = n
   const input = resolveCreationInputSnapshot(response, creationInputSnapshot(inputs));
   const record = { request, input };
   state.composerDrafts[conversationId] = record;
-  if (input && input.replacement_image && state.replacementPreviewURL) {
+  if (input && input.replacement_images.length && state.replacementPreviewURLs.length) {
     state.replacementPreviewOwnerId = conversationId;
   }
   if (typeof sessionStorage === "undefined") return;
@@ -341,10 +381,9 @@ function clearComposerSnapshots() {
   state.composerDrafts = {};
   state.viewingSubmittedConfig = false;
   state.file = null;
-  state.replacementImage = null;
-  state.submittedReplacement = null;
-  if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
-  state.replacementPreviewURL = null;
+  state.replacementImages = [];
+  state.submittedReplacements = [];
+  revokeReplacementPreviewURLs();
   state.replacementPreviewOwnerId = null;
   if (typeof sessionStorage !== "undefined") {
     try {
@@ -393,6 +432,10 @@ function projectComposerModel(detail, localDraft = null) {
       ? input.replacement_image
       : replacementUsed ? { filename: "已提交参考图", bytes: null, media_type: "", preview_url: "" }
         : null,
+    replacementImages: input && input.replacement_images.length
+      ? input.replacement_images
+      : replacementUsed ? [{ filename: "已提交参考图", bytes: null, media_type: "", preview_url: "" }]
+        : [],
   };
 }
 
@@ -1433,6 +1476,7 @@ async function loadMinimalCreationCapability() {
       $("dialogue-brief").maxLength = normalized.dialogue.max_brief_chars;
       $("replacement-instruction").maxLength = normalized.replacement.max_instruction_chars;
       $("replacement-image-input").accept = normalized.replacement.accept.join(",");
+      renderReplacementImages();
     }
   } catch (error) {
     if (handleAuthError(error)) return;
@@ -1483,9 +1527,10 @@ function updateSendBtn() {
   const langReady = !!targetLanguage && targetLanguage.length <= TARGET_LANGUAGE_MAX_CHARS;
   const briefReady = dialogueWriteMode() !== "generate" || !!$("dialogue-brief").value.trim();
   const hasInstruction = !!$("replacement-instruction").value.trim();
-  const replacementReady = !!state.replacementImage === hasInstruction;
-  const replacementSizeReady = !state.replacementImage || !state.minimalCreationCapability
-    || state.replacementImage.size <= state.minimalCreationCapability.replacement.max_bytes;
+  const replacementReady = (state.replacementImages.length > 0) === hasInstruction;
+  const replacementSizeReady = !state.minimalCreationCapability || state.replacementImages.every(
+    (image) => image.size <= state.minimalCreationCapability.replacement.max_bytes,
+  );
   const configReady = GENERATION_ASPECT_RATIOS.includes(selectedAspectRatio())
     && GENERATION_RESOLUTIONS.includes(selectedResolution())
     && !!state.minimalCreationCapability;
@@ -1531,67 +1576,116 @@ function isReferenceImageFile(file) {
 }
 
 function updateReplacementHint() {
-  const hasImage = !!state.replacementImage;
-  const hasSubmittedImage = !!state.submittedReplacement;
-  const hasAnyImage = hasImage || hasSubmittedImage;
+  const imageCount = state.replacementImages.length;
+  const submittedCount = state.submittedReplacements.length;
+  const hasAnyImage = imageCount + submittedCount > 0;
   const hasInstruction = !!$("replacement-instruction").value.trim();
   const capability = state.minimalCreationCapability;
-  const tooLarge = !!(hasImage && capability
-    && state.replacementImage.size > capability.replacement.max_bytes);
+  const tooLarge = !!(capability && state.replacementImages.some(
+    (image) => image.size > capability.replacement.max_bytes,
+  ));
   const hint = $("replacement-hint");
   hint.classList.toggle("is-error", hasAnyImage !== hasInstruction || tooLarge);
   hint.textContent = tooLarge
     ? "参考图过大，请选择不超过 " + fmtBytes(capability.replacement.max_bytes) + " 的图片"
     : hasAnyImage !== hasInstruction ? "请同时提供参考图和替换说明"
-    : hasSubmittedImage ? "该项目创建时已提交参考图；如需再次创建，请重新选择图片"
-    : hasImage ? "参考图和替换说明将在创建时一起提交" : "参考图与替换说明需要一起提供";
+    : submittedCount ? "该项目创建时已提交 " + submittedCount + " 张参考图；如需再次创建，请重新选择图片"
+    : imageCount ? imageCount + " 张参考图和替换说明将在创建时一起提交"
+      : "参考图与替换说明需要一起提供";
+}
+
+function revokeReplacementPreviewURLs() {
+  state.replacementPreviewURLs.forEach((url) => {
+    if (url) URL.revokeObjectURL(url);
+  });
+  state.replacementPreviewURLs = [];
+}
+
+function renderReplacementImages() {
+  const submitted = state.submittedReplacements.length > 0;
+  const images = submitted ? state.submittedReplacements : state.replacementImages;
+  const list = $("replacement-image-list");
+  list.textContent = "";
+  list.hidden = images.length === 0;
+  images.forEach((image, index) => {
+    const chip = el("div", "reference-image-chip");
+    const previewURL = state.replacementPreviewURLs[index];
+    if (previewURL) {
+      const preview = el("img");
+      preview.src = previewURL;
+      preview.alt = "参考图 " + (index + 1) + " 预览";
+      chip.appendChild(preview);
+    }
+    chip.appendChild(el("span", null, "参考图 " + (index + 1) + " · " + image.filename));
+    if (!submitted) {
+      const remove = el("button", "icon-btn icon-btn-sm");
+      remove.type = "button";
+      remove.setAttribute("aria-label", "移除参考图 " + (index + 1));
+      remove.appendChild(icon("i-close"));
+      remove.addEventListener("click", () => clearReplacementImage(index));
+      chip.appendChild(remove);
+    }
+    list.appendChild(chip);
+  });
+  const maxImages = state.minimalCreationCapability
+    ? state.minimalCreationCapability.replacement.max_images : 4;
+  $("replacement-select").hidden = submitted;
+  $("replacement-select").textContent = images.length
+    ? "添加参考图（" + images.length + "/" + maxImages + "）" : "上传参考图（最多 " + maxImages + " 张）";
+  $("replacement-select").disabled = state.uploading || state.viewingSubmittedConfig
+    || images.length >= maxImages;
 }
 
 function resetReplacementImageDisplay() {
-  if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
-  state.replacementImage = null;
-  state.replacementPreviewURL = null;
+  revokeReplacementPreviewURLs();
+  state.replacementImages = [];
   state.replacementPreviewOwnerId = null;
-  state.submittedReplacement = null;
+  state.submittedReplacements = [];
   $("replacement-image-input").value = "";
-  $("replacement-preview").removeAttribute("src");
-  $("replacement-preview").hidden = false;
-  $("replacement-name").textContent = "";
-  $("replacement-chip").hidden = true;
-  $("replacement-select").hidden = false;
+  renderReplacementImages();
 }
 
-function clearReplacementImage() {
-  resetReplacementImageDisplay();
+function clearReplacementImage(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= state.replacementImages.length) return;
+  const [previewURL] = state.replacementPreviewURLs.splice(index, 1);
+  if (previewURL) URL.revokeObjectURL(previewURL);
+  state.replacementImages.splice(index, 1);
+  $("replacement-image-input").value = "";
   state.clientRequestId = newRequestId();
+  renderReplacementImages();
   updateReplacementHint();
   updateSendBtn();
 }
 
-function pickReplacementImage(file) {
+function pickReplacementImages(files) {
   if (state.viewingSubmittedConfig) return;
   setComposerError(null);
-  if (!file) return;
-  if (!isReferenceImageFile(file)) {
-    setComposerError("参考图仅支持 JPG、PNG 或 WebP");
-    return;
-  }
+  const images = Array.from(files || []);
+  if (images.length === 0) return;
   const capability = state.minimalCreationCapability;
-  if (capability && file.size > capability.replacement.max_bytes) {
-    setComposerError("参考图过大，请选择不超过 " + fmtBytes(capability.replacement.max_bytes) + " 的图片");
+  const maxImages = capability ? capability.replacement.max_images : 4;
+  if (state.replacementImages.length + images.length > maxImages) {
+    setComposerError("最多可选择 " + maxImages + " 张参考图");
+    $("replacement-image-input").value = "";
     return;
   }
-  if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
-  state.replacementImage = file;
-  state.submittedReplacement = null;
-  state.replacementPreviewURL = URL.createObjectURL(file);
+  if (images.some((image) => !isReferenceImageFile(image))) {
+    setComposerError("参考图仅支持 JPG、PNG 或 WebP");
+    $("replacement-image-input").value = "";
+    return;
+  }
+  if (capability && images.some((image) => image.size > capability.replacement.max_bytes)) {
+    setComposerError("参考图过大，请选择不超过 " + fmtBytes(capability.replacement.max_bytes) + " 的图片");
+    $("replacement-image-input").value = "";
+    return;
+  }
+  state.submittedReplacements = [];
+  state.replacementImages.push(...images);
+  state.replacementPreviewURLs.push(...images.map((image) => URL.createObjectURL(image)));
   state.replacementPreviewOwnerId = null;
   state.clientRequestId = newRequestId();
-  $("replacement-preview").src = state.replacementPreviewURL;
-  $("replacement-preview").hidden = false;
-  $("replacement-name").textContent = file.name;
-  $("replacement-chip").hidden = false;
-  $("replacement-select").hidden = true;
+  $("replacement-image-input").value = "";
+  renderReplacementImages();
   updateReplacementHint();
   updateSendBtn();
 }
@@ -1629,34 +1723,40 @@ function prepareComposerForProjectLoad() {
   setUploading(false);
 }
 
-async function loadSubmittedReplacementPreview(conversationId, previewUrl) {
-  const safePath = creationInputReplacementPreviewPath(conversationId, previewUrl);
+async function loadSubmittedReplacementPreview(conversationId, previewUrl, index = null) {
+  const safePath = creationInputReplacementPreviewPath(conversationId, previewUrl, null, index);
   if (!safePath) return;
   try {
     const response = await api(safePath);
     if (!response.ok) return;
     const objectUrl = URL.createObjectURL(await response.blob());
     if (state.currentId !== conversationId
-        || !state.submittedReplacement
-        || state.submittedReplacement.preview_url !== previewUrl) {
+        || !state.submittedReplacements[index === null ? 0 : index - 1]
+        || state.submittedReplacements[index === null ? 0 : index - 1].preview_url !== previewUrl) {
       URL.revokeObjectURL(objectUrl);
       return;
     }
-    if (state.replacementPreviewURL) URL.revokeObjectURL(state.replacementPreviewURL);
-    state.replacementPreviewURL = objectUrl;
+    const previewIndex = index === null ? 0 : index - 1;
+    if (state.replacementPreviewURLs[previewIndex]) {
+      URL.revokeObjectURL(state.replacementPreviewURLs[previewIndex]);
+    }
+    state.replacementPreviewURLs[previewIndex] = objectUrl;
     state.replacementPreviewOwnerId = conversationId;
-    $("replacement-preview").src = objectUrl;
-    $("replacement-preview").hidden = false;
+    renderReplacementImages();
   } catch (error) {
     if (handleAuthError(error)) return;
     // 配置文字仍可展示；预览失败不改变已冻结配置。
   }
 }
 
-function creationInputReplacementPreviewPath(conversationId, previewUrl, origin = null) {
+function creationInputReplacementPreviewPath(conversationId, previewUrl, origin = null, index = null) {
   if (!conversationId || typeof previewUrl !== "string" || !previewUrl.trim()) return null;
-  const expectedPath = "/api/conversations/" + encodeURIComponent(conversationId)
-    + "/creation-input/replacement-image";
+  const basePath = "/api/conversations/" + encodeURIComponent(conversationId) + "/creation-input/";
+  const expectedPath = index === null
+    ? basePath + "replacement-image"
+    : Number.isInteger(index) && index >= 1 && index <= 4
+      ? basePath + "replacement-images/" + index : null;
+  if (!expectedPath) return null;
   const expectedOrigin = origin || (typeof window !== "undefined" && window.location
     ? window.location.origin : "");
   if (!expectedOrigin) return null;
@@ -1680,11 +1780,11 @@ function applyProjectComposer(detail) {
   const serverInput = hasServerInput
     ? normalizeCreationInputSnapshot(detail.creation_input) : null;
   const localPreviewAllowed = !hasServerInput
-    || !!(serverInput && serverInput.replacement_image);
-  const preservedPreview = localPreviewAllowed
+    || !!(serverInput && serverInput.replacement_images.length);
+  const preservedPreviews = localPreviewAllowed
     && state.replacementPreviewOwnerId === detail.id
-    ? state.replacementPreviewURL : null;
-  if (preservedPreview) state.replacementPreviewURL = null;
+    ? state.replacementPreviewURLs.slice() : [];
+  if (preservedPreviews.length) state.replacementPreviewURLs = [];
 
   state.viewingSubmittedConfig = true;
   state.file = null;
@@ -1697,7 +1797,7 @@ function applyProjectComposer(detail) {
   $("dialogue-brief").value = "";
 
   if (!model) {
-    if (preservedPreview) URL.revokeObjectURL(preservedPreview);
+    preservedPreviews.forEach((url) => URL.revokeObjectURL(url));
     showUnavailableSource("历史项目未保存来源信息");
     document.querySelectorAll(
       'input[name="aspect-ratio"], input[name="resolution"], input[name="target-language-mode"], input[name="dialogue-write-mode"]'
@@ -1738,24 +1838,26 @@ function applyProjectComposer(detail) {
     showUnavailableSource("历史项目未保存来源信息");
   }
 
-  if (model.replacementImage) {
-    state.submittedReplacement = model.replacementImage;
-    $("replacement-name").textContent = model.replacementImage.filename;
-    $("replacement-chip").hidden = false;
-    $("replacement-select").hidden = true;
-    if (preservedPreview) {
-      state.replacementPreviewURL = preservedPreview;
+  if (model.replacementImages.length) {
+    state.submittedReplacements = model.replacementImages;
+    if (preservedPreviews.length) {
+      state.replacementPreviewURLs = preservedPreviews;
       state.replacementPreviewOwnerId = detail.id;
-      $("replacement-preview").src = preservedPreview;
-      $("replacement-preview").hidden = false;
-    } else {
-      $("replacement-preview").hidden = true;
     }
-    if (!preservedPreview && model.replacementImage.preview_url) {
-      void loadSubmittedReplacementPreview(detail.id, model.replacementImage.preview_url);
+    renderReplacementImages();
+    const indexedPreviews = hasServerInput && detail.creation_input
+      && Object.prototype.hasOwnProperty.call(detail.creation_input, "replacement_images");
+    if (!preservedPreviews.length) {
+      model.replacementImages.forEach((image, index) => {
+        if (image.preview_url) {
+          void loadSubmittedReplacementPreview(
+            detail.id, image.preview_url, indexedPreviews ? index + 1 : null,
+          );
+        }
+      });
     }
-  } else if (preservedPreview) {
-    URL.revokeObjectURL(preservedPreview);
+  } else {
+    preservedPreviews.forEach((url) => URL.revokeObjectURL(url));
   }
 
   state.clientRequestId = newRequestId();
@@ -1803,7 +1905,9 @@ function setUploading(on) {
   $("file-remove").disabled = controlsDisabled;
   $("replacement-select").disabled = controlsDisabled;
   $("replacement-image-input").disabled = controlsDisabled;
-  $("replacement-remove").disabled = controlsDisabled;
+  document.querySelectorAll("#replacement-image-list .icon-btn").forEach((button) => {
+    button.disabled = controlsDisabled;
+  });
   $("replacement-instruction").disabled = controlsDisabled;
   document.querySelectorAll('input[name="source-mode"]').forEach((r) => {
     r.disabled = controlsDisabled;
@@ -1824,7 +1928,7 @@ function setUploading(on) {
 }
 
 function uploadConversation({
-  file, url, requestId, generationRequest, replacementImage, capability,
+  file, url, requestId, generationRequest, replacementImages = null, replacementImage = null, capability,
 }, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -1855,9 +1959,11 @@ function uploadConversation({
     else if (url) fd.append("reference_url", url);
     fd.append("client_request_id", requestId);
     fd.append(capability.request_field, JSON.stringify(generationRequest));
-    if (replacementImage) {
-      fd.append(capability.replacement_image_field, replacementImage, replacementImage.name);
-    }
+    const images = Array.isArray(replacementImages)
+      ? replacementImages : replacementImage ? [replacementImage] : [];
+    images.forEach((image) => {
+      fd.append(capability.replacement_image_field, image, image.name);
+    });
     xhr.send(fd);
   });
 }
@@ -1885,7 +1991,7 @@ async function handleSend(event) {
       dialogueMode: dialogueWriteMode(),
       dialogueBrief: $("dialogue-brief").value,
       targetLanguage: selectedTargetLanguage(),
-      hasReplacementImage: !!state.replacementImage,
+      replacementImageCount: state.replacementImages.length,
       replacementInstruction: $("replacement-instruction").value,
       addSubtitles: $("add-subtitles").checked,
     }, capability);
@@ -1910,7 +2016,7 @@ async function handleSend(event) {
       {
         file, url, requestId: state.clientRequestId,
         generationRequest,
-        replacementImage: state.replacementImage,
+        replacementImages: state.replacementImages,
         capability,
       },
       (ratio) => {
@@ -1926,13 +2032,13 @@ async function handleSend(event) {
       rememberSubmittedComposer(
         created.id,
         created.effective_request || generationRequest,
-        { file, url, replacementImage: state.replacementImage },
+        { file, url, replacementImages: state.replacementImages },
         created,
       );
       // 响应成功即冻结，不等待列表或详情请求，避免同一付费任务被再次提交。
       state.viewingSubmittedConfig = true;
       state.file = null;
-      state.replacementImage = null;
+      state.replacementImages = [];
       $("file-input").value = "";
       $("replacement-image-input").value = "";
     }
@@ -2005,9 +2111,8 @@ function bindEvents() {
   $("file-remove").addEventListener("click", clearFile);
   $("replacement-select").addEventListener("click", () => $("replacement-image-input").click());
   $("replacement-image-input").addEventListener("change", (event) => {
-    pickReplacementImage(event.target.files && event.target.files[0]);
+    pickReplacementImages(event.target.files);
   });
-  $("replacement-remove").addEventListener("click", clearReplacementImage);
 
   // 来源 radio 互斥切换
   document.querySelectorAll('input[name="source-mode"]').forEach((radio) => {

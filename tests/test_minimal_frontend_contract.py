@@ -40,6 +40,7 @@ def _capability(**overrides):
             "supported": True,
             "accept": ["image/jpeg", "image/png", "image/webp"],
             "max_bytes": 10 * 1024 * 1024,
+            "max_images": 4,
             "max_instruction_chars": 1000,
         },
     }
@@ -242,7 +243,9 @@ def test_minimal_creation_capability_is_exact_and_fails_closed():
         "dialogueBriefLimitDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,max_brief_chars:0}}}),"
         "dialogueOptionalDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,optional:false}}}),"
         "dialogueDefaultDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,default:{mode:'auto_rewrite',target_language:'中文'}}}}),"
-        "replacementDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,accept:['image/png']}}})"
+        "replacementDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,accept:['image/png']}}}),"
+        "replacementCountDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,max_images:3}}}),"
+        "replacementExtra:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,extra:true}}})"
         "}})()"
     )
 
@@ -266,6 +269,7 @@ def test_minimal_creation_capability_is_exact_and_fails_closed():
         "replacement": {
             "accept": ["image/jpeg", "image/png", "image/webp"],
             "max_bytes": 10 * 1024 * 1024,
+            "max_images": 4,
             "max_instruction_chars": 1000,
         },
     }
@@ -379,7 +383,8 @@ def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair()
         "briefBlank:capture({...base,dialogueMode:'generate',dialogueBrief:'  '}),"
         "briefLong:capture({...base,dialogueMode:'generate',dialogueBrief:'好'.repeat(1001)}),"
         "imageOnly:capture({...base,hasReplacementImage:true}),"
-        "instructionOnly:capture({...base,replacementInstruction:'替换产品'})}})()"
+        "instructionOnly:capture({...base,replacementInstruction:'替换产品'}),"
+        "tooMany:capture({...base,replacementImageCount:5,replacementInstruction:'替换产品'})}})()"
     )
     assert result == {
         "language": "请填写目标语言",
@@ -389,6 +394,7 @@ def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair()
         "briefLong": "口播描述超过长度限制",
         "imageOnly": "参考图与替换说明需要一起提供",
         "instructionOnly": "参考图与替换说明需要一起提供",
+        "tooMany": "参考图数量超出限制",
     }
 
 
@@ -425,11 +431,13 @@ def test_active_upload_appends_only_the_minimal_multipart_contract():
         '"reference_url", url',
         '"client_request_id", requestId',
         "capability.request_field, JSON.stringify(generationRequest)",
-        "capability.replacement_image_field, replacementImage, replacementImage.name",
+        "capability.replacement_image_field, image, image.name",
     ]
     assert "if (file)" in upload
     assert "else if (url)" in upload
-    assert "if (replacementImage)" in upload
+    assert "images.forEach" in upload
+    assert "replacementImages = null" in upload
+    assert "replacementImage = null" in upload  # 保留旧单图调用兼容。
     assert upload.count('xhr.open("POST", capability.endpoint)') == 1
     assert upload.count("xhr.send(fd)") == 1
     for legacy_field in (
@@ -449,6 +457,27 @@ def test_active_upload_appends_only_the_minimal_multipart_contract():
         "return {code:error.code,message:error.message}})()"
     )
     assert parsed == {"code": "queue_full", "message": "当前队列已满"}
+
+    result = _run_contract(
+        "(async()=>{const capability=" + json.dumps(_capability()) + ";"
+        "const state={token:'test'};let sent=[];"
+        "class FormData {constructor(){this.items=[]}append(...args){this.items.push(args)}};"
+        "class XMLHttpRequest {constructor(){this.upload={addEventListener(){}};this.status=201;}"
+        "open(){}setRequestHeader(){}addEventListener(name,fn){if(name==='load')this.loaded=fn;}"
+        "send(fd){sent=fd.items.map((entry)=>[entry[0],entry[1].name||entry[1],entry[2]||null]);this.loaded();}};"
+        + upload
+        + ";await uploadConversation({url:'https://example.com/v.mp4',requestId:'r1',generationRequest:{},"
+        "replacementImages:[{name:'one.png'},{name:'two.webp'},{name:'three.jpg'}],capability},()=>{});"
+        "return sent;})()"
+    )
+    assert result == [
+        ["reference_url", "https://example.com/v.mp4", None],
+        ["client_request_id", "r1", None],
+        ["generation_request", "{}", None],
+        ["replacement_image", "one.png", "one.png"],
+        ["replacement_image", "two.webp", "two.webp"],
+        ["replacement_image", "three.jpg", "three.jpg"],
+    ]
 
 
 def test_creation_form_has_no_internal_vertical_scroll_or_height_cap():
@@ -686,6 +715,10 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
             "filename": "product.png", "bytes": 321,
             "media_type": "image/png", "preview_url": "",
         },
+        "replacementImages": [{
+            "filename": "product.png", "bytes": 321,
+            "media_type": "image/png", "preview_url": "",
+        }],
     }
     assert result["same"] == {
         "addSubtitles": False,
@@ -698,6 +731,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "replacementInstruction": "",
         "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
         "replacementImage": None,
+        "replacementImages": [],
     }
     assert result["historical"] == {
         "addSubtitles": False,
@@ -710,6 +744,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "replacementInstruction": "",
         "source": None,
         "replacementImage": None,
+        "replacementImages": [],
     }
     assert result["generate"] == {
         "addSubtitles": False,
@@ -722,6 +757,7 @@ def test_project_configuration_model_restores_server_values_and_local_inputs():
         "replacementInstruction": "",
         "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
         "replacementImage": None,
+        "replacementImages": [],
     }
     assert result["invalid"] is None
 
@@ -751,15 +787,75 @@ def test_creation_input_server_presence_is_authoritative_and_link_null_is_preser
         "version": 1,
         "source": {"mode": "link", "reference_url": None},
         "replacement_image": None,
+        "replacement_images": [],
     }
+
+
+def test_multi_reference_snapshot_is_ordered_and_keeps_the_single_image_projection():
+    result = _run_contract(
+        "(()=>{const images=[{name:'first.png',size:3,type:'image/png'},"
+        "{name:'second.webp',size:5,type:'image/webp'},"
+        "{name:'third.jpg',size:7,type:'image/jpeg'}];"
+        "const local=contract.creationInputSnapshot({url:'https://media.example/source.mp4',replacementImages:images});"
+        "const base='/api/conversations/project-1/creation-input/';"
+        "const server={version:1,source:{mode:'link',reference_url:'https://media.example/source.mp4'},"
+        "replacement_image:{filename:'first.png',bytes:3,media_type:'image/png',preview_url:base+'replacement-image'},"
+        "replacement_images:[{filename:'first.png',bytes:3,media_type:'image/png',preview_url:base+'replacement-images/1'},"
+        "{filename:'second.webp',bytes:5,media_type:'image/webp',preview_url:base+'replacement-images/2'},"
+        "{filename:'third.jpg',bytes:7,media_type:'image/jpeg',preview_url:base+'replacement-images/3'}]};"
+        "const mismatch={...server,replacement_image:{...server.replacement_image,filename:'wrong.png'}};"
+        "const request={version:1,output:{aspect_ratio:'9:16',resolution:'768p',fit_mode:'auto'},"
+        "processing:{optimize_image:true,remove_subtitle:true,remove_logo:true},"
+        "dialogue:{mode:'auto_rewrite',target_language:'日语'},"
+        "replacement_guidance:{instruction:'替换成参考图',image_field:'replacement_image'},add_subtitles:false};"
+        "return {local,localNormalized:contract.normalizeCreationInputSnapshot(local,{allowLocalPreview:true}),"
+        "server:contract.normalizeCreationInputSnapshot(server),"
+        "model:contract.projectComposerModel({effective_request:request,creation_input:server},null),"
+        "mismatch:contract.normalizeCreationInputSnapshot(mismatch)};})()"
+    )
+    expected_images = [
+        {"filename": "first.png", "bytes": 3, "media_type": "image/png"},
+        {"filename": "second.webp", "bytes": 5, "media_type": "image/webp"},
+        {"filename": "third.jpg", "bytes": 7, "media_type": "image/jpeg"},
+    ]
+    assert result["local"]["replacement_images"] == expected_images
+    assert result["local"]["replacement_image"] == expected_images[0]
+    assert result["localNormalized"]["replacement_images"] == [
+        {**image, "preview_url": ""} for image in expected_images
+    ]
+    assert result["localNormalized"]["replacement_image"] == {
+        **expected_images[0], "preview_url": ""
+    }
+    assert [image["filename"] for image in result["server"]["replacement_images"]] == [
+        "first.png", "second.webp", "third.jpg"
+    ]
+    # 旧单图预览和列表第一个预览的安全路径不同，但元数据必须是首图投影。
+    assert result["server"]["replacement_image"]["preview_url"].endswith("replacement-image")
+    assert result["server"]["replacement_images"][0]["preview_url"].endswith("replacement-images/1")
+    assert [image["filename"] for image in result["model"]["replacementImages"]] == [
+        "first.png", "second.webp", "third.jpg"
+    ]
+    assert {
+        key: result["model"]["replacementImage"][key]
+        for key in ("filename", "bytes", "media_type")
+    } == {
+        key: result["model"]["replacementImages"][0][key]
+        for key in ("filename", "bytes", "media_type")
+    }
+    assert result["mismatch"] is None
 
 
 def test_creation_input_preview_path_is_exact_and_same_origin():
     result = _run_contract(
         "(()=>{const id='project-1';const origin='https://studio.example';"
         "const path='/api/conversations/project-1/creation-input/replacement-image';"
+        "const indexed='/api/conversations/project-1/creation-input/replacement-images/2';"
         "return {relative:contract.creationInputReplacementPreviewPath(id,path,origin),"
         "absolute:contract.creationInputReplacementPreviewPath(id,origin+path,origin),"
+        "indexed:contract.creationInputReplacementPreviewPath(id,indexed,origin,2),"
+        "indexedAbsolute:contract.creationInputReplacementPreviewPath(id,origin+indexed,origin,2),"
+        "wrongIndex:contract.creationInputReplacementPreviewPath(id,indexed,origin,1),"
+        "zeroIndex:contract.creationInputReplacementPreviewPath(id,indexed,origin,0),"
         "external:contract.creationInputReplacementPreviewPath(id,'https://evil.example'+path,origin),"
         "otherProject:contract.creationInputReplacementPreviewPath(id,"
         "'/api/conversations/project-2/creation-input/replacement-image',origin),"
@@ -771,6 +867,10 @@ def test_creation_input_preview_path_is_exact_and_same_origin():
     assert result == {
         "relative": expected,
         "absolute": expected,
+        "indexed": "/api/conversations/project-1/creation-input/replacement-images/2",
+        "indexedAbsolute": "/api/conversations/project-1/creation-input/replacement-images/2",
+        "wrongIndex": None,
+        "zeroIndex": None,
         "external": None,
         "otherProject": None,
         "query": None,
@@ -821,14 +921,14 @@ def test_restored_project_configuration_is_view_only_and_releases_file_objects()
     assert "sourceFile" not in remember
     assert "replacementImage:" not in remember
     assert "sessionStorage.removeItem(COMPOSER_SNAPSHOTS_KEY)" in cleanup
-    assert "URL.revokeObjectURL(state.replacementPreviewURL)" in cleanup
+    assert "revokeReplacementPreviewURLs()" in cleanup
     assert "clearComposerSnapshots()" in expired
 
     enter = _function_source(source, "enterApp")
     assert "resetComposerForNewProject()" in enter
 
     preview = _function_source(source, "loadSubmittedReplacementPreview")
-    assert "creationInputReplacementPreviewPath(conversationId, previewUrl)" in preview
+    assert "creationInputReplacementPreviewPath(conversationId, previewUrl, null, index)" in preview
     assert "api(safePath)" in preview
     assert "api(previewUrl)" not in preview
 
@@ -850,7 +950,7 @@ def test_success_response_freezes_configuration_before_followup_requests():
     for immediate_freeze in (
         "state.viewingSubmittedConfig = true",
         "state.file = null",
-        "state.replacementImage = null",
+        "state.replacementImages = []",
         '$("file-input").value = ""',
         '$("replacement-image-input").value = ""',
     ):
@@ -871,7 +971,7 @@ def test_view_only_configuration_blocks_hidden_file_and_drop_paths():
     source = APP_JS.read_text(encoding="utf-8")
     set_uploading = _function_source(source, "setUploading")
     pick_video = _function_source(source, "pickFile")
-    pick_replacement = _function_source(source, "pickReplacementImage")
+    pick_replacement = _function_source(source, "pickReplacementImages")
     bind_events = _function_source(source, "bindEvents")
 
     for input_id in ("file-input", "replacement-image-input"):
@@ -896,19 +996,21 @@ def test_reference_image_picker_rejects_unsupported_formats_before_submit():
     html = INDEX_HTML.read_text(encoding="utf-8")
     source = APP_JS.read_text(encoding="utf-8")
     file_check = _function_source(source, "isReferenceImageFile")
-    picker = _function_source(source, "pickReplacementImage")
+    picker = _function_source(source, "pickReplacementImages")
     capability_loader = _function_source(source, "loadMinimalCreationCapability")
 
     assert 'accept="image/jpeg,image/png,image/webp"' in _tag_attrs(
         html, "input", "replacement-image-input"
     )
+    assert "multiple" in _tag_attrs(html, "input", "replacement-image-input")
     assert '$("replacement-image-input").accept = normalized.replacement.accept.join(",")' in capability_loader
     assert "REPLACEMENT_IMAGE_TYPES.includes(file.type)" in file_check
     assert "jpe?g|png|webp" in file_check
-    assert "if (!isReferenceImageFile(file))" in picker
+    assert "images.some((image) => !isReferenceImageFile(image))" in picker
     assert "参考图仅支持 JPG、PNG 或 WebP" in picker
-    assert "file.size > capability.replacement.max_bytes" in picker
-    assert "state.replacementImage = file" in picker
+    assert "images.some((image) => image.size > capability.replacement.max_bytes)" in picker
+    assert "state.replacementImages.push(...images)" in picker
+    assert "state.replacementImages.length + images.length > maxImages" in picker
 
 
 def test_logout_and_401_scrub_composer_session_and_stream_urls():
@@ -938,7 +1040,7 @@ def test_logout_and_401_scrub_composer_session_and_stream_urls():
     assert logout.index("clearComposerSnapshots()") < logout.index("showLogin(")
 
     assert "sessionStorage.removeItem(COMPOSER_SNAPSHOTS_KEY)" in cleanup
-    assert "URL.revokeObjectURL(state.replacementPreviewURL)" in cleanup
+    assert "revokeReplacementPreviewURLs()" in cleanup
     for cleared_control in (
         '$("file-input").value = ""',
         '$("url-input").value = ""',
