@@ -1190,6 +1190,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
             "replacement_sheet",
             "authoritative_constraints",
             "user_replacement_instruction",
+            "user_reference_images",
         }
         for call in fusion_calls
     )
@@ -1823,9 +1824,11 @@ def test_h3_without_user_image_uses_sheet_as_image_1_and_keeps_tile_authority(
     ]
 
 
-def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
+@pytest.mark.parametrize("image_count", [1, 4])
+def test_h3_sends_original_user_image_even_when_sheet_is_not_needed(
     tmp_path: Path,
     monkeypatch: Any,
+    image_count: int,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
     request = _effective_request()
@@ -1836,6 +1839,12 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
         project_id,
         replacement_image_path="inputs/replacement-image",
     )
+    paths = ["inputs/replacement-image", *[
+        f"inputs/replacement-image-{order}" for order in range(2, image_count + 1)
+    ]]
+    for order, relative in enumerate(paths, 1):
+        (project / relative).write_bytes(f"replacement-{order}".encode())
+    store.update(project_id, replacement_image_paths=paths)
     registered: list[Path] = []
     seedream = _FlowSeedream()
     pipeline = Pipeline(
@@ -1852,9 +1861,7 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
     monkeypatch.setattr(
         media,
         "provider_reference_png",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("an unanchored user image must not be materialized")
-        ),
+        lambda _source, destination: destination.write_bytes(b"\x89PNG\r\n\x1a\nreference"),
     )
     monkeypatch.setattr(
         media,
@@ -1881,8 +1888,8 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
     )
     assert replacement_sheet_path is None
     assert replacement_sheet["status"] == "not_needed"
-    assert replacement_sheet["user_image_present"] is False
-    assert replacement_sheet["h3_reference_images"] == []
+    assert replacement_sheet["user_image_present"] is True
+    assert [reference["image_reference"] for reference in replacement_sheet["h3_reference_images"]] == [f"Image {order}" for order in range(1, image_count + 1)]
     raw_upload_receipt = replacement_sheet["upstream_bindings"][
         "replacement_image"
     ]
@@ -1928,9 +1935,10 @@ def test_h3_does_not_send_an_unanchored_user_image_when_sheet_is_not_needed(
         muted=muted,
     )
 
-    assert prepared.provider_images == ()
-    assert prepared.image_urls == ()
-    assert registered == [muted]
+    canonical = [Pipeline._canonical_user_reference_path(project, order) for order in range(1, image_count + 1)]
+    assert prepared.provider_images == tuple(canonical)
+    assert prepared.image_urls == tuple(f"https://assets.invalid/{path.name}" for path in canonical)
+    assert registered == [muted, *canonical]
 
 
 def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
@@ -3888,6 +3896,7 @@ def test_pre_picsart_resume_reuses_not_needed_sheet_and_keeps_upload_unbound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_fake_media(monkeypatch, [])
     request = _effective_request()
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(request, "no-sheet-checkpoint")
@@ -3919,6 +3928,11 @@ def test_pre_picsart_resume_reuses_not_needed_sheet_and_keeps_upload_unbound(
     )
     assert sheet_path is None
     assert frozen_sheet["status"] == "not_needed"
+    # An older frozen checkpoint excluded unbound uploads. Its exact image
+    # list is still authoritative on resume; fresh projects now include them.
+    frozen_sheet["user_image_present"] = False
+    frozen_sheet["h3_reference_images"] = []
+    store.update(project_id, replacement_sheet=frozen_sheet)
     assert frozen_sheet["user_image_present"] is False
     raw_upload_receipt = frozen_sheet["upstream_bindings"]["replacement_image"]
     assert raw_upload_receipt["path"] == "inputs/replacement-image"

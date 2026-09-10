@@ -1486,11 +1486,8 @@ class Pipeline:
                 "replacement sheet requires the current Object Replace output"
             )
         spec = build_replacement_sheet_spec(enhanced_element_index)
-        user_image_present = (
-            replacement is not None
-            and self._enhanced_index_uses_user_image(enhanced_element_index)
-        )
-        replacement_images = self._replacement_image_paths(project, replacement=replacement) if user_image_present else []
+        replacement_images = self._replacement_image_paths(project, replacement=replacement)
+        user_image_present = bool(replacement_images)
         existing = self.store.read(project_id).get("replacement_sheet")
         if (
             isinstance(existing, dict)
@@ -1555,6 +1552,27 @@ class Pipeline:
             "output": None,
         }
         if not spec["tiles"]:
+            views = product_views.frozen_product_views(project)
+            if views is not None:
+                # composed 模式：多图已合成为单一 provider 参考图。
+                h3_reference_images.append({
+                    "image_reference": "Image 1",
+                    "role": "user_replacement",
+                    **self._project_artifact_receipt(
+                        project, project / product_views.REFERENCE,
+                        product_views.REFERENCE,
+                    ),
+                })
+            else:
+                for order, original in enumerate(replacement_images, 1):
+                    canonical = self._canonical_user_reference_path(project, order)
+                    if not canonical.is_file():
+                        canonical = self._materialize_canonical_user_reference(project, original, log, order)
+                    h3_reference_images.append({
+                        "image_reference": f"Image {order}",
+                        "role": "user_replacement",
+                        **self._project_artifact_receipt(project, canonical, canonical.relative_to(project).as_posix()),
+                    })
             self.store.update(project_id, replacement_sheet=base_bundle)
             return base_bundle, None
 
@@ -3654,15 +3672,7 @@ class Pipeline:
             or raw.get("version") != REPLACEMENT_SHEET_VERSION
             or isinstance(raw.get("version"), bool)
             or not isinstance(raw.get("user_image_present"), bool)
-            or raw["user_image_present"]
-            != (
-                bool(cls._replacement_image_paths(project, state))
-                and cls._enhanced_index_uses_user_image(
-                    state.get("enhanced_element_index")
-                    if isinstance(state.get("enhanced_element_index"), dict)
-                    else {}
-                )
-            )
+            or (raw["user_image_present"] and not cls._replacement_image_paths(project, state))
             or not isinstance(raw.get("spec"), dict)
             or not isinstance(state.get("enhanced_element_index"), dict)
             or not isinstance(raw.get("h3_reference_images"), list)
@@ -3735,12 +3745,32 @@ class Pipeline:
         if not isinstance(tiles, list):
             raise ValueError("stored replacement sheet tiles are invalid")
         if status == "not_needed":
+            frozen_views = product_views.frozen_product_views(project)
+            if raw["user_image_present"] and frozen_views is not None:
+                # composed 模式：多图冻结合成为单一 provider 参考图。
+                expected_references = [{
+                    "image_reference": "Image 1",
+                    "role": "user_replacement",
+                    **cls._project_artifact_receipt(
+                        project, project / product_views.REFERENCE,
+                        product_views.REFERENCE,
+                    ),
+                }]
+            else:
+                expected_references = [{
+                    "image_reference": f"Image {order}",
+                    "role": "user_replacement",
+                    **cls._project_artifact_receipt(
+                        project, cls._canonical_user_reference_path(project, order),
+                        cls._canonical_user_reference_path(project, order).relative_to(project).as_posix(),
+                    ),
+                } for order, _path in enumerate(replacement_paths, 1)] if raw["user_image_present"] else []
             if (
                 tiles
                 or raw.get("h3_image_reference") is not None
                 or raw.get("seedream") is not None
                 or raw.get("output") is not None
-                or raw["h3_reference_images"] != []
+                or raw["h3_reference_images"] != expected_references
             ):
                 raise ValueError("stored replacement sheet skip state is invalid")
             return None
@@ -5193,6 +5223,13 @@ class Pipeline:
         ]
         sheet_reference: str | None = None
         sheet_tiles: dict[str, dict[str, Any]] = {}
+        user_image_mapping = {
+            f"image_{order}": reference["image_reference"]
+            for order, reference in enumerate([
+                reference for reference in (replacement_sheet or {}).get("h3_reference_images", [])
+                if reference.get("role") == "user_replacement"
+            ], 1)
+        }
         if isinstance(replacement_sheet, dict):
             candidate_reference = replacement_sheet.get("h3_image_reference")
             spec = replacement_sheet.get("spec")
@@ -5220,10 +5257,12 @@ class Pipeline:
                     # composed 模式：多图合成为 Image 2 一张合图。
                     lines.append(product_views.view_instruction(views["view_count"], "Image 2"))
                 else:
-                    # direct 模式：逐图直传，image_N 对应 H3 Image N+1。
+                    # direct 模式：逐图直传，编号以冻结的 h3_reference_images 为准。
                     lines.append(
-                        "User image_1 maps to H3 Image 2, image_2 to Image 3, "
-                        "image_3 to Image 4, and image_4 to Image 5 when supplied. "
+                        "User reference mapping: " + ", ".join(
+                            f"{reference_id} -> {image_label}"
+                            for reference_id, image_label in user_image_mapping.items()
+                        ) + ". "
                         "Only the original references explicitly bound to each stable key "
                         "control that key; multiple references need not show the same object."
                     )
@@ -5273,7 +5312,7 @@ class Pipeline:
                         ):
                             reference_ids = replacement.get("reference_image_ids") or ["image_1"]
                             image_labels = ", ".join(
-                                f"Image {int(reference_id.rsplit('_', 1)[1]) + 1}"
+                                user_image_mapping.get(reference_id, f"Image {int(reference_id.rsplit('_', 1)[1]) + 1}")
                                 for reference_id in reference_ids
                             )
                             reference_text += (
@@ -5410,6 +5449,14 @@ class Pipeline:
                 "h3_reference_images": replacement_sheet.get(
                     "h3_reference_images", []
                 ),
+                "user_reference_images": [{
+                    "reference_id": f"image_{order}",
+                    "image_reference": reference["image_reference"],
+                    "sha256": reference["sha256"],
+                } for order, reference in enumerate([
+                    reference for reference in replacement_sheet.get("h3_reference_images", [])
+                    if reference.get("role") == "user_replacement"
+                ], 1)],
                 "replacement_sheet": {
                     "spec_sha256": replacement_sheet.get("spec_sha256"),
                     "h3_image_reference": replacement_sheet.get(
@@ -5739,23 +5786,7 @@ class Pipeline:
                 if replacement_sheet is not None
                 else None
             )
-            if (
-                supplied_sheet != validated_sheet
-                or stored_sheet["user_image_present"]
-                != (
-                    bool(self._replacement_image_paths(
-                        project, stored_state, replacement,
-                    ))
-                    and self._enhanced_index_uses_user_image(
-                        stored_state.get("enhanced_element_index")
-                        if isinstance(
-                            stored_state.get("enhanced_element_index"),
-                            dict,
-                        )
-                        else {}
-                    )
-                )
-            ):
+            if supplied_sheet != validated_sheet:
                 raise ValueError(
                     "prepared Picsart image binding does not match"
                 )

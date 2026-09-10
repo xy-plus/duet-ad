@@ -11,6 +11,8 @@ description: 根据原片段描述、Object Replace 增强后的全局对象索�
 
 `replacement_sheet` 是按同一冻结索引生成的项目级单张新形象图版；`h3_reference_images` 给出 H3 图片的有序角色。后端生成的 `stable key -> TILE_XX -> 实际 Image N` 映射是唯一图片引用权威：图版固定为 `Image 1`，用户图按其冻结 `reference_id` 的顺序依次为后续 `Image N`。对 `replacement.source=image_1` 的 stable key，权威块会列出它唯一可用的用户图编号；这些原图是该 key 的外观权威，图版 tile 仅用于定位该 key 和保持跨段映射。不同用户图既不预设为同一商品、同一人物或不同视角，也不得扩散给未绑定 stable key。对 `generated_variant` 的 key，仍只以自身图版 tile 为外观权威，必须忽略全部用户图。多个 stable key 可按冻结计划共享同一组用户图，却仍各自保留身份、occurrences、动作和位置关系，不得合并。同一项目的每个 segment 必须沿用同一张图版和同一套映射，不得重新编号或自行推断图片顺序。
 
+若 `replacement_sheet.h3_image_reference=null`，本次没有图版：`h3_reference_images` 中原图从实际 Image 1 开始排序，`user_reference_images` 明确每个 reference_id 对应的真实槽位。不得虚构空白图版或源对象来凑编号。即使没有任何已选中的用户绑定，已上传原图仍是可见输入；已知 generated_variant key 不因此继承它们的外观。
+
 `authoritative_constraints` 是后端从增强索引和图版 spec 机械编译的本段替换、`stable key -> TILE_XX -> Image N`、关系和人物音色/台词轨权威块，后端会在你的 `prompt` 尾部原样附加。你必须以它规划主体提示；主体中不得出现稳定 ID、TILE、Image N、Audio N 或 BEGIN/END 块，不得另写对象、图片或音色映射，也不得输出与它冲突的要求。后端只校验输出结构和输入绑定，不会二次判断你是否完成这些语义要求；完整表达替换、音色和连续性是本节点自身职责。
 
 1. 对当前片段出现且 `replacement` 非 null 的每个 stable key，让动作、遮挡和连续性适配已冻结的新设计；模型主体只写自然的画面和动作衔接，不写 stable key。源对象、目标对象及其图版 tile 由输出尾部的权威块逐项明确。
