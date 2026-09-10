@@ -249,6 +249,7 @@ def _parse_generation_request(
         <= set(value)
         <= {
             "version", "output", "processing", "dialogue", "replacement_guidance",
+            "add_subtitles",
         }
     ):
         raise _error(

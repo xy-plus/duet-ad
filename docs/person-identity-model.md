@@ -16,7 +16,7 @@ SFace FP32 文件 SHA256：`0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83
 本开发树安装命令（默认从固定官方地址下载）：
 
 ```bash
-rtk python3 /home/xy/duet-ad1-h3-max-r2v-identity/scripts/install_person_identity_model.py --destination /home/xy/duet-ad1-h3-max-r2v-identity/models/face_recognition_sface_2021dec.onnx
+rtk python3 /home/xy/duet-ad1-h3-max-r2v-production-candidate/scripts/install_person_identity_model.py --destination /home/xy/duet-ad1-h3-max-r2v-production-candidate/models/face_recognition_sface_2021dec.onnx
 ```
 
 检测使用原分辨率并复用灰块节点阈值 0.73；关联使用镜头内时间、位置、脸部特征，跨镜头使用多帧模板与歧义门槛。至少三个不同时间的合格源采样支持才确认轨迹，同框共现禁止合并。精确九帧独立检测后以位置和特征映射，不按帧序号自动归人，也不追加为源轨迹确认票数。

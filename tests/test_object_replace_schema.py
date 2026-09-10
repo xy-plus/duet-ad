@@ -118,7 +118,7 @@ def test_planning_context_freezes_all_keys_and_removes_only_item_hints() -> None
 
 def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> None:
     skill = (
-        Path("/home/xy/duet-ad1-h3-max-r2v-identity/skills/object-replace/SKILL.md")
+        Path("/home/xy/duet-ad1-h3-max-r2v-production-candidate/skills/object-replace/SKILL.md")
         .read_text(encoding="utf-8")
     )
 
@@ -166,7 +166,7 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
 
 def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None:
     skill = Path(
-        "/home/xy/duet-ad1-h3-max-r2v-identity/skills/h3-max-r2v-prompt/SKILL.md"
+        "/home/xy/duet-ad1-h3-max-r2v-production-candidate/skills/h3-max-r2v-prompt/SKILL.md"
     ).read_text(encoding="utf-8")
 
     assert "只服从 `authoritative_constraints` 编译出的安全不变量" in skill
