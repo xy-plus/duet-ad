@@ -687,7 +687,7 @@ def test_normalizer_rejects_image_1_without_a_user_image() -> None:
         )
 
 
-def test_normalizer_rejects_zero_image_1_bindings_for_a_nonblank_request() -> None:
+def test_normalizer_accepts_zero_image_1_bindings_for_a_nonblank_request() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
@@ -697,8 +697,43 @@ def test_normalizer_rejects_zero_image_1_bindings_for_a_nonblank_request() -> No
     )
     value["people"]["person-01"]["matches_user_request"] = False
 
-    with pytest.raises(ValueError, match="binding count is invalid"):
-        _normalize(value, digest=digest, element_index=element_index)
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert all(
+        patch["replacement"]["source"] == "generated_variant"
+        for category in ("people", "entities", "scenes")
+        for patch in normalized[category].values()
+    )
+
+
+def test_normalizer_accepts_all_generated_variants_for_multiple_images() -> None:
+    element_index = _index()
+    payload = _payload(element_index)
+    payload["user_reference_images"] = [
+        {"reference_id": reference_id}
+        for reference_id in ("image_1", "image_2", "image_3", "image_4")
+    ]
+    _schema, digest = object_replace_schema(payload, VOICE_IDS)
+    value = _output(element_index, digest)
+    value["people"]["person-01"] = {
+        "matches_user_request": False,
+        "replacement": _replacement("generated_variant", "person-01"),
+        "voice_id": None,
+    }
+
+    normalized = _normalize(
+        value,
+        digest=digest,
+        element_index=element_index,
+        reference_image_ids=["image_1", "image_2", "image_3", "image_4"],
+    )
+
+    assert all(
+        patch["replacement"]["source"] == "generated_variant"
+        and "reference_image_ids" not in patch["replacement"]
+        for category in ("people", "entities", "scenes")
+        for patch in normalized[category].values()
+    )
 
 
 def test_normalizer_accepts_multiple_image_1_bindings() -> None:
@@ -739,7 +774,7 @@ def test_normalizer_accepts_image_1_even_when_the_match_flag_is_false() -> None:
     )
 
 
-def test_normalizer_rejects_true_match_without_image_1() -> None:
+def test_normalizer_accepts_true_match_without_image_1() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
@@ -748,8 +783,12 @@ def test_normalizer_rejects_true_match_without_image_1() -> None:
         "x",
     )
 
-    with pytest.raises(ValueError, match="binding count is invalid"):
-        _normalize(value, digest=digest, element_index=element_index)
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    assert normalized["people"]["person-01"]["matches_user_request"] is True
+    assert normalized["people"]["person-01"]["replacement"]["source"] == (
+        "generated_variant"
+    )
 
 
 def test_normalizer_accepts_true_match_without_a_user_image() -> None:

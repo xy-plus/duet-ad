@@ -412,12 +412,8 @@ def normalize_object_replace(
                     selected_voice_ids.add(normalized_voice_id)
                 normalized_patch["voice_id"] = normalized_voice_id
             normalized[category][stable_id] = normalized_patch
-    requires_image_1 = has_user_image and bool(user_instruction.strip())
-    # Several indexed views may depict the user's one replacement target.
-    # Keep each stable key, while allowing them to share the reference image.
-    if (requires_image_1 and not image_1_locations) or (
-        not requires_image_1 and image_1_locations
-    ):
+    allows_image_1 = has_user_image and bool(user_instruction.strip())
+    if not allows_image_1 and image_1_locations:
         raise ValueError("object-replace user-image binding count is invalid")
     normalized["dialogue_voices"] = _normalize_dialogue_voices(
         value["dialogue_voices"],
