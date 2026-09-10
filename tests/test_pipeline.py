@@ -612,7 +612,9 @@ class _FlowDeepSeek:
         segment_indices = [
             segment["segment_index"] for segment in payload["segments"]
         ]
-        assert schema == project_index_schema(segment_indices, payload.get("person_identity"))
+        assert schema == project_index_schema(segment_indices, payload.get("person_identity"), reference_image_ids=[
+            item["reference_id"] for item in payload.get("user_reference_images", [])
+        ])
         with self.lock:
             self.events.append("project-index")
             self.common_ready = True
@@ -1177,7 +1179,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         deepseek.events.index("branch-start-2"),
     )
     assert all(call["schema"]["additionalProperties"] is False for call in fusion_calls)
-    assert all(call["images"] == [] for call in fusion_calls)
+    assert all(call["images"] == [project / reference["path"] for reference in state["replacement_sheet"]["h3_reference_images"]] for call in fusion_calls)
     assert all(
         set(call["payload"]) == {
             "segment_index",
@@ -1187,6 +1189,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
             "h3_reference_images",
             "replacement_sheet",
             "authoritative_constraints",
+            "user_replacement_instruction",
         }
         for call in fusion_calls
     )
@@ -1197,9 +1200,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for call in fusion_calls
     )
     assert all(
-        "user_replacement_instruction" not in json.dumps(
-            call["payload"], ensure_ascii=False,
-        )
+        call["payload"]["user_replacement_instruction"] == "把主角替换成用户参考形象"
         and "user_replacement_image" not in json.dumps(
             call["payload"], ensure_ascii=False,
         )
@@ -1224,7 +1225,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         (segment["segment_index"], segment["visual_prompt"])
         for segment in index_payload["segments"]
     ] == [(1, "visual-1"), (2, "visual-2")]
-    expected_index_images = []
+    expected_index_images = [canonical_reference]
     for segment in index_payload["segments"]:
         assert set(segment) == {"segment_index", "visual_prompt", "frames"}
         assert len(segment["frames"]) == 9
@@ -1562,6 +1563,8 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
             or {"frames": 1, "frames_with_face": 1, "faces_total": 1}
         ),
     )
+    sheet_image = project / "work" / "reference-sheet.png"
+    sheet_image.write_bytes(b"sheet-pixels")
     replacement_sheet = {
         "spec_sha256": "s" * 64,
         "h3_image_reference": "Image 1",
@@ -1569,6 +1572,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
             "image_reference": "Image 1",
             "role": "global_replacement_sheet",
             "sha256": "f" * 64,
+            "path": "work/reference-sheet.png",
             "spec_sha256": "s" * 64,
         }],
         "user_image_present": False,
@@ -1624,7 +1628,7 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
         "tiles": replacement_sheet["spec"]["tiles"],
     }
     assert calls[0]["schema"]["additionalProperties"] is False
-    assert calls[0]["images"] == []
+    assert calls[0]["images"] == [sheet_image]
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
     assert prompt.startswith("Gray blocks mask source faces")
     assert "FACE REPLACEMENT IS MANDATORY" in prompt

@@ -1029,14 +1029,51 @@ class Pipeline:
             paths.append(destination)
         return metadata_by_id, references, paths, fallback_used
 
+    @staticmethod
+    def _replacement_image_paths(project, state=None, replacement=None):
+        if state is None:
+            state_path = project / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+        values = state.get("replacement_image_paths")
+        if not values:
+            single = state.get("replacement_image_path")
+            return [project / single] if single else ([replacement] if replacement else [])
+        expected = ["inputs/replacement-image", *[
+            f"inputs/replacement-image-{order}" for order in range(2, len(values) + 1)
+        ]]
+        if not isinstance(values, list) or not 1 <= len(values) <= 4 or values != expected:
+            raise ValueError("stored replacement image paths are invalid")
+        paths = [project / value for value in values]
+        for path in paths:
+            if path.is_symlink() or project.resolve() not in path.resolve().parents:
+                raise ValueError("stored replacement image is outside the project")
+        return paths
+
+    @staticmethod
+    def _canonical_user_reference_path(project, order):
+        name = "user-reference.png" if order == 1 else f"user-reference-{order}.png"
+        return project / "work" / "global-reference-sheet" / name
+
+    @staticmethod
+    def _user_reference_metadata(paths, *, image_offset=0):
+        return [{
+            "reference_id": f"image_{order}",
+            "image_reference": f"Image {order + image_offset}",
+            "role": "user_target_reference_not_source_video",
+            "sha256": Pipeline._sha256(path),
+        } for order, path in enumerate(paths, 1)]
+
     def _materialize_canonical_user_reference(
         self,
         project: Path,
         replacement: Path,
         log: ResearchLog,
+        order: int = 1,
         *,
         replacement_paths: list[Path] | None = None,
     ) -> Path:
+        # 分叉点（参考图构造与冻结）：composed 模式多图合成为单一 provider
+        # 参考图；direct 模式与两模式各自的 1 图情形走逐图规范化（order 定位）。
         if (
             replacement_paths is not None
             and len(replacement_paths) > 1
@@ -1049,16 +1086,13 @@ class Pipeline:
                 lambda: product_views.compose_product_views(project, replacement_paths),
                 output_media=lambda value: [value],
             )
-        destination = (
-            project / "work" / "global-reference-sheet"
-            / "user-reference.png"
-        )
+        destination = self._canonical_user_reference_path(project, order)
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.parent.chmod(0o700)
         self._node(
             log,
             "replacement-sheet-user-reference",
-            "project",
+            "project" if order == 1 else f"user-image-{order}",
             {"source": replacement, "output": destination},
             [replacement],
             lambda: media.user_reference_png(replacement, destination),
@@ -1073,7 +1107,7 @@ class Pipeline:
         self._project_artifact_receipt(
             project,
             destination,
-            "work/global-reference-sheet/user-reference.png",
+            destination.relative_to(project).as_posix(),
         )
         return destination
 
@@ -1093,6 +1127,18 @@ class Pipeline:
             guidance["instruction"] if guidance is not None else ""
         )
         target_language = request["dialogue"]["target_language"]
+        reference_paths = list(prepared[0].get("user_reference_paths", [])) if prepared else []
+        if not reference_paths and user_reference is not None:
+            if self.settings.multiref_mode == "composed":
+                # composed 模式：多图已合成为单一 provider 参考图，OR 只见合图。
+                reference_paths = [user_reference]
+            else:
+                originals = self._replacement_image_paths(project)
+                reference_paths = [user_reference, *[
+                    self._materialize_canonical_user_reference(project, path, log, order)
+                    for order, path in enumerate(originals[1:], 2)
+                ]]
+        reference_ids = [f"image_{order}" for order in range(1, len(reference_paths) + 1)]
         voice_ids = [voice["voice_id"] for voice in self.voice_library.voices]
         planning_context = object_replace_planning_context(element_index)
         payload = {
@@ -1108,6 +1154,7 @@ class Pipeline:
             "translated_dialogue": translated_lines,
             "user_replacement_instruction": user_instruction,
             "has_user_image": user_reference is not None,
+            "user_reference_images": self._user_reference_metadata(reference_paths),
             "user_replacement_image": (
                 {"name": "Image 1", "sha256": self._sha256(user_reference)}
                 if user_reference is not None else None
@@ -1142,6 +1189,7 @@ class Pipeline:
                 has_user_image=user_reference is not None,
                 user_instruction=user_instruction,
                 dialogue_line_count=len(translated_lines),
+                reference_image_ids=reference_ids,
             )
             (
                 metadata_by_id, references, paths, fallback_used,
@@ -1169,12 +1217,12 @@ class Pipeline:
                 "payload": payload,
                 "output_schema": output_schema,
             },
-            [user_reference] if user_reference is not None else [],
+            reference_paths,
             lambda: self.deepseek.complete_structured(
                 skill,
                 payload,
                 output_schema,
-                [user_reference] if user_reference is not None else [],
+                reference_paths,
                 validator=lambda value: normalize_object_replace(
                     value,
                     input_sha256=input_sha256,
@@ -1183,6 +1231,7 @@ class Pipeline:
                     has_user_image=user_reference is not None,
                     user_instruction=user_instruction,
                     dialogue_line_count=len(translated_lines),
+                    reference_image_ids=reference_ids,
                 ),
             ),
             transform=normalize_and_merge,
@@ -1441,6 +1490,7 @@ class Pipeline:
             replacement is not None
             and self._enhanced_index_uses_user_image(enhanced_element_index)
         )
+        replacement_images = self._replacement_image_paths(project, replacement=replacement) if user_image_present else []
         existing = self.store.read(project_id).get("replacement_sheet")
         if (
             isinstance(existing, dict)
@@ -1522,6 +1572,9 @@ class Pipeline:
                 directory,
                 spec,
                 user_image_present=user_image_present,
+                # composed 模式多图已合成单一 provider 参考图（1 图 + N 视角）；
+                # direct 模式逐图直传，数量即上传图数。
+                user_image_count=1 if views is not None else len(replacement_images),
                 **({"user_view_count": views["view_count"]} if views is not None else {}),
             ),
             output_media=lambda value: [value["canvas_path"]],
@@ -1529,8 +1582,20 @@ class Pipeline:
         canvas = inputs["canvas_path"]
         prompt_path = directory / "prompt.txt"
         spec_path = directory / "spec.json"
-        canonical_replacement = user_reference if user_image_present else None
-        if canonical_replacement is not None:
+        canonical_replacements: list[Path] = []
+        if views is not None:
+            # composed 模式：多图已冻结合成为单一 provider 参考图。
+            canonical_replacements.append(project / product_views.REFERENCE)
+        else:
+            for order, original in enumerate(replacement_images, 1):
+                canonical_replacement = (
+                    user_reference if order == 1 and user_reference is not None
+                    else self._canonical_user_reference_path(project, order)
+                )
+                if not canonical_replacement.is_file():
+                    canonical_replacement = self._materialize_canonical_user_reference(project, original, log, order)
+                canonical_replacements.append(canonical_replacement)
+        for order, canonical_replacement in enumerate(canonical_replacements, 1):
             canonical_bytes = canonical_replacement.read_bytes()
             if (
                 not canonical_bytes.startswith(b"\x89PNG\r\n\x1a\n")
@@ -1540,16 +1605,16 @@ class Pipeline:
             canonical_receipt = self._project_artifact_receipt(
                 project,
                 canonical_replacement,
-                "work/global-reference-sheet/user-reference.png",
+                canonical_replacement.relative_to(project).as_posix(),
             )
             h3_reference_images.append({
-                "image_reference": "Image 2",
+                "image_reference": f"Image {order + 1}",
                 "role": "user_replacement",
                 **canonical_receipt,
             })
         seedream_inputs = [
             canvas,
-            *([canonical_replacement] if canonical_replacement is not None else []),
+            *canonical_replacements,
         ]
         input_receipts = [
             self._project_artifact_receipt(
@@ -1919,15 +1984,19 @@ class Pipeline:
                 source,
                 f"work/segments/{index:04d}/source.mp4",
             ))
-        replacement_receipt = (
+        replacement_paths = cls._replacement_image_paths(
+            project, replacement=replacement,
+        )
+        replacement_receipts = [
             cls._project_artifact_receipt(
                 project,
-                replacement,
-                "inputs/replacement-image",
+                path,
+                "inputs/replacement-image"
+                if order == 1
+                else f"inputs/replacement-image-{order}",
             )
-            if replacement is not None
-            else None
-        )
+            for order, path in enumerate(replacement_paths, 1)
+        ]
         bindings = {
             "segments_sha256": cls._json_sha256(segment_bindings),
             "segment_sources": source_receipts,
@@ -1937,11 +2006,18 @@ class Pipeline:
             "object_replace_sha256": cls._json_sha256(object_replace),
             "voice_references_sha256": cls._json_sha256(voice_references),
             "effective_request_sha256": cls._json_sha256(effective_request),
-            "replacement_image": replacement_receipt,
+            "replacement_image": (
+                replacement_receipts[0] if replacement_receipts else None
+            ),
         }
+        # composed 模式：冻结合图清单进 bindings。
         views = product_views.frozen_product_views(project)
         if views is not None:
             bindings["replacement_views"] = views
+        # Keep old single-image checkpoint bytes stable.  Multi-image projects
+        # bind every ordered original independently, including Image 1.
+        if len(replacement_receipts) > 1:
+            bindings["replacement_images"] = replacement_receipts
         return bindings
 
     @staticmethod
@@ -2055,15 +2131,19 @@ class Pipeline:
                 "H3 preparation replacement sheet is not the stored sheet"
             )
         self._validated_stored_replacement_sheet(project, state)
-        if replacement is None and state.get("replacement_image_path") is not None:
-            replacement = project / "inputs" / "replacement-image"
-        replacement_receipt = (
-            self._project_artifact_receipt(
-                project, replacement, "inputs/replacement-image",
-            )
-            if replacement is not None
-            else None
+        replacement_paths = self._replacement_image_paths(
+            project, state, replacement,
         )
+        replacement_receipts = [
+            self._project_artifact_receipt(
+                project,
+                path,
+                "inputs/replacement-image"
+                if order == 1
+                else f"inputs/replacement-image-{order}",
+            )
+            for order, path in enumerate(replacement_paths, 1)
+        ]
         effective_request = self._validated_effective_request(
             state.get("effective_request")
         )
@@ -2072,26 +2152,29 @@ class Pipeline:
                 "H3 preparation request is not the stored effective request"
             )
         output_request = effective_request["output"]
+        bindings = {
+            "enhanced_element_index_sha256": self._json_sha256(
+                enhanced_index,
+            ),
+            "voice_references_sha256": self._json_sha256(
+                voice_references,
+            ),
+            "object_replace_input_sha256": object_replace["input_sha256"],
+            "replacement_image": (
+                replacement_receipts[0] if replacement_receipts else None
+            ),
+            "replacement_sheet_sha256": self._json_sha256(
+                frozen_replacement_sheet,
+            ),
+            "output_request_sha256": self._json_sha256(output_request),
+        }
+        if len(replacement_receipts) > 1:
+            bindings["replacement_images"] = replacement_receipts
         self.store.update(
             project_id,
             h3_prepared_artifacts={
                 "version": H3_PREPARED_ARTIFACTS_VERSION,
-                "bindings": {
-                    "enhanced_element_index_sha256": self._json_sha256(
-                        enhanced_index,
-                    ),
-                    "voice_references_sha256": self._json_sha256(
-                        voice_references,
-                    ),
-                    "object_replace_input_sha256": object_replace[
-                        "input_sha256"
-                    ],
-                    "replacement_image": replacement_receipt,
-                    "replacement_sheet_sha256": self._json_sha256(
-                        frozen_replacement_sheet,
-                    ),
-                    "output_request_sha256": self._json_sha256(output_request),
-                },
+                "bindings": bindings,
                 "segments": segments,
             },
         )
@@ -2233,6 +2316,7 @@ class Pipeline:
             project,
             prepared,
             self._generation_config(request),
+            user_replacement_instruction=(request.get("replacement_guidance") or {}).get("instruction", ""),
         )
         index_request_path = project / "work" / "project_index_request.json"
         index_request_path.write_text(
@@ -2240,10 +2324,11 @@ class Pipeline:
             encoding="utf-8",
         )
         identity_evidence = index_request.get("person_identity")
-        normalize_index = lambda value: normalize_project_index(value, identity_evidence)
+        reference_ids = [entry["reference_id"] for entry in index_request.get("user_reference_images", [])]
+        normalize_index = lambda value: normalize_project_index(value, identity_evidence, reference_image_ids=reference_ids)
         index_schema = project_index_schema([
             segment["segment_index"] for segment in index_request["segments"]
-        ], identity_evidence)
+        ], identity_evidence, reference_image_ids=reference_ids)
         self._progress(project_id, 50, "video-maker-project-index")
         skill = VIDEO_SKILL.read_text(encoding="utf-8")
         element_index = self._node(
@@ -2285,7 +2370,8 @@ class Pipeline:
             translated_voice_lines=translated_lines,
         )
 
-        user_reference = (
+        prepared_references = prepared[0].get("user_reference_paths", []) if prepared else []
+        user_reference = prepared_references[0] if prepared_references else (
             self._materialize_canonical_user_reference(
                 project, replacement, log,
                 replacement_paths=self._stored_replacement_paths(project, self.store.read(project_id)),
@@ -3405,12 +3491,15 @@ class Pipeline:
         ):
             raise ValueError("stored H3 preparation manifest is invalid")
         bindings = raw["bindings"]
+        replacement_paths = cls._replacement_image_paths(project, state)
         expected_binding_keys = {
             "enhanced_element_index_sha256", "voice_references_sha256",
             "object_replace_input_sha256", "replacement_image",
             "output_request_sha256",
         }
         expected_binding_keys.add("replacement_sheet_sha256")
+        if len(replacement_paths) > 1:
+            expected_binding_keys.add("replacement_images")
         if set(bindings) != expected_binding_keys:
             raise ValueError("stored H3 preparation bindings are invalid")
         enhanced_index = state.get("enhanced_element_index")
@@ -3439,13 +3528,32 @@ class Pipeline:
                 "stored H3 preparation Object Replace version does not match"
             )
         replacement_receipt = bindings.get("replacement_image")
-        has_replacement = state.get("replacement_image_path") is not None
+        has_replacement = bool(replacement_paths)
         if has_replacement != (replacement_receipt is not None):
             raise ValueError("stored H3 preparation replacement binding does not match")
         if replacement_receipt is not None:
             cls._validate_artifact_receipt(
                 project, replacement_receipt, "inputs/replacement-image",
             )
+        if len(replacement_paths) > 1:
+            replacement_receipts = bindings.get("replacement_images")
+            expected_replacement_receipts = [
+                cls._project_artifact_receipt(
+                    project,
+                    path,
+                    "inputs/replacement-image"
+                    if order == 1
+                    else f"inputs/replacement-image-{order}",
+                )
+                for order, path in enumerate(replacement_paths, 1)
+            ]
+            if (
+                replacement_receipts != expected_replacement_receipts
+                or replacement_receipt != expected_replacement_receipts[0]
+            ):
+                raise ValueError(
+                    "stored H3 preparation replacement bindings do not match"
+                )
         replacement_sheet = state.get("replacement_sheet")
         if (
             not isinstance(replacement_sheet, dict)
@@ -3548,7 +3656,7 @@ class Pipeline:
             or not isinstance(raw.get("user_image_present"), bool)
             or raw["user_image_present"]
             != (
-                state.get("replacement_image_path") is not None
+                bool(cls._replacement_image_paths(project, state))
                 and cls._enhanced_index_uses_user_image(
                     state.get("enhanced_element_index")
                     if isinstance(state.get("enhanced_element_index"), dict)
@@ -3598,11 +3706,8 @@ class Pipeline:
             or not isinstance(voice_references, list)
         ):
             raise ValueError("stored replacement sheet upstream state is invalid")
-        replacement = (
-            project / "inputs" / "replacement-image"
-            if state.get("replacement_image_path") is not None
-            else None
-        )
+        replacement_paths = cls._replacement_image_paths(project, state)
+        replacement = replacement_paths[0] if replacement_paths else None
         expected_upstream_bindings = cls._replacement_sheet_upstream_bindings(
             project,
             prepared_for_binding,
@@ -3644,26 +3749,29 @@ class Pipeline:
 
         expected_references: list[dict[str, Any]] = []
         if raw["user_image_present"]:
-            canonical_user = (
-                project / "work" / "global-reference-sheet"
-                / "user-reference.png"
+            # composed 模式多图冻结合成为单一 provider 参考图（order=1 即合图
+            # 路径）；direct 模式逐图直传，provider 图数 = 上传图数。
+            frozen_views = product_views.frozen_product_views(project)
+            provider_image_count = (
+                1 if frozen_views is not None else len(replacement_paths)
             )
-            canonical_receipt = cls._project_artifact_receipt(
-                project,
-                canonical_user,
-                "work/global-reference-sheet/user-reference.png",
-            )
-            canonical_bytes = canonical_user.read_bytes()
-            if (
-                not canonical_bytes.startswith(b"\x89PNG\r\n\x1a\n")
-                or len(canonical_bytes) < 9
-            ):
-                raise ValueError("stored user reference is not PNG")
-            expected_references.append({
-                "image_reference": "Image 2",
-                "role": "user_replacement",
-                **canonical_receipt,
-            })
+            for order in range(1, provider_image_count + 1):
+                canonical_user = cls._canonical_user_reference_path(project, order)
+                relative_path = canonical_user.relative_to(project).as_posix()
+                canonical_receipt = cls._project_artifact_receipt(
+                    project, canonical_user, relative_path,
+                )
+                canonical_bytes = canonical_user.read_bytes()
+                if (
+                    not canonical_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+                    or len(canonical_bytes) < 9
+                ):
+                    raise ValueError("stored user reference is not PNG")
+                expected_references.append({
+                    "image_reference": f"Image {order + 1}",
+                    "role": "user_replacement",
+                    **canonical_receipt,
+                })
 
         # The sheet is always H3 Image 1; the user image follows as Image 2.
         expected_image_reference = "Image 1"
@@ -3713,7 +3821,12 @@ class Pipeline:
         allowed_inputs = [
             "work/global-reference-sheet/canvas.png",
             *(
-                ["work/global-reference-sheet/user-reference.png"]
+                [
+                    cls._canonical_user_reference_path(
+                        project, order,
+                    ).relative_to(project).as_posix()
+                    for order in range(1, provider_image_count + 1)
+                ]
                 if raw["user_image_present"]
                 else []
             ),
@@ -4454,7 +4567,23 @@ class Pipeline:
             ) for segment in segments]
             materials = [future.result() for future in futures]
         identity = self._person_identity_prepass(project, source, materials, log)
+        replacement_originals = self._replacement_image_paths(project)
+        if (
+            self.settings.multiref_mode == "composed"
+            and len(replacement_originals) > 1
+        ):
+            # composed 模式：多图在参考图准备环节合成为单一 provider 参考图。
+            user_references = [self._materialize_canonical_user_reference(
+                project, replacement_originals[0], log,
+                replacement_paths=replacement_originals,
+            )]
+        else:
+            user_references = [self._materialize_canonical_user_reference(
+                project, path, log, order,
+            ) for order, path in enumerate(replacement_originals, 1)]
         for item in materials:
+            if user_references:
+                item["user_reference_paths"] = user_references
             item["person_identity"] = {
                 **identity,
                 "observations": [
@@ -4751,6 +4880,8 @@ class Pipeline:
         scope = self._segment_scope(index)
         directory = project / "work" / "segments" / f"{index:04d}"
         analysis_frames = segment["analysis_paths"]
+        user_references = segment.get("user_reference_paths", [])
+        vision_images = [*user_references, *analysis_frames]
         selection = segment.get("keyframe_selection", [])
         visual_payload = {
             "generation_config": self._generation_config(request),
@@ -4760,12 +4891,13 @@ class Pipeline:
                 if key not in {"visual_prompt", "dialogue", "source",
                                "keyframe_paths", "raw_keyframe_paths",
                                "analysis_paths", "segment_manifest",
-                               "person_identity", "keyframe_selection"}
+                               "person_identity", "keyframe_selection", "user_reference_paths"}
             },
             "manifest": segment["segment_manifest"],
             "frames": [
                 {
                     "frame_order": order,
+                    "image_reference": f"Image {len(user_references) + order}",
                     "path": path.relative_to(project).as_posix(),
                     "sha256": self._sha256(path),
                     **(selection[order - 1] if order <= len(selection) else {}),
@@ -4775,6 +4907,8 @@ class Pipeline:
         }
         if "person_identity" in segment:
             visual_payload["person_identity"] = segment["person_identity"]
+        visual_payload["user_replacement_instruction"] = (request.get("replacement_guidance") or {}).get("instruction", "")
+        visual_payload["user_reference_images"] = self._user_reference_metadata(user_references)
         visual_path = directory / "visual_prompt.txt"
         visual_prompt = visual_path.read_text(encoding="utf-8").strip() if resume and visual_path.is_file() else ""
         if visual_prompt:
@@ -4786,7 +4920,7 @@ class Pipeline:
                 "video-maker-resume" if resume else "video-maker",
                 scope,
                 visual_payload,
-                analysis_frames,
+                vision_images,
                 lambda: self.deepseek.complete_structured(
                     skill
                     + "\n\n本次只执行逐段视觉分析；最终输出严格遵循本次注入的 JSON Schema。"
@@ -4797,7 +4931,7 @@ class Pipeline:
                        if "person_identity" in segment else ""),
                     visual_payload,
                     VISUAL_PROMPT_SCHEMA,
-                    analysis_frames,
+                    vision_images,
                     validator=normalize_visual_prompt,
                 ),
                 transform=normalize_visual_prompt,
@@ -4970,9 +5104,11 @@ class Pipeline:
         project: Path,
         prepared: list[dict[str, Any]],
         generation_config: dict[str, bool],
+        *, user_replacement_instruction: str = "",
     ) -> tuple[dict[str, Any], list[Path]]:
         segments: list[dict[str, Any]] = []
-        images: list[Path] = []
+        user_references = list(prepared[0].get("user_reference_paths", [])) if prepared else []
+        images: list[Path] = list(user_references)
         for item in sorted(prepared, key=lambda value: int(value["index"])):
             frames = []
             for order, path in enumerate(item["analysis_paths"], 1):
@@ -4980,6 +5116,7 @@ class Pipeline:
                     **(item.get("keyframe_selection", [])[order - 1]
                        if order <= len(item.get("keyframe_selection", [])) else {}),
                     "frame_order": order,
+                    "image_reference": f"Image {len(images) + 1}",
                     "path": path.relative_to(project).as_posix(),
                     "sha256": Pipeline._sha256(path),
                 })
@@ -4993,6 +5130,8 @@ class Pipeline:
             "phase": "project_index",
             "generation_config": generation_config,
             "segments": segments,
+            "user_replacement_instruction": user_replacement_instruction,
+            "user_reference_images": Pipeline._user_reference_metadata(user_references),
         }
         evidence = [item.get("person_identity") for item in prepared
                     if isinstance(item.get("person_identity"), dict)]
@@ -5070,19 +5209,24 @@ class Pipeline:
         if sheet_reference is not None and sheet_tiles:
             lines.append(
                 f"The single global replacement appearance sheet is {sheet_reference}. "
-                "For every REPLACE item, copy the new identity or design only from "
-                "its bound tile; never borrow another tile or the source Video 1 "
-                "appearance. The same tile is authoritative in every segment."
+                "For generated-variant REPLACE items, copy the new identity or design only "
+                "from their own bound tile. For user-bound items, the explicitly mapped "
+                "original user images are appearance authority and the tile is a locator. "
+                "Never borrow unrelated tiles, user images, or source Video 1 appearance."
             )
             if replacement_sheet.get("user_image_present") is True:
-                lines.append(
-                    "The user reference image is Image 2. It already shaped its "
-                    "bound tiles during sheet creation and adds no further "
-                    "constraint; never copy from Image 2 directly."
-                )
                 views = replacement_sheet.get("upstream_bindings", {}).get("replacement_views")
                 if isinstance(views, dict):
+                    # composed 模式：多图合成为 Image 2 一张合图。
                     lines.append(product_views.view_instruction(views["view_count"], "Image 2"))
+                else:
+                    # direct 模式：逐图直传，image_N 对应 H3 Image N+1。
+                    lines.append(
+                        "User image_1 maps to H3 Image 2, image_2 to Image 3, "
+                        "image_3 to Image 4, and image_4 to Image 5 when supplied. "
+                        "Only the original references explicitly bound to each stable key "
+                        "control that key; multiple references need not show the same object."
+                    )
         replaced_ids: set[str] = set()
         for category in ("people", "entities", "scenes"):
             records = element_index.get(category)
@@ -5127,10 +5271,15 @@ class Pipeline:
                             replacement.get("source") == "image_1"
                             and replacement_sheet.get("user_image_present") is True
                         ):
+                            reference_ids = replacement.get("reference_image_ids") or ["image_1"]
+                            image_labels = ", ".join(
+                                f"Image {int(reference_id.rsplit('_', 1)[1]) + 1}"
+                                for reference_id in reference_ids
+                            )
                             reference_text += (
-                                "; this tile was designed from the user image "
-                                "Image 2, but the tile is the final appearance "
-                                "authority"
+                                f"; original user references {image_labels} are appearance authority; "
+                                "use this tile only to locate this stable key; interpret the "
+                                "reference set according to user_replacement_instruction"
                             )
                     else:
                         reference_text = (
@@ -5254,6 +5403,7 @@ class Pipeline:
             skill = R2V_SKILL.read_text(encoding="utf-8")
             fusion_payload = {
                 "segment_index": index,
+                "user_replacement_instruction": (request.get("replacement_guidance") or {}).get("instruction", ""),
                 "visual_prompt": item["visual_prompt"],
                 "global_element_index": element_index,
                 "translated_dialogue": item["dialogue"],
@@ -5279,6 +5429,7 @@ class Pipeline:
                 fusion_payload,
             )
             fusion_agent, fusion_client = self._fusion_client_for_request(request)
+            fusion_images = [project / reference["path"] for reference in replacement_sheet.get("h3_reference_images", [])]
             prompt = self._node(
                 log,
                 "h3-max-r2v-prompt",
@@ -5290,12 +5441,12 @@ class Pipeline:
                     "payload": fusion_payload,
                     "output_schema": fusion_schema,
                 },
-                [],
+                fusion_images,
                 lambda: fusion_client.complete_structured(
                     skill,
                     fusion_payload,
                     fusion_schema,
-                    [],
+                    fusion_images,
                     validator=lambda value: normalize_fusion_prompt(
                         value,
                         input_sha256=fusion_input_sha256,
@@ -5325,10 +5476,11 @@ class Pipeline:
             if masks_faces:
                 face_block = (
                     "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
-                    "EVERYTHING ELSE. Every person in Video 1 must appear with "
-                    f"the face from their tile in {sheet_reference}: face "
-                    "shape, eyes, nose, mouth, skin tone, and hairstyle all "
-                    "come from that tile, never from Video 1. Keeping the "
+                    "SOURCE IDENTITY. Each replaced person must use their "
+                    "explicitly bound original user reference images when user-bound, "
+                    f"or their own tile in {sheet_reference} when generated_variant. "
+                    "Face shape, eyes, nose, mouth, skin tone, and hairstyle follow "
+                    "that per-key appearance authority, never Video 1. Keeping the "
                     "source face is a failure, even if everything else is "
                     "correct.\n\n"
                 )
@@ -5591,7 +5743,9 @@ class Pipeline:
                 supplied_sheet != validated_sheet
                 or stored_sheet["user_image_present"]
                 != (
-                    replacement is not None
+                    bool(self._replacement_image_paths(
+                        project, stored_state, replacement,
+                    ))
                     and self._enhanced_index_uses_user_image(
                         stored_state.get("enhanced_element_index")
                         if isinstance(
