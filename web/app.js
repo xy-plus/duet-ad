@@ -1616,7 +1616,8 @@ function renderReplacementImages() {
       preview.alt = "参考图 " + (index + 1) + " 预览";
       chip.appendChild(preview);
     }
-    chip.appendChild(el("span", null, "参考图 " + (index + 1) + " · " + image.filename));
+    const filename = String(image.filename || image.name || "参考图");
+    chip.appendChild(el("span", null, "参考图 " + (index + 1) + " · " + filename));
     if (!submitted) {
       const remove = el("button", "icon-btn icon-btn-sm");
       remove.type = "button";

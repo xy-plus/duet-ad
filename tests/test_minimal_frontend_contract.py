@@ -1011,6 +1011,8 @@ def test_reference_image_picker_rejects_unsupported_formats_before_submit():
     assert "images.some((image) => image.size > capability.replacement.max_bytes)" in picker
     assert "state.replacementImages.push(...images)" in picker
     assert "state.replacementImages.length + images.length > maxImages" in picker
+    renderer = _function_source(source, "renderReplacementImages")
+    assert 'image.filename || image.name || "参考图"' in renderer
 
 
 def test_logout_and_401_scrub_composer_session_and_stream_urls():
