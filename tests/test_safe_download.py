@@ -86,12 +86,45 @@ def test_redirect_to_private_target_is_rejected_before_second_request(tmp_path: 
     assert not destination.exists()
 
 
-def test_any_non_global_dns_answer_rejects_the_target(tmp_path: Path):
+@pytest.mark.parametrize("answers,selected", [
+    ([PUBLIC_V4, "127.0.0.1"], PUBLIC_V4),
+    (["2001::1", "10.0.0.1", PUBLIC_V4], PUBLIC_V4),
+    (["::1", PUBLIC_V6, "224.0.0.1"], PUBLIC_V6),
+    ([PUBLIC_V6], PUBLIC_V6),
+    (["::ffff:127.0.0.1", "::ffff:93.184.216.34"], "::ffff:5db8:d822"),
+])
+def test_mixed_dns_pins_only_public_candidate(tmp_path: Path, answers, selected):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"video")
+
+    async def resolver(_hostname: str, _port: int):
+        return answers
+
+    assert run_download("https://mixed.example/video", tmp_path / "source.mp4",
+                        httpx.MockTransport(handler), resolver) == 5
+    assert len(seen) == 1
+    assert seen[0].url.host == selected
+    assert seen[0].headers["host"] == "mixed.example"
+    assert seen[0].extensions["sni_hostname"] == "mixed.example"
+
+
+@pytest.mark.parametrize("answers,code", [
+    (["127.0.0.1", "10.0.0.1", "::1", "2001::1", "224.0.0.1"], "reference_url_forbidden"),
+    (["169.254.169.254", "::ffff:127.0.0.1"], "reference_url_forbidden"),
+    ([], "invalid_reference_url"),
+    (None, "invalid_reference_url"),
+])
+def test_no_safe_dns_candidate_rejects_before_transport(tmp_path: Path, answers, code):
     def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("transport must not receive an unapproved target")
 
     async def resolver(_hostname: str, _port: int):
-        return [PUBLIC_V4, "127.0.0.1"]
+        if answers is None:
+            raise OSError("DNS unavailable")
+        return answers
 
     with pytest.raises(ReferenceDownloadError) as caught:
         run_download(
@@ -100,7 +133,27 @@ def test_any_non_global_dns_answer_rejects_the_target(tmp_path: Path):
             httpx.MockTransport(handler),
             resolver,
         )
-    assert caught.value.code == "reference_url_forbidden"
+    assert caught.value.code == code
+
+
+def test_each_redirect_filters_dns_and_preserves_pin(tmp_path: Path):
+    seen = []
+    targets = ["one.example", "two.example", "three.example"]
+
+    async def resolver(hostname: str, _port: int):
+        return ["127.0.0.1", PUBLIC_V6 if hostname == "two.example" else PUBLIC_V4]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) < 3:
+            return httpx.Response(302, headers={"Location": "https://" + targets[len(seen)] + "/video"})
+        return httpx.Response(200, content=b"video")
+
+    assert run_download("https://one.example/video", tmp_path / "source.mp4",
+                        httpx.MockTransport(handler), resolver) == 5
+    assert [r.url.host for r in seen] == [PUBLIC_V4, PUBLIC_V6, PUBLIC_V4]
+    assert [r.headers["host"] for r in seen] == targets
+    assert [r.extensions["sni_hostname"] for r in seen] == targets
 
 
 @pytest.mark.parametrize(
