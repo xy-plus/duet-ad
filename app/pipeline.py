@@ -146,7 +146,8 @@ PICSART_GENERATION_MAX_DURATION_S = 15
 PICSART_RESOLUTIONS = frozenset({"480p", "768p"})
 PICSART_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
 # Provider-side fetch/validation failure markers classify why a terminal H3
-# task failure happened; every terminal failure is resubmitted under a fresh
+# task failure happened; except explicit frozen-request validation failures,
+# terminal failures are resubmitted under a fresh
 # run identity (a resubmit also means fresh asset URLs, sidestepping the
 # 24h provider asset TTL), so there is no resubmit cap.
 _PICSART_FETCH_FAILURE_MARKERS = (
@@ -3221,9 +3222,39 @@ class Pipeline:
         return False
 
     @staticmethod
+    def _poll_failure_is_request_validation(record: dict[str, Any]) -> bool:
+        """Recognize explicit terminal validation of a frozen request field.
+
+        A generic ValidationError can also mean transient asset download
+        failure. Only the provider's body-property validation envelope proves
+        that reposting these unchanged inputs cannot repair the request.
+        """
+        for exchange in record.get("polls") or []:
+            if not isinstance(exchange, dict) or not Pipeline._poll_record_is_terminal_failure({"polls": [exchange]}):
+                continue
+            body = exchange["response"]["body"]
+            envelope = body.get("response")
+            details = envelope if isinstance(envelope, dict) else body
+            error = details.get("error")
+            values = [details.get("message"), error.get("message") if isinstance(error, dict) else error]
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                message = value.lower()
+                if (
+                    "validationerror:" in message
+                    and "[property:" in message
+                    and ("'body." in message or '"body.' in message)
+                    and "message:" in message
+                    and "failed to download" not in message
+                    and "unreachable" not in message
+                ):
+                    return True
+        return False
+
+    @staticmethod
     def _poll_failure_is_asset_fetch(record: dict[str, Any]) -> bool:
-        """True when a terminal task failure is a provider-side asset fetch
-        or validation error (safe to resubmit with the same frozen inputs)."""
+        """Classify asset-fetch failures after excluding request validation."""
 
         texts: list[str] = []
         for exchange in record.get("polls") or []:
@@ -5773,6 +5804,16 @@ class Pipeline:
                         exc.record
                     ):
                         raise
+                    if not hung and self._poll_failure_is_request_validation(exc.record):
+                        # poll_once already persisted the accepted task's
+                        # terminal receipt. Do not mint a new paid run identity
+                        # for the same deterministically invalid frozen input.
+                        log.event(
+                            "picsart_request_validation_failed",
+                            segment_index=index,
+                            failed_task_id=task_id,
+                        )
+                        raise
                     if hung:
                         self._mark_submission_task_failed(
                             current.project_id, index, task_id,
@@ -5786,7 +5827,7 @@ class Pipeline:
                             else "terminal_failure"
                         )
                         error_text = str(exc)
-                    # Any terminal task failure (or a task hung past the hang
+                    # Other terminal task failures (or a task hung past the hang
                     # limit) resubmits the same frozen segment under a fresh
                     # run identity — fresh asset URLs included — with no cap.
                     resubmits += 1
