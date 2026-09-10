@@ -7871,3 +7871,49 @@ def test_reusable_node_output_treats_zero_byte_artifacts_as_missing(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("view_count", [2, 3, 4])
+def test_multiview_product_uses_one_frozen_composite_through_all_providers(
+    tmp_path: Path, monkeypatch: Any, view_count: int,
+) -> None:
+    from PIL import Image
+    from app import product_views
+
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request(target_language="日语", replacement_instruction="把包替换成参考图中的同一个商品")
+    project_id, project, _state = store.create(request, f"views-{view_count}")
+    (project / "inputs/source.mp4").write_bytes(b"source")
+    names = ["inputs/replacement-image"] + [f"inputs/replacement-image-{i}" for i in range(2,view_count+1)]
+    for index, name in enumerate(names):
+        Image.new("RGB", (200,100), (index*40,50,100)).save(project / name,format="PNG")
+    store.update(project_id, source_path="inputs/source.mp4",replacement_image_path=names[0],replacement_image_paths=names)
+    _install_fake_media(monkeypatch, [])
+    deepseek, picsart, seedream = _FlowDeepSeek(), _FlowPicsart(), _FlowSeedream()
+    pipeline = Pipeline(_settings(tmp_path),store,
+                        lambda _pid,path: f"https://assets.invalid/{path.name}",
+                        deepseek=deepseek,picsart=picsart,seedream=seedream,
+                        mediakit=_FlowMediaKit(),autodl=_FlowAutodlTTS())
+    monkeypatch.setattr(pipeline, "_retry_sleep", lambda _delay: (_ for _ in ()).throw(AssertionError("unexpected repeated node failure")))
+    pipeline.run(project_id)
+    state = store.read(project_id)
+    assert state["status"] == "succeeded", state.get("error")
+    composite = project / product_views.REFERENCE
+    views = product_views.frozen_product_views(project)
+    assert views["view_count"] == view_count
+    object_call = next(call for call in deepseek.structured_calls if call["payload"].get("has_user_image"))
+    assert object_call["images"] == [composite]
+    assert object_call["payload"]["user_replacement_image"]["view_count"] == view_count
+    assert "SAME single product" in object_call["instruction"]
+    assert seedream.calls[0]["images"] == [project / "work/global-reference-sheet/canvas.png",composite]
+    assert f"containing {view_count} uploaded views" in seedream.calls[0]["prompt"]
+    assert [item["path"] for item in state["replacement_sheet"]["h3_reference_images"]] == [
+        "work/global-reference-sheet/reference-sheet.png",product_views.REFERENCE]
+    assert all(len(call["image_urls"]) == 2 for call in picsart.submits)
+    assert state["replacement_sheet"]["upstream_bindings"]["replacement_views"] == views
+    assert pipeline._validated_stored_replacement_sheet(project,state).name == "reference-sheet.png"
+    before = composite.read_bytes(),composite.stat().st_mtime_ns
+    monkeypatch.setattr(Image,"open",lambda *_args,**_kwargs: pytest.fail("frozen composite must not redraw"))
+    reused = pipeline._materialize_canonical_user_reference(project,project/names[0],ResearchLog(project),replacement_paths=[project/name for name in names])
+    assert reused == composite
+    assert (composite.read_bytes(),composite.stat().st_mtime_ns) == before

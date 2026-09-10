@@ -18,6 +18,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+from app.product_views import view_instruction
 
 
 REPLACEMENT_SHEET_SPEC_NAME = "duet.replacement-reference-sheet"
@@ -325,6 +326,7 @@ def _build_seedream_prompt(
     spec: Mapping[str, Any],
     *,
     user_image_present: bool,
+    user_view_count: int = 1,
 ) -> str:
     image_bound_tiles = [
         tile for tile in spec["tiles"] if tile.get("source") == "image_1"
@@ -341,6 +343,8 @@ def _build_seedream_prompt(
         "Input Image 1 is the blank 2048x2048 row-major layout canvas.",
     ]
     if user_image_present:
+        if user_view_count > 1:
+            lines.append(view_instruction(user_view_count, "Input Image 2"))
         lines.extend([
             (
                 "Input Image 2 is the user-reference image. In the frozen "
@@ -435,6 +439,7 @@ def materialize_replacement_sheet_inputs(
     spec: Mapping[str, Any],
     *,
     user_image_present: bool = False,
+    user_view_count: int = 1,
 ) -> dict[str, Any]:
     """Atomically publish a v2 spec, backend prompt, and layout input image."""
     validate_replacement_sheet_spec(spec, allow_empty=False)
@@ -447,6 +452,7 @@ def materialize_replacement_sheet_inputs(
     prompt = _build_seedream_prompt(
         spec,
         user_image_present=user_image_present,
+        user_view_count=user_view_count,
     )
 
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)

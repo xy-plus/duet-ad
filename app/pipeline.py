@@ -19,6 +19,7 @@ from app import media
 from app import face_mask
 from app import subtitles
 from app import person_identity
+from app import product_views
 from app.config import Settings
 from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
 from app.object_replace_schema import (
@@ -515,6 +516,28 @@ class Pipeline:
             log.write_text(directory / "stderr.log", stderr)
 
     @staticmethod
+    def _stored_replacement_paths(project: Path, state: dict[str, Any]) -> list[Path]:
+        single = state.get("replacement_image_path")
+        paths = state.get("replacement_image_paths")
+        if paths is None:
+            paths = [single] if single is not None else []
+        expected = ["inputs/replacement-image"] + [f"inputs/replacement-image-{i}" for i in range(2,len(paths)+1)] if isinstance(paths, list) and paths else []
+        if not isinstance(paths, list) or len(paths) > 4 or paths != expected or single != (paths[0] if paths else None):
+            raise ValueError("stored replacement images must preserve upload order")
+        root = project.resolve(strict=True)
+        result = []
+        for name in paths:
+            path = project / name
+            resolved = path.resolve(strict=True)
+            if path.is_symlink() or root not in resolved.parents or not resolved.is_file():
+                raise ValueError("stored replacement image is outside the project")
+            result.append(path)
+        frozen = product_views.frozen_product_views(project)
+        if frozen is not None and [item["path"] for item in frozen["sources"]] != paths:
+            raise ValueError("frozen product view upload order changed")
+        return result
+
+    @staticmethod
     def _stored_input_paths(
         project: Path,
         state: dict[str, Any],
@@ -546,6 +569,7 @@ class Pipeline:
                 or not replacement.is_file()
             ):
                 raise ValueError("stored replacement image is outside the project")
+        Pipeline._stored_replacement_paths(project, state)
         return source, replacement
 
     def _erase_source_subtitles(
@@ -1009,7 +1033,17 @@ class Pipeline:
         project: Path,
         replacement: Path,
         log: ResearchLog,
+        *,
+        replacement_paths: list[Path] | None = None,
     ) -> Path:
+        if replacement_paths is not None and len(replacement_paths) > 1:
+            return self._node(
+                log, "replacement-sheet-user-reference", "project",
+                {"sources": replacement_paths, "interpretation": "one_product_multiple_views"},
+                replacement_paths,
+                lambda: product_views.compose_product_views(project, replacement_paths),
+                output_media=lambda value: [value],
+            )
         destination = (
             project / "work" / "global-reference-sheet"
             / "user-reference.png"
@@ -1076,6 +1110,13 @@ class Pipeline:
             "voice_catalog_sha256": self.voice_library.digest,
             "voice_catalog_lines": self.voice_library.model_lines(),
         }
+        views = product_views.frozen_product_views(project)
+        if views is not None and user_reference is not None:
+            payload["user_replacement_image"].update(
+                view_count=views["view_count"], interpretation=views["interpretation"],
+                views=views["layout"]["views"],
+                instruction=product_views.view_instruction(views["view_count"], "Image 1"),
+            )
         output_schema, input_sha256 = object_replace_schema(payload, voice_ids)
         # Dialogue lines need a TTS voice even when the model deliberately
         # leaves every person voiceless (e.g. only hands on camera); pick a
@@ -1110,6 +1151,8 @@ class Pipeline:
             )
 
         skill = OBJECT_REPLACE_SKILL.read_text(encoding="utf-8")
+        if views is not None and user_reference is not None:
+            skill += "\n" + product_views.view_instruction(views["view_count"], "Image 1")
         enhanced_index = self._node(
             log,
             "object-replace",
@@ -1418,6 +1461,12 @@ class Pipeline:
             raise ValueError(
                 "prepared replacement sheet requires receipt-safe replay"
             )
+        if user_image_present and user_reference is None:
+            assert replacement is not None
+            user_reference = self._materialize_canonical_user_reference(
+                project, replacement, log,
+                replacement_paths=self._stored_replacement_paths(project, self.store.read(project_id)),
+            )
         # The replacement sheet is always H3 Image 1 so the identity anchor
         # carries the primary reference weight; the user image, when present,
         # follows as Image 2.
@@ -1455,6 +1504,7 @@ class Pipeline:
             return base_bundle, None
 
         directory = project / "work" / "global-reference-sheet"
+        views = product_views.frozen_product_views(project)
         inputs = self._node(
             log,
             "replacement-sheet-inputs",
@@ -1467,17 +1517,13 @@ class Pipeline:
                 directory,
                 spec,
                 user_image_present=user_image_present,
+                **({"user_view_count": views["view_count"]} if views is not None else {}),
             ),
             output_media=lambda value: [value["canvas_path"]],
         )
         canvas = inputs["canvas_path"]
         prompt_path = directory / "prompt.txt"
         spec_path = directory / "spec.json"
-        if user_image_present and user_reference is None:
-            assert replacement is not None
-            user_reference = self._materialize_canonical_user_reference(
-                project, replacement, log,
-            )
         canonical_replacement = user_reference if user_image_present else None
         if canonical_replacement is not None:
             canonical_bytes = canonical_replacement.read_bytes()
@@ -1877,7 +1923,7 @@ class Pipeline:
             if replacement is not None
             else None
         )
-        return {
+        bindings = {
             "segments_sha256": cls._json_sha256(segment_bindings),
             "segment_sources": source_receipts,
             "enhanced_element_index_sha256": cls._json_sha256(
@@ -1888,6 +1934,10 @@ class Pipeline:
             "effective_request_sha256": cls._json_sha256(effective_request),
             "replacement_image": replacement_receipt,
         }
+        views = product_views.frozen_product_views(project)
+        if views is not None:
+            bindings["replacement_views"] = views
+        return bindings
 
     @staticmethod
     def _muted_artifact_name(muted: Path) -> str:
@@ -2233,6 +2283,7 @@ class Pipeline:
         user_reference = (
             self._materialize_canonical_user_reference(
                 project, replacement, log,
+                replacement_paths=self._stored_replacement_paths(project, self.store.read(project_id)),
             )
             if replacement is not None
             else None
@@ -4994,6 +5045,9 @@ class Pipeline:
                     "bound tiles during sheet creation and adds no further "
                     "constraint; never copy from Image 2 directly."
                 )
+                views = replacement_sheet.get("upstream_bindings", {}).get("replacement_views")
+                if isinstance(views, dict):
+                    lines.append(product_views.view_instruction(views["view_count"], "Image 2"))
         replaced_ids: set[str] = set()
         for category in ("people", "entities", "scenes"):
             records = element_index.get(category)
