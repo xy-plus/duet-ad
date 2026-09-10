@@ -4,6 +4,8 @@ Duet API 用于提交视频生成任务，并在任务完成后返回最终视�
 
 本合同版本 `1.2.0` 新增报价与确认接口，支持先展示预计积分、用户确认后再执行。原有直接创建、查询、下载和账户接口保持兼容。
 
+生成请求支持可选字幕开关 `add_subtitles`，默认关闭；开启后在最终成片中叠加台词字幕。直接创建和报价都支持该参数，已有调用省略它即可保持原行为。
+
 视频生成通常需要数分钟，因此接口采用异步模式：创建任务后立即返回任务 ID；接入方使用任务 ID 查询状态；成功后再下载视频。
 
 ## 基本信息
@@ -11,7 +13,7 @@ Duet API 用于提交视频生成任务，并在任务完成后返回最终视�
 | 项目 | 值 |
 |---|---|
 | 合同版本 | `1.2.0` |
-| 文档更新日期 | `2026-09-09` |
+| 文档更新日期 | `2026-09-10` |
 | 联调环境 | `https://8.166.140.227:3211` |
 | API 前缀 | `/api/v1` |
 | 鉴权 | HTTP Bearer API Key |
@@ -153,6 +155,7 @@ HTTP `200 OK`
 | `endpoint` | string | 创建任务的路径 |
 | `encoding` | string | 创建任务使用的编码 |
 | `defaults` | object | 未传输出参数时采用的默认值 |
+| `defaults.add_subtitles` | boolean | 字幕开关默认值，当前为 `false` |
 | `allowed_output_combinations` | array<object> | 当前允许的画幅与清晰度组合 |
 | `source_video` | object | 原视频格式、大小、时长和 URL 限制 |
 | `replacement_image` | object | 参考图格式、大小和说明文字限制 |
@@ -174,6 +177,8 @@ Content-Type: multipart/form-data
 ```
 
 请求的 multipart 字段、输入限制和鉴权与下文“创建视频生成任务”完全相同，`Idempotency-Key` 必填。必须提交本次计划生成所需的完整输入：视频文件或 URL，以及需要的语言、画幅、清晰度、台词和替换参数。
+
+需要字幕时，在报价 multipart 中添加文本字段 `add_subtitles=true`。该开关与媒体和其他参数一起冻结；确认接口仍只接受 JSON `{"confirm":true}`，不能在确认时添加或修改字幕开关。需要改变开关时用新 Key 重新报价。Quote 响应不新增字幕字段；确认后的 Job 通过 `parameters.add_subtitles` 返回实际冻结值。
 
 服务端下载或接收视频、读取实际时长，并保存本次媒体与生成参数；不创建生成任务、不调用生成模型，也不产生 `reserve`、`capture` 或 `release` 积分流水。客户端无需事先知道视频时长。确认会复用报价保存的输入，不重新下载 URL 或重新上传文件；修改任何输入需要重新报价。
 
@@ -352,7 +357,7 @@ Content-Disposition: form-data; name="replacement_instruction"
 | `aspect_ratio` | string | 否 | `9:16` | `9:16`、`16:9` | 输出画幅 |
 | `resolution` | string | 否 | `768p` | `768p`、`480p` | 输出清晰度 |
 | `target_language` | string | 否 | 与原视频相同 | 去除首尾空白后不能为空；最多 80 个 UTF-16 字符单元 | 对白目标语言，例如 `中文`、`English` |
-| `add_subtitles` | boolean | 否 | `false` | `true`、`false` | 在最终成片上叠加台词字幕；参数随任务冻结，幂等重试必须保持一致 |
+| `add_subtitles` | boolean | 否 | `false` | multipart 文本 `true`、`false` | 在最终成片上叠加台词字幕；参数随任务冻结，幂等重试必须保持一致 |
 | `dialogue_mode` | string | 否 | `auto_rewrite` | `auto_rewrite`、`generate` | 台词模式；`auto_rewrite` 翻译并自然改写原台词，`generate` 按 `dialogue_brief` 描述自动生成台词 |
 | `dialogue_brief` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 口播台词的内容描述；`dialogue_mode` 为 `generate` 时必填，其余模式不允许提供 |
 | `replacement_image` | binary | 条件必填 | 无 | JPEG、PNG、WebP；最大 10 MiB | 主体替换参考图；必须与 `replacement_instruction` 同时提供 |
@@ -361,6 +366,20 @@ Content-Disposition: form-data; name="replacement_instruction"
 本接口没有 Path 或 Query 参数。未知字段、重复字段、同时提供两个视频来源或只提供参考图组合中的一个字段，都会返回 `422`。
 
 普通中文、英文和数字通常各占 1 个 UTF-16 字符单元；部分 Emoji 占 2 个。
+
+`add_subtitles` 的接口类型为 boolean，但上传与报价请求使用 multipart，应传表单文本 `true` 或 `false`，例如 `--form 'add_subtitles=true'`，不是将整个创建请求改成 JSON。省略或显式 `false` 均表示关闭；开启不会改变按原视频时长计算积分的规则。同一幂等 Key 从关闭改为开启会返回 `409 idempotency_key_reused`。
+
+开启字幕的直接创建示例：
+
+```bash
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Idempotency-Key: subtitle_order_20260910_000001' \
+  --form 'source_video_url=https://media.example.com/source.mp4' \
+  --form 'add_subtitles=true'
+```
+
+需要先报价时，仅将上面请求地址改为 `/api/v1/video-generations/quotes`，再按报价确认流程执行。
 
 ### Idempotency-Key 规则
 
@@ -395,7 +414,8 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
     "aspect_ratio": "9:16",
     "resolution": "480p",
     "target_language": "中文",
-    "replacement_image": true
+    "replacement_image": true,
+    "add_subtitles": false
   },
   "billing": {
     "currency": "CNY",
@@ -460,7 +480,8 @@ HTTP `200 OK`，响应体为 Job 对象。任务仍在处理时，响应头包�
     "aspect_ratio": "9:16",
     "resolution": "480p",
     "target_language": "中文",
-    "replacement_image": true
+    "replacement_image": true,
+    "add_subtitles": false
   },
   "billing": {
     "currency": "CNY",
