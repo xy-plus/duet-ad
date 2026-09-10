@@ -784,6 +784,77 @@ def provider_reference_png(source: Path, destination: Path) -> Path:
     return half_resolution_png(source, destination)
 
 
+def trim_user_reference_border(
+    rgb: np.ndarray, alpha: np.ndarray | None = None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Conservatively trim user-reference padding, not foreground segmentation.
+
+    Preserve every non-background pixel and interior white detail. Sparse dark
+    marks may be logos on white products, so ambiguous RGB images remain whole.
+    This helper is intentionally not part of general keyframe/image processing.
+    """
+    height, width = rgb.shape[:2]
+    full = (0, 0, width, height)
+    if alpha is not None and int(alpha.min()) < 255:
+        foreground = alpha > 0
+    else:
+        background = rgb[0, 0]
+        if int(background.min()) < 250 or any(
+            not np.array_equal(rgb[y, x], background)
+            for x, y in ((width-1, 0), (0, height-1), (width-1, height-1))
+        ):
+            return rgb, full
+        if np.count_nonzero(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) < 220) < width*height*.20:
+            return rgb, full
+        foreground = np.any(rgb != background, axis=2)
+    points = cv2.findNonZero(foreground.astype(np.uint8))
+    if points is None:
+        return rgb, full
+    left, top, content_width, content_height = cv2.boundingRect(points)
+    padding = max(2, min(width, height)//100)
+    bbox = (max(0, left-padding), max(0, top-padding),
+            min(width, left+content_width+padding), min(height, top+content_height+padding))
+    return rgb[bbox[1]:bbox[3], bbox[0]:bbox[2]], bbox
+
+
+def user_reference_png(source: Path, destination: Path) -> Path:
+    """Default user-image trim, followed by the existing provider size tool.
+
+    No crop confidence gate: uncertain borders use the original image. RGB EXIF
+    orientation is handled by the same OpenCV decoder as provider_reference_png.
+    Alpha with orientation metadata, or unusual channel depth, retains the old
+    decoder path rather than guessing a mismatched alpha orientation.
+    """
+    data = source.read_bytes()
+    encoded = np.frombuffer(data, dtype=np.uint8)
+    bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR) if data else None
+    if bgr is None or bgr.size == 0:
+        return provider_reference_png(source, destination)
+    raw = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    alpha = None
+    if raw is not None and raw.ndim == 3 and raw.shape[2] == 4:
+        if raw.dtype != np.uint8 or raw.shape[:2] != bgr.shape[:2] or b"eXIf" in data or b"EXIF" in data:
+            return provider_reference_png(source, destination)
+        alpha = raw[:, :, 3]
+        opacity = alpha[:, :, None].astype(np.float32)/255.
+        bgr = np.rint(bgr.astype(np.float32)*opacity+255.*(1.-opacity)).astype(np.uint8)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    cropped, bbox = trim_user_reference_border(rgb, alpha)
+    if alpha is None and bbox == (0, 0, rgb.shape[1], rgb.shape[0]):
+        return provider_reference_png(source, destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ok, payload = cv2.imencode(".png", cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR))
+    if not ok:
+        return provider_reference_png(source, destination)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".png", prefix=".user-reference-trim-", delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(payload.tobytes())
+    try:
+        return provider_reference_png(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _integer(value: object, label: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{label} must be an integer >= {minimum}")
