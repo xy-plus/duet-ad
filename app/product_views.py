@@ -6,7 +6,10 @@ import json
 import os
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps
+import numpy as np
+
+from app import media
 
 MANIFEST = "work/global-reference-sheet/user-reference-views.json"
 REFERENCE = "work/global-reference-sheet/user-reference.png"
@@ -15,39 +18,9 @@ LABEL_HEIGHT = 32
 
 
 def _trim_white_border(image: Image.Image, alpha: Image.Image) -> tuple[Image.Image, tuple[int,int,int,int]]:
-    """Crop only supported outer background; this is not object segmentation.
-
-    Mostly white/low-contrast RGB images may be white products with a dark
-    logo. Keep those whole rather than declaring the logo the entire product.
-    Exact white-on-white boundaries cannot be recovered from RGB alone.
-    """
-    full = (0,0,image.width,image.height)
-    alpha_range = alpha.getextrema()
-    if alpha_range[0] < 255:
-        # Original alpha carries support even for a white product. A fully
-        # transparent upload has no reliable subject, so keep its dimensions.
-        bbox = alpha.getbbox()
-        if bbox is None:
-            return image, full
-    else:
-        corners = [(0,0),(image.width-1,0),(0,image.height-1),(image.width-1,image.height-1)]
-        background = image.getpixel(corners[0])
-        if min(background) < 250 or any(image.getpixel(point) != background for point in corners):
-            return image, full
-        # A small contrast feature must not turn into a crop of a white
-        # product's logo. Ambiguous sparse subjects simply use the full image.
-        contrast = image.convert("L").point(lambda value: 255 if value < 220 else 0)
-        if contrast.histogram()[255] < image.width*image.height*.20:
-            return image, full
-        # Keep every visible difference, including faint white-product edges;
-        # do not threshold away near-white subject pixels or internal whites.
-        bbox = ImageChops.difference(image,Image.new("RGB",image.size,background)).getbbox()
-        if bbox is None:
-            return image, full
-    padding = max(2,min(image.size)//100)
-    crop = (max(0,bbox[0]-padding),max(0,bbox[1]-padding),
-            min(image.width,bbox[2]+padding),min(image.height,bbox[3]+padding))
-    return image.crop(crop), crop
+    """Use the same default user-reference border rules as single-image inputs."""
+    cropped,bbox = media.trim_user_reference_border(np.asarray(image),np.asarray(alpha))
+    return Image.fromarray(cropped),bbox
 
 
 def _receipt(project: Path, path: Path) -> dict:

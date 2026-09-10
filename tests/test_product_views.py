@@ -75,7 +75,7 @@ def test_frozen_source_change_and_order_change_are_rejected(tmp_path):
     assert output.read_bytes() == before
 
 
-def test_single_image_retains_existing_provider_conversion(tmp_path,monkeypatch):
+def test_single_image_defaults_to_user_preprocessing_and_existing_provider_conversion(tmp_path,monkeypatch):
     paths = sources(tmp_path,1)
     pipeline = object.__new__(Pipeline)
     calls = []
@@ -88,6 +88,21 @@ def test_single_image_retains_existing_provider_conversion(tmp_path,monkeypatch)
     assert calls == paths
     assert result == tmp_path / product_views.REFERENCE
     assert not (tmp_path / product_views.MANIFEST).exists()
+
+
+def test_single_image_white_border_is_trimmed_before_existing_size_tool(tmp_path):
+    paths = sources(tmp_path,1,size=(600,400))
+    image = Image.new("RGB",(600,400),"white")
+    image.paste((30,40,50),(100,60,500,340))
+    image.save(paths[0],format="PNG")
+    original_input = paths[0].read_bytes()
+    pipeline = object.__new__(Pipeline)
+    output = pipeline._materialize_canonical_user_reference(tmp_path,paths[0],ResearchLog(tmp_path),replacement_paths=paths)
+    with Image.open(output) as result:
+        assert result.size == (408,288)
+        assert .4 <= result.width/result.height <= 2.5
+    assert not (tmp_path/product_views.MANIFEST).exists()
+    assert paths[0].read_bytes() == original_input
 
 
 def test_exact_multiview_mapping_is_in_authoritative_h3_block():

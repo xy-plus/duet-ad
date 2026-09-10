@@ -1057,7 +1057,7 @@ class Pipeline:
             "project",
             {"source": replacement, "output": destination},
             [replacement],
-            lambda: media.provider_reference_png(replacement, destination),
+            lambda: media.user_reference_png(replacement, destination),
             output_media=lambda _value: [destination],
         )
         payload = destination.read_bytes()
