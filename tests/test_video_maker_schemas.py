@@ -191,6 +191,116 @@ def test_project_index_schema_has_no_segment_metrics() -> None:
     assert "segment_metrics" not in PROJECT_INDEX_SCHEMA["properties"]
 
 
+def test_project_index_schema_binds_optional_target_reference_ids() -> None:
+    schema = project_index_schema(
+        [1, 3],
+        reference_image_ids=["image_1", "image_2", "image_3", "image_4"],
+    )
+    expected = {
+        "type": "array",
+        "items": {
+            "type": "string",
+            "enum": ["image_1", "image_2", "image_3", "image_4"],
+        },
+        "minItems": 1,
+        "maxItems": 4,
+        "uniqueItems": True,
+    }
+
+    for category in ("people", "entities", "scenes"):
+        item = schema["properties"][category]["items"]
+        assert item["properties"]["target_reference_image_ids"] == expected
+        assert "target_reference_image_ids" not in item["required"]
+    assert "target_reference_image_ids" not in schema["properties"][
+        "relations"
+    ]["items"]["properties"]
+
+
+def test_project_index_schema_keeps_empty_reference_lists_legacy_compatible() -> None:
+    schema = project_index_schema([1], reference_image_ids=[])
+
+    for category in ("people", "entities", "scenes"):
+        item = schema["properties"][category]["items"]
+        assert "target_reference_image_ids" not in item["properties"]
+
+
+def test_project_index_normalizer_keeps_target_references_without_source_facts() -> None:
+    value = {
+        "people": [{
+            **_element(
+                "person-local",
+                occurrences=[{"segment_index": 1, "frame_orders": [1]}],
+            ),
+            "target_reference_image_ids": ["image_1", "image_3"],
+        }],
+        "entities": [{
+            **_element(
+                "bag-local",
+                occurrences=[{"segment_index": 3, "frame_orders": [2]}],
+            ),
+            "target_reference_image_ids": ["image_2"],
+        }],
+        "scenes": [],
+        "relations": [],
+    }
+
+    normalized = normalize_project_index(
+        value,
+        reference_image_ids=["image_1", "image_2", "image_3", "image_4"],
+    )
+
+    assert normalized["people"]["person-01"]["target_reference_image_ids"] == [
+        "image_1", "image_3",
+    ]
+    assert normalized["entities"]["entity-01"]["target_reference_image_ids"] == [
+        "image_2",
+    ]
+    assert normalized["people"]["person-01"]["occurrences"] == [
+        {"segment_index": 1, "frame_orders": [1]},
+    ]
+    assert normalized["entities"]["entity-01"]["occurrences"] == [
+        {"segment_index": 3, "frame_orders": [2]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "target_reference_image_ids",
+    [["image_1", "image_1"], ["unknown-image"]],
+)
+def test_project_index_normalizer_rejects_invalid_target_reference_ids(
+    target_reference_image_ids: list[str],
+) -> None:
+    value = {
+        "people": [{
+            **_element("person-local"),
+            "target_reference_image_ids": target_reference_image_ids,
+        }],
+        "entities": [],
+        "scenes": [],
+        "relations": [],
+    }
+
+    with pytest.raises(ValueError, match="reference image IDs"):
+        normalize_project_index(
+            value,
+            reference_image_ids=["image_1", "image_2"],
+        )
+
+
+def test_project_index_normalizer_drops_target_references_for_legacy_calls() -> None:
+    normalized = normalize_project_index({
+        "people": [{
+            **_element("person-local"),
+            "target_reference_image_ids": ["image_1"],
+        }],
+        "entities": [],
+        "scenes": [],
+        "relations": [],
+    })
+
+    assert "target_reference_image_ids" not in normalized["people"]["person-01"]
+
+
 def test_project_index_normalizer_tolerates_extra_segment_metrics_key() -> None:
     normalized = normalize_project_index({
         "people": [],

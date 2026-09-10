@@ -28,6 +28,9 @@ REPLACEMENT_SHEET_HEIGHT = 2048
 
 _ELEMENT_CATEGORIES = ("people", "entities", "scenes")
 _REPLACEMENT_SOURCES = {"image_1", "generated_variant"}
+_REFERENCE_IMAGE_IDS = frozenset(
+    f"image_{index}" for index in range(1, 5)
+)
 _SPEC_KEYS = {
     "schema",
     "version",
@@ -48,6 +51,7 @@ _V2_TILE_KEYS = {
     "source",
     "appearance_description",
 }
+_OPTIONAL_V2_TILE_KEYS = {"reference_image_ids"}
 _PNG_PARAMETERS = [cv2.IMWRITE_PNG_COMPRESSION, 3]
 
 
@@ -115,6 +119,48 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _normalized_reference_image_ids(value: object) -> list[str]:
+    """Validate the ordered target-reference identifiers carried by one tile."""
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > len(_REFERENCE_IMAGE_IDS)
+        or any(reference_id not in _REFERENCE_IMAGE_IDS for reference_id in value)
+        or len(value) != len(set(value))
+    ):
+        raise ValueError("replacement sheet reference image IDs are invalid")
+    return list(value)
+
+
+def _tile_reference_image_ids(tile: Mapping[str, Any]) -> list[str]:
+    """Return a tile's target evidence, preserving single-image v2 artifacts."""
+    if "reference_image_ids" in tile:
+        return _normalized_reference_image_ids(tile["reference_image_ids"])
+    return ["image_1"] if tile.get("source") == "image_1" else []
+
+
+def _reference_input_number(reference_id: str) -> int:
+    """Map ``image_N`` provenance to the canvas-relative provider slot."""
+    return int(reference_id.removeprefix("image_")) + 1
+
+
+def _effective_user_image_count(
+    *,
+    user_image_present: bool,
+    user_image_count: int | None,
+) -> int:
+    """Use the legacy boolean only when callers do not supply a real count."""
+    if user_image_count is None:
+        return 1 if user_image_present else 0
+    if (
+        isinstance(user_image_count, bool)
+        or not isinstance(user_image_count, int)
+        or not 0 <= user_image_count <= len(_REFERENCE_IMAGE_IDS)
+    ):
+        raise ValueError("replacement sheet user-reference image count is invalid")
+    return user_image_count
+
+
 def replacement_sheet_spec_sha256(spec: Mapping[str, Any]) -> str:
     """Return the digest of a spec without its self-referential digest field."""
     payload = dict(spec)
@@ -165,7 +211,7 @@ def build_replacement_sheet_spec(
             raise ValueError("replacement sheet source is invalid")
         if not isinstance(appearance, str) or not appearance.strip():
             raise ValueError("replacement sheet appearance description is invalid")
-        tiles.append({
+        tile: dict[str, Any] = {
             "tile_id": f"TILE_{offset + 1:02d}",
             "category": category,
             "stable_key": stable_key,
@@ -173,7 +219,16 @@ def build_replacement_sheet_spec(
             "column": offset % columns + 1,
             "source": source,
             "appearance_description": appearance.strip(),
-        })
+        }
+        if "reference_image_ids" in replacement:
+            if source != "image_1":
+                raise ValueError(
+                    "generated replacement cannot bind user-reference images"
+                )
+            tile["reference_image_ids"] = _normalized_reference_image_ids(
+                replacement["reference_image_ids"],
+            )
+        tiles.append(tile)
 
     spec: dict[str, Any] = {
         "schema": REPLACEMENT_SHEET_SPEC_NAME,
@@ -222,6 +277,7 @@ def validate_replacement_sheet_spec(
         appearance = tile.get("appearance_description")
         if (
             not _V2_TILE_KEYS <= set(tile)
+            or not set(tile) <= (_V2_TILE_KEYS | _OPTIONAL_V2_TILE_KEYS)
             or tile.get("category") not in _ELEMENT_CATEGORIES
             or not isinstance(stable_key, str)
             or not stable_key
@@ -231,6 +287,15 @@ def validate_replacement_sheet_spec(
             or not appearance.strip()
         ):
             raise ValueError("replacement sheet v2 tile binding is invalid")
+        if "reference_image_ids" in tile:
+            if tile.get("source") != "image_1":
+                raise ValueError("replacement sheet v2 tile binding is invalid")
+            try:
+                _normalized_reference_image_ids(tile["reference_image_ids"])
+            except ValueError as exc:
+                raise ValueError(
+                    "replacement sheet v2 tile binding is invalid"
+                ) from exc
         stable_keys.add(stable_key)
     return tiles
 
@@ -325,14 +390,28 @@ def _draw_layout(image: np.ndarray, spec: Mapping[str, Any]) -> None:
 def _build_seedream_prompt(
     spec: Mapping[str, Any],
     *,
-    user_image_present: bool,
+    user_image_count: int,
     user_view_count: int = 1,
 ) -> str:
     image_bound_tiles = [
         tile for tile in spec["tiles"] if tile.get("source") == "image_1"
     ]
-    if image_bound_tiles and not user_image_present:
+    if image_bound_tiles and not user_image_count:
         raise ValueError("replacement sheet user-reference image is missing")
+    bound_reference_ids = {
+        reference_id
+        for tile in image_bound_tiles
+        for reference_id in _tile_reference_image_ids(tile)
+    }
+    if any(
+        _reference_input_number(reference_id) > user_image_count + 1
+        for reference_id in bound_reference_ids
+    ):
+        raise ValueError("replacement sheet user-reference image count is insufficient")
+    # composed 模式的多图合图是单一 provider 输入图（Image 2），多视角只经
+    # user_view_count 表达；direct 模式逐图直传时 user_view_count 恒为 1。
+    if user_view_count > 1 and user_image_count != 1:
+        raise ValueError("composed product views must be one provider image")
 
     lines = [
         "CREATE ONE PROJECT-WIDE REPLACEMENT REFERENCE SHEET.",
@@ -342,30 +421,69 @@ def _build_seedream_prompt(
         ),
         "Input Image 1 is the blank 2048x2048 row-major layout canvas.",
     ]
-    if user_image_present:
+    if user_image_count:
         if user_view_count > 1:
             lines.append(view_instruction(user_view_count, "Input Image 2"))
-        lines.extend([
-            (
-                "Input Image 2 is the user-reference image. In the frozen "
-                "Object Replace provenance, SOURCE=image_1 maps only to this "
-                "Seedream Input Image 2."
-            ),
-            (
-                "Input Image 2 may influence only tiles whose SOURCE is "
-                "exactly image_1. Tiles with SOURCE=generated_variant must "
-                "ignore it completely."
-            ),
-            (
-                "Multiple distinct stable keys may share the user-reference "
-                "appearance. For image_1 tiles referring to the same reference "
-                "subject, keep that subject's intrinsic appearance consistent "
-                "across cells; do not invent a different color, design, or "
-                "identity for each key. Each key still occupies its own cell "
-                "with only its own isolated subject; never merge cells or "
-                "copy the reference background or unrelated subjects."
-            ),
-        ])
+            lines.extend([
+                (
+                    "Input Image 2 is the user-reference image. In the frozen "
+                    "Object Replace provenance, SOURCE=image_1 maps only to this "
+                    "Seedream Input Image 2."
+                ),
+                (
+                    "Input Image 2 may influence only tiles whose SOURCE is "
+                    "exactly image_1. Tiles with SOURCE=generated_variant must "
+                    "ignore it completely."
+                ),
+                (
+                    "Multiple distinct stable keys may share the user-reference "
+                    "appearance. For image_1 tiles referring to the same reference "
+                    "subject, keep that subject's intrinsic appearance consistent "
+                    "across cells; do not invent a different color, design, or "
+                    "identity for each key. Each key still occupies its own cell "
+                    "with only its own isolated subject; never merge cells or "
+                    "copy the reference background or unrelated subjects."
+                ),
+            ])
+        else:
+            if user_image_count == 1:
+                lines.extend([
+                    (
+                        "Input Image 2 is the user-reference image. In the frozen "
+                        "Object Replace provenance, SOURCE=image_1 maps only to this "
+                        "Seedream Input Image 2."
+                    ),
+                    (
+                        "Input Image 2 may influence only tiles whose SOURCE is "
+                        "exactly image_1. Tiles with SOURCE=generated_variant must "
+                        "ignore it completely."
+                    ),
+                ])
+            else:
+                lines.extend(
+                    (
+                        f"Input Image {index + 1} is user-reference {index} "
+                        f"(reference_id=image_{index})."
+                    )
+                    for index in range(1, user_image_count + 1)
+                )
+            lines.extend([
+                (
+                    "Each bound tile's REFERENCE_IMAGE_IDS maps image_N to "
+                    "Input Image N+1. Use only that tile's listed target evidence "
+                    "to implement its frozen APPEARANCE instruction. Do not assume "
+                    "different user images depict one product, one person, or "
+                    "different views of one subject; the per-tile frozen instruction "
+                    "defines how its listed images apply."
+                ),
+                (
+                    "A user image outside a tile's REFERENCE_IMAGE_IDS must not "
+                    "influence that tile. Tiles with SOURCE=generated_variant must "
+                    "ignore every user-reference image completely. Each key still "
+                    "occupies its own cell with only its own isolated subject; never "
+                    "merge cells or copy a reference background or unrelated subject."
+                ),
+            ])
     else:
         lines.extend([
             (
@@ -429,6 +547,10 @@ def _build_seedream_prompt(
                     "APPEARANCE="
                     f"{json.dumps(tile.get('appearance_description'), ensure_ascii=False)}"
                 ),
+                (
+                    "REFERENCE_IMAGE_IDS="
+                    f"{json.dumps(_tile_reference_image_ids(tile), ensure_ascii=False)}"
+                ),
             ])
         )
     return "\n".join(lines).strip()
@@ -440,9 +562,14 @@ def materialize_replacement_sheet_inputs(
     *,
     user_image_present: bool = False,
     user_view_count: int = 1,
+    user_image_count: int | None = None,
 ) -> dict[str, Any]:
     """Atomically publish a v2 spec, backend prompt, and layout input image."""
     validate_replacement_sheet_spec(spec, allow_empty=False)
+    effective_user_image_count = _effective_user_image_count(
+        user_image_present=user_image_present,
+        user_image_count=user_image_count,
+    )
     canvas = np.full(
         (REPLACEMENT_SHEET_HEIGHT, REPLACEMENT_SHEET_WIDTH, 3),
         255,
@@ -451,7 +578,7 @@ def materialize_replacement_sheet_inputs(
     _draw_layout(canvas, spec)
     prompt = _build_seedream_prompt(
         spec,
-        user_image_present=user_image_present,
+        user_image_count=effective_user_image_count,
         user_view_count=user_view_count,
     )
 

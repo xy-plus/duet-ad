@@ -10,11 +10,15 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 
-def _object(properties: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
+def _object(
+    properties: Mapping[str, dict[str, Any]],
+    *,
+    required: Sequence[str] | None = None,
+) -> dict[str, Any]:
     return {
         "type": "object",
         "properties": dict(properties),
-        "required": list(properties),
+        "required": list(properties) if required is None else list(required),
         "additionalProperties": False,
     }
 
@@ -51,21 +55,56 @@ _RELATION_FRAME = _object({
 })
 
 
+def _reference_image_ids(
+    value: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise ValueError("project-index reference image IDs are invalid")
+    values = tuple(value)
+    if (
+        any(not isinstance(reference_id, str) or not reference_id
+               for reference_id in values)
+        or len(values) != len(set(values))
+    ):
+        raise ValueError("project-index reference image IDs are invalid")
+    return values
+
+
 def _project_index_schema(
     segment_index_schema: dict[str, Any],
     identity_evidence: Mapping[str, Any] | None = None,
+    reference_image_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     element_occurrence = _object({
         "segment_index": dict(segment_index_schema),
         "frame_orders": _array(_INT1, maximum=9),
     })
-    element = _object({
+    element_properties: dict[str, dict[str, Any]] = {
         "key": _TEXT,
         "source_visual_description": _TEXT,
         "occurrences": _array(element_occurrence),
         "replaceable": _TEXTS,
         "preserve": _TEXTS,
-    })
+    }
+    if reference_image_ids:
+        element_properties["target_reference_image_ids"] = _array(
+            {"type": "string", "enum": list(reference_image_ids)},
+            minimum=1,
+            maximum=len(reference_image_ids),
+        )
+        element_properties["target_reference_image_ids"]["uniqueItems"] = True
+    element = _object(
+        element_properties,
+        required=(
+            "key",
+            "source_visual_description",
+            "occurrences",
+            "replaceable",
+            "preserve",
+        ),
+    )
     relation_occurrence = _object({
         "segment_index": dict(segment_index_schema),
         "frames": _array(_RELATION_FRAME, maximum=9),
@@ -90,7 +129,11 @@ def _project_index_schema(
                 {"type": "string", "enum": list(observations)} if observations else _TEXT,
                 maximum=None if observations else 0,
             ),
-        })
+        }, required=[
+            *element["required"],
+            "canonical_id",
+            "identity_observation_ids",
+        ])
     return _object({
         "people": _array(person),
         "entities": _array(element),
@@ -108,6 +151,8 @@ PROJECT_INDEX_SCHEMA = _project_index_schema(_INT1)
 def project_index_schema(
     segment_indices: Sequence[int],
     identity_evidence: Mapping[str, Any] | None = None,
+    *,
+    reference_image_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Bind project-index occurrences to the exact input segment identities."""
     indices = list(segment_indices)
@@ -122,7 +167,11 @@ def project_index_schema(
         or len(indices) != len(set(indices))
     ):
         raise ValueError("project-index segment identities are invalid")
-    return _project_index_schema({"type": "integer", "enum": indices}, identity_evidence)
+    return _project_index_schema(
+        {"type": "integer", "enum": indices},
+        identity_evidence,
+        _reference_image_ids(reference_image_ids),
+    )
 
 
 def normalize_visual_prompt(value: object) -> str:
@@ -141,7 +190,10 @@ def normalize_visual_prompt(value: object) -> str:
 
 
 def _index_records(
-    value: object, *, fields: set[str],
+    value: object,
+    *,
+    fields: set[str],
+    optional_fields: frozenset[str] = frozenset(),
 ) -> list[tuple[str, dict[str, Any]]]:
     if not isinstance(value, list):
         raise ValueError("model output collection is invalid")
@@ -152,7 +204,13 @@ def _index_records(
         key = item.get("key")
         if not isinstance(key, str):
             raise ValueError("model output key is invalid")
-        indexed.append((key, {name: item[name] for name in fields}))
+        record = {name: item[name] for name in fields}
+        record.update({
+            name: item[name]
+            for name in optional_fields
+            if name in item
+        })
+        indexed.append((key, record))
     return indexed
 
 
@@ -252,7 +310,10 @@ def _merge_person(target: dict[str, Any], source: Mapping[str, Any]) -> None:
 
 
 def normalize_project_index(
-    value: object, identity_evidence: Mapping[str, Any] | None = None,
+    value: object,
+    identity_evidence: Mapping[str, Any] | None = None,
+    *,
+    reference_image_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Mechanically replace invocation-local aliases with stable backend keys."""
     if not isinstance(value, dict) or not {
@@ -262,14 +323,39 @@ def normalize_project_index(
     element_fields = {
         "source_visual_description", "occurrences", "replaceable", "preserve",
     }
+    allowed_reference_image_ids = _reference_image_ids(reference_image_ids)
+    optional_element_fields = (
+        frozenset({"target_reference_image_ids"})
+        if allowed_reference_image_ids else frozenset()
+    )
     discovered = {
-        category: _index_records(value[category], fields=element_fields)
+        category: _index_records(
+            value[category],
+            fields=element_fields,
+            optional_fields=optional_element_fields,
+        )
         for category in ("people", "entities", "scenes")
     }
     discovered["relations"] = _index_records(value["relations"], fields={
         "subject_key", "predicate", "object_key", "occurrences", "preserve",
         "replace_together",
     })
+    if allowed_reference_image_ids:
+        allowed = set(allowed_reference_image_ids)
+        for category in ("people", "entities", "scenes"):
+            for _key, record in discovered[category]:
+                if "target_reference_image_ids" not in record:
+                    continue
+                target_reference_image_ids = _reference_image_ids(
+                    record["target_reference_image_ids"],
+                )
+                if not set(target_reference_image_ids) <= allowed:
+                    raise ValueError(
+                        "project-index target reference image IDs are invalid",
+                    )
+                record["target_reference_image_ids"] = list(
+                    target_reference_image_ids,
+                )
 
     result: dict[str, Any] = {}
     alias_candidates: dict[str, list[str]] = {}

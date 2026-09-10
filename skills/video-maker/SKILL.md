@@ -9,7 +9,7 @@ description: 分析后端为每个 segment 冻结的 9 张原始关键帧并生�
 
 ## 逐段分析
 
-项目统一为 `segments[N>=1]`。每次只处理当前 segment 的 `work/keyframes/01.png` 至 `09.png`、联系表和 `manifest.json`；像素证据优先于辅助信息。九帧由后端按源时间冻结，模型无权选帧或修改其数量、顺序和字节。
+项目统一为 `segments[N>=1]`。每次只处理当前 segment 的 `work/keyframes/01.png` 至 `09.png`、联系表和 `manifest.json`；像素证据优先于辅助信息。九帧由后端按源时间冻结，模型无权选帧或修改其数量、顺序和字节。若 payload 另带 `user_reference_images[{reference_id,image_reference,sha256}]` 和 `user_replacement_instruction`，它们只属于后续目标替换，不能作为源视频像素证据，不能据此新增、合并、拆分或补写人物、实体、场景、occurrences 或 relations；本节点不解释或重排这些编号。
 
 1. 按 01 至 09 顺序查看全部冻结帧；提取主体、场景、对象、动作、结果、镜头、构图、转场、空间关系和因果。
 2. 只据已查看帧生成视觉提示词：使用用户语言，描述可见主体与对象、镜头与构图、按图片顺序的动作因果、相对节奏和 segment 时间轴；与源片段时长一致但不写具体秒数，不引入优化后内容、声音或不可见事实。
@@ -18,7 +18,7 @@ description: 分析后端为每个 segment 冻结的 9 张原始关键帧并生�
 
 ## 项目级索引
 
-仅当 `work/project_index_request.json` 声明 `phase="project_index"` 时执行一次。输入是所有 segment 的半尺寸分析副本及 SHA，以及各段已完成的 `visual_prompt` 防漏清单；按 segment、frame 顺序查看全部帧，不读取 `prompt.txt`，只输出元素索引。
+仅当 `work/project_index_request.json` 声明 `phase="project_index"` 时执行一次。输入是所有 segment 的半尺寸分析副本及 SHA，以及各段已完成的 `visual_prompt` 防漏清单；按 segment、frame 顺序查看全部帧，不读取 `prompt.txt`，只输出元素索引。用户参考图和替换说明即使随 payload 同时传入，也只证明期望的目标外观，绝不能被当作源视频中已有对象或跨帧同一性的证据。
 
 先逐帧列出直接可见的人物、可独立移动或被动作作用的持久实体、场景以及元素间关系，再跨帧回查并合并。用调用内唯一的中性 `key` 互相引用，不要编码源属性；后端会机械分配稳定 ID。同一实例逐字复用；证据不足、特征冲突或同类实例可分别移动/接触时分开。硬切后重新依据当前帧确认；位置、相邻帧、服装颜色或叙事角色不能单独证明同一性。碎片、倒影、残影、模糊、过渡扫到的背景杂物不升格；occurrence 只记录当前帧可证实内容。
 

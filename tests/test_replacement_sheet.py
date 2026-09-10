@@ -28,17 +28,21 @@ def _replacement(
     source: str = "generated_variant",
     target: str = "TARGET_ACTION_RELATION_SENTINEL",
     occurrences: object = None,
+    reference_image_ids: list[str] | None = None,
 ) -> dict[str, object]:
+    replacement: dict[str, object] = {
+        "source": source,
+        "target_visual_description": target,
+        "appearance_description": appearance,
+    }
+    if reference_image_ids is not None:
+        replacement["reference_image_ids"] = reference_image_ids
     return {
         "source_visual_description": "SOURCE_VISUAL_SENTINEL",
         "occurrences": (
             ["OCCURRENCE_SENTINEL"] if occurrences is None else occurrences
         ),
-        "replacement": {
-            "source": source,
-            "target_visual_description": target,
-            "appearance_description": appearance,
-        },
+        "replacement": replacement,
     }
 
 
@@ -331,6 +335,181 @@ def test_materialize_rejects_missing_user_image_for_bound_tile(
         )
 
 
+def test_materialize_maps_each_bound_tile_to_its_ordered_user_images(
+    tmp_path: Path,
+) -> None:
+    spec = build_replacement_sheet_spec(
+        {
+            "people": {},
+            "entities": {
+                "entity-01": _replacement(
+                    "hand-painted yellow ceramic mug",
+                    source="image_1",
+                    reference_image_ids=["image_1", "image_3"],
+                ),
+                "entity-02": _replacement(
+                    "small red leather wallet",
+                    source="image_1",
+                    reference_image_ids=["image_2", "image_4"],
+                ),
+                "entity-03": _replacement("brushed steel teaspoon"),
+            },
+            "scenes": {},
+            "relations": {},
+        },
+    )
+
+    assert spec["tiles"][0]["reference_image_ids"] == ["image_1", "image_3"]
+    assert spec["tiles"][1]["reference_image_ids"] == ["image_2", "image_4"]
+    assert "reference_image_ids" not in spec["tiles"][2]
+    result = materialize_replacement_sheet_inputs(
+        tmp_path / "sheet",
+        spec,
+        user_image_count=4,
+    )
+    prompt = result["prompt"]
+    assert "Input Image 2 is user-reference 1 (reference_id=image_1)." in prompt
+    assert "Input Image 3 is user-reference 2 (reference_id=image_2)." in prompt
+    assert "Input Image 4 is user-reference 3 (reference_id=image_3)." in prompt
+    assert "Input Image 5 is user-reference 4 (reference_id=image_4)." in prompt
+    assert 'stable_key="entity-01" | SOURCE="image_1" | APPEARANCE="hand-painted yellow ceramic mug" | REFERENCE_IMAGE_IDS=["image_1", "image_3"]' in prompt
+    assert 'stable_key="entity-02" | SOURCE="image_1" | APPEARANCE="small red leather wallet" | REFERENCE_IMAGE_IDS=["image_2", "image_4"]' in prompt
+    assert 'stable_key="entity-03" | SOURCE="generated_variant" | APPEARANCE="brushed steel teaspoon" | REFERENCE_IMAGE_IDS=[]' in prompt
+    assert "Do not assume different user images depict one product" in prompt
+    assert "SOURCE=generated_variant must ignore every user-reference image completely" in prompt
+
+
+@pytest.mark.parametrize("user_image_count", [1, 2, 3, 4])
+def test_materialize_accepts_each_supported_user_image_count(
+    tmp_path: Path,
+    user_image_count: int,
+) -> None:
+    reference_id = f"image_{user_image_count}"
+    spec = build_replacement_sheet_spec(
+        {
+            "people": {},
+            "entities": {
+                "entity-01": _replacement(
+                    "a target-bound object",
+                    source="image_1",
+                    reference_image_ids=[reference_id],
+                ),
+            },
+            "scenes": {},
+            "relations": {},
+        },
+    )
+
+    prompt = materialize_replacement_sheet_inputs(
+        tmp_path / f"sheet-{user_image_count}",
+        spec,
+        user_image_count=user_image_count,
+    )["prompt"]
+    assert f"REFERENCE_IMAGE_IDS=[\"{reference_id}\"]" in prompt
+    assert f"Input Image {user_image_count + 1}" in prompt
+
+
+@pytest.mark.parametrize(
+    "reference_image_ids",
+    [
+        [],
+        ["image_5"],
+        ["image_1", "image_1"],
+        "image_1",
+    ],
+)
+def test_spec_rejects_malformed_reference_image_ids(
+    reference_image_ids: object,
+) -> None:
+    enhanced = {
+        "people": {},
+        "entities": {
+            "entity-01": _replacement(
+                "a reference-bound object",
+                source="image_1",
+                reference_image_ids=reference_image_ids,  # type: ignore[arg-type]
+            ),
+        },
+        "scenes": {},
+        "relations": {},
+    }
+    with pytest.raises(ValueError, match="reference image IDs"):
+        build_replacement_sheet_spec(enhanced)
+
+
+def test_materialize_rejects_reference_image_beyond_supplied_count(
+    tmp_path: Path,
+) -> None:
+    spec = build_replacement_sheet_spec(
+        {
+            "people": {},
+            "entities": {
+                "entity-01": _replacement(
+                    "a reference-bound object",
+                    source="image_1",
+                    reference_image_ids=["image_3"],
+                ),
+            },
+            "scenes": {},
+            "relations": {},
+        },
+    )
+    with pytest.raises(ValueError, match="count is insufficient"):
+        materialize_replacement_sheet_inputs(
+            tmp_path / "sheet",
+            spec,
+            user_image_count=2,
+        )
+
+
+def test_validation_rejects_tampered_reference_image_ids() -> None:
+    spec = build_replacement_sheet_spec(
+        {
+            "people": {},
+            "entities": {
+                "entity-01": _replacement(
+                    "a reference-bound object",
+                    source="image_1",
+                    reference_image_ids=["image_1"],
+                ),
+            },
+            "scenes": {},
+            "relations": {},
+        },
+    )
+    spec["tiles"][0]["reference_image_ids"] = ["image_5"]
+    spec["spec_sha256"] = replacement_sheet_spec_sha256(spec)
+
+    with pytest.raises(ValueError, match="v2 tile binding"):
+        validate_replacement_sheet_spec(spec)
+
+
+def test_single_image_legacy_tile_defaults_to_image_1(
+    tmp_path: Path,
+) -> None:
+    spec = build_replacement_sheet_spec(
+        {
+            "people": {},
+            "entities": {
+                "entity-01": _replacement(
+                    "legacy user-reference object",
+                    source="image_1",
+                ),
+            },
+            "scenes": {},
+            "relations": {},
+        },
+    )
+    assert "reference_image_ids" not in spec["tiles"][0]
+    prompt = materialize_replacement_sheet_inputs(
+        tmp_path / "sheet",
+        spec,
+        user_image_present=True,
+    )["prompt"]
+    assert "Input Image 2 is the user-reference image." in prompt
+    assert 'REFERENCE_IMAGE_IDS=["image_1"]' in prompt
+
+
 def test_multiple_keys_share_reference_without_merging_tiles_or_relations(tmp_path: Path) -> None:
     shared = "small blue plush bear with cream muzzle and round ears"
     enhanced = {
@@ -354,7 +533,7 @@ def test_multiple_keys_share_reference_without_merging_tiles_or_relations(tmp_pa
     prompt = result["prompt"]
     for tile in spec["tiles"][:2]:
         assert f'stable_key="{tile["stable_key"]}" | SOURCE="image_1" | APPEARANCE="{shared}"' in prompt
-    assert "Multiple distinct stable keys may share the user-reference appearance" in prompt
+    assert "Each bound tile's REFERENCE_IMAGE_IDS maps image_N" in prompt
     assert "SOURCE=generated_variant must ignore it completely" in prompt
     assert "bear held in left hand" not in prompt
     assert "bear displayed on shelf" not in prompt
@@ -365,7 +544,9 @@ def test_multiple_keys_share_reference_without_merging_tiles_or_relations(tmp_pa
     for tile in spec["tiles"]:
         line = next(line for line in authority.splitlines() if line.startswith(f'- {tile["stable_key"]} | REPLACE'))
         assert f'Image 1, {tile["tile_id"]}' in line
-        assert ("designed from the user image Image 2" in line) == (tile["source"] == "image_1")
+        assert (
+            "original user references Image 2 are appearance authority" in line
+        ) == (tile["source"] == "image_1")
     assert "bear held in left hand" in authority
     assert "bear displayed on shelf" in authority
     assert Pipeline._enhanced_index_uses_user_image(enhanced)

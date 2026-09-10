@@ -22,6 +22,11 @@ _REPLACEMENT_KEYS = {
     "target_visual_description",
     "appearance_description",
 }
+_REPLACEMENT_FIELDS = (
+    "source",
+    "target_visual_description",
+    "appearance_description",
+)
 _REPLACEMENT_SOURCES = {"image_1", "generated_variant"}
 
 
@@ -94,9 +99,70 @@ def _catalog_ids(voice_ids: Collection[str]) -> tuple[str, ...]:
     return values
 
 
+def _reference_image_ids(
+    value: object,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)):
+        raise ValueError("object-replace reference image IDs are invalid")
+    try:
+        values = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("object-replace reference image IDs are invalid") from exc
+    if (
+        (not values and not allow_empty)
+        or any(not isinstance(reference_id, str) or not reference_id
+               for reference_id in values)
+        or len(values) != len(set(values))
+    ):
+        raise ValueError("object-replace reference image IDs are invalid")
+    return values
+
+
+def _payload_reference_image_ids(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    references = payload.get("user_reference_images")
+    if references is None:
+        return ("image_1",) if payload.get("has_user_image") is True else ()
+    if not isinstance(references, list):
+        raise ValueError("object-replace reference images are invalid")
+    return _reference_image_ids([
+        reference.get("reference_id")
+        if isinstance(reference, Mapping) else None
+        for reference in references
+    ], allow_empty=True)
+
+
+def _replacement_object(
+    *,
+    sources: Collection[str],
+    reference_image_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    properties: dict[str, dict[str, Any]] = {
+        "source": {"type": "string", "enum": sorted(sources)},
+        "target_visual_description": {"type": "string"},
+        "appearance_description": {"type": "string"},
+    }
+    if reference_image_ids is not None:
+        properties["reference_image_ids"] = {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": len(reference_image_ids),
+            "uniqueItems": True,
+            "items": {"type": "string", "enum": list(reference_image_ids)},
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(_REPLACEMENT_FIELDS),
+        "additionalProperties": False,
+    }
+
+
 def _replacement_schema(
     *,
     allow_user_image_binding: bool,
+    reference_image_ids: Sequence[str],
     voice_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     replacement_sources = (
@@ -104,12 +170,12 @@ def _replacement_schema(
         if allow_user_image_binding
         else {"generated_variant"}
     )
-    properties: dict[str, dict[str, Any]] = {
-        "source": {"type": "string", "enum": sorted(replacement_sources)},
-        "target_visual_description": {"type": "string"},
-        "appearance_description": {"type": "string"},
-    }
-    replacement = _closed_object(properties)
+    replacement = _replacement_object(
+        sources=replacement_sources,
+        reference_image_ids=(
+            reference_image_ids if allow_user_image_binding else None
+        ),
+    )
     patch_properties: dict[str, dict[str, Any]] = {
         "matches_user_request": (
             {"type": "boolean"}
@@ -132,19 +198,19 @@ def _replacement_schema(
             "type": "boolean",
             "enum": [True],
         }
-        image_patch_properties["replacement"] = copy.deepcopy(replacement)
-        image_patch_properties["replacement"]["properties"]["source"][
-            "enum"
-        ] = ["image_1"]
+        image_patch_properties["replacement"] = _replacement_object(
+            sources={"image_1"},
+            reference_image_ids=reference_image_ids,
+        )
 
         generated_patch_properties = copy.deepcopy(patch_properties)
         generated_patch_properties["matches_user_request"] = {
             "type": "boolean",
             "enum": [False],
         }
-        generated_patch_properties["replacement"]["properties"]["source"][
-            "enum"
-        ] = ["generated_variant"]
+        generated_patch_properties["replacement"] = _replacement_object(
+            sources={"generated_variant"},
+        )
         patch_schema["anyOf"] = [
             _closed_object(image_patch_properties),
             _closed_object(generated_patch_properties),
@@ -165,8 +231,9 @@ def object_replace_schema(
     catalog_ids = _catalog_ids(voice_ids)
     input_sha256 = hashlib.sha256(canonical_input(payload)).hexdigest()
     user_instruction = payload.get("user_replacement_instruction")
+    reference_image_ids = _payload_reference_image_ids(payload)
     allow_user_image_binding = (
-        payload.get("has_user_image") is True
+        bool(reference_image_ids)
         and isinstance(user_instruction, str)
         and bool(user_instruction.strip())
     )
@@ -177,6 +244,7 @@ def object_replace_schema(
         for stable_id in element_ids[category]:
             patch_schema = _replacement_schema(
                 allow_user_image_binding=allow_user_image_binding,
+                reference_image_ids=reference_image_ids,
                 voice_ids=catalog_ids if category == "people" else None,
             )
             properties[stable_id] = patch_schema
@@ -202,7 +270,9 @@ def object_replace_schema(
 
 def _normalize_replacement(
     value: object,
-) -> dict[str, str]:
+    *,
+    allowed_reference_image_ids: Collection[str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, dict) or not _REPLACEMENT_KEYS <= set(value):
         raise ValueError("object-replace replacement is invalid")
     source = value["source"]
@@ -217,11 +287,22 @@ def _normalize_replacement(
     appearance_description = appearance_description.strip()
     if not appearance_description:
         raise ValueError("object-replace appearance description is empty")
-    return {
+    normalized: dict[str, Any] = {
         "source": source,
         "target_visual_description": description,
         "appearance_description": appearance_description,
     }
+    if "reference_image_ids" not in value:
+        return normalized
+    if source != "image_1":
+        raise ValueError("object-replace replacement reference IDs are invalid")
+    reference_image_ids = _reference_image_ids(value["reference_image_ids"])
+    if allowed_reference_image_ids is not None:
+        allowed = set(_reference_image_ids(allowed_reference_image_ids))
+        if not set(reference_image_ids) <= allowed:
+            raise ValueError("object-replace replacement reference IDs are invalid")
+    normalized["reference_image_ids"] = list(reference_image_ids)
+    return normalized
 
 
 def _normalize_dialogue_voices(
@@ -255,10 +336,15 @@ def normalize_object_replace(
     has_user_image: bool,
     user_instruction: str,
     dialogue_line_count: int,
+    reference_image_ids: Collection[str] | None = None,
 ) -> dict[str, Any]:
     """Normalize the closed transport shape without judging model quality."""
     element_ids = _element_ids(element_index)
     catalog_ids = set(_catalog_ids(voice_ids))
+    allowed_reference_image_ids = (
+        _reference_image_ids(reference_image_ids, allow_empty=True)
+        if reference_image_ids is not None else None
+    )
     expected_top_level = {
         "schema",
         "version",
@@ -298,7 +384,10 @@ def normalize_object_replace(
             matches_user_request = patch["matches_user_request"]
             if not isinstance(matches_user_request, bool):
                 raise ValueError("object-replace match flag is invalid")
-            replacement = _normalize_replacement(patch["replacement"])
+            replacement = _normalize_replacement(
+                patch["replacement"],
+                allowed_reference_image_ids=allowed_reference_image_ids,
+            )
             uses_image_1 = replacement["source"] == "image_1"
             if uses_image_1:
                 image_1_locations.append((category, stable_id))

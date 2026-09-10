@@ -66,7 +66,7 @@ def _replacement(
     source: str,
     description: str,
     appearance: str = "isolated new appearance",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     return {
         "source": source,
         "target_visual_description": description,
@@ -249,6 +249,7 @@ def _normalize(
     has_user_image: bool = True,
     instruction: str = "replace the held product",
     dialogue_line_count: int = 0,
+    reference_image_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     return normalize_object_replace(
         value,
@@ -258,6 +259,7 @@ def _normalize(
         has_user_image=has_user_image,
         user_instruction=instruction,
         dialogue_line_count=dialogue_line_count,
+        reference_image_ids=reference_image_ids,
     )
 
 
@@ -344,6 +346,137 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
             ]["enum"] == ["generated_variant"]
 
 
+def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
+    element_index = _index()
+    payload = _payload(element_index)
+    payload["user_reference_images"] = [
+        {"reference_id": reference_id, "sha256": "a" * 64}
+        for reference_id in ("image_1", "image_2", "image_3", "image_4")
+    ]
+
+    schema, _digest = object_replace_schema(payload, VOICE_IDS)
+
+    expected_reference_ids = {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 4,
+        "uniqueItems": True,
+        "items": {
+            "type": "string",
+            "enum": ["image_1", "image_2", "image_3", "image_4"],
+        },
+    }
+    for category in ("people", "entities", "scenes"):
+        for patch_schema in schema["properties"][category]["properties"].values():
+            replacement = patch_schema["properties"]["replacement"]
+            assert replacement["required"] == [
+                "source",
+                "target_visual_description",
+                "appearance_description",
+            ]
+            assert replacement["properties"]["reference_image_ids"] == (
+                expected_reference_ids
+            )
+            image_branch, generated_branch = patch_schema["anyOf"]
+            assert image_branch["properties"]["replacement"]["properties"][
+                "reference_image_ids"
+            ] == expected_reference_ids
+            assert "reference_image_ids" not in generated_branch["properties"][
+                "replacement"
+            ]["properties"]
+
+
+def test_normalizer_preserves_multiple_user_reference_ids_per_stable_key() -> None:
+    element_index = _index()
+    payload = _payload(element_index)
+    payload["user_reference_images"] = [
+        {"reference_id": reference_id}
+        for reference_id in ("image_1", "image_2", "image_3", "image_4")
+    ]
+    _schema, digest = object_replace_schema(payload, VOICE_IDS)
+    value = _output(element_index, digest)
+    value["people"]["person-01"]["replacement"]["reference_image_ids"] = [
+        "image_1", "image_3",
+    ]
+    value["entities"]["entity-01"] = {
+        "matches_user_request": True,
+        "replacement": {
+            **_replacement("image_1", "entity-01"),
+            "reference_image_ids": ["image_2"],
+        },
+    }
+
+    normalized = _normalize(
+        value,
+        digest=digest,
+        element_index=element_index,
+        reference_image_ids=["image_1", "image_2", "image_3", "image_4"],
+    )
+    merged = merge_object_replace_index(element_index, normalized, {})
+
+    assert normalized["people"]["person-01"]["replacement"][
+        "reference_image_ids"
+    ] == ["image_1", "image_3"]
+    assert normalized["entities"]["entity-01"]["replacement"][
+        "reference_image_ids"
+    ] == ["image_2"]
+    assert merged["people"]["person-01"]["replacement"][
+        "reference_image_ids"
+    ] == ["image_1", "image_3"]
+    assert merged["entities"]["entity-01"]["replacement"][
+        "reference_image_ids"
+    ] == ["image_2"]
+
+
+def test_normalizer_keeps_legacy_image_binding_without_reference_ids() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+
+    normalized = _normalize(
+        _output(element_index, digest),
+        digest=digest,
+        element_index=element_index,
+    )
+
+    assert "reference_image_ids" not in normalized["people"]["person-01"][
+        "replacement"
+    ]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {
+            **_replacement("generated_variant", "entity-01"),
+            "reference_image_ids": ["image_1"],
+        },
+        {
+            **_replacement("image_1", "entity-01"),
+            "reference_image_ids": ["image_1", "image_1"],
+        },
+        {
+            **_replacement("image_1", "entity-01"),
+            "reference_image_ids": ["image_9"],
+        },
+    ],
+)
+def test_normalizer_rejects_unusable_reference_image_ids(
+    replacement: dict[str, Any],
+) -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"]["entity-01"]["replacement"] = replacement
+
+    with pytest.raises(ValueError, match="reference"):
+        _normalize(
+            value,
+            digest=digest,
+            element_index=element_index,
+            reference_image_ids=["image_1", "image_2"],
+        )
+
+
 @pytest.mark.parametrize(
     ("has_user_image", "instruction"),
     [(False, "replace the held product"), (True, "  \n\t  ")],
@@ -370,6 +503,23 @@ def test_schema_forbids_image_1_without_an_explicit_image_request(
             assert patch_schema["properties"]["replacement"]["properties"][
                 "source"
             ]["enum"] == ["generated_variant"]
+
+
+def test_schema_accepts_an_empty_reference_list_without_a_user_image() -> None:
+    element_index = _index()
+    payload = _payload(element_index)
+    payload["has_user_image"] = False
+    payload["user_replacement_image"] = None
+    payload["user_replacement_instruction"] = ""
+    payload["user_reference_images"] = []
+
+    schema, _digest = object_replace_schema(payload, VOICE_IDS)
+
+    for category in ("people", "entities", "scenes"):
+        for patch_schema in schema["properties"][category]["properties"].values():
+            assert "reference_image_ids" not in patch_schema["properties"][
+                "replacement"
+            ]["properties"]
 
 
 @pytest.mark.parametrize(
