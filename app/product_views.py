@@ -59,8 +59,11 @@ def compose_product_views(project: Path, sources: list[Path]) -> Path:
         if existing["sources"] != source_receipts:
             raise ValueError("frozen product view order changed")
         return project / REFERENCE
-    columns = 2 if len(sources) == 4 else len(sources)
-    rows = 2 if len(sources) == 4 else 1
+    # H3 accepts reference aspect ratios only in [0.4, 2.5]. Three
+    # horizontal cells were 3:1; use two columns with one unlabelled blank
+    # cell for three views. Frozen composites above are deliberately reused.
+    columns = 2
+    rows = 2 if len(sources) >= 3 else 1
     canvas = Image.new("RGB", (columns*CELL_SIZE, rows*CELL_SIZE), "white")
     drawing = ImageDraw.Draw(canvas)
     views = []
@@ -71,7 +74,17 @@ def compose_product_views(project: Path, sources: list[Path]) -> Path:
             # or stretch; no invented front/side/back interpretation.
             background = Image.new("RGBA", image.size, "white")
             background.alpha_composite(image)
-            fitted = ImageOps.contain(background.convert("RGB"), (CELL_SIZE-24,CELL_SIZE-LABEL_HEIGHT-24))
+            bounds = (CELL_SIZE-24,CELL_SIZE-LABEL_HEIGHT-24)
+            scale = min(bounds[0]/image.width, bounds[1]/image.height)
+            # An extreme aspect ratio may round the short edge to zero in
+            # ImageOps.contain. One pixel is the minimum representable edge.
+            if min(round(image.width*scale),round(image.height*scale)) < 1:
+                fitted = background.convert("RGB").resize(
+                    (max(1,round(image.width*scale)), max(1,round(image.height*scale))),
+                    resample=Image.Resampling.BICUBIC,
+                )
+            else:
+                fitted = ImageOps.contain(background.convert("RGB"), bounds)
         x, y = (index % columns)*CELL_SIZE, (index // columns)*CELL_SIZE
         left, top = x+(CELL_SIZE-fitted.width)//2, y+LABEL_HEIGHT+(CELL_SIZE-LABEL_HEIGHT-fitted.height)//2
         canvas.paste(fitted, (left, top))
