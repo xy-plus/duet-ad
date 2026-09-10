@@ -12,6 +12,7 @@ from typing import Awaitable, Callable, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
+from app.reference_proxy import ReferenceTransport
 
 
 ResolverResult = Sequence[str | ipaddress.IPv4Address | ipaddress.IPv6Address]
@@ -183,7 +184,7 @@ async def download_reference_url(
         async with (
             asyncio.timeout(timeout_s),
             httpx.AsyncClient(
-                transport=transport,
+                transport=transport if transport is not None else ReferenceTransport(),
                 trust_env=False,
                 follow_redirects=False,
                 timeout=timeout_s,
