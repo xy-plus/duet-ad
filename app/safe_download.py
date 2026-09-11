@@ -14,7 +14,7 @@ from typing import Awaitable, Callable, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
-from app.reference_proxy import ReferenceTransport
+from app.reference_proxy import ReferenceTransport, configured_proxy
 
 
 ResolverResult = Sequence[str | ipaddress.IPv4Address | ipaddress.IPv6Address]
@@ -106,6 +106,32 @@ async def resolve_addresses(hostname: str, port: int) -> ResolverResult:
     return [record[4][0] for record in records if record[0] in {socket.AF_INET, socket.AF_INET6}]
 
 
+async def _doh_addresses(hostname: str, proxy: str, *, transport=None) -> ResolverResult:
+    """Restore the old downloader's proxy-side Cloudflare A-record lookup.
+
+    Fixed numeric bootstrap avoids local DNS. Failure never falls back to local
+    resolution; callers still validate/filter all returned addresses before use.
+    """
+    options = {"transport": transport} if transport is not None else {"proxy": proxy}
+    async with httpx.AsyncClient(**options, trust_env=False,
+                                 follow_redirects=False, timeout=None) as client:
+        async with client.stream("GET", "https://1.1.1.1/dns-query",
+                params={"name": hostname, "type": "A"}, headers={"Accept": "application/dns-json"}) as response:
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > 1024 * 1024:
+                    raise ValueError("DoH response too large")
+        payload = json.loads(body)
+    answers = payload.get("Answer") if isinstance(payload, dict) else None
+    addresses = [item["data"] for item in answers or []
+                 if isinstance(item, dict) and item.get("type") == 1 and isinstance(item.get("data"), str)]
+    if not addresses:
+        raise ValueError("DoH returned no A records")
+    return addresses
+
+
 def _invalid(message: str = "视频链接无效") -> ReferenceDownloadError:
     return ReferenceDownloadError("invalid_reference_url", message, status_code=400)
 
@@ -143,7 +169,8 @@ async def _approved_target(url: str, resolver: Resolver) -> ApprovedTarget:
         raw_addresses: ResolverResult = [numeric_host]
     except ValueError:
         try:
-            result = resolver(ascii_hostname, port)
+            proxy = configured_proxy(scheme) if resolver is resolve_addresses else None
+            result = _doh_addresses(ascii_hostname, proxy) if proxy else resolver(ascii_hostname, port)
             raw_addresses = await result if inspect.isawaitable(result) else result
         except Exception as exc:
             raise _invalid("视频链接无法解析") from exc
