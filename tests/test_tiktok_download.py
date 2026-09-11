@@ -8,6 +8,76 @@ from app.safe_download import ReferenceDownloadError, download_reference_url, is
 PAGE = "https://www.tiktok.com/@person/video/123456"
 
 
+@pytest.fixture(autouse=True)
+def no_real_retry_wait(monkeypatch):
+    async def sleep(_seconds):
+        return None
+    monkeypatch.setattr("app.safe_download.asyncio.sleep", sleep)
+
+
+@pytest.mark.parametrize("failures", [0, 1, 2, 3])
+def test_parser_retry_count_and_interval(monkeypatch, failures):
+    from app.safe_download import _resolve_tiktok_with_retries
+    calls, sleeps = [], []
+    async def parser(*_args):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise ReferenceDownloadError("tiktok_resolution_failed", "failed", status_code=422)
+        return "https://cdn.example/video"
+    async def sleep(seconds):
+        sleeps.append(seconds)
+    monkeypatch.setattr("app.safe_download._tiktok_media_url", parser)
+    monkeypatch.setattr("app.safe_download.asyncio.sleep", sleep)
+    if failures == 3:
+        with pytest.raises(ReferenceDownloadError):
+            asyncio.run(_resolve_tiktok_with_retries(PAGE, None, None))
+    else:
+        assert asyncio.run(_resolve_tiktok_with_retries(PAGE, None, None)) == "https://cdn.example/video"
+    assert len(calls) == min(failures + 1, 3)
+    assert sleeps == [10] * min(failures, 2)
+
+
+@pytest.mark.parametrize("exception", [asyncio.CancelledError(), TimeoutError(), ReferenceDownloadError("reference_url_forbidden", "private", status_code=400)])
+def test_parser_cancellation_timeout_and_unsafe_url_never_retry(monkeypatch, exception):
+    from app.safe_download import _resolve_tiktok_with_retries
+    calls = []
+    async def parser(*_args):
+        calls.append(1)
+        raise exception
+    monkeypatch.setattr("app.safe_download._tiktok_media_url", parser)
+    with pytest.raises(type(exception)):
+        asyncio.run(_resolve_tiktok_with_retries(PAGE, None, None))
+    assert len(calls) == 1
+
+
+def test_cancellation_during_retry_wait_propagates(monkeypatch):
+    from app.safe_download import _resolve_tiktok_with_retries
+    calls = []
+    async def parser(*_args):
+        calls.append(1)
+        raise ReferenceDownloadError("tiktok_resolution_failed", "failed", status_code=422)
+    async def sleep(_seconds):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr("app.safe_download._tiktok_media_url", parser)
+    monkeypatch.setattr("app.safe_download.asyncio.sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_resolve_tiktok_with_retries(PAGE, None, None))
+    assert len(calls) == 1
+
+
+def test_media_download_failure_does_not_retry_parser(tmp_path):
+    seen = []
+    def handler(request):
+        seen.append(request.headers["host"])
+        if seen[-1] == "www.tikwm.com":
+            return httpx.Response(200, json={"code": 0, "data": {"play": "https://cdn.example/video"}})
+        return httpx.Response(503)
+    with pytest.raises(ReferenceDownloadError) as caught:
+        download(tmp_path, handler)
+    assert caught.value.code == "reference_download_failed"
+    assert seen == ["www.tikwm.com", "cdn.example"]
+
+
 @pytest.mark.parametrize("url,expected", [
     (PAGE, True), ("https://tiktok.com/@p/video/1", True),
     ("https://tiktok.com.evil.example/video/1", False),

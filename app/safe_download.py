@@ -66,6 +66,17 @@ async def _tiktok_media_url(url: str, client: httpx.AsyncClient, resolver: Resol
         raise ReferenceDownloadError("tiktok_resolution_failed", "TikTok 视频解析失败，请稍后重试或上传视频文件", status_code=422) from exc
 
 
+async def _resolve_tiktok_with_retries(url: str, client: httpx.AsyncClient, resolver: Resolver) -> str:
+    for attempt in range(3):
+        try:
+            return await _tiktok_media_url(url, client, resolver)
+        except ReferenceDownloadError as exc:
+            if exc.code != "tiktok_resolution_failed" or attempt == 2:
+                raise
+            await asyncio.sleep(10)
+    raise AssertionError("unreachable")
+
+
 class ReferenceDownloadError(RuntimeError):
     def __init__(self, code: str, message: str, *, status_code: int) -> None:
         super().__init__(message)
@@ -239,7 +250,7 @@ async def download_reference_url(
             if is_tiktok_page_url(current_url):
                 # Validate the user URL before sending it to the fixed parser.
                 await _approved_target(current_url, resolver)
-                current_url = await _tiktok_media_url(current_url, client, resolver)
+                current_url = await _resolve_tiktok_with_retries(current_url, client, resolver)
             while True:
                 target = await _approved_target(current_url, resolver)
                 async with client.stream(
