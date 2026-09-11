@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import ipaddress
+import json
 import os
+import re
 import socket
 import tempfile
 from dataclasses import dataclass
@@ -19,6 +21,49 @@ ResolverResult = Sequence[str | ipaddress.IPv4Address | ipaddress.IPv6Address]
 Resolver = Callable[[str, int], ResolverResult | Awaitable[ResolverResult]]
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 DEFAULT_PORTS = {"http": 80, "https": 443}
+TIKWM_API = "https://www.tikwm.com/api/"
+
+
+def is_tiktok_page_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (parsed.scheme in DEFAULT_PORTS
+            and (host == "tiktok.com" or host.endswith(".tiktok.com"))
+            and re.search(r"/video/[0-9]+(?:/|$)", parsed.path) is not None)
+
+
+async def _tiktok_media_url(url: str, client: httpx.AsyncClient, resolver: Resolver) -> str:
+    """Restore duet-ad1's TikWM GET/code=0/data.play protocol, without retries.
+
+    The returned URL remains untrusted and goes through the normal pinned
+    downloader. The caller retains the original page as input provenance.
+    """
+    if not re.search(r"/video/[0-9]+(?:/|$)", urlsplit(url).path):
+        raise ReferenceDownloadError("tiktok_resolution_failed", "无法解析 TikTok 视频编号", status_code=422)
+    target = await _approved_target(str(httpx.URL(TIKWM_API, params={"url": url})), resolver)
+    try:
+        async with client.stream("GET", target.pinned_url,
+                headers={"Host": target.host_header, "Accept": "application/json", "Accept-Encoding": "identity"},
+                extensions={"sni_hostname": target.sni_hostname}) as response:
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > 1024 * 1024:
+                    raise ValueError("TikWM response too large")
+            payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("TikWM response is not an object")
+        data = payload.get("data")
+        play = data.get("play") if isinstance(data, dict) else None
+        if payload.get("code") != 0 or not isinstance(play, str) or not play.strip():
+            raise ValueError("TikWM response lacks media URL")
+        return play.strip()
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        raise ReferenceDownloadError("tiktok_resolution_failed", "TikTok 视频解析失败，请稍后重试或上传视频文件", status_code=422) from exc
 
 
 class ReferenceDownloadError(RuntimeError):
@@ -191,6 +236,10 @@ async def download_reference_url(
                 limits=httpx.Limits(max_keepalive_connections=0),
             ) as client,
         ):
+            if is_tiktok_page_url(current_url):
+                # Validate the user URL before sending it to the fixed parser.
+                await _approved_target(current_url, resolver)
+                current_url = await _tiktok_media_url(current_url, client, resolver)
             while True:
                 target = await _approved_target(current_url, resolver)
                 async with client.stream(

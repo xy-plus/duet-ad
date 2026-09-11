@@ -17,6 +17,47 @@ from app.main import create_app
 BASE = "/api/v1/video-generations/quotes"
 
 
+def test_invalid_downloaded_media_returns_structured_error(quote_env, tmp_path):
+    app, client, auth, settings = quote_env
+    invalid = tmp_path / "page.mp4"
+    invalid.write_text("<html>not a video</html>")
+    response = quote(client, auth, invalid)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "video_duration_invalid"
+    assert response.json()["error"]["request_id"]
+    assert_idle(app, settings)
+
+
+def test_tiktok_quote_keeps_page_provenance_and_replays(quote_env, quote_video, monkeypatch):
+    import httpx
+    from app.safe_download import download_reference_url
+    app, client, auth, settings = quote_env
+    page = "https://www.tiktok.com/@person/video/123456"
+    seen = []
+    async def resolver(_hostname, _port):
+        return ["93.184.216.34"]
+    def handler(request):
+        seen.append(request)
+        if request.headers["host"] == "www.tikwm.com":
+            return httpx.Response(200, json={"code": 0, "data": {"play": "https://cdn.example/video?secret=signed"}})
+        return httpx.Response(200, content=quote_video.read_bytes())
+    async def mock_download(url, destination, **kwargs):
+        kwargs.update(resolver=resolver, transport=httpx.MockTransport(handler))
+        return await download_reference_url(url, destination, **kwargs)
+    monkeypatch.setattr("app.main.download_reference_url", mock_download)
+    def send():
+        return client.post(BASE, headers={**auth, "Idempotency-Key": "tiktok-provenance"},
+                           files={k: (None, v) for k, v in {"source_video_url": page, "resolution": "480p", "aspect_ratio": "9:16"}.items()})
+    response = send()
+    assert response.status_code == 201, response.text
+    frozen = json.loads(record_path(settings, response.json()["quote_id"]).read_text())
+    assert frozen["staged"]["source_snapshot"]["reference_url"] == page
+    assert "secret=signed" not in json.dumps(frozen)
+    assert send().status_code == 200
+    assert len(seen) == 2
+    assert_idle(app, settings)
+
+
 class RecordingPipeline:
     def __init__(self):
         self.calls = []
