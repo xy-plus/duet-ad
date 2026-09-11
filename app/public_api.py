@@ -95,6 +95,7 @@ _CREATE_ERROR_MAP = {
     "unsupported_replacement_image": (415, "unsupported_replacement_media_type", "参考图格式不受支持"),
     "invalid_reference_url": (422, "invalid_source_video_url", "视频链接不是可访问的公网 HTTPS 地址"),
     "reference_url_forbidden": (422, "invalid_source_video_url", "视频链接不是可访问的公网 HTTPS 地址"),
+    "tiktok_resolution_failed": (422, "source_video_resolution_failed", "TikTok 视频解析失败，请稍后重试或上传视频文件"),
     "reference_too_large": (413, "source_too_large", "原视频超过大小限制"),
 }
 # Actionable job error codes fixed by the public contract.  Internal codes
@@ -1102,7 +1103,7 @@ def install(
                     if is_quote and float(probed["duration_s"]) > 300:
                         raise PublicAPIError(422, "video_duration_invalid",
                                              "原视频时长超过 300 秒，请裁剪后重新报价", field="source_video")
-                except (media.MediaError, public_credits.CreditError) as exc:
+                except (media.MediaError, media.CommandError, public_credits.CreditError) as exc:
                     raise PublicAPIError(
                         422, "video_duration_invalid",
                         "无法确认视频时长，请更换视频后重新创建任务",
