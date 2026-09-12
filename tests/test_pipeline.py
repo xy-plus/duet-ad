@@ -15,6 +15,8 @@ import pytest
 
 from app import face_mask
 from app import media
+from app import object_detect
+from app import object_mask
 from app.config import SEEDREAM_API_BASE, SEEDREAM_PRO_MODEL, Settings
 from app.fusion_schema import AUTHORITY_BEGIN, AUTHORITY_END, FUSION_OUTPUT_NAME
 from app.object_replace_schema import (
@@ -6970,6 +6972,178 @@ def test_face_mask_missing_model_stays_fatal(
     assert calls == 1
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "face_mask_degraded" not in trace
+
+
+def _prepare_h3_object_mask_fixture(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> tuple[
+    Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
+    list[tuple[Path, Path, list[str]]],
+]:
+    pipeline, project, item, enhanced_index, replacement_sheet, _face_calls = (
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    )
+    enhanced_index["entities"] = {
+        "entity-01": {
+            "source_visual_description": "the red scarf around the neck",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            "replacement": {
+                "reason": "user_request",
+                "source": "image_1",
+                "target_visual_description": "a blue silk scarf",
+            },
+        },
+    }
+    object_calls: list[tuple[Path, Path, list[str]]] = []
+
+    def fake_mask_objects(
+        source_path: Path,
+        destination: Path,
+        targets: list[str],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        object_calls.append((source_path, destination, list(targets)))
+        destination.write_bytes(source_path.read_bytes() + b"-objects-masked")
+        return {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
+
+    monkeypatch.setattr(object_mask, "mask_objects", fake_mask_objects)
+    monkeypatch.setattr(
+        object_detect, "available_providers", lambda _settings: ["doubao"]
+    )
+    return (
+        pipeline, project, item, enhanced_index, replacement_sheet, object_calls,
+    )
+
+
+def test_h3_segment_with_a_replaced_object_masks_objects(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    # The object mask chains on the face-masked stream and takes its target
+    # descriptions from the OR replacement bindings.
+    assert muted == segment_dir / "source-objects-masked.mp4"
+    assert muted.read_bytes() == b"source-masked-objects-masked"
+    assert object_calls == [(
+        segment_dir / "source-faces-masked.mp4",
+        segment_dir / "source-objects-masked.mp4",
+        ["the red scarf around the neck"],
+    )]
+    output = json.loads(
+        (
+            project / "logs" / "mask-replaceable-objects" / "segment-0001"
+            / "attempt-1" / "output.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert output == {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
+
+
+def test_h3_segment_without_replaced_object_skips_object_mask(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    enhanced_index["entities"] = {
+        "entity-02": {
+            "source_visual_description": "a kept prop",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+        },
+    }
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert object_calls == []
+    assert not (project / "logs" / "mask-replaceable-objects").exists()
+
+
+def test_h3_segment_object_mask_skipped_without_available_provider(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    # No configured/available detection provider is the missing-key case:
+    # the node does not trigger at all, like a segment without OR targets.
+    monkeypatch.setattr(
+        object_detect, "available_providers", lambda _settings: []
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert object_calls == []
+    assert not (project / "logs" / "mask-replaceable-objects").exists()
+
+
+def test_object_mask_failure_degrades_to_face_masked_reference(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    def broken_mask(
+        _source: Path, _destination: Path, _targets: list[str], **_kwargs: Any,
+    ) -> None:
+        raise object_mask.ObjectMaskError("detection provider unavailable")
+
+    monkeypatch.setattr(object_mask, "mask_objects", broken_mask)
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    # Persistent object-mask failures degrade to the reference stream without
+    # object blocks (face masking still applied) and log a prominent event.
+    segment_dir = project / "work" / "segments" / "0001"
+    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert object_calls == []  # the patched mask_objects replaced the fake
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "object_mask_degraded" in trace
+    assert '"attempts": 3' in trace
+    attempts = (
+        project / "logs" / "mask-replaceable-objects" / "segment-0001"
+    ).iterdir()
+    assert sorted(path.name for path in attempts) == [
+        f"attempt-{index}"
+        for index in range(1, object_mask.OBJECT_MASK_MAX_ATTEMPTS + 1)
+    ]
 
 
 def test_h3_task_hang_limit_resubmits_with_fresh_identity(

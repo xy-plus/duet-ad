@@ -17,6 +17,8 @@ from urllib.parse import urlsplit
 
 from app import media
 from app import face_mask
+from app import object_detect
+from app import object_mask
 from app import subtitles
 from app import person_identity
 from app import product_views
@@ -5208,6 +5210,38 @@ class Pipeline:
         )
 
     @classmethod
+    def _segment_replaced_object_targets(
+        cls, element_index: dict[str, Any], segment_index: int
+    ) -> list[str]:
+        """Descriptions of the OR-flagged entities to mask in this segment.
+
+        The detection prompt must describe the object as it appears in the
+        source video, so the target text is the record's source description;
+        records without a usable one cannot be detected and are left out.
+        """
+        entities = element_index.get("entities")
+        if not isinstance(entities, dict):
+            return []
+        targets: list[str] = []
+        for record in entities.values():
+            if (
+                not isinstance(record, dict)
+                or not isinstance(record.get("replacement"), dict)
+                or not cls._appears_in_segment(record, segment_index)
+            ):
+                continue
+            description = record.get("source_visual_description")
+            if isinstance(description, str) and description.strip():
+                targets.append(description.strip())
+        return targets
+
+    @classmethod
+    def _segment_has_replaced_object(
+        cls, element_index: dict[str, Any], segment_index: int
+    ) -> bool:
+        return bool(cls._segment_replaced_object_targets(element_index, segment_index))
+
+    @classmethod
     def _fusion_authority_block(
         cls,
         element_index: dict[str, Any],
@@ -5635,6 +5669,56 @@ class Pipeline:
                     )
                 else:
                     muted = masked
+            object_targets = self._segment_replaced_object_targets(
+                element_index, index
+            )
+            if object_targets and object_detect.available_providers(self.settings):
+                # Same contract as the face mask above, for OR-flagged
+                # objects: persistent failures degrade to the stream without
+                # object blocks instead of blocking the render.  No
+                # configured provider means the node never runs (the
+                # missing-key case); a misconfigured explicitly enabled
+                # provider fails loudly through Settings validation or the
+                # client error itself.
+                object_masked = segment_dir / "source-objects-masked.mp4"
+                object_mask_failures = 0
+
+                def _object_mask_retry(exc: Exception) -> bool:
+                    nonlocal object_mask_failures
+                    object_mask_failures += 1
+                    return object_mask_failures < object_mask.OBJECT_MASK_MAX_ATTEMPTS
+
+                try:
+                    self._node(
+                        log,
+                        "mask-replaceable-objects",
+                        scope,
+                        {
+                            "source": muted,
+                            "output": object_masked,
+                            "targets": object_targets,
+                        },
+                        [muted],
+                        lambda: object_mask.mask_objects(
+                            muted, object_masked, object_targets
+                        ),
+                        lambda _value: [object_masked],
+                        retry_if=_object_mask_retry,
+                    )
+                except Exception as exc:
+                    log.event(
+                        "object_mask_degraded",
+                        scope=scope,
+                        attempts=object_mask_failures,
+                        error=str(exc),
+                        impact=(
+                            "replaceable objects stay visible in the "
+                            "reference video; H3 may copy the source object "
+                            "appearance"
+                        ),
+                    )
+                else:
+                    muted = object_masked
             return item, final_prompt, muted, fusion_input_sha256
         except Exception:
             item["status"] = "failed"
