@@ -30,6 +30,8 @@ OBJECT_DETECT_PROVIDER_NAMES = (
 DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 # 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
 DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+GLM_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
+GLM_GROUNDING_MODEL = "glm-4.5v"
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,9 @@ class Settings:
     doubao_api_key: str | None = field(default=None, repr=False)
     doubao_api_base: str = DOUBAO_API_BASE
     doubao_model: str = DOUBAO_GROUNDING_MODEL
+    glm_api_key: str | None = field(default=None, repr=False)
+    glm_api_base: str = GLM_API_BASE
+    glm_model: str = GLM_GROUNDING_MODEL
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -244,6 +249,37 @@ class Settings:
         if not _MODEL_ID_RE.fullmatch(doubao_model):
             raise ValueError("DOUBAO_MODEL must be a valid model identifier")
         object.__setattr__(self, "doubao_model", doubao_model)
+        glm_key = self.glm_api_key
+        if glm_key is not None:
+            if not isinstance(glm_key, str) or not glm_key.strip():
+                raise ValueError("GLM_API_KEY must be a non-empty value or unset")
+            glm_key = glm_key.strip()
+            if (
+                not glm_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in glm_key)
+            ):
+                raise ValueError("GLM_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "glm_api_key", glm_key)
+        glm_base = (
+            self.glm_api_base.strip().rstrip("/")
+            if isinstance(self.glm_api_base, str)
+            else ""
+        )
+        try:
+            glm_url = urlsplit(glm_base)
+        except ValueError as exc:
+            raise ValueError("GLM_API_BASE must be an HTTPS base URL") from exc
+        if glm_url.scheme != "https" or not glm_url.netloc:
+            raise ValueError("GLM_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "glm_api_base", glm_base)
+        glm_model = (
+            self.glm_model.strip()
+            if isinstance(self.glm_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(glm_model):
+            raise ValueError("GLM_MODEL must be a valid model identifier")
+        object.__setattr__(self, "glm_model", glm_model)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -315,4 +351,7 @@ def get_settings() -> Settings:
         doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
         doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
         doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
+        glm_api_key=os.environ.get("GLM_API_KEY", "").strip() or None,
+        glm_api_base=os.environ.get("GLM_API_BASE", GLM_API_BASE).strip(),
+        glm_model=os.environ.get("GLM_MODEL", GLM_GROUNDING_MODEL).strip(),
     )
