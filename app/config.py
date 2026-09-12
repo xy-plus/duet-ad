@@ -30,6 +30,9 @@ OBJECT_DETECT_PROVIDER_NAMES = (
 DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 # 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
 DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+QWEN_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# 模型 ID 以阿里云百炼控制台为准，改动时同步 QWEN_MODEL 环境变量。
+QWEN_GROUNDING_MODEL = "qwen3-vl-plus"
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,9 @@ class Settings:
     doubao_api_key: str | None = field(default=None, repr=False)
     doubao_api_base: str = DOUBAO_API_BASE
     doubao_model: str = DOUBAO_GROUNDING_MODEL
+    qwen_api_key: str | None = field(default=None, repr=False)
+    qwen_api_base: str = QWEN_API_BASE
+    qwen_model: str = QWEN_GROUNDING_MODEL
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -244,6 +250,37 @@ class Settings:
         if not _MODEL_ID_RE.fullmatch(doubao_model):
             raise ValueError("DOUBAO_MODEL must be a valid model identifier")
         object.__setattr__(self, "doubao_model", doubao_model)
+        qwen_key = self.qwen_api_key
+        if qwen_key is not None:
+            if not isinstance(qwen_key, str) or not qwen_key.strip():
+                raise ValueError("QWEN_API_KEY must be a non-empty value or unset")
+            qwen_key = qwen_key.strip()
+            if (
+                not qwen_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in qwen_key)
+            ):
+                raise ValueError("QWEN_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "qwen_api_key", qwen_key)
+        qwen_base = (
+            self.qwen_api_base.strip().rstrip("/")
+            if isinstance(self.qwen_api_base, str)
+            else ""
+        )
+        try:
+            qwen_url = urlsplit(qwen_base)
+        except ValueError as exc:
+            raise ValueError("QWEN_API_BASE must be an HTTPS base URL") from exc
+        if qwen_url.scheme != "https" or not qwen_url.netloc:
+            raise ValueError("QWEN_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "qwen_api_base", qwen_base)
+        qwen_model = (
+            self.qwen_model.strip()
+            if isinstance(self.qwen_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(qwen_model):
+            raise ValueError("QWEN_MODEL must be a valid model identifier")
+        object.__setattr__(self, "qwen_model", qwen_model)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -315,4 +352,7 @@ def get_settings() -> Settings:
         doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
         doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
         doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
+        qwen_api_key=os.environ.get("QWEN_API_KEY", "").strip() or None,
+        qwen_api_base=os.environ.get("QWEN_API_BASE", QWEN_API_BASE).strip(),
+        qwen_model=os.environ.get("QWEN_MODEL", QWEN_GROUNDING_MODEL).strip(),
     )
