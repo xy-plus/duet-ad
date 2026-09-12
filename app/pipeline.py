@@ -5612,13 +5612,13 @@ class Pipeline:
                 element_index, index
             )
             if object_targets and object_detect.available_providers(self.settings):
-                # Same contract as the face mask above, for OR-flagged
-                # objects: persistent failures degrade to the stream without
-                # object blocks instead of blocking the render.  No
+                # Unlike the face mask (whose missing model stays fatal), the
+                # object mask node degrades on ANY failure: the except below
+                # catches Exception, so after the node's own retries the
+                # render continues on the stream without object blocks.  No
                 # configured provider means the node never runs (the
                 # missing-key case); a misconfigured explicitly enabled
-                # provider fails loudly through Settings validation or the
-                # client error itself.
+                # provider is rejected earlier by Settings validation.
                 object_masked = segment_dir / "source-objects-masked.mp4"
                 object_mask_failures = 0
 
@@ -5674,11 +5674,14 @@ class Pipeline:
                                 "block exists in the reference video"
                             ),
                         )
-            # The prompt is assembled only after the mask nodes so the gray
-            # block description matches what the reference stream actually
-            # contains: the dark gray object clause appears only when the
-            # object mask node produced masking.  The frozen h3_prompt.txt is
-            # replayed verbatim on resume, keeping the decision stable.
+            # The prompt is assembled only after the mask nodes so the dark
+            # gray object clause matches what the reference stream actually
+            # contains: it appears only when the object mask node painted at
+            # least one block.  (The medium gray face clause still follows
+            # masks_faces even when the face mask degraded — pre-existing
+            # behavior of the face path, not covered by this guarantee.)
+            # The frozen h3_prompt.txt is replayed verbatim on resume,
+            # keeping the decision stable.
             processing = self._validated_effective_request(request)["processing"]
             face_block = ""
             sheet_reference = replacement_sheet.get("h3_image_reference")

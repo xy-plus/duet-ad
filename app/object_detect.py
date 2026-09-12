@@ -19,7 +19,7 @@
    未配置）、``<name>_api_base``、``<name>_model``（默认值见 spec 调研表），
    并在 ``__post_init__`` 与 ``get_settings`` 的独立段落加同款校验/读取
    （环境变量 ``<NAME>_API_KEY`` / ``<NAME>_API_BASE`` / ``<NAME>_MODEL``）。
-2. 本模块新增 client 类：OpenAI 兼容的 5 家继承
+2. 本模块新增 client 类：OpenAI 兼容的 6 家继承
    ``OpenAICompatibleGroundingClient``，只需设 ``provider_name = "<name>"``
    并实现 ``parse_response(text, target)``（坐标一律归一化到 0–1 后交给
    ``ObjectDetection`` 校验，非法条目抛 ValueError 计入重试）；上传方式或
@@ -647,7 +647,12 @@ def _hunyuan_bbox_values(bbox: Any, index: int) -> tuple[int, int, int, int]:
 
 
 class HunyuanGroundingClient(OpenAICompatibleGroundingClient):
-    """腾讯混元 TokenHub：OpenAI 兼容，bbox 保守解析（同 glm 策略）。"""
+    """腾讯混元 TokenHub：OpenAI 兼容，bbox 保守解析。
+
+    解析只接受 0–1000 整数四元组（``<bbox>`` 标签、纯数字串、四元素整数
+    数组三种形态，见上方段落注释），统一除以 1000；与 glm 不同，不做
+    0–1 浮点直收。
+    """
 
     provider_name = "hunyuan"
 
