@@ -1611,9 +1611,11 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     )
 
     assert result_item["index"] == 1
-    assert result_prompt.startswith("Gray blocks mask source faces")
+    assert result_prompt.startswith(
+        "Medium gray (128,128,128) blocks mask source faces"
+    )
     assert "FACE REPLACEMENT IS MANDATORY" in result_prompt
-    assert result_prompt.index("Gray blocks") < result_prompt.index(
+    assert result_prompt.index("(128,128,128)") < result_prompt.index(
         "FACE REPLACEMENT"
     )
     assert "Preserve the source motion" in result_prompt
@@ -1633,9 +1635,11 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert calls[0]["schema"]["additionalProperties"] is False
     assert calls[0]["images"] == [sheet_image]
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
-    assert prompt.startswith("Gray blocks mask source faces")
+    assert prompt.startswith(
+        "Medium gray (128,128,128) blocks mask source faces"
+    )
     assert "FACE REPLACEMENT IS MANDATORY" in prompt
-    assert prompt.index("Gray blocks") < prompt.index(
+    assert prompt.index("(128,128,128)") < prompt.index(
         "FACE REPLACEMENT IS MANDATORY"
     )
     assert prompt.index("FACE REPLACEMENT IS MANDATORY") < prompt.index(
@@ -7144,6 +7148,105 @@ def test_object_mask_failure_degrades_to_face_masked_reference(
         f"attempt-{index}"
         for index in range(1, object_mask.OBJECT_MASK_MAX_ATTEMPTS + 1)
     ]
+
+
+def test_h3_prompt_introduces_both_mask_block_colors(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    _item, prompt, _muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert prompt.startswith("Medium gray (128,128,128) blocks mask source faces")
+    assert "Dark gray (64,64,64) blocks mask replaced objects" in prompt
+    assert prompt.index("(128,128,128)") < prompt.index("(64,64,64)")
+    assert "never draw" in prompt
+    assert prompt.index("(64,64,64)") < prompt.index("FACE REPLACEMENT")
+    frozen = (
+        project / "work" / "segments" / "0001" / "h3_prompt.txt"
+    ).read_text(encoding="utf-8")
+    assert frozen == prompt
+
+
+def test_h3_prompt_object_block_clause_absent_without_object_masking(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    _item, prompt, _muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert prompt.startswith("Medium gray (128,128,128) blocks mask source faces")
+    assert "(64,64,64)" not in prompt
+
+
+def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    def broken_mask(
+        _source: Path, _destination: Path, _targets: list[str], **_kwargs: Any,
+    ) -> None:
+        raise object_mask.ObjectMaskError("detection provider unavailable")
+
+    monkeypatch.setattr(object_mask, "mask_objects", broken_mask)
+
+    _item, prompt, _muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    # Degraded object masking produced no dark gray blocks, so the frozen
+    # prompt must not claim they exist (resume replays this file verbatim).
+    assert "(128,128,128)" in prompt
+    assert "(64,64,64)" not in prompt
+
+
+def test_h3_prompt_object_block_clause_without_a_replaced_person(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    del enhanced_index["people"]["person-01"]["replacement"]
+
+    _item, prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    segment_dir = project / "work" / "segments" / "0001"
+    assert muted == segment_dir / "source-objects-masked.mp4"
+    assert "(128,128,128)" not in prompt
+    assert prompt.startswith("Dark gray (64,64,64) blocks mask replaced objects")
 
 
 def test_h3_task_hang_limit_resubmits_with_fresh_identity(

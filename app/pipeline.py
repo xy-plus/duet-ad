@@ -5546,71 +5546,7 @@ class Pipeline:
                     ],
                 ),
             )
-            processing = self._validated_effective_request(request)["processing"]
-            face_block = ""
-            sheet_reference = replacement_sheet.get("h3_image_reference")
-            masks_faces = (
-                isinstance(sheet_reference, str)
-                and bool(sheet_reference.strip())
-                and self._segment_has_replaced_person(element_index, index)
-            )
-            if masks_faces:
-                face_block = (
-                    "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
-                    "SOURCE IDENTITY. Each replaced person must use their "
-                    "explicitly bound original user reference images when user-bound, "
-                    f"or their own tile in {sheet_reference} when generated_variant. "
-                    "Face shape, eyes, nose, mouth, skin tone, and hairstyle follow "
-                    "that per-key appearance authority, never Video 1. Keeping the "
-                    "source face is a failure, even if everything else is "
-                    "correct.\n\n"
-                )
-            mask_block = ""
-            if masks_faces:
-                # 灰块说明放最前（primacy 效应下开头约束遵守度最高）；
-                # 压到最短（90 字符），给 Agent 生成的长提示词留预算。
-                # 换脸要求由紧随其后的 FACE REPLACEMENT 块承载。
-                mask_block = (
-                    "Gray blocks mask source faces; never draw them. "
-                    "Replace them with the face provided below.\n\n"
-                )
-            overlay_targets = []
-            if processing["remove_subtitle"]:
-                overlay_targets.append(
-                    "burned-in subtitles, captions, and on-screen text"
-                )
-            if processing["remove_logo"]:
-                overlay_targets.append("watermarks and logos")
-            overlay_block = ""
-            if overlay_targets:
-                overlay_block = (
-                    "\n\nOverlay removal: Video 1 may contain "
-                    + " and ".join(overlay_targets)
-                    + ". Remove all of them from the generated video and "
-                    "reconstruct the occluded background naturally. Do not "
-                    "reproduce, translate, or re-render any source on-screen "
-                    "text, watermark, or logo."
-                )
-            dialogue = "\n".join(
-                f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
-                for line in item["dialogue"]
-            )
-            final_prompt = mask_block + face_block + prompt + overlay_block + (
-                "\n\nDialogue requirements: Audio 1 is this segment's "
-                "pre-recorded dialogue speech track in the target language. "
-                "Every speaking person must lip-sync precisely to Audio 1: "
-                "match its timing, rhythm, and mouth movements exactly, and do "
-                "not change its words. Do not generate any speech beyond "
-                "Audio 1, do not speak the original-language dialogue, and do "
-                "not render captions or subtitles. Do not add dialogue in "
-                "padded time. The spoken lines in Audio 1 are:\n" + dialogue
-                if dialogue
-                else "\n\nDo not add captions, subtitles, or new dialogue."
-            )
             segment_dir = item["source"].parent
-            (segment_dir / "h3_prompt.txt").write_text(
-                final_prompt, encoding="utf-8",
-            )
             muted = segment_dir / "source-muted.mp4"
             self._node(
                 log,
@@ -5669,6 +5605,7 @@ class Pipeline:
                     )
                 else:
                     muted = masked
+            objects_masked = False
             object_targets = self._segment_replaced_object_targets(
                 element_index, index
             )
@@ -5719,6 +5656,83 @@ class Pipeline:
                     )
                 else:
                     muted = object_masked
+                    objects_masked = True
+            # The prompt is assembled only after the mask nodes so the gray
+            # block description matches what the reference stream actually
+            # contains: the dark gray object clause appears only when the
+            # object mask node produced masking.  The frozen h3_prompt.txt is
+            # replayed verbatim on resume, keeping the decision stable.
+            processing = self._validated_effective_request(request)["processing"]
+            face_block = ""
+            sheet_reference = replacement_sheet.get("h3_image_reference")
+            masks_faces = (
+                isinstance(sheet_reference, str)
+                and bool(sheet_reference.strip())
+                and self._segment_has_replaced_person(element_index, index)
+            )
+            if masks_faces:
+                face_block = (
+                    "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
+                    "SOURCE IDENTITY. Each replaced person must use their "
+                    "explicitly bound original user reference images when user-bound, "
+                    f"or their own tile in {sheet_reference} when generated_variant. "
+                    "Face shape, eyes, nose, mouth, skin tone, and hairstyle follow "
+                    "that per-key appearance authority, never Video 1. Keeping the "
+                    "source face is a failure, even if everything else is "
+                    "correct.\n\n"
+                )
+            mask_block = ""
+            if masks_faces:
+                # 灰块说明放最前（primacy 效应下开头约束遵守度最高）；
+                # 压到最短，给 Agent 生成的长提示词留预算。
+                # 换脸要求由紧随其后的 FACE REPLACEMENT 块承载。
+                mask_block += (
+                    "Medium gray (128,128,128) blocks mask source faces; "
+                    "never draw or restore what they hide. Replace them with "
+                    "the face provided below.\n\n"
+                )
+            if objects_masked:
+                mask_block += (
+                    "Dark gray (64,64,64) blocks mask replaced objects; "
+                    "never draw or restore what they hide. Rebuild them from "
+                    "the bound reference images.\n\n"
+                )
+            overlay_targets = []
+            if processing["remove_subtitle"]:
+                overlay_targets.append(
+                    "burned-in subtitles, captions, and on-screen text"
+                )
+            if processing["remove_logo"]:
+                overlay_targets.append("watermarks and logos")
+            overlay_block = ""
+            if overlay_targets:
+                overlay_block = (
+                    "\n\nOverlay removal: Video 1 may contain "
+                    + " and ".join(overlay_targets)
+                    + ". Remove all of them from the generated video and "
+                    "reconstruct the occluded background naturally. Do not "
+                    "reproduce, translate, or re-render any source on-screen "
+                    "text, watermark, or logo."
+                )
+            dialogue = "\n".join(
+                f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
+                for line in item["dialogue"]
+            )
+            final_prompt = mask_block + face_block + prompt + overlay_block + (
+                "\n\nDialogue requirements: Audio 1 is this segment's "
+                "pre-recorded dialogue speech track in the target language. "
+                "Every speaking person must lip-sync precisely to Audio 1: "
+                "match its timing, rhythm, and mouth movements exactly, and do "
+                "not change its words. Do not generate any speech beyond "
+                "Audio 1, do not speak the original-language dialogue, and do "
+                "not render captions or subtitles. Do not add dialogue in "
+                "padded time. The spoken lines in Audio 1 are:\n" + dialogue
+                if dialogue
+                else "\n\nDo not add captions, subtitles, or new dialogue."
+            )
+            (segment_dir / "h3_prompt.txt").write_text(
+                final_prompt, encoding="utf-8",
+            )
             return item, final_prompt, muted, fusion_input_sha256
         except Exception:
             item["status"] = "failed"

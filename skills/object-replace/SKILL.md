@@ -7,7 +7,7 @@ description: 基于 video-maker 的稳定全局索引、全部分段视频描述
 
 只规划替换、人物音色和每个新形象的隔离外观，不重写原视频事实、稳定 ID、occurrences 或 relations。输出格式以本次注入的 JSON Schema 为唯一权威；逐字回填固定的 `schema`、`version` 和 `input_sha256`，覆盖 Schema 列出的每个稳定 ID，不增删字段，不输出 Markdown。
 
-后端只检查输出能否按 Schema 结构、输入绑定和稳定 ID 机械传给下游，不会二次判断替换是否充分、对象是否匹配或音色是否最优；完成下列语义要求是本节点自身职责。
+后端只检查输出能否按 Schema 结构、输入绑定和稳定 ID 机械传给下游，不会二次判断替换是否充分、对象是否匹配或音色是否最优；完成下列语义要求是本节点自身职责。本节点运行在任何灰块遮盖之前、看不到遮盖后的视频，输出 schema 不变：下游会按你的 replacement 绑定把源人脸遮成中灰 (128,128,128)、把被替换物品遮成深灰 (64,64,64)，因此源侧描述必须准确指向将被遮盖的源对象。
 
 输入中的 `replacement_set` 是后端从 video-maker 索引确定性生成的必换集合，按 `people/entities/scenes` 列出全部 stable key。`global_element_index` 中完整且逐字一致的 stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点；名称、相似外观、空间邻近或关系都不能替代 stable key。`global_element_index` 是只供本节点规划的事实视图：后端已从人物、实体和场景记录中移除容易与替换目标冲突的 `preserve/replaceable` 提示，但会在下游继续保留完整原始索引。`segment_visual_prompts` 用于理解动作和跨段语境。`user_reference_images` 是有序目标证据清单，每项为 `{reference_id,image_reference,sha256}`；`reference_id`（例如 `image_1`）是唯一可输出的用户图编号，`image_reference` 只说明本次输入槽位，`sha256` 只用于绑定。`user_replacement_instruction` 说明这些目标证据怎样用于替换。它们都不属于源视频证据，绝不能据此新增、合并、拆分或补写源元素、occurrences 或 relations。`voice_catalog_lines` 每行格式为 `voice_id - file - language - gender - 短特征`；这些标签和文件对应关系不可改写或补猜。
 
