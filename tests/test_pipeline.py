@@ -7226,6 +7226,43 @@ def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
     assert "(64,64,64)" not in prompt
 
 
+def test_h3_prompt_object_block_clause_absent_when_no_block_was_painted(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    def no_blocks_mask(
+        source: Path, destination: Path, _targets: list[str], **_kwargs: Any,
+    ) -> dict[str, Any]:
+        # Every target exhausted its detection retries and was skipped: the
+        # node "succeeds" but paints zero blocks (all targets unfound).
+        destination.write_bytes(source.read_bytes())
+        return {"frames": 3, "frames_with_block": 0, "blocks_total": 0}
+
+    monkeypatch.setattr(object_mask, "mask_objects", no_blocks_mask)
+
+    _item, prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    # Zero painted blocks means the reference stream carries no dark gray
+    # block: the prompt must not claim one exists, and the pointlessly
+    # re-encoded identical video must not replace the face-masked stream.
+    segment_dir = project / "work" / "segments" / "0001"
+    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert "(128,128,128)" in prompt
+    assert "(64,64,64)" not in prompt
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "object_mask_no_blocks" in trace
+
+
 def test_h3_prompt_object_block_clause_without_a_replaced_person(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:

@@ -261,6 +261,44 @@ def test_frame_boxes_interpolates_and_holds_then_disappears() -> None:
     assert 2 + OBJECT_MASK_HOLD_FRAMES + 1 not in boxes
 
 
+def test_frame_boxes_counts_each_shared_anchor_frame_once() -> None:
+    # Adjacent interpolation intervals share their boundary anchor frame;
+    # the anchor must appear once per frame, not once per interval.
+    detections = [
+        _detection(0.0, (0.1, 0.1, 0.2, 0.2)),
+        _detection(1.0, (0.3, 0.1, 0.4, 0.2)),
+        _detection(2.0, (0.5, 0.1, 0.6, 0.2)),
+    ]
+
+    boxes = object_mask._frame_boxes(detections, fps=1.0)
+
+    assert boxes[0] == [(0.1, 0.1, 0.2, 0.2)]
+    assert boxes[1] == [(0.3, 0.1, 0.4, 0.2)]
+    assert boxes[2] == [(0.5, 0.1, 0.6, 0.2)]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
+def test_mask_objects_blocks_total_counts_anchor_frames_once(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=3, fps=1.0)
+    detector = _SparseDetector(
+        [
+            _detection(0.0, (0.05, 0.25, 0.35, 0.75)),
+            _detection(1.0, (0.30, 0.25, 0.60, 0.75)),
+            _detection(2.0, (0.55, 0.25, 0.85, 0.75)),
+        ]
+    )
+
+    destination = tmp_path / "source-objects-masked.mp4"
+    stats = object_mask.mask_objects(
+        source, destination, ["mug"], detector=detector
+    )
+
+    assert stats == {"frames": 3, "frames_with_block": 3, "blocks_total": 3}
+
+
 def test_mask_objects_rejects_an_unreadable_source(tmp_path: Path) -> None:
     with pytest.raises(ObjectMaskError, match="source video is invalid"):
         object_mask.mask_objects(

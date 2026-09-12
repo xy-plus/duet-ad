@@ -5626,7 +5626,7 @@ class Pipeline:
                     return object_mask_failures < object_mask.OBJECT_MASK_MAX_ATTEMPTS
 
                 try:
-                    self._node(
+                    mask_stats = self._node(
                         log,
                         "mask-replaceable-objects",
                         scope,
@@ -5655,8 +5655,23 @@ class Pipeline:
                         ),
                     )
                 else:
-                    muted = object_masked
-                    objects_masked = True
+                    if mask_stats["blocks_total"] > 0:
+                        muted = object_masked
+                        objects_masked = True
+                    else:
+                        # Every target exhausted its detection retries and was
+                        # skipped: the re-encoded video carries no block, so
+                        # keep the previous stream and prompt as unmasked.
+                        log.event(
+                            "object_mask_no_blocks",
+                            scope=scope,
+                            targets=object_targets,
+                            stats=mask_stats,
+                            impact=(
+                                "no target could be located, so no dark gray "
+                                "block exists in the reference video"
+                            ),
+                        )
             # The prompt is assembled only after the mask nodes so the gray
             # block description matches what the reference stream actually
             # contains: the dark gray object clause appears only when the

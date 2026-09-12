@@ -95,15 +95,16 @@ def _frame_boxes(
     for label_tracks in tracks.values():
         for track in label_tracks:
             for (f0, b0), (f1, b1) in zip(track, track[1:]):
-                for frame_index in range(f0, f1 + 1):
+                # The next interval re-owns its left anchor; ending each
+                # interval at f1 - 1 keeps every anchor frame painted once.
+                for frame_index in range(f0, f1):
                     ratio = (frame_index - f0) / (f1 - f0)
                     box = tuple(
                         b0[axis] + (b1[axis] - b0[axis]) * ratio for axis in range(4)
                     )
                     boxes_by_frame.setdefault(frame_index, []).append(box)  # type: ignore[arg-type]
             last_frame, last_box = track[-1]
-            if len(track) == 1:
-                boxes_by_frame.setdefault(last_frame, []).append(last_box)
+            boxes_by_frame.setdefault(last_frame, []).append(last_box)
             for frame_index in range(
                 last_frame + 1, last_frame + OBJECT_MASK_HOLD_FRAMES + 1
             ):
