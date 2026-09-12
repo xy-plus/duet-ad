@@ -591,6 +591,76 @@ class GlmGroundingClient(OpenAICompatibleGroundingClient):
         scale = 1000.0 if any(value > 1.0 for value in raw) else 1.0
         x0, y0, x1, y1 = (value / scale for value in raw)
         return (x0, y0, x1, y1)
+# ==== hunyuan（腾讯混元 TokenHub）段落开始 ====
+# bbox 输出格式官方未文档化（spec 调研表），沿用基类 prompt 的
+# ``<bbox>x1 y1 x2 y2</bbox>`` 0–1000 整数约定，解析端保守兼容三种形态。
+_HUNYUAN_BBOX_TAG_RE = re.compile(
+    r"<bbox>\s*(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s*</bbox>"
+)
+_HUNYUAN_BBOX_PLAIN_RE = re.compile(
+    r"(\d{1,4})\s*[,\s]\s*(\d{1,4})\s*[,\s]\s*(\d{1,4})\s*[,\s]\s*(\d{1,4})"
+)
+
+
+def _hunyuan_bbox_values(bbox: Any, index: int) -> tuple[int, int, int, int]:
+    """从模型输出取 0–1000 整数四元组；无法识别抛 ValueError/TypeError。"""
+    if isinstance(bbox, str):
+        match = _HUNYUAN_BBOX_TAG_RE.fullmatch(bbox.strip())
+        if match is None:
+            match = _HUNYUAN_BBOX_PLAIN_RE.fullmatch(bbox.strip())
+        if match is None:
+            raise ValueError(f"detection entry {index} bbox format is unrecognized")
+        return tuple(int(value) for value in match.groups())  # type: ignore[return-value]
+    if (
+        isinstance(bbox, list)
+        and len(bbox) == 4
+        and all(isinstance(value, int) and not isinstance(value, bool) for value in bbox)
+    ):
+        return (bbox[0], bbox[1], bbox[2], bbox[3])
+    raise TypeError(f"detection entry {index} has no recognizable bbox")
+
+
+class HunyuanGroundingClient(OpenAICompatibleGroundingClient):
+    """腾讯混元 TokenHub：OpenAI 兼容，bbox 保守解析（同 glm 策略）。"""
+
+    provider_name = "hunyuan"
+
+    def parse_response(
+        self, text: str, target: str
+    ) -> list[ObjectDetection]:
+        payload = extract_json_object(text)
+        entries = payload.get("detections")
+        if not isinstance(entries, list):
+            raise TypeError("model output must contain a detections list")
+        detections: list[ObjectDetection] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise TypeError(f"detection entry {index} must be an object")
+            timestamp = entry.get("timestamp_s")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+            ):
+                raise ValueError(f"detection entry {index} has an invalid timestamp")
+            values = _hunyuan_bbox_values(entry.get("bbox"), index)
+            try:
+                detections.append(
+                    ObjectDetection(
+                        label=target,
+                        timestamp_s=float(timestamp),
+                        bbox_xyxy_normalized=tuple(
+                            value / 1000.0 for value in values
+                        ),  # type: ignore[arg-type]
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"detection entry {index} has invalid coordinates: {exc}"
+                ) from exc
+        return detections
+# ==== hunyuan（腾讯混元 TokenHub）段落结束 ====
+
+
 
 
 
@@ -601,7 +671,7 @@ PROVIDER_REGISTRY: dict[str, type | None] = {
     "doubao": DoubaoGroundingClient,
     "qwen": QwenGroundingClient,  # 阿里百炼，bbox_2d 绝对像素 ÷ 帧宽高归一化
     "glm": GlmGroundingClient,
-    "hunyuan": None,  # 待实现：腾讯混元 TokenHub
+    "hunyuan": HunyuanGroundingClient,
     "kimi": None,  # 待实现：Moonshot k2.6（k2.5/k3 不支持视频）
     "step": None,  # 待实现：阶跃星辰
     "gemini": None,  # 待实现：File API + generateContent，不继承 OpenAI 基类
