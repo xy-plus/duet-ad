@@ -26,6 +26,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "access_token": "test-access",
         "data_dir": tmp_path,
         "public_base_url": "https://detect.test",
+        "multiref_mode": "direct",
         "qwen_api_key": "qwen-secret",
         "qwen_api_base": "https://qwen.test/compatible-mode/v1",
         "qwen_model": "qwen-test-model",
@@ -254,6 +255,7 @@ def test_settings_qwen_defaults(tmp_path: Path) -> None:
         access_token="test-access",
         data_dir=tmp_path,
         public_base_url="https://detect.test",
+        multiref_mode="direct",
     )
     assert settings.qwen_api_key is None
     assert (
@@ -285,6 +287,7 @@ def test_settings_rejects_non_https_qwen_api_base(tmp_path: Path) -> None:
 
 def test_get_settings_reads_qwen_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.setenv("QWEN_API_KEY", "  qwen-key ")
     monkeypatch.delenv("QWEN_API_BASE", raising=False)
@@ -300,6 +303,7 @@ def test_get_settings_reads_qwen_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_settings_qwen_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.delenv("QWEN_API_KEY", raising=False)
     settings = get_settings()

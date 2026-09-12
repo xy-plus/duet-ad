@@ -20,6 +20,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "access_token": "test-access",
         "data_dir": tmp_path,
         "public_base_url": "https://detect.test",
+        "multiref_mode": "direct",
         "hunyuan_api_key": "hunyuan-secret",
         "hunyuan_api_base": "https://hunyuan.test/v1",
         "hunyuan_model": "hunyuan-test-model",
@@ -279,6 +280,7 @@ def test_settings_rejects_non_https_hunyuan_api_base(tmp_path: Path) -> None:
 
 def test_get_settings_reads_hunyuan_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.setenv("HUNYUAN_API_KEY", "  hunyuan-key ")
     monkeypatch.delenv("HUNYUAN_API_BASE", raising=False)
@@ -291,6 +293,7 @@ def test_get_settings_reads_hunyuan_env(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_get_settings_hunyuan_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.delenv("HUNYUAN_API_KEY", raising=False)
     settings = get_settings()

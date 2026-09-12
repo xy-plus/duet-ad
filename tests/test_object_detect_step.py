@@ -25,6 +25,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "access_token": "test-access",
         "data_dir": tmp_path,
         "public_base_url": "https://detect.test",
+        "multiref_mode": "direct",
         "step_api_key": "step-secret",
         "step_api_base": "https://step.test/v1",
         "step_model": "step-test-model",
@@ -279,6 +280,7 @@ def test_settings_rejects_non_https_step_api_base(tmp_path: Path) -> None:
 
 def test_get_settings_reads_step_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.setenv("OBJECT_DETECT_PROVIDERS", "step")
     monkeypatch.setenv("STEP_API_KEY", "  step-key ")
@@ -292,6 +294,7 @@ def test_get_settings_reads_step_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_settings_step_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.delenv("STEP_API_KEY", raising=False)
     settings = get_settings()

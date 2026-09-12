@@ -26,6 +26,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "access_token": "test-access",
         "data_dir": tmp_path,
         "public_base_url": "https://detect.test",
+        "multiref_mode": "direct",
         "gemini_api_key": "gemini-secret",
         "gemini_api_base": "https://gemini.test",
         "gemini_model": "gemini-2.5-flash",
@@ -436,6 +437,7 @@ def test_settings_gemini_defaults(tmp_path: Path) -> None:
         access_token="test-access",
         data_dir=tmp_path,
         public_base_url="https://detect.test",
+        multiref_mode="direct",
     )
     assert settings.gemini_api_key is None
     assert settings.gemini_api_base == "https://generativelanguage.googleapis.com"
@@ -470,6 +472,7 @@ def test_settings_accepts_socks5_gemini_proxy(tmp_path: Path) -> None:
 
 def test_get_settings_reads_gemini_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.setenv("GEMINI_API_KEY", "  gemini-key ")
     monkeypatch.setenv("GEMINI_API_BASE", "https://gemini.example.com")
@@ -484,6 +487,7 @@ def test_get_settings_reads_gemini_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_settings_gemini_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     for name in ("GEMINI_API_KEY", "GEMINI_API_BASE", "GEMINI_MODEL", "GEMINI_PROXY"):
         monkeypatch.delenv(name, raising=False)

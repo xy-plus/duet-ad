@@ -25,6 +25,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "access_token": "test-access",
         "data_dir": tmp_path,
         "public_base_url": "https://detect.test",
+        "multiref_mode": "direct",
         "doubao_api_key": "doubao-secret",
         "doubao_api_base": "https://doubao.test/api/v3",
         "doubao_model": "doubao-test-model",
@@ -489,6 +490,7 @@ def test_settings_rejects_non_https_doubao_api_base(tmp_path: Path) -> None:
 def test_get_settings_reads_object_detect_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.setenv("OBJECT_DETECT_PROVIDERS", "doubao, qwen")
     monkeypatch.setenv("DOUBAO_API_KEY", "  ark-key ")
     monkeypatch.delenv("DOUBAO_API_BASE", raising=False)
@@ -503,6 +505,7 @@ def test_get_settings_reads_object_detect_env(monkeypatch: pytest.MonkeyPatch) -
 def test_get_settings_object_detect_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "env-access")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.setenv("MULTIREF_MODE", "direct")
     monkeypatch.delenv("OBJECT_DETECT_PROVIDERS", raising=False)
     monkeypatch.delenv("DOUBAO_API_KEY", raising=False)
     settings = get_settings()
