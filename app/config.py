@@ -16,6 +16,40 @@ SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MULTIREF_MODES = frozenset({"composed", "direct"})
 
+# ==== 物品检测 provider（实验分支阶段 4；独立段落，便于 7 家分支合并） ====
+# 已知 7 家视频理解 provider；注册表与实现在 app/object_detect.py，
+# 两家清单必须保持一致（object_detect.py 断言）。
+OBJECT_DETECT_PROVIDER_NAMES = (
+    "doubao",
+    "qwen",
+    "glm",
+    "hunyuan",
+    "kimi",
+    "step",
+    "gemini",
+)
+DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+# 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
+DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+QWEN_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# 模型 ID 以阿里云百炼控制台为准，改动时同步 QWEN_MODEL 环境变量。
+QWEN_GROUNDING_MODEL = "qwen3-vl-plus"
+GLM_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
+GLM_GROUNDING_MODEL = "glm-4.5v"
+HUNYUAN_API_BASE = "https://api.hunyuan.cloud.tencent.com/v1"
+HUNYUAN_VISION_MODEL = "hunyuan-large-vision"
+KIMI_API_BASE = "https://api.moonshot.cn/v1"
+# k2.5/k3 不支持视频输入；模型 ID 以 Moonshot 控制台为准。
+KIMI_GROUNDING_MODEL = "kimi-k2.6"
+STEP_API_BASE = "https://api.stepfun.com/v1"
+# 模型 ID 以阶跃星辰控制台为准（Step-1.5V 起支持视频理解），改动时同步
+# STEP_MODEL 环境变量。
+STEP_GROUNDING_MODEL = "step-3.7-flash"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+GEMINI_MODEL = "gemini-2.5-flash"
+# GEMINI_PROXY 允许 http/https/socks5/socks5h，Scheme 白名单见 __post_init__。
+_GEMINI_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -56,6 +90,35 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
+    # ==== 物品检测 provider 字段（阶段 4 独立段落） ====
+    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。
+    object_detect_providers: tuple[str, ...] = ()
+    # 缺省 None 表示未配置（该 provider 不启用）。
+    doubao_api_key: str | None = field(default=None, repr=False)
+    doubao_api_base: str = DOUBAO_API_BASE
+    doubao_model: str = DOUBAO_GROUNDING_MODEL
+    qwen_api_key: str | None = field(default=None, repr=False)
+    qwen_api_base: str = QWEN_API_BASE
+    qwen_model: str = QWEN_GROUNDING_MODEL
+    glm_api_key: str | None = field(default=None, repr=False)
+    glm_api_base: str = GLM_API_BASE
+    glm_model: str = GLM_GROUNDING_MODEL
+    hunyuan_api_key: str | None = field(default=None, repr=False)
+    hunyuan_api_base: str = HUNYUAN_API_BASE
+    hunyuan_model: str = HUNYUAN_VISION_MODEL
+    kimi_api_key: str | None = field(default=None, repr=False)
+    kimi_api_base: str = KIMI_API_BASE
+    kimi_model: str = KIMI_GROUNDING_MODEL
+    step_api_key: str | None = field(default=None, repr=False)
+    step_api_base: str = STEP_API_BASE
+    step_model: str = STEP_GROUNDING_MODEL
+    # 缺省 None 表示未配置（该 provider 不启用）。
+    gemini_api_key: str | None = field(default=None, repr=False)
+    gemini_api_base: str = GEMINI_API_BASE
+    gemini_model: str = GEMINI_MODEL
+    # 国内直连 generativelanguage.googleapis.com 不通时需代理，
+    # 本机一般为 http://127.0.0.1:7897；None = 直连。
+    gemini_proxy: str | None = None
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -184,6 +247,257 @@ class Settings:
         if not isinstance(clients_file, Path):
             raise ValueError("PUBLIC_API_CLIENTS_FILE must be a filesystem path")
         object.__setattr__(self, "public_api_clients_file", clients_file)
+        # ==== 物品检测 provider 校验（阶段 4 独立段落） ====
+        if not isinstance(self.object_detect_providers, tuple) or any(
+            not isinstance(name, str) for name in self.object_detect_providers
+        ):
+            raise ValueError("OBJECT_DETECT_PROVIDERS must be a tuple of names")
+        unknown = [
+            name
+            for name in self.object_detect_providers
+            if name not in OBJECT_DETECT_PROVIDER_NAMES
+        ]
+        if unknown:
+            raise ValueError(
+                "OBJECT_DETECT_PROVIDERS has unknown provider names: "
+                + ", ".join(unknown)
+            )
+        doubao_key = self.doubao_api_key
+        if doubao_key is not None:
+            if not isinstance(doubao_key, str) or not doubao_key.strip():
+                raise ValueError("DOUBAO_API_KEY must be a non-empty value or unset")
+            doubao_key = doubao_key.strip()
+            if (
+                not doubao_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in doubao_key)
+            ):
+                raise ValueError("DOUBAO_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "doubao_api_key", doubao_key)
+        doubao_base = (
+            self.doubao_api_base.strip().rstrip("/")
+            if isinstance(self.doubao_api_base, str)
+            else ""
+        )
+        try:
+            doubao_url = urlsplit(doubao_base)
+        except ValueError as exc:
+            raise ValueError("DOUBAO_API_BASE must be an HTTPS base URL") from exc
+        if doubao_url.scheme != "https" or not doubao_url.netloc:
+            raise ValueError("DOUBAO_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "doubao_api_base", doubao_base)
+        doubao_model = (
+            self.doubao_model.strip()
+            if isinstance(self.doubao_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(doubao_model):
+            raise ValueError("DOUBAO_MODEL must be a valid model identifier")
+        object.__setattr__(self, "doubao_model", doubao_model)
+        qwen_key = self.qwen_api_key
+        if qwen_key is not None:
+            if not isinstance(qwen_key, str) or not qwen_key.strip():
+                raise ValueError("QWEN_API_KEY must be a non-empty value or unset")
+            qwen_key = qwen_key.strip()
+            if (
+                not qwen_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in qwen_key)
+            ):
+                raise ValueError("QWEN_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "qwen_api_key", qwen_key)
+        qwen_base = (
+            self.qwen_api_base.strip().rstrip("/")
+            if isinstance(self.qwen_api_base, str)
+            else ""
+        )
+        try:
+            qwen_url = urlsplit(qwen_base)
+        except ValueError as exc:
+            raise ValueError("QWEN_API_BASE must be an HTTPS base URL") from exc
+        if qwen_url.scheme != "https" or not qwen_url.netloc:
+            raise ValueError("QWEN_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "qwen_api_base", qwen_base)
+        qwen_model = (
+            self.qwen_model.strip()
+            if isinstance(self.qwen_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(qwen_model):
+            raise ValueError("QWEN_MODEL must be a valid model identifier")
+        object.__setattr__(self, "qwen_model", qwen_model)
+        glm_key = self.glm_api_key
+        if glm_key is not None:
+            if not isinstance(glm_key, str) or not glm_key.strip():
+                raise ValueError("GLM_API_KEY must be a non-empty value or unset")
+            glm_key = glm_key.strip()
+            if (
+                not glm_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in glm_key)
+            ):
+                raise ValueError("GLM_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "glm_api_key", glm_key)
+        glm_base = (
+            self.glm_api_base.strip().rstrip("/")
+            if isinstance(self.glm_api_base, str)
+            else ""
+        )
+        try:
+            glm_url = urlsplit(glm_base)
+        except ValueError as exc:
+            raise ValueError("GLM_API_BASE must be an HTTPS base URL") from exc
+        if glm_url.scheme != "https" or not glm_url.netloc:
+            raise ValueError("GLM_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "glm_api_base", glm_base)
+        glm_model = (
+            self.glm_model.strip()
+            if isinstance(self.glm_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(glm_model):
+            raise ValueError("GLM_MODEL must be a valid model identifier")
+        object.__setattr__(self, "glm_model", glm_model)
+        hunyuan_key = self.hunyuan_api_key
+        if hunyuan_key is not None:
+            if not isinstance(hunyuan_key, str) or not hunyuan_key.strip():
+                raise ValueError("HUNYUAN_API_KEY must be a non-empty value or unset")
+            hunyuan_key = hunyuan_key.strip()
+            if (
+                not hunyuan_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in hunyuan_key)
+            ):
+                raise ValueError("HUNYUAN_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "hunyuan_api_key", hunyuan_key)
+        hunyuan_base = (
+            self.hunyuan_api_base.strip().rstrip("/")
+            if isinstance(self.hunyuan_api_base, str)
+            else ""
+        )
+        try:
+            hunyuan_url = urlsplit(hunyuan_base)
+        except ValueError as exc:
+            raise ValueError("HUNYUAN_API_BASE must be an HTTPS base URL") from exc
+        if hunyuan_url.scheme != "https" or not hunyuan_url.netloc:
+            raise ValueError("HUNYUAN_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "hunyuan_api_base", hunyuan_base)
+        hunyuan_model = (
+            self.hunyuan_model.strip()
+            if isinstance(self.hunyuan_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(hunyuan_model):
+            raise ValueError("HUNYUAN_MODEL must be a valid model identifier")
+        object.__setattr__(self, "hunyuan_model", hunyuan_model)
+        kimi_key = self.kimi_api_key
+        if kimi_key is not None:
+            if not isinstance(kimi_key, str) or not kimi_key.strip():
+                raise ValueError("KIMI_API_KEY must be a non-empty value or unset")
+            kimi_key = kimi_key.strip()
+            if (
+                not kimi_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in kimi_key)
+            ):
+                raise ValueError("KIMI_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "kimi_api_key", kimi_key)
+        kimi_base = (
+            self.kimi_api_base.strip().rstrip("/")
+            if isinstance(self.kimi_api_base, str)
+            else ""
+        )
+        try:
+            kimi_url = urlsplit(kimi_base)
+        except ValueError as exc:
+            raise ValueError("KIMI_API_BASE must be an HTTPS base URL") from exc
+        if kimi_url.scheme != "https" or not kimi_url.netloc:
+            raise ValueError("KIMI_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "kimi_api_base", kimi_base)
+        kimi_model = (
+            self.kimi_model.strip()
+            if isinstance(self.kimi_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(kimi_model):
+            raise ValueError("KIMI_MODEL must be a valid model identifier")
+        object.__setattr__(self, "kimi_model", kimi_model)
+        step_key = self.step_api_key
+        if step_key is not None:
+            if not isinstance(step_key, str) or not step_key.strip():
+                raise ValueError("STEP_API_KEY must be a non-empty value or unset")
+            step_key = step_key.strip()
+            if (
+                not step_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in step_key)
+            ):
+                raise ValueError("STEP_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "step_api_key", step_key)
+        step_base = (
+            self.step_api_base.strip().rstrip("/")
+            if isinstance(self.step_api_base, str)
+            else ""
+        )
+        try:
+            step_url = urlsplit(step_base)
+        except ValueError as exc:
+            raise ValueError("STEP_API_BASE must be an HTTPS base URL") from exc
+        if step_url.scheme != "https" or not step_url.netloc:
+            raise ValueError("STEP_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "step_api_base", step_base)
+        step_model = (
+            self.step_model.strip()
+            if isinstance(self.step_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(step_model):
+            raise ValueError("STEP_MODEL must be a valid model identifier")
+        object.__setattr__(self, "step_model", step_model)
+        gemini_key = self.gemini_api_key
+        if gemini_key is not None:
+            if not isinstance(gemini_key, str) or not gemini_key.strip():
+                raise ValueError("GEMINI_API_KEY must be a non-empty value or unset")
+            gemini_key = gemini_key.strip()
+            if (
+                not gemini_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in gemini_key)
+            ):
+                raise ValueError("GEMINI_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "gemini_api_key", gemini_key)
+        gemini_base = (
+            self.gemini_api_base.strip().rstrip("/")
+            if isinstance(self.gemini_api_base, str)
+            else ""
+        )
+        try:
+            gemini_url = urlsplit(gemini_base)
+        except ValueError as exc:
+            raise ValueError("GEMINI_API_BASE must be an HTTPS base URL") from exc
+        if gemini_url.scheme != "https" or not gemini_url.netloc:
+            raise ValueError("GEMINI_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "gemini_api_base", gemini_base)
+        gemini_model = (
+            self.gemini_model.strip()
+            if isinstance(self.gemini_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(gemini_model):
+            raise ValueError("GEMINI_MODEL must be a valid model identifier")
+        object.__setattr__(self, "gemini_model", gemini_model)
+        gemini_proxy = self.gemini_proxy
+        if gemini_proxy is not None:
+            if not isinstance(gemini_proxy, str) or not gemini_proxy.strip():
+                raise ValueError("GEMINI_PROXY must be a non-empty value or unset")
+            gemini_proxy = gemini_proxy.strip()
+            try:
+                proxy_url = urlsplit(gemini_proxy)
+            except ValueError as exc:
+                raise ValueError(
+                    "GEMINI_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                ) from exc
+            if (
+                proxy_url.scheme not in _GEMINI_PROXY_SCHEMES
+                or not proxy_url.netloc
+            ):
+                raise ValueError(
+                    "GEMINI_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                )
+            object.__setattr__(self, "gemini_proxy", gemini_proxy)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -252,4 +566,32 @@ def get_settings() -> Settings:
         # therefore cannot disable the single-worker store lock; tests may do
         # so only by constructing Settings explicitly.
         store_lock_enabled=True,
+        # ==== 物品检测 provider（阶段 4 独立段落） ====
+        object_detect_providers=tuple(
+            name.strip().lower()
+            for name in os.environ.get("OBJECT_DETECT_PROVIDERS", "").split(",")
+            if name.strip()
+        ),
+        doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
+        doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
+        doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
+        qwen_api_key=os.environ.get("QWEN_API_KEY", "").strip() or None,
+        qwen_api_base=os.environ.get("QWEN_API_BASE", QWEN_API_BASE).strip(),
+        qwen_model=os.environ.get("QWEN_MODEL", QWEN_GROUNDING_MODEL).strip(),
+        glm_api_key=os.environ.get("GLM_API_KEY", "").strip() or None,
+        glm_api_base=os.environ.get("GLM_API_BASE", GLM_API_BASE).strip(),
+        glm_model=os.environ.get("GLM_MODEL", GLM_GROUNDING_MODEL).strip(),
+        hunyuan_api_key=os.environ.get("HUNYUAN_API_KEY", "").strip() or None,
+        hunyuan_api_base=os.environ.get("HUNYUAN_API_BASE", HUNYUAN_API_BASE).strip(),
+        hunyuan_model=os.environ.get("HUNYUAN_MODEL", HUNYUAN_VISION_MODEL).strip(),
+        kimi_api_key=os.environ.get("KIMI_API_KEY", "").strip() or None,
+        kimi_api_base=os.environ.get("KIMI_API_BASE", KIMI_API_BASE).strip(),
+        kimi_model=os.environ.get("KIMI_MODEL", KIMI_GROUNDING_MODEL).strip(),
+        step_api_key=os.environ.get("STEP_API_KEY", "").strip() or None,
+        step_api_base=os.environ.get("STEP_API_BASE", STEP_API_BASE).strip(),
+        step_model=os.environ.get("STEP_MODEL", STEP_GROUNDING_MODEL).strip(),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
+        gemini_api_base=os.environ.get("GEMINI_API_BASE", GEMINI_API_BASE).strip(),
+        gemini_model=os.environ.get("GEMINI_MODEL", GEMINI_MODEL).strip(),
+        gemini_proxy=os.environ.get("GEMINI_PROXY", "").strip() or None,
     )
