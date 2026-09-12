@@ -15,6 +15,22 @@ SEEDREAM_PRO_MODEL = "doubao-seedream-5-0-pro-260628"
 SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+# ==== 物品检测 provider（实验分支阶段 4；独立段落，便于 7 家分支合并） ====
+# 已知 7 家视频理解 provider；注册表与实现在 app/object_detect.py，
+# 两家清单必须保持一致（object_detect.py 断言）。
+OBJECT_DETECT_PROVIDER_NAMES = (
+    "doubao",
+    "qwen",
+    "glm",
+    "hunyuan",
+    "kimi",
+    "step",
+    "gemini",
+)
+DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+# 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
+DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -51,6 +67,13 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
+    # ==== 物品检测 provider 字段（阶段 4 独立段落） ====
+    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。
+    object_detect_providers: tuple[str, ...] = ()
+    # 缺省 None 表示未配置（该 provider 不启用）。
+    doubao_api_key: str | None = field(default=None, repr=False)
+    doubao_api_base: str = DOUBAO_API_BASE
+    doubao_model: str = DOUBAO_GROUNDING_MODEL
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -175,6 +198,52 @@ class Settings:
         if not isinstance(clients_file, Path):
             raise ValueError("PUBLIC_API_CLIENTS_FILE must be a filesystem path")
         object.__setattr__(self, "public_api_clients_file", clients_file)
+        # ==== 物品检测 provider 校验（阶段 4 独立段落） ====
+        if not isinstance(self.object_detect_providers, tuple) or any(
+            not isinstance(name, str) for name in self.object_detect_providers
+        ):
+            raise ValueError("OBJECT_DETECT_PROVIDERS must be a tuple of names")
+        unknown = [
+            name
+            for name in self.object_detect_providers
+            if name not in OBJECT_DETECT_PROVIDER_NAMES
+        ]
+        if unknown:
+            raise ValueError(
+                "OBJECT_DETECT_PROVIDERS has unknown provider names: "
+                + ", ".join(unknown)
+            )
+        doubao_key = self.doubao_api_key
+        if doubao_key is not None:
+            if not isinstance(doubao_key, str) or not doubao_key.strip():
+                raise ValueError("DOUBAO_API_KEY must be a non-empty value or unset")
+            doubao_key = doubao_key.strip()
+            if (
+                not doubao_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in doubao_key)
+            ):
+                raise ValueError("DOUBAO_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "doubao_api_key", doubao_key)
+        doubao_base = (
+            self.doubao_api_base.strip().rstrip("/")
+            if isinstance(self.doubao_api_base, str)
+            else ""
+        )
+        try:
+            doubao_url = urlsplit(doubao_base)
+        except ValueError as exc:
+            raise ValueError("DOUBAO_API_BASE must be an HTTPS base URL") from exc
+        if doubao_url.scheme != "https" or not doubao_url.netloc:
+            raise ValueError("DOUBAO_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "doubao_api_base", doubao_base)
+        doubao_model = (
+            self.doubao_model.strip()
+            if isinstance(self.doubao_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(doubao_model):
+            raise ValueError("DOUBAO_MODEL must be a valid model identifier")
+        object.__setattr__(self, "doubao_model", doubao_model)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -237,4 +306,13 @@ def get_settings() -> Settings:
         # therefore cannot disable the single-worker store lock; tests may do
         # so only by constructing Settings explicitly.
         store_lock_enabled=True,
+        # ==== 物品检测 provider（阶段 4 独立段落） ====
+        object_detect_providers=tuple(
+            name.strip().lower()
+            for name in os.environ.get("OBJECT_DETECT_PROVIDERS", "").split(",")
+            if name.strip()
+        ),
+        doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
+        doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
+        doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
     )
