@@ -81,7 +81,12 @@ def test_fusion_uses_each_keys_original_reference_set_without_merging_keys():
     } for key, replacement in entries.items()}}
     sheet = {"h3_image_reference": "Image 1", "user_image_present": True,
              "spec": {"tiles": [{"stable_key": key, "tile_id": f"TILE_{i}", "row": 1, "column": i}
-                                for i, key in enumerate(entries, 1)]}}
+                                for i, key in enumerate(entries, 1)]},
+             # 生产形态（pipeline._prepare 阶段冻结）：image_N -> Image N+1。
+             "h3_reference_images": [
+                 {"role": "user_replacement", "image_reference": f"Image {order + 1}"}
+                 for order in range(1, 4)
+             ]}
     block = Pipeline._fusion_authority_block(index, 1, sheet)
     lines = {key: next(line for line in block.splitlines() if line.startswith(f"- {key} | REPLACE")) for key in entries}
     assert "original user references Image 2, Image 4 are appearance authority" in lines["bag-a"]

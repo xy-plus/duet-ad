@@ -58,7 +58,7 @@ from app.seedream import (
     reset_attempt as _seedream_reset_attempt,
 )
 from app.research_log import ResearchLog
-from app.store import ProjectStore
+from app.store import ProjectStore, replacement_input_paths
 from app.voice_catalog import VoiceLibrary, load_voice_library
 from app.video_maker_schemas import (
     VISUAL_PROMPT_SCHEMA,
@@ -524,7 +524,7 @@ class Pipeline:
         paths = state.get("replacement_image_paths")
         if paths is None:
             paths = [single] if single is not None else []
-        expected = ["inputs/replacement-image"] + [f"inputs/replacement-image-{i}" for i in range(2,len(paths)+1)] if isinstance(paths, list) and paths else []
+        expected = replacement_input_paths(len(paths)) if isinstance(paths, list) and paths else []
         if not isinstance(paths, list) or len(paths) > 4 or paths != expected or single != (paths[0] if paths else None):
             raise ValueError("stored replacement images must preserve upload order")
         root = project.resolve(strict=True)
@@ -1040,9 +1040,7 @@ class Pipeline:
         if not values:
             single = state.get("replacement_image_path")
             return [project / single] if single else ([replacement] if replacement else [])
-        expected = ["inputs/replacement-image", *[
-            f"inputs/replacement-image-{order}" for order in range(2, len(values) + 1)
-        ]]
+        expected = replacement_input_paths(len(values))
         if not isinstance(values, list) or not 1 <= len(values) <= 4 or values != expected:
             raise ValueError("stored replacement image paths are invalid")
         paths = [project / value for value in values]
@@ -2008,14 +2006,11 @@ class Pipeline:
             project, replacement=replacement,
         )
         replacement_receipts = [
-            cls._project_artifact_receipt(
-                project,
-                path,
-                "inputs/replacement-image"
-                if order == 1
-                else f"inputs/replacement-image-{order}",
+            cls._project_artifact_receipt(project, path, name)
+            for path, name in zip(
+                replacement_paths,
+                replacement_input_paths(len(replacement_paths)),
             )
-            for order, path in enumerate(replacement_paths, 1)
         ]
         bindings = {
             "segments_sha256": cls._json_sha256(segment_bindings),
@@ -2155,14 +2150,11 @@ class Pipeline:
             project, state, replacement,
         )
         replacement_receipts = [
-            self._project_artifact_receipt(
-                project,
-                path,
-                "inputs/replacement-image"
-                if order == 1
-                else f"inputs/replacement-image-{order}",
+            self._project_artifact_receipt(project, path, name)
+            for path, name in zip(
+                replacement_paths,
+                replacement_input_paths(len(replacement_paths)),
             )
-            for order, path in enumerate(replacement_paths, 1)
         ]
         effective_request = self._validated_effective_request(
             state.get("effective_request")
@@ -3558,14 +3550,11 @@ class Pipeline:
         if len(replacement_paths) > 1:
             replacement_receipts = bindings.get("replacement_images")
             expected_replacement_receipts = [
-                cls._project_artifact_receipt(
-                    project,
-                    path,
-                    "inputs/replacement-image"
-                    if order == 1
-                    else f"inputs/replacement-image-{order}",
+                cls._project_artifact_receipt(project, path, name)
+                for path, name in zip(
+                    replacement_paths,
+                    replacement_input_paths(len(replacement_paths)),
                 )
-                for order, path in enumerate(replacement_paths, 1)
             ]
             if (
                 replacement_receipts != expected_replacement_receipts
@@ -5345,8 +5334,21 @@ class Pipeline:
                             and replacement_sheet.get("user_image_present") is True
                         ):
                             reference_ids = replacement.get("reference_image_ids") or ["image_1"]
+                            unmapped = [
+                                reference_id
+                                for reference_id in reference_ids
+                                if reference_id not in user_image_mapping
+                            ]
+                            if unmapped:
+                                # 冻结的 h3_reference_images 不含绑定的 id，
+                                # 猜标签只会把错误指引进 prompt。
+                                raise ValueError(
+                                    "replacement reference_image_ids not in the "
+                                    "frozen user reference mapping: "
+                                    + ", ".join(unmapped)
+                                )
                             image_labels = ", ".join(
-                                user_image_mapping.get(reference_id, f"Image {int(reference_id.rsplit('_', 1)[1]) + 1}")
+                                user_image_mapping[reference_id]
                                 for reference_id in reference_ids
                             )
                             reference_text += (

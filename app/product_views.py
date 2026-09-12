@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageOps
 import numpy as np
 
 from app import media
+from app.store import replacement_input_paths
 
 MANIFEST = "work/global-reference-sheet/user-reference-views.json"
 REFERENCE = "work/global-reference-sheet/user-reference.png"
@@ -45,7 +46,7 @@ def frozen_product_views(project: Path) -> dict | None:
     sources = value.get("sources")
     if not isinstance(sources, list) or not 2 <= len(sources) <= 4:
         raise ValueError("invalid product view count")
-    expected_paths = ["inputs/replacement-image"] + [f"inputs/replacement-image-{i}" for i in range(2,len(sources)+1)]
+    expected_paths = replacement_input_paths(len(sources))
     for receipt, expected in zip(sources, expected_paths):
         if not isinstance(receipt, dict) or receipt.get("path") != expected or receipt != _receipt(project, project / expected):
             raise ValueError("frozen product view source changed")
@@ -59,7 +60,7 @@ def frozen_product_views(project: Path) -> dict | None:
 def compose_product_views(project: Path, sources: list[Path]) -> Path:
     if not 2 <= len(sources) <= 4:
         raise ValueError("product composite requires 2 to 4 ordered views")
-    expected_paths = [project / "inputs/replacement-image"] + [project / f"inputs/replacement-image-{i}" for i in range(2,len(sources)+1)]
+    expected_paths = [project / name for name in replacement_input_paths(len(sources))]
     if sources != expected_paths:
         raise ValueError("product view order must match stored upload order")
     source_receipts = [_receipt(project, source) for source in sources]

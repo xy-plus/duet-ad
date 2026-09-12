@@ -541,6 +541,10 @@ def test_multiple_keys_share_reference_without_merging_tiles_or_relations(tmp_pa
     assert enhanced["entities"]["entity-01"]["replacement"]["target_visual_description"] != enhanced["entities"]["entity-02"]["replacement"]["target_visual_description"]
     authority = Pipeline._fusion_authority_block(enhanced, 1, {
         "spec": spec, "h3_image_reference": "Image 1", "user_image_present": True,
+        # 生产形态：image_1 在冻结的 h3_reference_images 里映射为 Image 2。
+        "h3_reference_images": [
+            {"role": "user_replacement", "image_reference": "Image 2"},
+        ],
     })
     for tile in spec["tiles"]:
         line = next(line for line in authority.splitlines() if line.startswith(f'- {tile["stable_key"]} | REPLACE'))

@@ -90,14 +90,123 @@ class ObjectDetection:
         object.__setattr__(self, "bbox_xyxy_normalized", (x0, y0, x1, y1))
 
 
-class OpenAICompatibleGroundingClient:
+class _GroundingClientBase:
+    """两类 grounding client 共享的单目标重试循环与重试日志。
+
+    重试 = 重新推理，镜像 ``app.providers._send`` 语义：首试 + 2 次，
+    backoff 2s/5s，只重试 transport 错误、502/503/504、解析失败/坐标越界/
+    空结果；4xx 立即致命。子类提供 ``provider_name``、``_request_url``、
+    ``_headers``、``_request_body``、``_response_text``、``parse_response``；
+    ``media_ref`` 是单次 detect 内复用的视频引用（OpenAI 兼容家为 base64
+    content part，Gemini 为 File API 的 file_uri）。
+    """
+
+    provider_name: str = ""
+
+    def _request_url(self) -> str:
+        raise NotImplementedError
+
+    def _headers(self, api_key: str) -> dict[str, str]:
+        raise NotImplementedError
+
+    def _request_body(self, media_ref: Any, target: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _response_text(self, body: Any) -> str:
+        raise NotImplementedError
+
+    def parse_response(
+        self, text: str, target: str
+    ) -> list[ObjectDetection]:
+        """把模型输出文本解析为合法检测列表；格式非法/坐标越界抛 ValueError。"""
+        raise NotImplementedError
+
+    def _detect_target(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        media_ref: Any,
+        target: str,
+    ) -> list[ObjectDetection] | None:
+        """单目标检测；返回 None 表示重试上限内无合法框（调用方跳过该目标）。"""
+        max_attempts = len(providers.RETRY_BACKOFF_S) + 1
+        url = self._request_url()
+        headers = self._headers(api_key)
+        attempts: list[dict[str, Any]] = []
+        for attempt_number in range(1, max_attempts + 1):
+            body = self._request_body(media_ref, target)
+            request = client.build_request("POST", url, headers=headers, json=body)
+            try:
+                response = client.send(request)
+            except httpx.HTTPError as exc:
+                exchange = {
+                    "request": {
+                        "method": "POST",
+                        "url": url,
+                        "body": body,
+                    },
+                    "response": None,
+                    "attempt": attempt_number,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+                attempts.append(exchange)
+                if not providers.is_retryable_transport_error(exc):
+                    failure = {**exchange, "attempts": attempts}
+                    raise ProviderFailure(failure, [], exc) from exc
+                if attempt_number < max_attempts:
+                    self._log_retry(attempt_number, max_attempts, str(exc))
+                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
+                    continue
+                return None
+            exchange = providers.response_record(response, request_body=body)
+            exchange["attempt"] = attempt_number
+            attempts.append(exchange)
+            if response.status_code in providers.RETRYABLE_STATUSES:
+                if attempt_number < max_attempts:
+                    self._log_retry(
+                        attempt_number, max_attempts, f"HTTP {response.status_code}"
+                    )
+                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
+                    continue
+                return None
+            if not response.is_success:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    failure = {**exchange, "attempts": attempts}
+                    raise ProviderFailure(failure, [], exc) from exc
+            try:
+                detections = self.parse_response(
+                    self._response_text(providers._json_body(response)), target
+                )
+                if not detections:
+                    raise ValueError("model returned no valid bbox")
+            except (ValueError, TypeError, KeyError) as exc:
+                if attempt_number < max_attempts:
+                    self._log_retry(attempt_number, max_attempts, str(exc))
+                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
+                    continue
+                return None
+            return detections
+        raise AssertionError("unreachable")
+
+    def _log_retry(self, attempt_number: int, max_attempts: int, reason: str) -> None:
+        _LOGGER.warning(
+            "object detect provider %s attempt %d/%d failed (%s); retrying in %gs",
+            self.provider_name,
+            attempt_number,
+            max_attempts,
+            reason,
+            providers.RETRY_BACKOFF_S[attempt_number - 1],
+        )
+
+
+class OpenAICompatibleGroundingClient(_GroundingClientBase):
     """OpenAI 兼容 chat completions 的视频 grounding 基类（覆盖 6 家）。
 
     子类契约：设 ``provider_name``（对应 config 的 ``<name>_api_key/_api_base/_model``
     三字段），实现 ``parse_response``。视频默认 base64 inline、fps 默认 1。
     """
-
-    provider_name: str = ""
 
     def __init__(
         self,
@@ -118,8 +227,14 @@ class OpenAICompatibleGroundingClient:
     def _model(self) -> str:
         return getattr(self.settings, f"{self.provider_name}_model")
 
-    def _chat_completions_url(self) -> str:
+    def _request_url(self) -> str:
         return f"{self._api_base()}/chat/completions"
+
+    def _headers(self, api_key: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
     def _video_content_part(self, data_url: str, fps: float) -> dict[str, Any]:
         return {"type": "video_url", "video_url": {"url": data_url, "fps": fps}}
@@ -137,13 +252,7 @@ class OpenAICompatibleGroundingClient:
             'If the object is not visible, output {"detections": []}.'
         )
 
-    def parse_response(
-        self, text: str, target: str
-    ) -> list[ObjectDetection]:
-        """把模型输出文本解析为合法检测列表；格式非法/坐标越界抛 ValueError。"""
-        raise NotImplementedError
-
-    def _message_text(self, body: Any) -> str:
+    def _response_text(self, body: Any) -> str:
         if not isinstance(body, dict):
             raise TypeError("chat completion response must be an object")
         choices = body.get("choices")
@@ -216,93 +325,6 @@ class OpenAICompatibleGroundingClient:
                     continue
                 results.extend(detections)
         return results
-
-    def _detect_target(
-        self,
-        client: httpx.Client,
-        api_key: str,
-        video_part: dict[str, Any],
-        target: str,
-    ) -> list[ObjectDetection] | None:
-        """单目标检测；返回 None 表示重试上限内无合法框（调用方跳过该目标）。
-
-        重试镜像 ``app.providers._send`` 语义：首试 + 2 次，backoff 2s/5s，
-        只重试 transport 错误与 502/503/504；此外解析失败/坐标越界/空结果
-        也计入同一重试预算（重试 = 重新推理，单目标费用上限 3 次推理）。
-        """
-        max_attempts = len(providers.RETRY_BACKOFF_S) + 1
-        url = self._chat_completions_url()
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        attempts: list[dict[str, Any]] = []
-        for attempt_number in range(1, max_attempts + 1):
-            body = self._request_body(video_part, target)
-            request = client.build_request("POST", url, headers=headers, json=body)
-            try:
-                response = client.send(request)
-            except httpx.HTTPError as exc:
-                exchange = {
-                    "request": {
-                        "method": "POST",
-                        "url": url,
-                        "body": body,
-                    },
-                    "response": None,
-                    "attempt": attempt_number,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
-                attempts.append(exchange)
-                if not providers.is_retryable_transport_error(exc):
-                    failure = {**exchange, "attempts": attempts}
-                    raise ProviderFailure(failure, [], exc) from exc
-                if attempt_number < max_attempts:
-                    self._log_retry(attempt_number, max_attempts, str(exc))
-                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
-                    continue
-                return None
-            exchange = providers.response_record(response, request_body=body)
-            exchange["attempt"] = attempt_number
-            attempts.append(exchange)
-            if response.status_code in providers.RETRYABLE_STATUSES:
-                if attempt_number < max_attempts:
-                    self._log_retry(
-                        attempt_number, max_attempts, f"HTTP {response.status_code}"
-                    )
-                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
-                    continue
-                return None
-            if not response.is_success:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    failure = {**exchange, "attempts": attempts}
-                    raise ProviderFailure(failure, [], exc) from exc
-            try:
-                detections = self.parse_response(
-                    self._message_text(providers._json_body(response)), target
-                )
-                if not detections:
-                    raise ValueError("model returned no valid bbox")
-            except (ValueError, TypeError, KeyError) as exc:
-                if attempt_number < max_attempts:
-                    self._log_retry(attempt_number, max_attempts, str(exc))
-                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
-                    continue
-                return None
-            return detections
-        raise AssertionError("unreachable")
-
-    def _log_retry(self, attempt_number: int, max_attempts: int, reason: str) -> None:
-        _LOGGER.warning(
-            "object detect provider %s attempt %d/%d failed (%s); retrying in %gs",
-            self.provider_name,
-            attempt_number,
-            max_attempts,
-            reason,
-            providers.RETRY_BACKOFF_S[attempt_number - 1],
-        )
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL)
@@ -796,8 +818,12 @@ class StepGroundingClient(OpenAICompatibleGroundingClient):
 GEMINI_FILE_ACTIVE_POLLS = 10
 
 
-class GeminiGroundingClient:
-    """Gemini 视频 grounding：File API 上传 + generateContent，box_2d 解析。"""
+class GeminiGroundingClient(_GroundingClientBase):
+    """Gemini 视频 grounding：File API 上传 + generateContent，box_2d 解析。
+
+    不继承 OpenAICompatibleGroundingClient（上传与请求形态完全不同），
+    只共享重试循环，满足同一 detect 契约。
+    """
 
     provider_name = "gemini"
 
@@ -950,11 +976,14 @@ class GeminiGroundingClient:
 
     # --- generateContent 推理（重试 = 重新推理，复用已上传 file_uri） ---
 
-    def _generate_url(self) -> str:
+    def _request_url(self) -> str:
         return (
             f"{self.settings.gemini_api_base}/v1beta/models/"
             f"{self.settings.gemini_model}:generateContent"
         )
+
+    def _headers(self, api_key: str) -> dict[str, str]:
+        return {"x-goog-api-key": api_key, "Content-Type": "application/json"}
 
     def _prompt(self, target: str, fps: float) -> str:
         return (
@@ -988,77 +1017,7 @@ class GeminiGroundingClient:
             "generationConfig": {"temperature": 0},
         }
 
-    def _detect_target(
-        self,
-        client: httpx.Client,
-        api_key: str,
-        file_uri: str,
-        target: str,
-    ) -> list[ObjectDetection] | None:
-        """单目标检测；返回 None 表示重试上限内无合法框（调用方跳过该目标）。
-
-        重试语义与 OpenAICompatibleGroundingClient._detect_target 一致：首试 +
-        2 次，backoff 2s/5s，只重试 transport 错误、502/503/504、解析失败/
-        坐标越界/空结果；4xx 立即致命。
-        """
-        max_attempts = len(providers.RETRY_BACKOFF_S) + 1
-        url = self._generate_url()
-        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-        attempts: list[dict[str, Any]] = []
-        for attempt_number in range(1, max_attempts + 1):
-            body = self._request_body(file_uri, target)
-            request = client.build_request("POST", url, headers=headers, json=body)
-            try:
-                response = client.send(request)
-            except httpx.HTTPError as exc:
-                exchange = {
-                    "request": {"method": "POST", "url": url, "body": body},
-                    "response": None,
-                    "attempt": attempt_number,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
-                attempts.append(exchange)
-                if not providers.is_retryable_transport_error(exc):
-                    failure = {**exchange, "attempts": attempts}
-                    raise ProviderFailure(failure, [], exc) from exc
-                if attempt_number < max_attempts:
-                    self._log_retry(attempt_number, max_attempts, str(exc))
-                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
-                    continue
-                return None
-            exchange = providers.response_record(response, request_body=body)
-            exchange["attempt"] = attempt_number
-            attempts.append(exchange)
-            if response.status_code in providers.RETRYABLE_STATUSES:
-                if attempt_number < max_attempts:
-                    self._log_retry(
-                        attempt_number, max_attempts, f"HTTP {response.status_code}"
-                    )
-                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
-                    continue
-                return None
-            if not response.is_success:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    failure = {**exchange, "attempts": attempts}
-                    raise ProviderFailure(failure, [], exc) from exc
-            try:
-                detections = self.parse_response(
-                    self._candidates_text(providers._json_body(response)), target
-                )
-                if not detections:
-                    raise ValueError("model returned no valid bbox")
-            except (ValueError, TypeError, KeyError) as exc:
-                if attempt_number < max_attempts:
-                    self._log_retry(attempt_number, max_attempts, str(exc))
-                    retry_sleep(providers.RETRY_BACKOFF_S[attempt_number - 1])
-                    continue
-                return None
-            return detections
-        raise AssertionError("unreachable")
-
-    def _candidates_text(self, body: Any) -> str:
+    def _response_text(self, body: Any) -> str:
         if not isinstance(body, dict):
             raise TypeError("generateContent response must be an object")
         candidates = body.get("candidates")
@@ -1124,17 +1083,6 @@ class GeminiGroundingClient:
                 ) from exc
         return detections
 
-    def _log_retry(self, attempt_number: int, max_attempts: int, reason: str) -> None:
-        _LOGGER.warning(
-            "object detect provider %s attempt %d/%d failed (%s); retrying in %gs",
-            self.provider_name,
-            attempt_number,
-            max_attempts,
-            reason,
-            providers.RETRY_BACKOFF_S[attempt_number - 1],
-        )
-
-
 def _extract_gemini_json(text: str) -> Any:
     """从模型输出提取 JSON（对象或数组），容忍 markdown 围栏和前后散文。"""
     candidates = [text.strip()]
@@ -1199,8 +1147,9 @@ def available_providers(settings: Settings) -> list[str]:
 
 def select_provider(settings: Settings) -> Any | None:
     """返回顺序最前的可用 provider client；无可用返回 None。"""
-    for name in available_providers(settings):
-        client_class = PROVIDER_REGISTRY[name]
-        assert client_class is not None
-        return client_class(settings)
-    return None
+    available = available_providers(settings)
+    if not available:
+        return None
+    client_class = PROVIDER_REGISTRY[available[0]]
+    assert client_class is not None
+    return client_class(settings)

@@ -3080,6 +3080,41 @@ def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> Non
         assert stable_target in second
 
 
+def test_fusion_authority_rejects_reference_ids_outside_the_frozen_mapping() -> None:
+    index = {
+        "people": {},
+        "entities": {
+            "entity-01": {
+                "source_visual_description": "a mug",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replacement": {
+                    "source": "image_1",
+                    "target_visual_description": "a red mug",
+                    "reference_image_ids": ["image_2"],
+                },
+            },
+        },
+        "scenes": {},
+        "relations": {},
+    }
+    sheet = {
+        "h3_image_reference": "Image 1",
+        "user_image_present": True,
+        "spec": {
+            "tiles": [
+                {"tile_id": "T1", "row": 1, "column": 1, "stable_key": "entity-01"},
+            ],
+        },
+        # Only image_1 is a frozen user replacement; image_2 is unmapped.
+        "h3_reference_images": [
+            {"role": "user_replacement", "image_reference": "Image 2"},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="reference_image_ids"):
+        Pipeline._fusion_authority_block(index, 1, sheet)
+
+
 def test_fusion_authority_keeps_global_index_element_with_empty_occurrences() -> None:
     authority = Pipeline._fusion_authority_block({
         "people": {},
