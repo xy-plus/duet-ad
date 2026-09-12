@@ -30,6 +30,10 @@ OBJECT_DETECT_PROVIDER_NAMES = (
 DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 # 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
 DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+GEMINI_MODEL = "gemini-2.5-flash"
+# GEMINI_PROXY 允许 http/https/socks5/socks5h，Scheme 白名单见 __post_init__。
+_GEMINI_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,13 @@ class Settings:
     doubao_api_key: str | None = field(default=None, repr=False)
     doubao_api_base: str = DOUBAO_API_BASE
     doubao_model: str = DOUBAO_GROUNDING_MODEL
+    # 缺省 None 表示未配置（该 provider 不启用）。
+    gemini_api_key: str | None = field(default=None, repr=False)
+    gemini_api_base: str = GEMINI_API_BASE
+    gemini_model: str = GEMINI_MODEL
+    # 国内直连 generativelanguage.googleapis.com 不通时需代理，
+    # 本机一般为 http://127.0.0.1:7897；None = 直连。
+    gemini_proxy: str | None = None
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -244,6 +255,56 @@ class Settings:
         if not _MODEL_ID_RE.fullmatch(doubao_model):
             raise ValueError("DOUBAO_MODEL must be a valid model identifier")
         object.__setattr__(self, "doubao_model", doubao_model)
+        gemini_key = self.gemini_api_key
+        if gemini_key is not None:
+            if not isinstance(gemini_key, str) or not gemini_key.strip():
+                raise ValueError("GEMINI_API_KEY must be a non-empty value or unset")
+            gemini_key = gemini_key.strip()
+            if (
+                not gemini_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in gemini_key)
+            ):
+                raise ValueError("GEMINI_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "gemini_api_key", gemini_key)
+        gemini_base = (
+            self.gemini_api_base.strip().rstrip("/")
+            if isinstance(self.gemini_api_base, str)
+            else ""
+        )
+        try:
+            gemini_url = urlsplit(gemini_base)
+        except ValueError as exc:
+            raise ValueError("GEMINI_API_BASE must be an HTTPS base URL") from exc
+        if gemini_url.scheme != "https" or not gemini_url.netloc:
+            raise ValueError("GEMINI_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "gemini_api_base", gemini_base)
+        gemini_model = (
+            self.gemini_model.strip()
+            if isinstance(self.gemini_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(gemini_model):
+            raise ValueError("GEMINI_MODEL must be a valid model identifier")
+        object.__setattr__(self, "gemini_model", gemini_model)
+        gemini_proxy = self.gemini_proxy
+        if gemini_proxy is not None:
+            if not isinstance(gemini_proxy, str) or not gemini_proxy.strip():
+                raise ValueError("GEMINI_PROXY must be a non-empty value or unset")
+            gemini_proxy = gemini_proxy.strip()
+            try:
+                proxy_url = urlsplit(gemini_proxy)
+            except ValueError as exc:
+                raise ValueError(
+                    "GEMINI_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                ) from exc
+            if (
+                proxy_url.scheme not in _GEMINI_PROXY_SCHEMES
+                or not proxy_url.netloc
+            ):
+                raise ValueError(
+                    "GEMINI_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                )
+            object.__setattr__(self, "gemini_proxy", gemini_proxy)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -315,4 +376,8 @@ def get_settings() -> Settings:
         doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
         doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
         doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
+        gemini_api_base=os.environ.get("GEMINI_API_BASE", GEMINI_API_BASE).strip(),
+        gemini_model=os.environ.get("GEMINI_MODEL", GEMINI_MODEL).strip(),
+        gemini_proxy=os.environ.get("GEMINI_PROXY", "").strip() or None,
     )
