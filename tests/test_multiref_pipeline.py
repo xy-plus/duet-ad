@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.config import Settings
 from app.pipeline import Pipeline
 
 
@@ -10,6 +11,12 @@ from app.pipeline import Pipeline
 @pytest.mark.parametrize("resume", [False, True])
 def test_ordered_references_reach_every_visual_stage(tmp_path, monkeypatch, count, resume):
     pipeline = object.__new__(Pipeline)
+    # direct 模式：逐图直传语义（本测试文件覆盖的就是 direct 链路）。
+    pipeline.settings = Settings(
+        access_token="test",
+        multiref_mode="direct",
+        public_base_url="https://multiref-pipeline.test",
+    )
     monkeypatch.setattr(pipeline, "_generation_config", lambda request: {})
     originals = []
     for order in range(1, count + 1):

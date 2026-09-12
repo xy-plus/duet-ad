@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from app.config import Settings
 from app.pipeline import Pipeline
 from app import person_identity
 
@@ -12,6 +13,12 @@ from app import person_identity
 @pytest.mark.parametrize("resume", [False, True])
 def test_project_frame_barrier_precedes_every_agent(tmp_path, monkeypatch, resume):
     pipeline = object.__new__(Pipeline)
+    # 本用例无用户图、与模式无关；显式固定 direct 仅为满足 Settings 无缺省约束。
+    pipeline.settings = Settings(
+        access_token="test",
+        multiref_mode="direct",
+        public_base_url="https://identity-barrier.test",
+    )
     events = []
     barrier = threading.Barrier(2)
 

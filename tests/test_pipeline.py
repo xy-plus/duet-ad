@@ -1848,7 +1848,8 @@ def test_h3_sends_original_user_image_even_when_sheet_is_not_needed(
     registered: list[Path] = []
     seedream = _FlowSeedream()
     pipeline = Pipeline(
-        _settings(tmp_path),
+        # 本用例断言逐图直传（direct）语义，显式固定 direct 模式。
+        _settings(tmp_path, multiref_mode="direct"),
         store,
         lambda _project_id, path: (
             registered.append(path) or f"https://assets.invalid/{path.name}"
@@ -2211,10 +2212,12 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
         for receipt in state["picsart_submission_receipts"]["segments"]["2"]
     ] == ["provider_failed", "accepted"]
     expected_registered = {
-        "source-muted.mp4", "reference-sheet.png",
+        "source-muted.mp4", "reference-sheet.png", "user-reference.png",
     }
+    # b0e092c 语义：未绑定 stable key 的上传图仍保留为 H3 参考输入。
     assert picsart.submits[0]["image_urls"] == [
         "https://assets.invalid/reference-sheet.png",
+        "https://assets.invalid/user-reference.png",
     ]
     assert len(seedream.calls) == 1
     assert {path.name for path in registered} == expected_registered
@@ -4708,7 +4711,8 @@ def test_h3_manifest_rejects_a_changed_replacement_image(
     project_id, project, _state = store.create(request, "replacement-binding")
     (project / "inputs" / "source.mp4").write_bytes(b"project-source")
     replacement = project / "inputs" / "replacement-image"
-    replacement.write_bytes(b"original-image")
+    # b0e092c 起未绑定上传图也会被规范化处理，夹具必须是可解码的图片。
+    replacement.write_bytes(_TEST_PNG)
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
     source = segment_dir / "source.mp4"
@@ -7972,3 +7976,50 @@ def test_direct_mode_never_composes_user_references(
         replacement_paths=[project / name for name in names],
     )
     assert result == project / "work/global-reference-sheet/user-reference.png"
+
+
+def test_composed_mode_not_needed_sheet_keeps_one_composite_reference(
+    tmp_path: Path,
+) -> None:
+    """composed 模式 + 无图版（not_needed）：多图仍只暴露合图一条 H3 引用。"""
+    from PIL import Image
+
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request()
+    project_id, project, _state = store.create(request, "composed-no-tiles")
+    (project / "inputs/source.mp4").write_bytes(b"source")
+    names = ["inputs/replacement-image", "inputs/replacement-image-2"]
+    for index, name in enumerate(names):
+        Image.new("RGB", (64, 48), (index * 80, 20, 120)).save(
+            project / name, format="PNG",
+        )
+    store.update(
+        project_id, source_path="inputs/source.mp4",
+        replacement_image_path=names[0], replacement_image_paths=names,
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path, multiref_mode="composed"), store,
+        lambda _pid, path: f"https://assets.invalid/{path.name}",
+        deepseek=object(), mediakit=object(), picsart=_FlowPicsart(),
+        seedream=_FlowSeedream(),
+    )
+    empty_index = {"people": {}, "entities": {}, "scenes": {}, "relations": {}}
+    sheet, sheet_path = _materialize_test_replacement_sheet(
+        pipeline, project_id, project,
+        [{"index": 1, "analysis_paths": []}], empty_index,
+        replacement=project / names[0],
+    )
+    assert sheet_path is None
+    assert sheet["status"] == "not_needed"
+    assert [
+        reference["image_reference"] for reference in sheet["h3_reference_images"]
+    ] == ["Image 1"]
+    assert sheet["h3_reference_images"][0]["path"] == (
+        "work/global-reference-sheet/user-reference.png"
+    )
+    assert sheet["upstream_bindings"]["replacement_views"]["view_count"] == 2
+    # 冻结校验往返一致（composed 分支的 expected_references 与冻结侧同源）。
+    assert (
+        pipeline._validated_stored_replacement_sheet(project, store.read(project_id))
+        is None
+    )

@@ -23,7 +23,6 @@ from test_pipeline import (
     _FlowSeedream,
     _effective_request as _pipeline_request,
     _install_fake_media,
-    _settings as _pipeline_settings,
 )
 
 
@@ -73,14 +72,18 @@ def _request() -> dict[str, Any]:
     }
 
 
-def _settings(path: Path) -> Settings:
-    return Settings(
-        access_token="test-token",
-        data_dir=path,
-        public_base_url="https://pipeline.test",
-        enable_mediakit=False,
-        provider_poll_interval_s=0,
-    )
+def _settings(path: Path, **changes: Any) -> Settings:
+    # 本文件覆盖 direct（逐图直传）链路，显式固定 direct 模式。
+    values: dict[str, Any] = {
+        "access_token": "test-token",
+        "multiref_mode": "direct",
+        "data_dir": path,
+        "public_base_url": "https://pipeline.test",
+        "enable_mediakit": False,
+        "provider_poll_interval_s": 0,
+    }
+    values.update(changes)
+    return Settings(**values)
 
 
 def _project_with_replacements(
@@ -253,7 +256,7 @@ def test_pipeline_multi_reference_inputs_are_frozen_and_r2v_resume_reuses_them(
     picsart = _FlowPicsart()
     registered: list[Path] = []
     pipeline = Pipeline(
-        _pipeline_settings(tmp_path, enable_mediakit=True),
+        _settings(tmp_path, enable_mediakit=True),
         store,
         lambda _project_id, path: (
             registered.append(path)
@@ -333,6 +336,7 @@ def test_pipeline_multi_reference_inputs_are_frozen_and_r2v_resume_reuses_them(
         },
     )
 
+    monkeypatch.setattr("app.media.user_reference_png", lambda *args, **kwargs: pytest.fail("frozen references must not be cropped again"))
     pipeline.validate_r2v_resume(project_id)
     pipeline.resume_r2v(project_id)
 
@@ -377,7 +381,7 @@ def test_all_uploaded_references_reach_h3_when_no_key_binds_them(
     seedream = _FlowSeedream(deepseek.events)
     picsart = _FlowPicsart()
     pipeline = Pipeline(
-        _pipeline_settings(tmp_path, enable_mediakit=True),
+        _settings(tmp_path, enable_mediakit=True),
         store,
         lambda _project_id, path: (
             f"https://assets.invalid/{path.parent.name}/{path.name}"
@@ -457,6 +461,7 @@ def test_all_uploaded_references_reach_h3_when_no_key_binds_them(
             "status": "failed", "stage": "pipeline_failed", "error": "retry",
         },
     )
+    monkeypatch.setattr("app.media.user_reference_png", lambda *args, **kwargs: pytest.fail("frozen references must not be cropped again"))
     pipeline.validate_r2v_resume(project_id)
     pipeline.resume_r2v(project_id)
     assert (
