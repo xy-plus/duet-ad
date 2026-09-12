@@ -520,6 +520,79 @@ class QwenGroundingClient(OpenAICompatibleGroundingClient):
         if not isinstance(entries, list):
             raise TypeError("model output must contain a detections list")
         return entries
+# ---- glm（智谱 BigModel）----
+# bbox 输出为 prompt 产物、官方未文档化，故采用保守解析：优先提取 JSON 对象
+# （复用 extract_json_object，容忍 markdown 围栏与前后散文），detections 条目
+# 的 bbox 兼容两种形态：``<bbox>x1 y1 x2 y2</bbox>`` 标签字符串、四元素数字
+# 数组。坐标约定为 0–1000 归一化（除以 1000 转 0–1）；若四值全部落在
+# [0, 1] 内则视为模型直接给了 0–1 浮点，原样采用。不扫描 JSON 之外的裸
+# <bbox> 标签：缺少 timestamp_s 无法构造合法 ObjectDetection，宁可判解析
+# 失败计入重试，也不猜测时间戳。
+_GLM_BBOX_TAG_RE = re.compile(
+    r"<bbox>\s*(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s*</bbox>"
+)
+
+
+class GlmGroundingClient(OpenAICompatibleGroundingClient):
+    """智谱 BigModel GLM-4.5V：OpenAI 兼容端点，保守 JSON 解析（见上方段落注释）。"""
+
+    provider_name = "glm"
+
+    def parse_response(
+        self, text: str, target: str
+    ) -> list[ObjectDetection]:
+        payload = extract_json_object(text)
+        entries = payload.get("detections")
+        if not isinstance(entries, list):
+            raise TypeError("model output must contain a detections list")
+        detections: list[ObjectDetection] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise TypeError(f"detection entry {index} must be an object")
+            timestamp = entry.get("timestamp_s")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+            ):
+                raise ValueError(f"detection entry {index} has an invalid timestamp")
+            raw_bbox = self._entry_bbox(entry.get("bbox"), index)
+            try:
+                detections.append(
+                    ObjectDetection(
+                        label=target,
+                        timestamp_s=float(timestamp),
+                        bbox_xyxy_normalized=self._normalize_bbox(raw_bbox, index),
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"detection entry {index} has invalid coordinates: {exc}"
+                ) from exc
+        return detections
+
+    def _entry_bbox(self, bbox: Any, index: int) -> tuple[float, ...]:
+        if isinstance(bbox, str):
+            match = _GLM_BBOX_TAG_RE.fullmatch(bbox.strip())
+            if match is None:
+                raise ValueError(f"detection entry {index} bbox is not a <bbox> tag")
+            return tuple(float(value) for value in match.groups())
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4 and not any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in bbox
+        ):
+            return tuple(float(value) for value in bbox)
+        raise TypeError(f"detection entry {index} has no usable bbox")
+
+    def _normalize_bbox(
+        self, raw: tuple[float, ...], index: int
+    ) -> tuple[float, float, float, float]:
+        if any(value < 0 for value in raw):
+            raise ValueError(f"detection entry {index} has negative coordinates")
+        scale = 1000.0 if any(value > 1.0 for value in raw) else 1.0
+        x0, y0, x1, y1 = (value / scale for value in raw)
+        return (x0, y0, x1, y1)
+
+
 
 
 # 名称 → client 类；None = 已预留未实现（不进可选列表）。
@@ -527,7 +600,7 @@ class QwenGroundingClient(OpenAICompatibleGroundingClient):
 PROVIDER_REGISTRY: dict[str, type | None] = {
     "doubao": DoubaoGroundingClient,
     "qwen": QwenGroundingClient,  # 阿里百炼，bbox_2d 绝对像素 ÷ 帧宽高归一化
-    "glm": None,  # 待实现：智谱 BigModel
+    "glm": GlmGroundingClient,
     "hunyuan": None,  # 待实现：腾讯混元 TokenHub
     "kimi": None,  # 待实现：Moonshot k2.6（k2.5/k3 不支持视频）
     "step": None,  # 待实现：阶跃星辰
