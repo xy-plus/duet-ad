@@ -40,6 +40,10 @@ HUNYUAN_VISION_MODEL = "hunyuan-large-vision"
 KIMI_API_BASE = "https://api.moonshot.cn/v1"
 # k2.5/k3 不支持视频输入；模型 ID 以 Moonshot 控制台为准。
 KIMI_GROUNDING_MODEL = "kimi-k2.6"
+STEP_API_BASE = "https://api.stepfun.com/v1"
+# 模型 ID 以阶跃星辰控制台为准（Step-1.5V 起支持视频理解），改动时同步
+# STEP_MODEL 环境变量。
+STEP_GROUNDING_MODEL = "step-3.7-flash"
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,9 @@ class Settings:
     kimi_api_key: str | None = field(default=None, repr=False)
     kimi_api_base: str = KIMI_API_BASE
     kimi_model: str = KIMI_GROUNDING_MODEL
+    step_api_key: str | None = field(default=None, repr=False)
+    step_api_base: str = STEP_API_BASE
+    step_model: str = STEP_GROUNDING_MODEL
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -390,6 +397,37 @@ class Settings:
         if not _MODEL_ID_RE.fullmatch(kimi_model):
             raise ValueError("KIMI_MODEL must be a valid model identifier")
         object.__setattr__(self, "kimi_model", kimi_model)
+        step_key = self.step_api_key
+        if step_key is not None:
+            if not isinstance(step_key, str) or not step_key.strip():
+                raise ValueError("STEP_API_KEY must be a non-empty value or unset")
+            step_key = step_key.strip()
+            if (
+                not step_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in step_key)
+            ):
+                raise ValueError("STEP_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "step_api_key", step_key)
+        step_base = (
+            self.step_api_base.strip().rstrip("/")
+            if isinstance(self.step_api_base, str)
+            else ""
+        )
+        try:
+            step_url = urlsplit(step_base)
+        except ValueError as exc:
+            raise ValueError("STEP_API_BASE must be an HTTPS base URL") from exc
+        if step_url.scheme != "https" or not step_url.netloc:
+            raise ValueError("STEP_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "step_api_base", step_base)
+        step_model = (
+            self.step_model.strip()
+            if isinstance(self.step_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(step_model):
+            raise ValueError("STEP_MODEL must be a valid model identifier")
+        object.__setattr__(self, "step_model", step_model)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -473,4 +511,7 @@ def get_settings() -> Settings:
         kimi_api_key=os.environ.get("KIMI_API_KEY", "").strip() or None,
         kimi_api_base=os.environ.get("KIMI_API_BASE", KIMI_API_BASE).strip(),
         kimi_model=os.environ.get("KIMI_MODEL", KIMI_GROUNDING_MODEL).strip(),
+        step_api_key=os.environ.get("STEP_API_KEY", "").strip() or None,
+        step_api_base=os.environ.get("STEP_API_BASE", STEP_API_BASE).strip(),
+        step_model=os.environ.get("STEP_MODEL", STEP_GROUNDING_MODEL).strip(),
     )

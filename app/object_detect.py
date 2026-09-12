@@ -726,6 +726,59 @@ class KimiGroundingClient(OpenAICompatibleGroundingClient):
         ):
             return tuple(bbox)
         raise ValueError(f"detection entry {index} has an unrecognized bbox format")
+# --- step（阶跃星辰）---
+
+_STEP_BBOX_RE = _DOUBAO_BBOX_RE
+
+
+class StepGroundingClient(OpenAICompatibleGroundingClient):
+    """阶跃星辰：bbox 输出格式未文档化，保守沿用基类 prompt 约定的
+    ``<bbox>x1 y1 x2 y2</bbox>``（0–1000 归一化整数），解析同豆包模式。"""
+
+    provider_name = "step"
+
+    def parse_response(
+        self, text: str, target: str
+    ) -> list[ObjectDetection]:
+        payload = extract_json_object(text)
+        entries = payload.get("detections")
+        if not isinstance(entries, list):
+            raise TypeError("model output must contain a detections list")
+        detections: list[ObjectDetection] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise TypeError(f"detection entry {index} must be an object")
+            timestamp = entry.get("timestamp_s")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+            ):
+                raise ValueError(f"detection entry {index} has an invalid timestamp")
+            bbox_text = entry.get("bbox")
+            if not isinstance(bbox_text, str):
+                raise TypeError(f"detection entry {index} has no bbox")
+            match = _STEP_BBOX_RE.fullmatch(bbox_text.strip())
+            if match is None:
+                raise ValueError(
+                    f"detection entry {index} bbox is not a <bbox> tag"
+                )
+            try:
+                detections.append(
+                    ObjectDetection(
+                        label=target,
+                        timestamp_s=float(timestamp),
+                        bbox_xyxy_normalized=tuple(
+                            int(value) / 1000.0 for value in match.groups()
+                        ),  # type: ignore[arg-type]
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"detection entry {index} has invalid coordinates: {exc}"
+                ) from exc
+        return detections
+
+
 
 
 
@@ -742,7 +795,7 @@ PROVIDER_REGISTRY: dict[str, type | None] = {
     "glm": GlmGroundingClient,
     "hunyuan": HunyuanGroundingClient,
     "kimi": KimiGroundingClient,
-    "step": None,  # 待实现：阶跃星辰
+    "step": StepGroundingClient,
     "gemini": None,  # 待实现：File API + generateContent，不继承 OpenAI 基类
 }
 
