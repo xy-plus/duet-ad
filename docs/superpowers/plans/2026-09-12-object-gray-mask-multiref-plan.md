@@ -94,6 +94,12 @@
 2. 用户根据效果定主力与回退顺序（调整 `OBJECT_DETECT_PROVIDERS` 顺序即可）。
 3. 部署（3241→3242，`duet-ad1-h3-max-r2v-object-mask{,-caddy}.service`）只在全部测试通过且用户确认后进行；部署前确认无在飞项目。
 
+## 验收（最终 E2E，通过对外 API）
+
+1. 验收一律走 v1 公开 API（不是内部入口）：多参考图创建（1 图与 2–4 图各一），确认公开 API 参数/响应中不出现 `multiref_mode`、provider 名称等内部切换概念（`max_images` capability 属上传能力，可保留）。
+2. 最后一轮用 TikTok 链接验收：TikTok 解析修复（`app/safe_download.py` TikWM 解析、代理、重试）必须还在，TikTok 输入经报价/确认流跑通。
+3. 验收涉及真实生成费用，`confirm: true` 前向用户确认。
+
 ## 执行约束（给工作子代理）
 
 - TDD：每个功能先写失败测试再实现。

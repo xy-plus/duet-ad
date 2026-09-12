@@ -25,6 +25,8 @@
 | 多参考图 | cherry-pick 移植 multiref-common 公共层 + A（composed）+ B（direct），后端开关 `multiref_mode` 只有 `composed | direct` 两个值，不保留旧单图链路（单图 = 所选模式的 1 图情形），不暴露前端 |
 | 掩码→灰块 | 不需要模型，OpenCV 确定性填色；物品块用深灰 `(64,64,64)` 与人脸块 `(128,128,128)` 区分 |
 | 提示词联动 | 生成提示词节点（fusion / H3 为主，object-replace 补一句色块语义）同步修改，明确介绍两种色块的含义 |
+| 对外 API | v1 公开 API 同步支持多参考图上传（随公共层移植）；**不暴露任何内部模型切换**（`multiref_mode`、`object_detect_providers`、provider 名称一律不出现在公开 API 参数与响应里） |
+| 验收方式 | 通过对外 API 做 E2E 验收；最后一轮用 TikTok 链接验收（TikTok 解析修复已在 main 的 `app/safe_download.py` / `app/public_api.py`，本分支已继承，移植过程中不得丢失） |
 
 ## 检测模型 API 调研结论
 
@@ -101,7 +103,8 @@ pipeline 集成（`app/pipeline.py`）：
 - 不做本地 GPU 模型部署；CPU 备选（YOLO-World + MobileSAM）本轮不接。
 - 不做"掩码转灰块"模型（确定性 OpenCV 填色）。
 - 不动 seedream 图版链路；不改人脸灰块现有算法（YuNet、0.73 阈值、外扩比例）。
-- 开关不进前端、不进公开 API；不新增任何质量/语义/产品门禁（replay 测试基建的 fail-closed 属测试工具链，不在此列）。
+- 开关不进前端、不进公开 API（含 provider 名称、`multiref_mode`、检测模型选择，一律不出现在 v1 参数与响应里）；不新增任何质量/语义/产品门禁（replay 测试基建的 fail-closed 属测试工具链，不在此列）。
+- 不丢 main 已有的 TikTok 链接解析与下载修复（`app/safe_download.py` / `app/public_api.py` 的 TikWM 解析、代理、重试），移植冲突时保留这些修复。
 
 ## 部署与端口
 
