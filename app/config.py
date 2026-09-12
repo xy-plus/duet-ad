@@ -14,11 +14,16 @@ FUSION_AGENTS = frozenset({"codex", "deepseek"})
 SEEDREAM_PRO_MODEL = "doubao-seedream-5-0-pro-260628"
 SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+MULTIREF_MODES = frozenset({"composed", "direct"})
 
 
 @dataclass(frozen=True)
 class Settings:
     access_token: str
+    # --- multiref section (experiment/object-gray-mask-multiref) ---
+    # 多参考图模式开关：只有 composed | direct 两个值，必须显式配置、无缺省。
+    multiref_mode: str
+    # --- end multiref section ---
     data_dir: Path = ROOT / "data"
     public_base_url: str = ""
     picsart_api_key: str = ""
@@ -58,6 +63,10 @@ class Settings:
             raise ValueError("ACCESS_TOKEN must be a non-empty value")
         if token != self.access_token:
             object.__setattr__(self, "access_token", token)
+        # --- multiref section ---
+        if self.multiref_mode not in MULTIREF_MODES:
+            raise ValueError("MULTIREF_MODE must be composed or direct")
+        # --- end multiref section ---
         seedream_key = (
             self.seedream_api_key.strip()
             if isinstance(self.seedream_api_key, str)
@@ -189,8 +198,14 @@ def get_settings() -> Settings:
     deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not deepseek_api_key:
         raise RuntimeError("DEEPSEEK_API_KEY must be set to a non-empty value")
+    # --- multiref section ---
+    multiref_mode = os.environ.get("MULTIREF_MODE", "").strip().lower()
+    if not multiref_mode:
+        raise RuntimeError("MULTIREF_MODE must be set to composed or direct")
+    # --- end multiref section ---
     return Settings(
         access_token=access_token,
+        multiref_mode=multiref_mode,
         data_dir=Path(os.environ.get("DATA_DIR", str(ROOT / "data"))).resolve(),
         public_base_url=os.environ.get("PUBLIC_BASE_URL", ""),
         picsart_api_key=os.environ.get("PICSART_API_KEY", ""),

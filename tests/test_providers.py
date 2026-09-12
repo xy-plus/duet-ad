@@ -25,6 +25,7 @@ from app.providers import (
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
     values: dict[str, object] = {
         "access_token": "test-access",
+        "multiref_mode": "composed",
         "data_dir": tmp_path,
         "public_base_url": "https://providers.test",
         "deepseek_api_key": "deepseek-secret",

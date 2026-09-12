@@ -29,6 +29,7 @@ _PNG = _png(2048, 2048)
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
     values: dict[str, object] = {
         "access_token": "test-access",
+        "multiref_mode": "composed",
         "data_dir": tmp_path,
         "public_base_url": "https://seedream-app.test",
         "seedream_api_key": "ark-secret",
@@ -65,6 +66,7 @@ def test_seedream_settings_have_closed_defaults_and_environment_mapping(
 ) -> None:
     defaults = Settings(
         access_token="test-access",
+        multiref_mode="composed",
         public_base_url="https://seedream-app.test",
     )
     assert defaults.seedream_api_base == SEEDREAM_API_BASE
@@ -77,6 +79,7 @@ def test_seedream_settings_have_closed_defaults_and_environment_mapping(
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://seedream-app.test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
     monkeypatch.setenv("ARK_API_KEY", "  ark-key  ")
+    monkeypatch.setenv("MULTIREF_MODE", "composed")
     monkeypatch.setenv("SEEDREAM_API_BASE", "https://ark.override/api/v3/")
     monkeypatch.setenv("SEEDREAM_MODEL", "seedream-override")
     monkeypatch.setenv("SEEDREAM_TIMEOUT_S", "42")

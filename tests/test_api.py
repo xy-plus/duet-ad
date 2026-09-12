@@ -181,6 +181,7 @@ class ResumablePipeline:
 def settings(tmp_path: Path, *, max_upload_mb: int = 1) -> Settings:
     return Settings(
         access_token="test-secret",
+        multiref_mode="composed",
         data_dir=tmp_path / "data",
         public_base_url="https://studio.example",
         max_upload_mb=max_upload_mb,
@@ -218,7 +219,7 @@ def wait_for_status(client: TestClient, project_id: str, status: str) -> dict:
 
 def test_default_and_blank_access_tokens_are_rejected(monkeypatch: pytest.MonkeyPatch):
     with pytest.raises(ValueError, match="ACCESS_TOKEN"):
-        Settings(access_token="")
+        Settings(access_token="", multiref_mode="composed")
     monkeypatch.delenv("ACCESS_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="ACCESS_TOKEN"):
         get_settings()
@@ -236,6 +237,7 @@ def test_get_settings_requires_the_canonical_deepseek_key(
         get_settings()
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "  canonical-deepseek-key  ")
+    monkeypatch.setenv("MULTIREF_MODE", "composed")
     assert get_settings().deepseek_api_key == "canonical-deepseek-key"
 
 
@@ -245,16 +247,22 @@ def test_get_settings_requires_the_canonical_deepseek_key(
 )
 def test_public_base_url_must_be_a_public_https_origin(base: str):
     with pytest.raises(ValueError, match="PUBLIC_BASE_URL"):
-        Settings(access_token="test-secret", public_base_url=base)
+        Settings(
+            access_token="test-secret",
+            multiref_mode="composed",
+            public_base_url=base,
+        )
 
 
 def test_fusion_agent_configuration_is_closed() -> None:
     assert Settings(
         access_token="test-secret",
+        multiref_mode="composed",
         public_base_url="https://studio.example",
     ).fusion_agent == "deepseek"
     assert Settings(
         access_token="test-secret",
+        multiref_mode="composed",
         public_base_url="https://studio.example",
         fusion_agent="codex",
     ).fusion_agent == "codex"
@@ -262,6 +270,7 @@ def test_fusion_agent_configuration_is_closed() -> None:
         with pytest.raises(ValueError, match="FUSION_AGENT"):
             Settings(
                 access_token="test-secret",
+                multiref_mode="composed",
                 public_base_url="https://studio.example",
                 fusion_agent=unsupported_agent,
             )
@@ -270,6 +279,7 @@ def test_fusion_agent_configuration_is_closed() -> None:
 def test_fusion_is_internal_and_client_cannot_select_it(tmp_path: Path) -> None:
     configured = Settings(
         access_token="test-secret",
+        multiref_mode="composed",
         data_dir=tmp_path / "data",
         public_base_url="https://studio.example",
         fusion_agent="deepseek",

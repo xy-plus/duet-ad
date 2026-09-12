@@ -92,7 +92,8 @@ def quote_env(tmp_path):
     registry = tmp_path / "clients.json"
     key = public_api_auth.create_client_key(registry, "quote_owner", key_id="key00001")
     settings = Settings(
-        access_token="private-test-secret", data_dir=tmp_path / "data",
+        access_token="private-test-secret", multiref_mode="composed",
+        data_dir=tmp_path / "data",
         public_base_url="https://studio.example", store_lock_enabled=False,
         public_api_enabled=True, public_api_clients_file=registry,
     )

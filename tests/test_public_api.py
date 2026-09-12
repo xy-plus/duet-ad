@@ -106,6 +106,7 @@ def manual_factory(_settings, _store, _register_asset):
 def make_settings(tmp_path: Path, **overrides) -> Settings:
     base = dict(
         access_token=TOKEN,
+        multiref_mode="composed",
         data_dir=tmp_path / "data",
         public_base_url="https://studio.example",
         store_lock_enabled=False,

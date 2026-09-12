@@ -85,6 +85,7 @@ def pytest_collection_modifyitems(
 def replay_settings() -> Settings:
     return Settings(
         access_token="node-replay",
+        multiref_mode="composed",
         public_base_url="https://node-replay.test",
         enable_mediakit=False,
         provider_poll_interval_s=2.0,

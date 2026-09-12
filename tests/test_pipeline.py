@@ -68,6 +68,7 @@ _TEST_PNG = base64.b64decode(
 def _settings(path: Path, **changes: Any) -> Settings:
     values = {
         "access_token": "test-token",
+        "multiref_mode": "composed",
         "data_dir": path,
         "public_base_url": "https://pipeline.test",
         "enable_mediakit": False,
