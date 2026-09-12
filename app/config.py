@@ -30,6 +30,8 @@ OBJECT_DETECT_PROVIDER_NAMES = (
 DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 # 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
 DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+HUNYUAN_API_BASE = "https://api.hunyuan.cloud.tencent.com/v1"
+HUNYUAN_VISION_MODEL = "hunyuan-large-vision"
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,9 @@ class Settings:
     doubao_api_key: str | None = field(default=None, repr=False)
     doubao_api_base: str = DOUBAO_API_BASE
     doubao_model: str = DOUBAO_GROUNDING_MODEL
+    hunyuan_api_key: str | None = field(default=None, repr=False)
+    hunyuan_api_base: str = HUNYUAN_API_BASE
+    hunyuan_model: str = HUNYUAN_VISION_MODEL
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -244,6 +249,37 @@ class Settings:
         if not _MODEL_ID_RE.fullmatch(doubao_model):
             raise ValueError("DOUBAO_MODEL must be a valid model identifier")
         object.__setattr__(self, "doubao_model", doubao_model)
+        hunyuan_key = self.hunyuan_api_key
+        if hunyuan_key is not None:
+            if not isinstance(hunyuan_key, str) or not hunyuan_key.strip():
+                raise ValueError("HUNYUAN_API_KEY must be a non-empty value or unset")
+            hunyuan_key = hunyuan_key.strip()
+            if (
+                not hunyuan_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in hunyuan_key)
+            ):
+                raise ValueError("HUNYUAN_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "hunyuan_api_key", hunyuan_key)
+        hunyuan_base = (
+            self.hunyuan_api_base.strip().rstrip("/")
+            if isinstance(self.hunyuan_api_base, str)
+            else ""
+        )
+        try:
+            hunyuan_url = urlsplit(hunyuan_base)
+        except ValueError as exc:
+            raise ValueError("HUNYUAN_API_BASE must be an HTTPS base URL") from exc
+        if hunyuan_url.scheme != "https" or not hunyuan_url.netloc:
+            raise ValueError("HUNYUAN_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "hunyuan_api_base", hunyuan_base)
+        hunyuan_model = (
+            self.hunyuan_model.strip()
+            if isinstance(self.hunyuan_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(hunyuan_model):
+            raise ValueError("HUNYUAN_MODEL must be a valid model identifier")
+        object.__setattr__(self, "hunyuan_model", hunyuan_model)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -315,4 +351,7 @@ def get_settings() -> Settings:
         doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
         doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
         doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
+        hunyuan_api_key=os.environ.get("HUNYUAN_API_KEY", "").strip() or None,
+        hunyuan_api_base=os.environ.get("HUNYUAN_API_BASE", HUNYUAN_API_BASE).strip(),
+        hunyuan_model=os.environ.get("HUNYUAN_MODEL", HUNYUAN_VISION_MODEL).strip(),
     )
