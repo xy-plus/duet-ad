@@ -47,8 +47,9 @@ STEP_API_BASE = "https://api.stepfun.com/v1"
 STEP_GROUNDING_MODEL = "step-3.7-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
 GEMINI_MODEL = "gemini-2.5-flash"
-# GEMINI_PROXY 允许 http/https/socks5/socks5h，Scheme 白名单见 __post_init__。
-_GEMINI_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+# GEMINI_PROXY 只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
+# Scheme 白名单见 __post_init__。
+_GEMINI_PROXY_SCHEMES = frozenset({"http", "https"})
 
 
 @dataclass(frozen=True)

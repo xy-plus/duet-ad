@@ -465,9 +465,17 @@ def test_settings_rejects_invalid_gemini_proxy(tmp_path: Path) -> None:
         _settings(tmp_path, gemini_proxy="not a url")
 
 
-def test_settings_accepts_socks5_gemini_proxy(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, gemini_proxy="socks5://127.0.0.1:7897")
-    assert settings.gemini_proxy == "socks5://127.0.0.1:7897"
+def test_settings_rejects_socks5_gemini_proxy(tmp_path: Path) -> None:
+    # socks5/socks5h 需要 socksio 依赖（未安装），白名单只留 http/https。
+    with pytest.raises(ValueError, match="GEMINI_PROXY"):
+        _settings(tmp_path, gemini_proxy="socks5://127.0.0.1:7897")
+    with pytest.raises(ValueError, match="GEMINI_PROXY"):
+        _settings(tmp_path, gemini_proxy="socks5h://127.0.0.1:7897")
+
+
+def test_settings_accepts_https_gemini_proxy(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, gemini_proxy="https://127.0.0.1:7897")
+    assert settings.gemini_proxy == "https://127.0.0.1:7897"
 
 
 def test_get_settings_reads_gemini_env(monkeypatch: pytest.MonkeyPatch) -> None:
