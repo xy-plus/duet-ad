@@ -520,6 +520,8 @@ class QwenGroundingClient(OpenAICompatibleGroundingClient):
         if not isinstance(entries, list):
             raise TypeError("model output must contain a detections list")
         return entries
+
+
 # ---- glm（智谱 BigModel）----
 # bbox 输出为 prompt 产物、官方未文档化，故采用保守解析：优先提取 JSON 对象
 # （复用 extract_json_object，容忍 markdown 围栏与前后散文），detections 条目
@@ -591,6 +593,8 @@ class GlmGroundingClient(OpenAICompatibleGroundingClient):
         scale = 1000.0 if any(value > 1.0 for value in raw) else 1.0
         x0, y0, x1, y1 = (value / scale for value in raw)
         return (x0, y0, x1, y1)
+
+
 # ==== hunyuan（腾讯混元 TokenHub）段落开始 ====
 # bbox 输出格式官方未文档化（spec 调研表），沿用基类 prompt 的
 # ``<bbox>x1 y1 x2 y2</bbox>`` 0–1000 整数约定，解析端保守兼容三种形态。
@@ -659,6 +663,8 @@ class HunyuanGroundingClient(OpenAICompatibleGroundingClient):
                 ) from exc
         return detections
 # ==== hunyuan（腾讯混元 TokenHub）段落结束 ====
+
+
 # ==== Kimi（Moonshot）====
 
 _KIMI_BBOX_TAG_RE = re.compile(
@@ -726,6 +732,8 @@ class KimiGroundingClient(OpenAICompatibleGroundingClient):
         ):
             return tuple(bbox)
         raise ValueError(f"detection entry {index} has an unrecognized bbox format")
+
+
 # --- step（阶跃星辰）---
 
 _STEP_BBOX_RE = _DOUBAO_BBOX_RE
@@ -777,6 +785,8 @@ class StepGroundingClient(OpenAICompatibleGroundingClient):
                     f"detection entry {index} has invalid coordinates: {exc}"
                 ) from exc
         return detections
+
+
 # ==== Gemini（Google AI Studio）独立实现：File API resumable 上传 + generateContent ====
 # 不继承 OpenAICompatibleGroundingClient（上传与请求形态完全不同），满足同一 detect 契约。
 # 响应 box_2d 为 0–1000 归一化，顺序 [ymin, xmin, ymax, xmax]；转 xyxy 后除 1000。
@@ -1144,16 +1154,6 @@ def _extract_gemini_json(text: str) -> Any:
         if isinstance(parsed, (dict, list)):
             return parsed
     raise ValueError("model output does not contain a JSON object or array")
-
-
-
-
-
-
-
-
-
-
 
 
 # 名称 → client 类；None = 已预留未实现（不进可选列表）。
