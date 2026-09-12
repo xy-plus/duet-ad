@@ -4,7 +4,9 @@ import json
 import logging
 from pathlib import Path
 
+import cv2
 import httpx
+import numpy as np
 import pytest
 
 from app import object_detect
@@ -39,8 +41,15 @@ def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture()
 def video(tmp_path: Path) -> Path:
+    """真实可解码视频：qwen 需要 cv2.VideoCapture 读到实际宽高做归一化。"""
     path = tmp_path / "clip.mp4"
-    path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 2.0, (320, 240)
+    )
+    assert writer.isOpened(), "cv2.VideoWriter cannot create the test video"
+    for _ in range(4):
+        writer.write(np.full((240, 320, 3), 127, dtype=np.uint8))
+    writer.release()
     return path
 
 
@@ -301,8 +310,57 @@ def test_select_provider_returns_none_when_nothing_available(tmp_path: Path) -> 
 
 
 # --- 统一契约参数化框架：每家 provider 在 CONTRACT_CASES 注册一个正常用例 ---
-# 后续 6 家代理：在 CONTRACT_CASES 加同名条目（settings 覆盖 + 正常响应文本），
-# 本测试自动覆盖该家的统一输入输出契约。
+# settings = Settings 覆盖项；response_text = 该家正常响应文本；flow = "gemini"
+# 表示走 File API 上传三步流程而非 OpenAI chat completions。
+
+_QWEN_GOOD = (
+    '{"detections": ['
+    '{"timestamp_s": 0, "bbox_2d": [32, 48, 160, 144]},'
+    '{"timestamp_s": 1.5, "bbox_2d": [0, 0, 320, 240]}'
+    "]}"
+)
+
+_GEMINI_GOOD = (
+    '{"detections": ['
+    '{"timestamp_s": 0, "box_2d": [200, 100, 400, 300]},'
+    '{"timestamp_s": 1.5, "box_2d": [0, 0, 1000, 1000]}'
+    "]}"
+)
+
+
+def _gemini_contract_handler(text: str):
+    """File API resumable 上传（start → PUT finalize 即 ACTIVE）+ generateContent。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/upload/v1beta/files":
+            return httpx.Response(
+                200, headers={"X-Goog-Upload-URL": "https://gemini.test/upload/session"}
+            )
+        if request.method == "PUT" and path == "/upload/session":
+            return httpx.Response(
+                200,
+                json={
+                    "file": {
+                        "name": "files/clip-1",
+                        "uri": "https://files.test/clip-1",
+                        "state": "ACTIVE",
+                    }
+                },
+            )
+        if request.method == "POST" and ":generateContent" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {"content": {"role": "model", "parts": [{"text": text}]}}
+                    ]
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    return handler
+
 
 CONTRACT_CASES: dict[str, dict[str, object]] = {
     "doubao": {
@@ -312,6 +370,55 @@ CONTRACT_CASES: dict[str, dict[str, object]] = {
             "doubao_model": "doubao-test-model",
         },
         "response_text": _DOUBAO_GOOD,
+    },
+    "qwen": {
+        "settings": {
+            "qwen_api_key": "qwen-secret",
+            "qwen_api_base": "https://qwen.test/compatible-mode/v1",
+            "qwen_model": "qwen-test-model",
+        },
+        "response_text": _QWEN_GOOD,
+    },
+    "glm": {
+        "settings": {
+            "glm_api_key": "glm-secret",
+            "glm_api_base": "https://glm.test/api/paas/v4",
+            "glm_model": "glm-test-model",
+        },
+        "response_text": _DOUBAO_GOOD,
+    },
+    "hunyuan": {
+        "settings": {
+            "hunyuan_api_key": "hunyuan-secret",
+            "hunyuan_api_base": "https://hunyuan.test/v1",
+            "hunyuan_model": "hunyuan-test-model",
+        },
+        "response_text": _DOUBAO_GOOD,
+    },
+    "kimi": {
+        "settings": {
+            "kimi_api_key": "kimi-secret",
+            "kimi_api_base": "https://kimi.test/v1",
+            "kimi_model": "kimi-test-model",
+        },
+        "response_text": _DOUBAO_GOOD,
+    },
+    "step": {
+        "settings": {
+            "step_api_key": "step-secret",
+            "step_api_base": "https://step.test/v1",
+            "step_model": "step-test-model",
+        },
+        "response_text": _DOUBAO_GOOD,
+    },
+    "gemini": {
+        "settings": {
+            "gemini_api_key": "gemini-secret",
+            "gemini_api_base": "https://gemini.test",
+            "gemini_model": "gemini-2.5-flash",
+        },
+        "response_text": _GEMINI_GOOD,
+        "flow": "gemini",
     },
 }
 
@@ -323,8 +430,12 @@ def test_unified_contract(provider_name: str, tmp_path: Path, video: Path) -> No
     client_class = object_detect.PROVIDER_REGISTRY[provider_name]
     assert client_class is not None
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return _chat_response(str(case["response_text"]))
+    if case.get("flow") == "gemini":
+        handler = _gemini_contract_handler(str(case["response_text"]))
+    else:
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _chat_response(str(case["response_text"]))
 
     client = client_class(settings, transport=httpx.MockTransport(handler))
     result = client.detect(video, ["bottle"])
