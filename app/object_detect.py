@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cv2
 import httpx
 
 from app import providers
@@ -385,11 +386,147 @@ class DoubaoGroundingClient(OpenAICompatibleGroundingClient):
         return detections
 
 
+# ==== qwen（阿里百炼 Qwen-VL）实现段落 ====
+
+
+def _probe_frame_size(video_path: Path) -> tuple[int, int]:
+    """cv2.VideoCapture 读视频实际宽高；读不到（不可解码）抛 ValueError。"""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    if width <= 0 or height <= 0:
+        raise ValueError(f"cannot read frame size from video: {video_path}")
+    return width, height
+
+
+def _extract_json_array(text: str) -> list[Any]:
+    """容忍顶层 JSON 数组输出（Qwen grounding 惯用形态）及 markdown 围栏。"""
+    candidates = [text.strip()]
+    fence = _JSON_FENCE_RE.search(text)
+    if fence is not None:
+        candidates.append(fence.group(1).strip())
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    raise ValueError("model output does not contain a detections list")
+
+
+class QwenGroundingClient(OpenAICompatibleGroundingClient):
+    """阿里百炼 Qwen-VL：``bbox_2d`` 绝对像素坐标，÷ 视频实际宽高归一化。
+
+    基类 ``parse_response(text, target)`` 拿不到帧尺寸，因此覆写
+    ``_load_video_part`` 在加载视频时用 cv2 探测宽高存到实例；
+    对外 ``detect`` 契约不变。
+    """
+
+    provider_name = "qwen"
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        super().__init__(settings, transport)
+        self._frame_size: tuple[int, int] | None = None
+
+    def _load_video_part(self, video_path: Path) -> dict[str, Any]:
+        part = super()._load_video_part(video_path)
+        self._frame_size = _probe_frame_size(video_path)
+        return part
+
+    def _prompt(self, target: str, fps: float) -> str:
+        return (
+            f"Watch the video (sampled at {fps:g} fps) and locate this object: "
+            f"{target}\n"
+            "For each sampled second where the object is visible, report the "
+            "second timestamp and its bounding box.\n"
+            'Output JSON only: {"detections": [{"timestamp_s": <float seconds>, '
+            '"bbox_2d": [x1, y1, x2, y2]}]}\n'
+            "bbox_2d coordinates are absolute pixel positions in the video "
+            "frame.\n"
+            'If the object is not visible, output {"detections": []}.'
+        )
+
+    def parse_response(
+        self, text: str, target: str
+    ) -> list[ObjectDetection]:
+        if self._frame_size is None:
+            raise ValueError("qwen frame size is unknown; load the video first")
+        width, height = self._frame_size
+        entries = self._detection_entries(text)
+        detections: list[ObjectDetection] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise TypeError(f"detection entry {index} must be an object")
+            timestamp = entry.get("timestamp_s")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+            ):
+                raise ValueError(f"detection entry {index} has an invalid timestamp")
+            bbox = entry.get("bbox_2d")
+            if (
+                not isinstance(bbox, list)
+                or len(bbox) != 4
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    for value in bbox
+                )
+            ):
+                raise ValueError(f"detection entry {index} has an invalid bbox_2d")
+            x1, y1, x2, y2 = (float(value) for value in bbox)
+            try:
+                detections.append(
+                    ObjectDetection(
+                        label=target,
+                        timestamp_s=float(timestamp),
+                        bbox_xyxy_normalized=(
+                            x1 / width,
+                            y1 / height,
+                            x2 / width,
+                            y2 / height,
+                        ),
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"detection entry {index} has invalid coordinates: {exc}"
+                ) from exc
+        return detections
+
+    @staticmethod
+    def _detection_entries(text: str) -> list[Any]:
+        try:
+            payload = extract_json_object(text)
+        except ValueError:
+            payload = None
+        entries: Any = (
+            payload.get("detections")
+            if payload is not None
+            else _extract_json_array(text)
+        )
+        if not isinstance(entries, list):
+            raise TypeError("model output must contain a detections list")
+        return entries
+
+
 # 名称 → client 类；None = 已预留未实现（不进可选列表）。
 # 与 config.OBJECT_DETECT_PROVIDER_NAMES 必须一一对应。
 PROVIDER_REGISTRY: dict[str, type | None] = {
     "doubao": DoubaoGroundingClient,
-    "qwen": None,  # 待实现：阿里百炼，bbox_2d 绝对像素 ÷ 宽高归一化
+    "qwen": QwenGroundingClient,  # 阿里百炼，bbox_2d 绝对像素 ÷ 帧宽高归一化
     "glm": None,  # 待实现：智谱 BigModel
     "hunyuan": None,  # 待实现：腾讯混元 TokenHub
     "kimi": None,  # 待实现：Moonshot k2.6（k2.5/k3 不支持视频）
