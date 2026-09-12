@@ -30,6 +30,9 @@ OBJECT_DETECT_PROVIDER_NAMES = (
 DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 # 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
 DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
+KIMI_API_BASE = "https://api.moonshot.cn/v1"
+# k2.5/k3 不支持视频输入；模型 ID 以 Moonshot 控制台为准。
+KIMI_GROUNDING_MODEL = "kimi-k2.6"
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,9 @@ class Settings:
     doubao_api_key: str | None = field(default=None, repr=False)
     doubao_api_base: str = DOUBAO_API_BASE
     doubao_model: str = DOUBAO_GROUNDING_MODEL
+    kimi_api_key: str | None = field(default=None, repr=False)
+    kimi_api_base: str = KIMI_API_BASE
+    kimi_model: str = KIMI_GROUNDING_MODEL
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -244,6 +250,37 @@ class Settings:
         if not _MODEL_ID_RE.fullmatch(doubao_model):
             raise ValueError("DOUBAO_MODEL must be a valid model identifier")
         object.__setattr__(self, "doubao_model", doubao_model)
+        kimi_key = self.kimi_api_key
+        if kimi_key is not None:
+            if not isinstance(kimi_key, str) or not kimi_key.strip():
+                raise ValueError("KIMI_API_KEY must be a non-empty value or unset")
+            kimi_key = kimi_key.strip()
+            if (
+                not kimi_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in kimi_key)
+            ):
+                raise ValueError("KIMI_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "kimi_api_key", kimi_key)
+        kimi_base = (
+            self.kimi_api_base.strip().rstrip("/")
+            if isinstance(self.kimi_api_base, str)
+            else ""
+        )
+        try:
+            kimi_url = urlsplit(kimi_base)
+        except ValueError as exc:
+            raise ValueError("KIMI_API_BASE must be an HTTPS base URL") from exc
+        if kimi_url.scheme != "https" or not kimi_url.netloc:
+            raise ValueError("KIMI_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "kimi_api_base", kimi_base)
+        kimi_model = (
+            self.kimi_model.strip()
+            if isinstance(self.kimi_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(kimi_model):
+            raise ValueError("KIMI_MODEL must be a valid model identifier")
+        object.__setattr__(self, "kimi_model", kimi_model)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -315,4 +352,7 @@ def get_settings() -> Settings:
         doubao_api_key=os.environ.get("DOUBAO_API_KEY", "").strip() or None,
         doubao_api_base=os.environ.get("DOUBAO_API_BASE", DOUBAO_API_BASE).strip(),
         doubao_model=os.environ.get("DOUBAO_MODEL", DOUBAO_GROUNDING_MODEL).strip(),
+        kimi_api_key=os.environ.get("KIMI_API_KEY", "").strip() or None,
+        kimi_api_base=os.environ.get("KIMI_API_BASE", KIMI_API_BASE).strip(),
+        kimi_model=os.environ.get("KIMI_MODEL", KIMI_GROUNDING_MODEL).strip(),
     )

@@ -385,6 +385,75 @@ class DoubaoGroundingClient(OpenAICompatibleGroundingClient):
         return detections
 
 
+# ==== Kimi（Moonshot）====
+
+_KIMI_BBOX_TAG_RE = re.compile(
+    r"<bbox>\s*(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s+(\d{1,4})\s*</bbox>"
+)
+_KIMI_BBOX_PLAIN_RE = re.compile(
+    r"(\d{1,4})[\s,]+(\d{1,4})[\s,]+(\d{1,4})[\s,]+(\d{1,4})"
+)
+
+
+class KimiGroundingClient(OpenAICompatibleGroundingClient):
+    """Kimi / Moonshot：bbox 输出格式官方未文档化，采取保守解析。
+
+    提示词沿用基类（要求 ``<bbox>x1 y1 x2 y2</bbox>``，0–1000 归一化），
+    解析时额外容忍两种格式漂移：纯数字串（"x1 y1 x2 y2"）与 JSON 数组
+    （``[x1, y1, x2, y2]``）；三种形态统一除以 1000 后交给
+    ``ObjectDetection`` 校验。
+    """
+
+    provider_name = "kimi"
+
+    def parse_response(
+        self, text: str, target: str
+    ) -> list[ObjectDetection]:
+        payload = extract_json_object(text)
+        entries = payload.get("detections")
+        if not isinstance(entries, list):
+            raise TypeError("model output must contain a detections list")
+        detections: list[ObjectDetection] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise TypeError(f"detection entry {index} must be an object")
+            timestamp = entry.get("timestamp_s")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+            ):
+                raise ValueError(f"detection entry {index} has an invalid timestamp")
+            values = self._bbox_values(entry.get("bbox"), index)
+            try:
+                detections.append(
+                    ObjectDetection(
+                        label=target,
+                        timestamp_s=float(timestamp),
+                        bbox_xyxy_normalized=tuple(
+                            value / 1000.0 for value in values
+                        ),  # type: ignore[arg-type]
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"detection entry {index} has invalid coordinates: {exc}"
+                ) from exc
+        return detections
+
+    def _bbox_values(self, bbox: Any, index: int) -> tuple[int, ...]:
+        if isinstance(bbox, str):
+            match = _KIMI_BBOX_TAG_RE.fullmatch(bbox.strip())
+            if match is None:
+                match = _KIMI_BBOX_PLAIN_RE.fullmatch(bbox.strip())
+            if match is not None:
+                return tuple(int(value) for value in match.groups())
+        elif isinstance(bbox, list) and len(bbox) == 4 and all(
+            isinstance(value, int) and not isinstance(value, bool) for value in bbox
+        ):
+            return tuple(bbox)
+        raise ValueError(f"detection entry {index} has an unrecognized bbox format")
+
+
 # 名称 → client 类；None = 已预留未实现（不进可选列表）。
 # 与 config.OBJECT_DETECT_PROVIDER_NAMES 必须一一对应。
 PROVIDER_REGISTRY: dict[str, type | None] = {
@@ -392,7 +461,7 @@ PROVIDER_REGISTRY: dict[str, type | None] = {
     "qwen": None,  # 待实现：阿里百炼，bbox_2d 绝对像素 ÷ 宽高归一化
     "glm": None,  # 待实现：智谱 BigModel
     "hunyuan": None,  # 待实现：腾讯混元 TokenHub
-    "kimi": None,  # 待实现：Moonshot k2.6（k2.5/k3 不支持视频）
+    "kimi": KimiGroundingClient,
     "step": None,  # 待实现：阶跃星辰
     "gemini": None,  # 待实现：File API + generateContent，不继承 OpenAI 基类
 }
