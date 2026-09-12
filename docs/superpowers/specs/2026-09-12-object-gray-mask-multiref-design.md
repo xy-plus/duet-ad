@@ -13,7 +13,7 @@
 
 同时移植实验线的**多参考图**能力（合图 A + 逐图直传 B 两套），用后端开关控制。
 
-三条铁律约束：增量改动，不影响旧链路；不加新门禁；单图链路行为与 main 字节级一致。
+三条铁律约束：增量改动，不新增门禁；人脸灰块原样不动；多参考图只有 composed/direct 两条链路，单图是两种模式各自的 1 图情形，不保留 main 的旧单图链路（本分支是独立实验线，不承担存量项目兼容）。
 
 ## 用户已拍板的决策
 
@@ -22,8 +22,9 @@
 | 检测方式 | 整段视频直接交给视频理解模型 API（不做"抽帧+本地传播"重方案；拿到稀疏时间点框后仍需本地线性插值续帧，这是纯 CPU 几行代码，不算重方案） |
 | 遮盖范围 | 只遮 OR 判定要替换的物品；检测提示词用 OR 输出的目标名称/描述 |
 | 接入范围 | 所有满足条件的视频模型 API（见下表 7 家）；研究阶段后端配置选择，逐家测完效果再定主力 |
-| 多参考图 | cherry-pick 移植 multiref-common 公共层 + A（composed）+ B（direct），后端开关 `multiref_mode`，不暴露前端 |
-| 掩码→灰块 | 不需要模型，OpenCV 确定性填灰（与人脸同一画法） |
+| 多参考图 | cherry-pick 移植 multiref-common 公共层 + A（composed）+ B（direct），后端开关 `multiref_mode` 只有 `composed | direct` 两个值，不保留旧单图链路（单图 = 所选模式的 1 图情形），不暴露前端 |
+| 掩码→灰块 | 不需要模型，OpenCV 确定性填色；物品块用深灰 `(64,64,64)` 与人脸块 `(128,128,128)` 区分 |
+| 提示词联动 | 各生成提示词节点（object-replace / fusion / H3）同步修改，明确介绍两种色块的含义 |
 
 ## 检测模型 API 调研结论
 
@@ -54,17 +55,18 @@
 - cherry-pick `feature/multiref-common`（`c316c60..ed080d3`，5 个提交）公共层：`app/main.py` + `app/public_api.py` 多文件上传（表单字段 `replacement_image` 重复 1–4 次，`REPLACEMENT_MAX_IMAGES = 4`）、`app/store.py` 回执 version 2（`replacement_images` 有序 sha256）、`app/public_quotes.py` 暂存、`web/app.js` 多图上传 UI。
 - 整合方案 A（`experiment/multiref-product-views`）：`app/product_views.py` 合图（2–4 张 → 768px 格 2 列拼图，`compose_product_views` + `frozen_product_views` 冻结清单 + `view_instruction` 提示词注入）。
 - 整合方案 B（`experiment/multiref-prompt-directed`）：逐图直传，`reference_image_ids` 贯穿 `app/video_maker_schemas.py`、`app/object_replace_schema.py`、`app/replacement_sheet.py`；pipeline 的 `_replacement_image_paths` / `_canonical_user_reference_path` / `h3_reference_images` 构造 / bindings `replacement_images` 校验链。
-- A/B 在同一分支共存，pipeline 分叉处按开关选路。单图时保持 main 行为字节级不变（receipt v1、checkpoint 稳定、bindings 不加 `replacement_images` 键——沿用 B 树 `pipeline.py:1946` 的兼容注释语义）。
+- A/B 在同一分支共存，pipeline 分叉处按开关选路。同一模式内 1 图与多图共享链路，仅按上传数量分叉（沿用 B 树的单图兼容语义：单图 checkpoint 字节稳定、bindings 不加 `replacement_images` 键），保证同模式断点续跑一致。
 
-开关：`Settings.multiref_mode`，取值 `off | composed | direct`，仅从后端环境变量读（如 `MULTIREF_MODE`），不进前端、不进公开 API 参数。`off` 或未配 = 现状单图链路；上传只有 1 张时无论开关都走单图链路（沿用数据驱动分叉）。
+开关：`Settings.multiref_mode`，取值**只有 `composed | direct` 两个**，仅从后端环境变量读（如 `MULTIREF_MODE`），必须显式配置、不设缺省，不进前端、不进公开 API 参数。**不存在第三条"旧单图链路"**：上传 1 张图就是所选模式的 1 图情形（composed 模式 1 图直接规范化装入图版位，direct 模式 1 图即 Image 序列里的一张）。两模式的 1 图路径沿用 B 树的单图兼容语义（checkpoint 字节稳定、bindings 单图不加 `replacement_images` 键），保证同模式内断点续跑一致。
 
 ### 2. 物品检测 provider 层
 
-新模块 `app/object_detect.py`：
+新模块 `app/object_detect.py`，**7 家 provider 平行可插拔，对外暴露同一套接口**：
 
-- `OpenAICompatibleGroundingClient` 基类覆盖 6 家（豆包、Qwen、GLM、混元、Kimi、阶跃），endpoint/model/prompt 参数化；`GeminiGroundingClient` 单独实现（File API 上传 + generateContent，走代理配置）。
+- 统一接口契约：所有 provider 实现相同的 `detect(video_path, targets) -> list[ObjectDetection]`，输入输出完全一致；`ObjectDetection = {label, timestamp_s, bbox_xyxy_normalized}`。内部实现因模型而异（上传方式、提示词模板、响应解析），对调用方完全透明；pipeline 只面向这个统一接口，不知道背后是哪家模型。
+- 实现结构：`OpenAICompatibleGroundingClient` 基类覆盖 6 家（豆包、Qwen、GLM、混元、Kimi、阶跃），endpoint/model/prompt 参数化；`GeminiGroundingClient` 单独实现（File API 上传 + generateContent，走代理配置）。两家实现都满足同一接口契约。
 - 遵循现有 `app/providers.py` 模式：构造注入 `Settings` + 可注入 `transport`（测试 seam）；同步 httpx；统一 `_send` 重试（transport 错误 + 502/503/504，backoff 2s/5s）；返回 `ProviderResult` / 抛 `ProviderFailure`（全 HTTP 证据记录）。
-- 统一输出契约 `list[ObjectDetection]`：`{label, timestamp_s, bbox_xyxy_normalized}`。每家独立解析器适配格式差异；坐标越界/结构非法 → 判失败重试；仍失败则该目标跳过（记日志，不挡任务）。
+- 统一输出契约已在上方接口契约中定义；每家独立解析器适配格式差异；坐标越界/结构非法 → 判失败重试；仍失败则该目标跳过（记日志，不挡任务）。
 - 配置：`config.py` 每家加 `<name>_api_key`（`field(repr=False)`，无默认）+ `<name>_api_base` + `<name>_model`；没配 key = 该 provider 不启用。研究期选择：`object_detect_providers`（有序名称列表），按序回退；支持配多家同时跑互验（各家结果都落日志供对比）。
 
 ### 3. 物品灰块节点
@@ -73,20 +75,21 @@
 
 - `mask_objects(source, destination, targets, *, detector=None) -> dict`：逐帧读视频，`detector` 抽象（生产实现调 object_detect provider；测试注入假检测器，同 `_FixedDetector` seam）。
 - 稀疏时间点 bbox → 每帧线性插值（相邻时间点间插值；IoU 匹配续帧；物品出画时灰块在最后已知位置续 `hold_frames` 帧后消失）。
-- 填灰与人脸完全一致：`frame[y0:y1, x0:x1] = (128,128,128)`，先写 mp4v 临时文件再 ffmpeg 重编码 H.264/yuv420p。错误抛 `ObjectMaskError`。
+- 物品块填**深灰 `(64,64,64)`**，与人脸块 `(128,128,128)` 明确区分；先写 mp4v 临时文件再 ffmpeg 重编码 H.264/yuv420p。错误抛 `ObjectMaskError`。
 
 pipeline 集成（`app/pipeline.py`）：
 
 - 新增独立节点 `mask-replaceable-objects`，串联在 `mask-reference-faces` 之后，作用于同一条参考视频流。
 - 触发条件：该段 OR 判定有对象替换（类比 `_segment_has_replaced_person` 的判定）；目标描述列表来自 OR 输出。
-- 容错照抄人脸模式：重试上限内持续失败 → 降级为不打灰继续渲染 + `object_mask_degraded` 日志；缺 key / 配置错误 → 致命。**不新增任何门禁**。
-- H3 prompt 的 `mask_block` 文案从 faces 泛化为 "faces and replaced objects"，仅当物品灰块节点实际产出遮盖时变化。
+- 容错照抄人脸模式：重试上限内持续失败 → **降级到未遮物品的原视频继续渲染** + `object_mask_degraded` 日志；缺 key / 配置错误 → 致命。**不新增任何门禁**。人脸灰块节点本身（YuNet、0.73 阈值、外扩比例、降级逻辑）原样不动。
+
+提示词联动：object-replace / fusion / H3 各生成提示词节点同步修改，明确介绍两种色块——人脸灰块 `(128,128,128)` 遮源人脸、物品深灰块 `(64,64,64)` 遮被替换物品，H3 不得绘制/复原色块内容、须用提供的参考图补全。原 `mask_block` 文案随此泛化，仅在物品灰块节点实际产出遮盖时包含物品部分。
 
 ### 4. 测试
 
-- `tests/test_object_mask.py`：注入假检测器，合成视频断言灰块像素 = `(128,128,128)`、时序保持、缺模型/降级分支（镜像 `tests/test_face_mask.py`）。
-- `tests/test_object_detect.py`：`httpx.MockTransport` 测 7 家解析器（正常/格式漂移/坐标越界/重试）。
-- `tests/test_pipeline.py` 增补：monkeypatch `object_mask.mask_objects`，验证节点日志目录、降级路径、`object_mask_degraded` 事件；`multiref_mode` 三条路径（off 字节不变、composed、direct）覆盖。
+- `tests/test_object_mask.py`：注入假检测器，合成视频断言物品块像素 = `(64,64,64)`、人脸块仍为 `(128,128,128)`、时序保持、缺模型/降级分支（镜像 `tests/test_face_mask.py`）。
+- `tests/test_object_detect.py`：`httpx.MockTransport` 测 7 家解析器（正常/格式漂移/坐标越界/重试），并断言 7 家对外接口输入输出契约一致。
+- `tests/test_pipeline.py` 增补：monkeypatch `object_mask.mask_objects`，验证节点日志目录、降级到原视频路径、`object_mask_degraded` 事件；`multiref_mode` 两条路径（composed、direct，各含 1 图与多图情形）覆盖。
 - 节点重放：采集 fixtures 后扩展 `test_node_replay_*`；E2E 前按仓库门禁 `pytest tests/test_node_replay_{local,external,boundary}.py -n auto` 全绿。
 - 真实 API 对比测试等用户配 key 后进行，是本实验核心产出。
 
