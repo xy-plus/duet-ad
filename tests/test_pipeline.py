@@ -7917,3 +7917,40 @@ def test_multiview_product_uses_one_frozen_composite_through_all_providers(
     reused = pipeline._materialize_canonical_user_reference(project,project/names[0],ResearchLog(project),replacement_paths=[project/name for name in names])
     assert reused == composite
     assert (composite.read_bytes(),composite.stat().st_mtime_ns) == before
+
+
+def test_direct_mode_never_composes_user_references(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """multiref_mode=direct 时多图不合图（composed 合图只属 composed 模式）。"""
+    from PIL import Image
+    from app import product_views
+
+    store = ProjectStore(tmp_path / "projects")
+    request = _effective_request(
+        target_language="日语", replacement_instruction="把包替换成参考图中的同一个商品",
+    )
+    project_id, project, _state = store.create(request, "direct-gate")
+    (project / "inputs/source.mp4").write_bytes(b"source")
+    names = ["inputs/replacement-image", "inputs/replacement-image-2"]
+    for index, name in enumerate(names):
+        Image.new("RGB", (200, 100), (index * 40, 50, 100)).save(
+            project / name, format="PNG",
+        )
+    store.update(
+        project_id, source_path="inputs/source.mp4",
+        replacement_image_path=names[0], replacement_image_paths=names,
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path, multiref_mode="direct"), store,
+        lambda _pid, path: f"https://assets.invalid/{path.name}",
+    )
+    monkeypatch.setattr(
+        product_views, "compose_product_views",
+        lambda *_args, **_kwargs: pytest.fail("direct mode must not compose"),
+    )
+    result = pipeline._materialize_canonical_user_reference(
+        project, project / names[0], ResearchLog(project),
+        replacement_paths=[project / name for name in names],
+    )
+    assert result == project / "work/global-reference-sheet/user-reference.png"

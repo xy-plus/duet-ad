@@ -6,8 +6,19 @@ import pytest
 from PIL import Image, ImageOps
 
 from app import media, product_views
+from app.config import Settings
 from app.pipeline import Pipeline
 from app.research_log import ResearchLog
+
+
+def _composed_pipeline() -> Pipeline:
+    pipeline = object.__new__(Pipeline)
+    pipeline.settings = Settings(
+        access_token="test",
+        multiref_mode="composed",
+        public_base_url="https://product-views.test",
+    )
+    return pipeline
 
 
 def sources(project, count, *, size=(200,100)):
@@ -77,7 +88,7 @@ def test_frozen_source_change_and_order_change_are_rejected(tmp_path):
 
 def test_single_image_defaults_to_user_preprocessing_and_existing_provider_conversion(tmp_path,monkeypatch):
     paths = sources(tmp_path,1)
-    pipeline = object.__new__(Pipeline)
+    pipeline = _composed_pipeline()
     calls = []
     def convert(source,destination):
         calls.append(source)
@@ -96,7 +107,7 @@ def test_single_image_white_border_is_trimmed_before_existing_size_tool(tmp_path
     image.paste((30,40,50),(100,60,500,340))
     image.save(paths[0],format="PNG")
     original_input = paths[0].read_bytes()
-    pipeline = object.__new__(Pipeline)
+    pipeline = _composed_pipeline()
     output = pipeline._materialize_canonical_user_reference(tmp_path,paths[0],ResearchLog(tmp_path),replacement_paths=paths)
     with Image.open(output) as result:
         assert result.size == (408,288)
@@ -119,7 +130,7 @@ def test_exact_multiview_mapping_is_in_authoritative_h3_block():
 @pytest.mark.parametrize("size", [(1,4096),(4096,1),(1,1),(100,4096),(4096,100)])
 def test_all_upload_counts_and_extreme_source_sizes_meet_h3_ratio(tmp_path,count,size):
     paths = sources(tmp_path,count,size=size)
-    pipeline = object.__new__(Pipeline)
+    pipeline = _composed_pipeline()
     output = pipeline._materialize_canonical_user_reference(
         tmp_path,paths[0],ResearchLog(tmp_path),replacement_paths=paths,
     )

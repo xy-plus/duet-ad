@@ -1037,7 +1037,11 @@ class Pipeline:
         *,
         replacement_paths: list[Path] | None = None,
     ) -> Path:
-        if replacement_paths is not None and len(replacement_paths) > 1:
+        if (
+            replacement_paths is not None
+            and len(replacement_paths) > 1
+            and self.settings.multiref_mode == "composed"
+        ):
             return self._node(
                 log, "replacement-sheet-user-reference", "project",
                 {"sources": replacement_paths, "interpretation": "one_product_multiple_views"},
