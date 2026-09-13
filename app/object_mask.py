@@ -9,6 +9,23 @@ last known box for OBJECT_MASK_HOLD_FRAMES frames before disappearing.
 The block is a solid deep gray (64,64,64), deliberately distinct from the
 face gray (128,128,128); the output goes through the same mp4v -> ffmpeg
 H.264/yuv420p pipeline as the face mask.
+
+Pipeline integration (app/pipeline.py): the ``mask-replaceable-objects``
+node runs immediately after ``mask-reference-faces`` on the same reference
+video stream.  It triggers only when the segment has OR-flagged replaced
+objects (targets come from the OR output) AND at least one detection
+provider is available; no configured/available provider means the node is
+skipped entirely, like a segment without OR targets.  Persistent failure
+within OBJECT_MASK_MAX_ATTEMPTS degrades to the unmasked video plus an
+``object_mask_degraded`` log event instead of blocking the render (unlike
+the face mask, whose missing model stays fatal).  No new gates are added.
+
+Two-block convention surfaced to H3 via the fusion/H3 prompts: mid gray
+(128,128,128) covers source faces, deep gray (64,64,64) covers replaced
+objects; H3 must not redraw block contents and must fill them from the
+supplied reference images.  The object part of the prompt appears only
+when this node actually produced masking for the segment (frozen per
+segment, so resumes stay consistent).
 """
 
 from __future__ import annotations

@@ -60,6 +60,12 @@ _GEMINI_PROXY_SCHEMES = frozenset({"http", "https"})
 class Settings:
     access_token: str
     # 多参考图模式开关：只有 composed | direct 两个值，必须显式配置、无缺省。
+    # composed：在"参考图构造与冻结"环节把多张用户图合成单一 provider
+    # reference（app/product_views.py），下游与单图完全同构；direct：逐图直传，
+    # reference_image_ids 贯穿 video-maker / object-replace / 图版 / bindings。
+    # 两模式的分叉点在参考图构造与冻结环节，H3 提交处共用"按 h3_reference_images
+    # 顺序传图"。不存在第三条旧单图链路：上传 1 张图就是所选模式的 1 图情形。
+    # 本开关不进前端、不进公开 API 参数与响应。
     multiref_mode: str
     data_dir: Path = ROOT / "data"
     public_base_url: str = ""
@@ -93,7 +99,8 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
-    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。
+    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。名称必须是已知 7 家
+    # 之一（OBJECT_DETECT_PROVIDER_NAMES），名称与选择一律不出现在公开 API。
     object_detect_providers: tuple[str, ...] = ()
     # 每家的 <name>_api_key 缺省 None 表示未配置（该 provider 不启用）；
     # 默认值来自 _OBJECT_DETECT_PROVIDER_SPECS。

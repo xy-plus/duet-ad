@@ -12,6 +12,30 @@
   transport 错误、502/503/504、解析失败/坐标越界/无合法框；4xx 立即致命。
 - 单目标粒度：某目标重试上限内仍无合法框 → 跳过该目标记日志，不挡其它目标。
 
+已实现的 7 家与格式差异（endpoint/模型默认值见 app/config.py 的
+``_OBJECT_DETECT_PROVIDER_SPECS``，各家输出一律归一化到 0–1 后进入统一契约）：
+
+- doubao：火山方舟，OpenAI 兼容；``<bbox>x1 y1 x2 y2</bbox>``，0–1000 归一化。
+- qwen：阿里百炼，OpenAI 兼容；``bbox_2d`` 绝对像素，÷ 视频实际宽高归一化。
+- glm：智谱 BigModel GLM-4.5V，OpenAI 兼容；保守 JSON 解析。
+- hunyuan：腾讯混元 TokenHub，OpenAI 兼容；只接受 0–1000 整数四元组。
+- kimi：Moonshot，OpenAI 兼容，仅 k2.6 支持视频；解析容忍格式漂移。
+- step：阶跃星辰，OpenAI 兼容；沿用 ``<bbox>`` 0–1000 约定，解析同豆包。
+- gemini：File API 上传 + generateContent（非 OpenAI 兼容），``box_2d``
+  0–1000 归一化；国内需 GEMINI_PROXY 代理；一次 detect 内重试与多目标
+  复用已上传文件句柄，不重复上传。
+
+缺 key 语义（与人脸节点"model is missing 才致命"对齐）：
+``object_detect_providers`` 未配置（空）或所列 provider 全部缺 key → 物品
+灰块节点不触发（缺 key 的 provider 跳过并记日志，等同该段无 OR 目标）；
+配置非法（非空但非法的 key/base/model、未知名称）→ Settings 启动校验报错，
+即致命。各家效果对比不在 pipeline 内并发，由研究期独立对比脚本逐家跑；
+主力与回退顺序只调 OBJECT_DETECT_PROVIDERS 的顺序即可。provider 名称
+一律不出现在公开 API 的参数与响应里。
+
+重试成本：每次重试 = 重新上传 + 重新推理（Gemini 复用文件句柄除外），
+单家单目标一次 detect 费用上限 = 3 次推理。
+
 新增一家 provider 的步骤（6 个并行代理照做）：
 
 1. ``app/config.py`` 在"物品检测 provider"独立段落追加三字段：
