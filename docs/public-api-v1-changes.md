@@ -1,5 +1,30 @@
 # 对外 API v1 客户快速迁移指南与差异清单
 
+## 字幕开关补充（2026-09-10，合同版本保持 1.2.0）
+
+本次增加可选 `add_subtitles` 参数，用于在最终成片叠加台词字幕；默认 `false`，旧调用无需修改。接口路径、报价确认流程、积分算法及轮询下载方式不变。
+
+| 位置 | 客户适配 |
+|---|---|
+| `POST /api/v1/video-generations` | 需要字幕时添加 multipart 文本字段 `add_subtitles=true` |
+| `POST /api/v1/video-generations/quotes` | 同样支持该字段，并在报价时冻结；更改开关需要新 Key 重新报价 |
+| `POST /api/v1/video-generations/quotes/{quote_id}/confirm` | 仍只发送 JSON `{"confirm":true}`，不添加字幕参数 |
+| `GET /api/v1/video-generations/capabilities` | `defaults.add_subtitles` 为 JSON 布尔值 `false` |
+| 创建、确认和查询任务的 Job 响应 | `parameters.add_subtitles` 返回 JSON 布尔值；历史任务默认 `false` |
+| Quote 响应 | 字段不变，不单独返回字幕开关；创建的 Job 返回冻结值 |
+
+上传/报价的字段逻辑类型为 boolean，但请求编码仍为 multipart，使用表单文本 `true` 或 `false`；不是将创建请求改成 JSON。最小报价示例：
+
+```bash
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/quotes' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Idempotency-Key: subtitle_quote_20260910_000001' \
+  --form 'source_video_url=https://media.example.com/source.mp4' \
+  --form 'add_subtitles=true'
+```
+
+用户同意积分后按下文确认流程执行。省略或显式 `false` 均关闭字幕；同一幂等 Key 改成 `true` 返回 `409 idempotency_key_reused`。字幕不额外改变报价公式，仍为 `ceil(原视频时长秒数) × 60`。
+
 ## 1.1.0 → 1.2.0（2026-09-09）
 
 本节说明 1.2.0 新增接口与客户适配方式。现有 1.1.0 接口保持兼容。
