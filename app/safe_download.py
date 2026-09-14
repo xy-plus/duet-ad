@@ -28,6 +28,7 @@ TIKWM_API = "https://www.tikwm.com/api/"
 # proxy itself, which is where these queries go anyway.
 DOH_ENDPOINTS = (
     "https://1.1.1.1/dns-query",
+    "https://8.8.8.8/resolve",
     "https://1.0.0.1/dns-query",
     "https://cloudflare-dns.com/dns-query",
     "https://dns.google/resolve",

@@ -26,6 +26,7 @@ def test_doh_uses_fixed_bootstrap_and_a_protocol():
 def test_endpoint_candidates_in_priority_order():
     assert safe_download.DOH_ENDPOINTS == (
         "https://1.1.1.1/dns-query",
+        "https://8.8.8.8/resolve",
         "https://1.0.0.1/dns-query",
         "https://cloudflare-dns.com/dns-query",
         "https://dns.google/resolve",
@@ -41,7 +42,7 @@ def test_connect_error_falls_through_to_next_candidate():
         return httpx.Response(200, json={"Answer": [{"type": 1, "data": "93.184.216.34"}]})
     result = asyncio.run(safe_download._doh_addresses("cdn.example", "http://127.0.0.1:7897", transport=httpx.MockTransport(handler)))
     assert result == ["93.184.216.34"]
-    assert seen == ["1.1.1.1", "1.0.0.1"]
+    assert seen == ["1.1.1.1", "8.8.8.8"]
 
 
 def test_non_200_response_falls_through_to_next_candidate():
@@ -53,7 +54,7 @@ def test_non_200_response_falls_through_to_next_candidate():
         return httpx.Response(200, json={"Answer": [{"type": 1, "data": "93.184.216.34"}]})
     result = asyncio.run(safe_download._doh_addresses("cdn.example", "http://127.0.0.1:7897", transport=httpx.MockTransport(handler)))
     assert result == ["93.184.216.34"]
-    assert seen == ["1.1.1.1", "1.0.0.1"]
+    assert seen == ["1.1.1.1", "8.8.8.8"]
 
 
 def test_empty_answers_fall_through_to_next_candidate():
@@ -65,7 +66,7 @@ def test_empty_answers_fall_through_to_next_candidate():
         return httpx.Response(200, json={"Answer": [{"type": 1, "data": "93.184.216.34"}]})
     result = asyncio.run(safe_download._doh_addresses("cdn.example", "http://127.0.0.1:7897", transport=httpx.MockTransport(handler)))
     assert result == ["93.184.216.34"]
-    assert seen == ["1.1.1.1", "1.0.0.1"]
+    assert seen == ["1.1.1.1", "8.8.8.8"]
 
 
 def test_all_endpoints_failing_raises_after_trying_every_candidate():
@@ -75,7 +76,7 @@ def test_all_endpoints_failing_raises_after_trying_every_candidate():
         raise httpx.ConnectError("SSL_ERROR_SYSCALL", request=request)
     with pytest.raises(ValueError, match="dns.google"):
         asyncio.run(safe_download._doh_addresses("cdn.example", "http://127.0.0.1:7897", transport=httpx.MockTransport(handler)))
-    assert seen == ["1.1.1.1", "1.0.0.1", "cloudflare-dns.com", "dns.google"]
+    assert seen == ["1.1.1.1", "8.8.8.8", "1.0.0.1", "cloudflare-dns.com", "dns.google"]
 
 
 def test_dns_google_candidate_uses_resolve_path():
