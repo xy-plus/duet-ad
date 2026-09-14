@@ -23,6 +23,16 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 DEFAULT_PORTS = {"http": 80, "https": 443}
 TIKWM_API = "https://www.tikwm.com/api/"
 
+# Public DoH candidates sharing the dns-json wire format, tried in order.
+# The numeric ones bootstrap without DNS; the domain ones are resolved by the
+# proxy itself, which is where these queries go anyway.
+DOH_ENDPOINTS = (
+    "https://1.1.1.1/dns-query",
+    "https://1.0.0.1/dns-query",
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+)
+
 
 def is_tiktok_page_url(url: str) -> bool:
     try:
@@ -107,29 +117,38 @@ async def resolve_addresses(hostname: str, port: int) -> ResolverResult:
 
 
 async def _doh_addresses(hostname: str, proxy: str, *, transport=None) -> ResolverResult:
-    """Restore the old downloader's proxy-side Cloudflare A-record lookup.
+    """Resolve A records via proxy-side public DoH, trying candidates in order.
 
-    Fixed numeric bootstrap avoids local DNS. Failure never falls back to local
-    resolution; callers still validate/filter all returned addresses before use.
+    A candidate that fails to connect, answers non-200, or returns no A
+    records is recorded and the next candidate is tried; only when every
+    candidate fails does this raise. Failure never falls back to local
+    resolution; callers still validate/filter all returned addresses before
+    use.
     """
     options = {"transport": transport} if transport is not None else {"proxy": proxy}
+    failures = []
     async with httpx.AsyncClient(**options, trust_env=False,
                                  follow_redirects=False, timeout=None) as client:
-        async with client.stream("GET", "https://1.1.1.1/dns-query",
-                params={"name": hostname, "type": "A"}, headers={"Accept": "application/dns-json"}) as response:
-            response.raise_for_status()
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > 1024 * 1024:
-                    raise ValueError("DoH response too large")
-        payload = json.loads(body)
-    answers = payload.get("Answer") if isinstance(payload, dict) else None
-    addresses = [item["data"] for item in answers or []
-                 if isinstance(item, dict) and item.get("type") == 1 and isinstance(item.get("data"), str)]
-    if not addresses:
-        raise ValueError("DoH returned no A records")
-    return addresses
+        for endpoint in DOH_ENDPOINTS:
+            try:
+                async with client.stream("GET", endpoint,
+                        params={"name": hostname, "type": "A"}, headers={"Accept": "application/dns-json"}) as response:
+                    response.raise_for_status()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > 1024 * 1024:
+                            raise ValueError("DoH response too large")
+                payload = json.loads(body)
+                answers = payload.get("Answer") if isinstance(payload, dict) else None
+                addresses = [item["data"] for item in answers or []
+                             if isinstance(item, dict) and item.get("type") == 1 and isinstance(item.get("data"), str)]
+                if not addresses:
+                    raise ValueError("DoH returned no A records")
+                return addresses
+            except (httpx.HTTPError, ValueError) as exc:
+                failures.append(f"{endpoint}: {exc}")
+    raise ValueError("all DoH endpoints failed: " + "; ".join(failures))
 
 
 def _invalid(message: str = "视频链接无效") -> ReferenceDownloadError:
