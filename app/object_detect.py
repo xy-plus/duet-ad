@@ -26,10 +26,12 @@
   复用已上传文件句柄，不重复上传。
 - fal_sam3：fal.ai SAM 3.1 video-rle（默认 fal-ai/sam-3-1/video-rle），
   第一家专用检测模型（前 7 家通用 VLM）。
-  存储上传 + 队列提交/轮询，一次提交覆盖全部 targets（prompt 逗号分隔）；
-  逐帧归一化 cxcywh box → xyxy 钳位，frame_index ÷ 视频 fps → timestamp_s，
-  label 回映射 targets；track_id/score/RLE 不进契约（无对应字段），保留在
-  落盘产物与 ``last_frames`` 供二期。确定性模型不做"重试 = 重新推理"：
+  存储上传 + 队列提交/轮询；响应为 rle/boxes/metadata 三个等长列表、
+  下标 = 帧号（已按 2026-09-14 真实响应校准，与 OpenAPI 文档不符处以
+  段落头注释为准）；逐帧归一化 cxcywh box → xyxy 钳位，帧号 ÷ 视频 fps
+  → timestamp_s；单目标直接归属（多目标形态未校准，detect 拒绝多
+  targets）。score/RLE 不进契约（无对应字段），保留在落盘产物与
+  ``last_frames`` 供二期。确定性模型不做"重试 = 重新推理"：
   空结果即确定答案、畸形结果直接致命（重提只会得到同样结果，白花钱）。
   国内需 FAL_PROXY 代理。fal 原始响应落盘为 JSON 产物（cache_path 由
   pipeline 经 object_mask 注入），同项目重试/续跑指纹匹配直接复用，绝不
@@ -1147,22 +1149,28 @@ def _extract_gemini_json(text: str) -> Any:
 
 
 # ==== fal_sam3（fal.ai SAM 3.1 video-rle）独立实现：存储上传 + 队列轮询 ====
-# 第一家专用检测模型（前 7 家是通用 VLM）：一次提交覆盖全部 targets
-# （prompt 逗号分隔），不按目标重试——确定性模型的空结果就是确定答案，
-# 畸形结果重提只会得到同样的结果，两者都不重提（省钱纪律）。
+# 第一家专用检测模型（前 7 家是通用 VLM）：一次提交一个 target，不按目标
+# 重试——确定性模型的空结果就是确定答案，畸形结果重提只会得到同样的结果，
+# 两者都不重提（省钱纪律）。
 # 流程：fal CDN 两步上传（initiate 拿预签名 PUT URL）→ POST 队列提交拿
 # request_id → GET status 轮询（PROVIDER_POLL_INTERVAL_S /
 # PROVIDER_POLL_TIMEOUT_S 语义）→ GET 取结果。
-# 逐帧结构化输出的顶层字段名未经真实响应校准：fal 文档 Output 节只声明
-# video 与 boundingbox_frames_zip，这里按 SAM3VideoObjectFrame
-# （frame_index + objects[SAM3ObjectMask{track_id, rle}]）与 MaskMetadata
-# （index + score + 归一化 cxcywh box）假设最合理结构。校准入口 =
-# 罐头 fixture tests/fixtures/fal_sam3_video_rle_response.json +
-# 下面两个字段名常量。video_url 也接受 base64 data URI，但大视频会显著
-# 拖慢请求（base64 膨胀约 33% 且随请求体传输），仅作存储不可用时的兜底，
-# 未实现。
-FAL_SAM3_FRAMES_KEY = "frames"
-FAL_SAM3_METADATA_KEY = "metadata"
+# 响应形态已按 2026-09-14 真实校准调用校准（fixture 来源
+# data-verify/fal-sam31-calib-20260914/result.json，精简版在
+# tests/fixtures/fal_sam3_video_rle_response.json）。真实响应与 fal OpenAPI
+# 文档的差异：
+# - 文档 Output 只声明 video（必填）与 boundingbox_frames_zip；真实响应
+#   **没有 video 字段**（文档错误），但有文档未声明的逐帧结构化数据：
+#   rle / boxes / metadata 三个等长列表，**下标 = 帧号**（rle 为 COCO RLE
+#   字符串，boxes 为归一化 cxcywh，metadata[i].index == i 且 box 与
+#   boxes[i] 同值、score 恒 null），另有 scores（恒 null）。
+# - 未检出的帧：rle 与 boxes 同位置为 null（真实响应 302 帧中 49 帧如此），
+#   是正常语义不是错误。
+# - 多目标（逗号分隔 prompt）响应形态未校准：本次校准是单目标，多 prompt
+#   时是合并单列表还是分组没有真实数据；detect 拒绝多 targets（致命，
+#   不花钱），待有真实数据再放开。
+# video_url 也接受 base64 data URI，但大视频会显著拖慢请求（base64 膨胀
+# 约 33% 且随请求体传输），仅作存储不可用时的兜底，未实现。
 FAL_STORAGE_UPLOAD_URL = (
     "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3"
 )
@@ -1186,14 +1194,14 @@ def _clamp01(value: float) -> float:
 
 
 class FalSam3GroundingClient:
-    """fal.ai SAM 3 video-rle：逐帧 track_id + RLE + 归一化 cxcywh box。
+    """fal.ai SAM 3.1 video-rle：逐帧 RLE + 归一化 cxcywh box（下标=帧号）。
 
     满足同一 detect 契约但不继承任何基类（队列模式与单次推理完全不同）。
     产物复用：``cache_path`` 指向项目 work 目录里的 JSON 产物，内容是
     {fingerprint, fal_response}；指纹（视频 sha256 + prompt + 阈值 + 模型）
     匹配时直接复用 fal 原始响应，不发任何 HTTP（fal 调用很贵，同一项目
-    重试/续跑绝不重复调用）。契约没有 track_id/score 的对应字段，它们与
-    RLE 一起保留在落盘产物和 ``last_frames`` 里，供二期消费。
+    重试/续跑绝不重复调用）。契约没有 score 的对应字段，score 与 RLE
+    一起保留在落盘产物和 ``last_frames`` 里，供二期消费。
     """
 
     provider_name = "fal_sam3"
@@ -1227,6 +1235,13 @@ class FalSam3GroundingClient:
             raise ValueError(
                 "fal_sam3 API key is not configured; "
                 "this provider must not be selected"
+            )
+        if len(targets) > 1:
+            # 多目标响应形态未校准（2026-09-14 校准调用是单目标）：拒绝执行，
+            # 在任何 HTTP 之前失败，不花钱、不猜测归因。
+            raise ValueError(
+                "fal_sam3 multi-target response shape is not calibrated; "
+                "pass exactly one target"
             )
         content = Path(video_path).read_bytes()
         if not content:
@@ -1444,117 +1459,72 @@ class FalSam3GroundingClient:
             raise ValueError("fal result response must be an object")
         return payload
 
-    # --- 响应解析（字段名以首次真实响应校准，见段落头注释） ---
+    # --- 响应解析（已按 2026-09-14 真实响应校准，见段落头注释） ---
 
     def _parse_result(
         self, payload: dict[str, Any], targets: list[str], fps: float
     ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
-        frames_raw = payload.get(FAL_SAM3_FRAMES_KEY)
-        if frames_raw is None:
+        """真实形态：rle / boxes / metadata 三个等长列表，下标 = 帧号。
+
+        无 box 的帧 = 该帧未检出（rle 同位置为 null），跳过不是错误；
+        列表缺失/不等长/metadata 错位 = 非预期形态，致命不重试。
+        targets 恰一个（detect 已在任何 HTTP 之前拒绝多目标）。
+        """
+        rles = payload.get("rle")
+        boxes = payload.get("boxes")
+        if not isinstance(rles, list) or not isinstance(boxes, list):
             raise ValueError(
-                f"fal result has no {FAL_SAM3_FRAMES_KEY!r} field; the assumed "
-                "response shape does not match, recalibrate against the fixture"
+                "fal result must contain rle and boxes lists; "
+                "uncalibrated response shape"
             )
-        if not isinstance(frames_raw, list):
-            raise ValueError(f"fal result {FAL_SAM3_FRAMES_KEY!r} must be a list")
-        metadata_raw = payload.get(FAL_SAM3_METADATA_KEY)
-        metadata = metadata_raw if isinstance(metadata_raw, list) else []
-        target_lookup = {target.strip().lower(): target for target in targets}
+        if len(rles) != len(boxes):
+            raise ValueError(
+                "fal result rle/boxes length mismatch; uncalibrated response shape"
+            )
+        metadata_raw = payload.get("metadata")
+        if metadata_raw is not None and (
+            not isinstance(metadata_raw, list) or len(metadata_raw) != len(rles)
+        ):
+            raise ValueError(
+                "fal result metadata length mismatch; uncalibrated response shape"
+            )
+        metadata: list[Any] = metadata_raw or [None] * len(rles)
+        target = targets[0]
         detections: list[ObjectDetection] = []
         frames: list[dict[str, Any]] = []
-        position = 0
-        for frame_position, frame in enumerate(frames_raw):
-            if not isinstance(frame, dict):
-                raise ValueError(f"fal result frame {frame_position} must be an object")
-            frame_index = frame.get("frame_index")
-            if frame_index is None:
-                frame_index = frame_position
-            if (
-                isinstance(frame_index, bool)
-                or not isinstance(frame_index, int)
-                or frame_index < 0
-            ):
+        for frame_index, rle in enumerate(rles):
+            if rle is not None and not isinstance(rle, str):
                 raise ValueError(
-                    f"fal result frame {frame_position} has an invalid frame_index"
+                    f"fal result frame {frame_index} rle must be a string or null"
                 )
-            objects = frame.get("objects") or []
-            if not isinstance(objects, list):
+            box = boxes[frame_index]
+            meta = metadata[frame_index]
+            if isinstance(meta, dict) and meta.get("index") != frame_index:
                 raise ValueError(
-                    f"fal result frame {frame_position} objects must be a list"
+                    f"fal result metadata index mismatch at frame {frame_index}; "
+                    "uncalibrated response shape"
                 )
-            for entry in objects:
-                if not isinstance(entry, dict):
-                    raise ValueError(
-                        f"fal result object {position} must be an object"
-                    )
-                meta = metadata[position] if position < len(metadata) else None
-                if not isinstance(meta, dict):
-                    meta = {}
-                position += 1
-                box = entry.get("box")
-                if box is None:
-                    box = meta.get("box")
-                score = entry.get("score")
-                if score is None:
-                    score = meta.get("score")
-                label = entry.get("label")
-                if label is None:
-                    label = meta.get("label")
-                frames.append({
-                    "frame_index": frame_index,
-                    "track_id": entry.get("track_id"),
-                    "label": label,
-                    "score": score,
-                    "box": box,
-                    "rle": entry.get("rle"),
-                })
-                if box is None:
-                    continue  # 该帧此对象无检出
-                target = self._map_label(label, targets, target_lookup, position)
-                if target is None:
-                    continue
-                bbox = self._cxcywh_to_xyxy(box, position)
-                if bbox is None:
-                    continue  # 钳位后退化（零面积），无框可画
-                detections.append(
-                    ObjectDetection(
-                        label=target,
-                        timestamp_s=frame_index / fps,
-                        bbox_xyxy_normalized=bbox,
-                    )
+            score = meta.get("score") if isinstance(meta, dict) else None
+            frames.append({
+                "frame_index": frame_index,
+                "label": target,
+                "score": score,
+                "box": box,
+                "rle": rle,
+            })
+            if box is None:
+                continue  # 该帧未检出（rle 同位置为 null）
+            bbox = self._cxcywh_to_xyxy(box, frame_index)
+            if bbox is None:
+                continue  # 钳位后退化（零面积），无框可画
+            detections.append(
+                ObjectDetection(
+                    label=target,
+                    timestamp_s=frame_index / fps,
+                    bbox_xyxy_normalized=bbox,
                 )
-        detections.sort(key=lambda item: (item.timestamp_s, item.label))
+            )
         return detections, frames
-
-    def _map_label(
-        self,
-        label: Any,
-        targets: list[str],
-        target_lookup: dict[str, str],
-        position: int,
-    ) -> str | None:
-        """把 fal 返回的 label 回映射到 targets；无法映射的跳过（记日志）。
-
-        响应完全不带 label 时：单目标全部归该目标；多目标无法归因，
-        属响应形态假设失配，抛 ValueError 触发校准。
-        """
-        if isinstance(label, str) and label.strip():
-            target = target_lookup.get(label.strip().lower())
-            if target is None:
-                _LOGGER.warning(
-                    "object detect provider fal_sam3: object %d label %r maps to "
-                    "no target; skipped",
-                    position - 1,
-                    label,
-                )
-                return None
-            return target
-        if len(targets) == 1:
-            return targets[0]
-        raise ValueError(
-            "fal result objects carry no label; cannot attribute tracks to "
-            "multiple targets, recalibrate against the fixture"
-        )
 
     @staticmethod
     def _cxcywh_to_xyxy(
@@ -1590,7 +1560,7 @@ PROVIDER_REGISTRY: dict[str, type | None] = {
     "kimi": KimiGroundingClient,
     "step": StepGroundingClient,
     "gemini": GeminiGroundingClient,
-    "fal_sam3": FalSam3GroundingClient,  # fal.ai SAM 3 video-rle，专用检测模型
+    "fal_sam3": FalSam3GroundingClient,  # fal.ai SAM 3.1 video-rle，专用检测模型
 }
 
 if set(PROVIDER_REGISTRY) != set(OBJECT_DETECT_PROVIDER_NAMES):
