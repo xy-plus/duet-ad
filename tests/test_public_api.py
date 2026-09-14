@@ -162,6 +162,21 @@ def _create(client, auth, video, *, key="request001", **data):
         )
 
 
+def _create_upload(client, auth, video, *, key, filename, content_type):
+    with video.open("rb") as stream_content:
+        upload = (
+            (filename, stream_content, content_type)
+            if content_type is not None
+            else (filename, stream_content)
+        )
+        return client.post(
+            "/api/v1/video-generations",
+            headers={**auth, "Idempotency-Key": key},
+            data={"aspect_ratio": "9:16", "resolution": "768p"},
+            files={"source_video": upload},
+        )
+
+
 def _store(app) -> ProjectStore:
     return app.state.store
 
@@ -609,6 +624,62 @@ def test_create_uses_specific_parameter_error_codes(
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("source", "video/mp4"),
+        ("clip.avi", "video/quicktime"),
+        ("source", "video/webm"),
+        ("clip.MP4", "application/octet-stream"),
+    ],
+)
+def test_create_accepts_source_video_via_filename_or_content_type(
+    tmp_path, video_1s, filename, content_type
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    with TestClient(app) as client:
+        created = _create_upload(
+            client,
+            auth,
+            video_1s,
+            key="uploadkind1",
+            filename=filename,
+            content_type=content_type,
+        )
+
+    assert created.status_code == 201
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("clip.avi", "video/x-msvideo"),
+        ("source", "application/octet-stream"),
+        ("source", None),
+    ],
+)
+def test_create_rejects_source_video_when_filename_and_content_type_both_unknown(
+    tmp_path, video_1s, filename, content_type
+):
+    settings, auth, _ = _public_setup(tmp_path)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    with TestClient(app) as client:
+        response = _create_upload(
+            client,
+            auth,
+            video_1s,
+            key="uploadkind1",
+            filename=filename,
+            content_type=content_type,
+        )
+
+    assert response.status_code == 415
+    assert response.json()["error"]["code"] == "unsupported_source_media_type"
+    assert response.json()["error"]["field"] == "source_video"
+    assert _store(app).list() == []
 
 
 def test_create_requires_multipart_and_wraps_malformed_boundary(tmp_path):

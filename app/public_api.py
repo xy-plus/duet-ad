@@ -70,6 +70,12 @@ from app.store import (
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _JOB_RE = re.compile(r"^vg_([0-9a-f]{32})$")
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}
+# Fallback for uploads whose multipart filename lacks a usable extension.
+_CONTENT_TYPE_SUFFIXES = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+}
 _CREATE_FIELDS = {
     "source_video",
     "source_video_url",
@@ -944,6 +950,9 @@ def install(
         normalized_url = _normalize_url(url) if url else None
         if source_video is not None:
             suffix = Path(source_video.filename or "").suffix.lower()
+            if suffix not in _VIDEO_SUFFIXES:
+                media_type = (source_video.content_type or "").split(";", 1)[0].strip().lower()
+                suffix = _CONTENT_TYPE_SUFFIXES.get(media_type, "")
             if suffix not in _VIDEO_SUFFIXES:
                 raise PublicAPIError(415, "unsupported_source_media_type", "原视频格式不受支持", field="source_video")
         raw_aspect_ratio = form.get("aspect_ratio", aspect_ratio)
