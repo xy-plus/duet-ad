@@ -1,4 +1,4 @@
-"""multiref_mode 开关：只允许 composed|direct，显式配置、无缺省（spec §1）。"""
+"""multiref_mode 开关：显式设置只允许 composed|direct，缺省默认 direct（spec §1）。"""
 
 from __future__ import annotations
 
@@ -27,18 +27,19 @@ def test_multiref_mode_rejects_unknown_value() -> None:
         Settings(**_BASE, multiref_mode="legacy")
 
 
-def test_multiref_mode_has_no_default() -> None:
-    with pytest.raises(TypeError):
-        Settings(**_BASE)
+def test_multiref_mode_defaults_to_direct() -> None:
+    settings = Settings(**_BASE)
+    assert settings.multiref_mode == "direct"
 
 
-def test_get_settings_requires_multiref_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_settings_defaults_multiref_mode_to_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ACCESS_TOKEN", "test-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://multiref.test")
     monkeypatch.delenv("MULTIREF_MODE", raising=False)
-    with pytest.raises(RuntimeError, match="MULTIREF_MODE"):
-        get_settings()
+    assert get_settings().multiref_mode == "direct"
 
 
 def test_get_settings_reads_multiref_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:

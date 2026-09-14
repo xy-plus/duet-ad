@@ -59,14 +59,14 @@ _GEMINI_PROXY_SCHEMES = frozenset({"http", "https"})
 @dataclass(frozen=True)
 class Settings:
     access_token: str
-    # 多参考图模式开关：只有 composed | direct 两个值，必须显式配置、无缺省。
+    # 多参考图模式开关：显式设置只接受 composed | direct，缺省默认 direct。
     # composed：在"参考图构造与冻结"环节把多张用户图合成单一 provider
     # reference（app/product_views.py），下游与单图完全同构；direct：逐图直传，
     # reference_image_ids 贯穿 video-maker / object-replace / 图版 / bindings。
     # 两模式的分叉点在参考图构造与冻结环节，H3 提交处共用"按 h3_reference_images
     # 顺序传图"。不存在第三条旧单图链路：上传 1 张图就是所选模式的 1 图情形。
     # 本开关不进前端、不进公开 API 参数与响应。
-    multiref_mode: str
+    multiref_mode: str = "direct"
     data_dir: Path = ROOT / "data"
     public_base_url: str = ""
     picsart_api_key: str = ""
@@ -332,9 +332,8 @@ def get_settings() -> Settings:
     deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not deepseek_api_key:
         raise RuntimeError("DEEPSEEK_API_KEY must be set to a non-empty value")
-    multiref_mode = os.environ.get("MULTIREF_MODE", "").strip().lower()
-    if not multiref_mode:
-        raise RuntimeError("MULTIREF_MODE must be set to composed or direct")
+    # 缺省默认 direct；显式设置的合法性由 Settings.__post_init__ 校验。
+    multiref_mode = os.environ.get("MULTIREF_MODE", "").strip().lower() or "direct"
     provider_fields: dict[str, str | None] = {}
     for name, default_base, default_model in _OBJECT_DETECT_PROVIDER_SPECS:
         env_prefix = name.upper()
