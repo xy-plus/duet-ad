@@ -30,6 +30,10 @@ segment, so resumes stay consistent).
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -42,6 +46,8 @@ from app.config import get_settings
 from app.object_detect import ObjectDetection, select_provider
 
 
+_LOGGER = logging.getLogger(__name__)
+
 OBJECT_BLOCK_FILL = (64, 64, 64)  # solid deep gray (BGR) filling the object box
 OBJECT_MASK_HOLD_FRAMES = 12  # frames a lost object keeps its last known box
 OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
@@ -49,6 +55,13 @@ OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
 
 class ObjectMaskError(RuntimeError):
     """Object detection or masking could not be completed deterministically."""
+
+
+def _target_slug(target: str) -> str:
+    """检测产物文件名的 target 段：可读前缀 + 短哈希，确定且防碰撞。"""
+    readable = re.sub(r"[^a-z0-9]+", "-", target.lower()).strip("-")[:40].strip("-")
+    digest = hashlib.sha1(target.encode("utf-8")).hexdigest()[:8]
+    return f"{readable or 'target'}-{digest}"
 
 
 def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
@@ -74,7 +87,10 @@ def _center_distance(
 
 
 def _frame_boxes(
-    detections: list[ObjectDetection], fps: float
+    detections: list[ObjectDetection],
+    fps: float,
+    *,
+    hold_frames: set[int] | None = None,
 ) -> dict[int, list[tuple[float, float, float, float]]]:
     """Expand sparse timestamped detections into a per-frame box list.
 
@@ -85,6 +101,7 @@ def _frame_boxes(
     simultaneous instance). Within a track, boxes between anchor frames are
     linearly interpolated; after the last anchor the final box is held for
     OBJECT_MASK_HOLD_FRAMES frames, then the object is treated as gone.
+    ``hold_frames``（可选 out 参数）收集由续盖逻辑产生的帧号。
     """
     points = sorted(
         (
@@ -126,6 +143,8 @@ def _frame_boxes(
                 last_frame + 1, last_frame + OBJECT_MASK_HOLD_FRAMES + 1
             ):
                 boxes_by_frame.setdefault(frame_index, []).append(last_box)
+                if hold_frames is not None:
+                    hold_frames.add(frame_index)
     return boxes_by_frame
 
 
@@ -160,21 +179,61 @@ def _production_detector() -> Any:
     return client
 
 
+def _detect_all(
+    source: Path,
+    targets: list[str],
+    detector: Any,
+    artifacts_dir: Path | None,
+) -> list[ObjectDetection]:
+    """按 provider 能力分发检测调用（注释即约束，不要对调两条路径）。
+
+    - ``single_target_only`` 的 provider（fal_sam3：多目标响应形态未校准，
+      detect 拒绝多 targets）：N 个 target = N 次独立 detect，每次一个独立
+      产物文件 object-detect-response-<slug>.json，各自指纹复用；某 target
+      无检出记日志跳过，不影响其它 target。
+    - 其它 provider（7 家 VLM 契约支持多目标）：一次 detect 调用全部
+      targets。VLM 没有产物复用钩子，artifacts_dir 对它们只产
+      object-detections.json。
+    """
+    if getattr(detector, "single_target_only", False):
+        detections: list[ObjectDetection] = []
+        for target in targets:
+            client = detector
+            if artifacts_dir is not None and hasattr(detector, "with_cache"):
+                client = detector.with_cache(
+                    artifacts_dir
+                    / f"object-detect-response-{_target_slug(target)}.json"
+                )
+            found = client.detect(source, [target])
+            if not found:
+                _LOGGER.warning(
+                    "object mask: target %r got no detections; other targets "
+                    "continue",
+                    target,
+                )
+            detections.extend(found)
+        return detections
+    if artifacts_dir is not None and hasattr(detector, "with_cache"):
+        detector = detector.with_cache(artifacts_dir / "object-detect-response.json")
+    return detector.detect(source, targets)
+
+
 def mask_objects(
     source: Path,
     destination: Path,
     targets: list[str],
     *,
     detector: Any | None = None,
-    detect_cache: Path | None = None,
+    detect_artifacts_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
     omitted, the first available configured provider is used.
-    ``detect_cache`` 是检测原始响应的落盘产物路径（项目 work 目录内）；
-    支持产物复用的 provider（with_cache 钩子，如 fal_sam3）命中指纹时直接
-    复用、不再发起付费调用，其它 provider 忽略该参数。"""
+    ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
+    支持产物复用的 provider（with_cache 钩子，如 fal_sam3）把原始响应按
+    target 写到 object-detect-response-<slug>.json，命中指纹即零 HTTP；
+    解析后的契约 detections 写 object-detections.json（见 _detect_all）。"""
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
@@ -190,10 +249,35 @@ def mask_objects(
         raise ObjectMaskError("object mask source metadata is incomplete")
     if detector is None and targets:
         detector = _production_detector()
-    if detect_cache is not None and hasattr(detector, "with_cache"):
-        detector = detector.with_cache(detect_cache)
-    detections = detector.detect(source, targets) if targets else []
-    boxes_by_frame = _frame_boxes(detections, fps)
+    detections = (
+        _detect_all(source, targets, detector, detect_artifacts_dir)
+        if targets
+        else []
+    )
+    if detect_artifacts_dir is not None and targets:
+        detect_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (detect_artifacts_dir / "object-detections.json").write_text(
+            json.dumps(
+                {
+                    "targets": list(targets),
+                    "detections": [
+                        {
+                            "label": detection.label,
+                            "timestamp_s": detection.timestamp_s,
+                            "bbox_xyxy_normalized": list(
+                                detection.bbox_xyxy_normalized
+                            ),
+                        }
+                        for detection in detections
+                    ],
+                },
+                ensure_ascii=False,
+                indent=1,
+            ),
+            encoding="utf-8",
+        )
+    hold_frame_set: set[int] = set()
+    boxes_by_frame = _frame_boxes(detections, fps, hold_frames=hold_frame_set)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=".objects-masked-",
@@ -202,7 +286,7 @@ def mask_objects(
         delete=False,
     ) as handle:
         raw = Path(handle.name)
-    stats = {"frames": 0, "frames_with_block": 0, "blocks_total": 0}
+    stats: dict[str, Any] = {"frames": 0, "frames_with_block": 0, "blocks_total": 0}
     try:
         writer = cv2.VideoWriter(
             str(raw),
@@ -247,4 +331,22 @@ def mask_objects(
         )
     finally:
         raw.unlink(missing_ok=True)
+    painted = set(range(stats["frames"]))
+    anchor_frame_set = {
+        round(detection.timestamp_s * fps) for detection in detections
+    }
+    stats["anchor_frames"] = len(anchor_frame_set & painted)
+    stats["hold_frames"] = len(hold_frame_set & painted)
+    stats["interpolated_frames"] = (
+        stats["frames_with_block"] - stats["anchor_frames"] - stats["hold_frames"]
+    )
+    stats["targets"] = {
+        target: {
+            "detections": sum(1 for d in detections if d.label == target),
+            "detected_frames": len({
+                round(d.timestamp_s * fps) for d in detections if d.label == target
+            } & painted),
+        }
+        for target in targets
+    }
     return stats

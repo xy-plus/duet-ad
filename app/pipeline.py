@@ -5620,10 +5620,12 @@ class Pipeline:
                 # missing-key case); a misconfigured explicitly enabled
                 # provider is rejected earlier by Settings validation.
                 object_masked = segment_dir / "source-objects-masked.mp4"
-                # 检测原始响应的落盘产物：放在段 work 目录（跨节点重试与
-                # resume-pre-picsart 续跑存活），支持复用的 provider
-                # （fal_sam3）命中指纹即复用，不再发起付费调用。
-                detect_cache = segment_dir / "object-detect-response.json"
+                # 检测产物落盘目录 = 段 work 目录（跨节点重试与
+                # resume-pre-picsart 续跑存活）：fal 原始响应按 target 一个
+                # JSON（object-detect-response-<slug>.json，命中指纹即零
+                # HTTP），解析后的契约 detections 收 object-detections.json，
+                # 全部计入下面 output-media 的节点产物清单。
+                detect_artifacts_dir = segment_dir
                 object_mask_failures = 0
 
                 def _object_mask_retry(exc: Exception) -> bool:
@@ -5644,11 +5646,14 @@ class Pipeline:
                         [muted],
                         lambda: object_mask.mask_objects(
                             muted, object_masked, object_targets,
-                            detect_cache=detect_cache,
+                            detect_artifacts_dir=detect_artifacts_dir,
                         ),
                         lambda _value: [
                             path
-                            for path in (object_masked, detect_cache)
+                            for path in (
+                                object_masked,
+                                *sorted(segment_dir.glob("object-detect*.json")),
+                            )
                             if path.is_file()
                         ],
                         retry_if=_object_mask_retry,

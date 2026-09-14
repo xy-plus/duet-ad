@@ -6,11 +6,13 @@ import subprocess
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 import pytest
 
 from app import object_mask
-from app.object_detect import ObjectDetection
+from app.config import Settings
+from app.object_detect import FalSam3GroundingClient, ObjectDetection
 from app.object_mask import (
     OBJECT_BLOCK_FILL,
     OBJECT_MASK_HOLD_FRAMES,
@@ -101,7 +103,15 @@ def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
         source, destination, ["mug"], detector=detector
     )
 
-    assert stats == {"frames": 8, "frames_with_block": 8, "blocks_total": 8}
+    assert stats == {
+        "frames": 8,
+        "frames_with_block": 8,
+        "blocks_total": 8,
+        "anchor_frames": 2,
+        "hold_frames": 4,
+        "interpolated_frames": 2,
+        "targets": {"mug": {"detections": 2, "detected_frames": 2}},
+    }
     assert detector.calls == [(source, ["mug"])]
     capture = cv2.VideoCapture(str(destination))
     assert capture.get(cv2.CAP_PROP_FPS) == pytest.approx(2.0)
@@ -181,6 +191,10 @@ def test_mask_objects_holds_the_last_position_then_disappears(
         "frames": 20,
         "frames_with_block": 1 + OBJECT_MASK_HOLD_FRAMES,
         "blocks_total": 1 + OBJECT_MASK_HOLD_FRAMES,
+        "anchor_frames": 1,
+        "hold_frames": OBJECT_MASK_HOLD_FRAMES,
+        "interpolated_frames": 0,
+        "targets": {"mug": {"detections": 1, "detected_frames": 1}},
     }
     frames = _read_frames(destination)
     assert len(frames) == 20
@@ -215,7 +229,15 @@ def test_mask_objects_matches_simultaneous_boxes_to_tracks_by_iou(
         source, destination, ["mug"], detector=detector
     )
 
-    assert stats == {"frames": 3, "frames_with_block": 3, "blocks_total": 6}
+    assert stats == {
+        "frames": 3,
+        "frames_with_block": 3,
+        "blocks_total": 6,
+        "anchor_frames": 2,
+        "hold_frames": 0,
+        "interpolated_frames": 1,
+        "targets": {"mug": {"detections": 4, "detected_frames": 2}},
+    }
     frames = _read_frames(destination)
     for frame in frames:
         columns = _block_columns(frame)
@@ -240,7 +262,15 @@ def test_mask_objects_without_detections_leaves_frames_untouched(
         source, destination, ["mug"], detector=_SparseDetector([])
     )
 
-    assert stats == {"frames": 3, "frames_with_block": 0, "blocks_total": 0}
+    assert stats == {
+        "frames": 3,
+        "frames_with_block": 0,
+        "blocks_total": 0,
+        "anchor_frames": 0,
+        "hold_frames": 0,
+        "interpolated_frames": 0,
+        "targets": {"mug": {"detections": 0, "detected_frames": 0}},
+    }
     frames = _read_frames(destination)
     assert len(frames) == 3
     assert len(_block_columns(frames[0])) == 0
@@ -296,7 +326,15 @@ def test_mask_objects_blocks_total_counts_anchor_frames_once(
         source, destination, ["mug"], detector=detector
     )
 
-    assert stats == {"frames": 3, "frames_with_block": 3, "blocks_total": 3}
+    assert stats == {
+        "frames": 3,
+        "frames_with_block": 3,
+        "blocks_total": 3,
+        "anchor_frames": 3,
+        "hold_frames": 0,
+        "interpolated_frames": 0,
+        "targets": {"mug": {"detections": 3, "detected_frames": 3}},
+    }
 
 
 def test_mask_objects_rejects_an_unreadable_source(tmp_path: Path) -> None:
@@ -324,40 +362,215 @@ def test_mask_objects_requires_a_provider_when_no_detector_is_injected(
     assert not destination.exists()
 
 
-class _CacheableDetector(_SparseDetector):
-    """Test seam mirroring the fal_sam3 with_cache hook."""
+class _SingleTargetDetector:
+    """Test seam mirroring fal_sam3: single_target_only + with_cache hook."""
 
-    def __init__(self, detections: list[ObjectDetection]) -> None:
-        super().__init__(detections)
+    single_target_only = True
+
+    def __init__(self, detections_by_target: dict[str, list[ObjectDetection]]) -> None:
+        self.detections_by_target = detections_by_target
+        self.calls: list[tuple[Path, list[str]]] = []
         self.cache_paths: list[Path] = []
 
-    def with_cache(self, cache_path: Path) -> "_CacheableDetector":
+    def with_cache(self, cache_path: Path) -> "_SingleTargetDetector":
         self.cache_paths.append(cache_path)
         return self
 
+    def detect(self, video_path: Path, targets: list[str]) -> list[ObjectDetection]:
+        assert len(targets) == 1, "single_target_only detector got multi targets"
+        self.calls.append((video_path, list(targets)))
+        return list(self.detections_by_target.get(targets[0], []))
 
-def test_mask_objects_passes_detect_cache_to_cacheable_detector(
+
+def test_mask_objects_splits_single_target_only_detector_per_target(
     tmp_path: Path,
 ) -> None:
+    """fal 型 provider：N target = N 次独立 detect + 各自产物文件，合并盖块。"""
     source = tmp_path / "source-muted.mp4"
-    _solid_video(source, frames=2)
-    detector = _CacheableDetector([])
-    cache = tmp_path / "object-detect-response.json"
-    object_mask.mask_objects(
-        source, tmp_path / "out.mp4", ["mug"],
-        detector=detector, detect_cache=cache,
+    _solid_video(source, frames=3)
+    detector = _SingleTargetDetector({
+        "mug": [_detection(0.0, (0.1, 0.1, 0.4, 0.4))],
+        "scarf": [_detection(1.0, (0.5, 0.5, 0.9, 0.9), label="scarf")],
+    })
+    artifacts = tmp_path / "segment"
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["mug", "scarf"],
+        detector=detector, detect_artifacts_dir=artifacts,
     )
-    assert detector.cache_paths == [cache]
+    assert detector.calls == [(source, ["mug"]), (source, ["scarf"])]
+    assert detector.cache_paths == [
+        artifacts / f"object-detect-response-{object_mask._target_slug('mug')}.json",
+        artifacts / f"object-detect-response-{object_mask._target_slug('scarf')}.json",
+    ]
+    detections_file = artifacts / "object-detections.json"
+    assert detections_file.is_file()
+    payload = json.loads(detections_file.read_text(encoding="utf-8"))
+    assert payload["targets"] == ["mug", "scarf"]
+    assert [entry["label"] for entry in payload["detections"]] == ["mug", "scarf"]
+    assert stats["targets"] == {
+        "mug": {"detections": 1, "detected_frames": 1},
+        "scarf": {"detections": 1, "detected_frames": 1},
+    }
 
 
-def test_mask_objects_detect_cache_ignored_by_plain_detector(
+def test_mask_objects_single_target_empty_detection_does_not_block_others(
     tmp_path: Path,
 ) -> None:
+    """某 target 无检出：记日志跳过，其它 target 照常盖块。"""
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=3)
+    detector = _SingleTargetDetector({
+        "mug": [_detection(0.0, (0.1, 0.1, 0.4, 0.4))],
+        "ghost": [],
+    })
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["mug", "ghost"],
+        detector=detector, detect_artifacts_dir=tmp_path / "segment",
+    )
+    assert stats["blocks_total"] > 0
+    assert stats["targets"]["ghost"] == {"detections": 0, "detected_frames": 0}
+    assert stats["targets"]["mug"]["detections"] == 1
+
+
+def test_mask_objects_multi_target_detector_called_once(
+    tmp_path: Path,
+) -> None:
+    """VLM 型 provider（无 single_target_only）：一次调用全部 targets。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=2)
-    detector = _SparseDetector([])
+    detector = _SparseDetector([_detection(0.0, (0.1, 0.1, 0.4, 0.4))])
+    artifacts = tmp_path / "segment"
     object_mask.mask_objects(
-        source, tmp_path / "out.mp4", ["mug"],
-        detector=detector, detect_cache=tmp_path / "object-detect-response.json",
+        source, tmp_path / "out.mp4", ["mug", "scarf"],
+        detector=detector, detect_artifacts_dir=artifacts,
     )
-    assert detector.calls == [(source, ["mug"])]
+    assert detector.calls == [(source, ["mug", "scarf"])]
+    # VLM 无产物复用钩子：只有解析后的 detections JSON，无响应产物文件。
+    assert (artifacts / "object-detections.json").is_file()
+    assert not list(artifacts.glob("object-detect-response*.json"))
+
+
+def test_mask_objects_stats_breakdown(tmp_path: Path) -> None:
+    """统计分解：锚点帧 / 插值帧 / 续盖帧 / 每 target 检出率。"""
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=30)
+    # 帧 0 与帧 20 两个锚点 → 0 锚点、1-19 插值、20 锚点、21-32 续盖
+    # （视频 30 帧，续盖实际画 21-29）。
+    detector = _SparseDetector([
+        _detection(0.0, (0.1, 0.1, 0.4, 0.4)),
+        _detection(20.0, (0.2, 0.2, 0.5, 0.5)),
+    ])
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["mug"], detector=detector,
+    )
+    assert stats["frames"] == 30
+    assert stats["anchor_frames"] == 2
+    assert stats["interpolated_frames"] == 19
+    assert stats["hold_frames"] == 9
+    assert (
+        stats["frames_with_block"]
+        == stats["anchor_frames"]
+        + stats["interpolated_frames"]
+        + stats["hold_frames"]
+    )
+
+
+# --- fal_sam3 真实 client 集成：产物落盘与指纹复用（mock HTTP，零真实调用）---
+
+_FAL_QUEUE_RESULT = {
+    "rle": ["rle-frame-0"],
+    "boxes": [[0.5, 0.5, 0.4, 0.4]],
+    "metadata": [{"index": 0, "score": None, "box": [0.5, 0.5, 0.4, 0.4]}],
+}
+
+
+def _fal_test_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        access_token="test-access",
+        data_dir=tmp_path,
+        public_base_url="https://detect.test",
+        multiref_mode="direct",
+        fal_sam3_api_key="fal-secret",
+        fal_sam3_api_base="https://fal.test/fal-ai/sam-3-1",
+        fal_sam3_model="video-rle",
+        provider_poll_interval_s=0.01,
+        request_timeout_s=1.0,
+    )
+
+
+def _fal_mock_handler(state: dict[str, int]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/storage/upload/initiate":
+            state["uploads"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "upload_url": "https://fal.test/upload/presigned",
+                    "file_url": "https://fal.test/files/source-muted.mp4",
+                },
+            )
+        if request.method == "PUT" and path == "/upload/presigned":
+            return httpx.Response(200)
+        if request.method == "POST" and path == "/fal-ai/sam-3-1/video-rle":
+            state["submits"] += 1
+            body = json.loads(request.content)
+            assert "," not in body["prompt"], "fal 单目标限制被穿透"
+            state.setdefault("prompts", []).append(body["prompt"])
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "req-1",
+                    "status_url": "https://fal.test/requests/req-1/status",
+                    "response_url": "https://fal.test/requests/req-1",
+                },
+            )
+        if request.method == "GET" and path == "/requests/req-1/status":
+            return httpx.Response(200, json={"status": "COMPLETED"})
+        if request.method == "GET" and path == "/requests/req-1":
+            return httpx.Response(200, json=_FAL_QUEUE_RESULT)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    return handler
+
+
+def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> None:
+    """真实 fal client（mock HTTP）：2 target = 2 提交 + 2 产物文件；
+    二次运行命中指纹零 HTTP，且结果一致。"""
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=2)
+    artifacts = tmp_path / "segment"
+    state: dict[str, int] = {"uploads": 0, "submits": 0}
+    client = FalSam3GroundingClient(
+        _fal_test_settings(tmp_path),
+        transport=httpx.MockTransport(_fal_mock_handler(state)),
+    )
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["handbag", "bottle"],
+        detector=client, detect_artifacts_dir=artifacts,
+    )
+    assert state["submits"] == 2
+    assert state["uploads"] == 2
+    response_files = sorted(artifacts.glob("object-detect-response-*.json"))
+    assert len(response_files) == 2
+    for path in response_files:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        # 原始响应字段一个不丢（rle/boxes/metadata 原样）。
+        assert cached["fal_response"] == _FAL_QUEUE_RESULT
+        assert set(cached["fingerprint"]) == {
+            "video_sha256", "prompt", "detection_threshold", "model",
+        }
+    assert stats["blocks_total"] == 4  # 2 target × (帧 0 锚点 + 帧 1 续盖)
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    reused = FalSam3GroundingClient(
+        _fal_test_settings(tmp_path),
+        transport=httpx.MockTransport(fail_handler),
+    )
+    stats2 = object_mask.mask_objects(
+        source, tmp_path / "out2.mp4", ["handbag", "bottle"],
+        detector=reused, detect_artifacts_dir=artifacts,
+    )
+    assert stats2["blocks_total"] == stats["blocks_total"]

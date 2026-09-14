@@ -7040,10 +7040,22 @@ def _prepare_h3_object_mask_fixture(
         source_path: Path,
         destination: Path,
         targets: list[str],
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         object_calls.append((source_path, destination, list(targets)))
         destination.write_bytes(source_path.read_bytes() + b"-objects-masked")
+        # 模仿真实 mask_objects 的产物落盘：每 target 一个响应 JSON +
+        # 解析后的 detections JSON，供节点 output-media 收编。
+        artifacts_dir = kwargs.get("detect_artifacts_dir")
+        if artifacts_dir is not None:
+            for target in targets:
+                (
+                    artifacts_dir
+                    / f"object-detect-response-{object_mask._target_slug(target)}.json"
+                ).write_text("{}", encoding="utf-8")
+            (artifacts_dir / "object-detections.json").write_text(
+                "{}", encoding="utf-8"
+            )
         return {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
 
     monkeypatch.setattr(object_mask, "mask_objects", fake_mask_objects)
@@ -7182,6 +7194,51 @@ def test_object_mask_failure_degrades_to_face_masked_reference(
     assert sorted(path.name for path in attempts) == [
         f"attempt-{index}"
         for index in range(1, object_mask.OBJECT_MASK_MAX_ATTEMPTS + 1)
+    ]
+
+
+def test_h3_object_mask_node_collects_detect_artifacts(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """节点产物清单：output-media 收盖块视频 + 每 target 响应 JSON +
+    解析 detections JSON（input-media 收输入视频，沿用既有节点纪律）。"""
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    enhanced_index["entities"]["entity-02"] = {
+        "source_visual_description": "the leather wallet",
+        "occurrences": [{"segment_index": 1, "frame_orders": [2]}],
+        "replacement": {
+            "reason": "user_request",
+            "source": "image_1",
+            "target_visual_description": "a canvas wallet",
+        },
+    }
+
+    pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    targets = [call[2] for call in object_calls][0]
+    assert targets == ["the red scarf around the neck", "the leather wallet"]
+    attempt = (
+        project / "logs" / "mask-replaceable-objects" / "segment-0001"
+        / "attempt-1"
+    )
+    input_media = sorted(path.name for path in (attempt / "input-media").iterdir())
+    assert input_media == ["001-source-faces-masked.mp4"]
+    output_media = sorted(path.name for path in (attempt / "output-media").iterdir())
+    slugs = sorted(object_mask._target_slug(target) for target in targets)
+    assert output_media == [
+        "001-source-objects-masked.mp4",
+        f"002-object-detect-response-{slugs[0]}.json",
+        f"003-object-detect-response-{slugs[1]}.json",
+        "004-object-detections.json",
     ]
 
 

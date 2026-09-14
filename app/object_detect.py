@@ -1205,6 +1205,9 @@ class FalSam3GroundingClient:
     """
 
     provider_name = "fal_sam3"
+    # 多目标响应形态未校准：detect 拒绝多 targets，由 object_mask._detect_all
+    # 按此标记拆成逐 target 独立调用（各自产物文件、各自指纹复用）。
+    single_target_only = True
 
     def __init__(
         self,
