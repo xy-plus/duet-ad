@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import ipaddress
+import json
 import os
+import re
 import socket
 import tempfile
 from dataclasses import dataclass
@@ -12,12 +14,67 @@ from typing import Awaitable, Callable, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
+from app.reference_proxy import ReferenceTransport, configured_proxy
 
 
 ResolverResult = Sequence[str | ipaddress.IPv4Address | ipaddress.IPv6Address]
 Resolver = Callable[[str, int], ResolverResult | Awaitable[ResolverResult]]
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 DEFAULT_PORTS = {"http": 80, "https": 443}
+TIKWM_API = "https://www.tikwm.com/api/"
+
+
+def is_tiktok_page_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (parsed.scheme in DEFAULT_PORTS
+            and (host == "tiktok.com" or host.endswith(".tiktok.com"))
+            and re.search(r"/video/[0-9]+(?:/|$)", parsed.path) is not None)
+
+
+async def _tiktok_media_url(url: str, client: httpx.AsyncClient, resolver: Resolver) -> str:
+    """Restore duet-ad1's TikWM GET/code=0/data.play protocol, without retries.
+
+    The returned URL remains untrusted and goes through the normal pinned
+    downloader. The caller retains the original page as input provenance.
+    """
+    if not re.search(r"/video/[0-9]+(?:/|$)", urlsplit(url).path):
+        raise ReferenceDownloadError("tiktok_resolution_failed", "无法解析 TikTok 视频编号", status_code=422)
+    target = await _approved_target(str(httpx.URL(TIKWM_API, params={"url": url})), resolver)
+    try:
+        async with client.stream("GET", target.pinned_url,
+                headers={"Host": target.host_header, "Accept": "application/json", "Accept-Encoding": "identity"},
+                extensions={"sni_hostname": target.sni_hostname}) as response:
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > 1024 * 1024:
+                    raise ValueError("TikWM response too large")
+            payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("TikWM response is not an object")
+        data = payload.get("data")
+        play = data.get("play") if isinstance(data, dict) else None
+        if payload.get("code") != 0 or not isinstance(play, str) or not play.strip():
+            raise ValueError("TikWM response lacks media URL")
+        return play.strip()
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        raise ReferenceDownloadError("tiktok_resolution_failed", "TikTok 视频解析失败，请稍后重试或上传视频文件", status_code=422) from exc
+
+
+async def _resolve_tiktok_with_retries(url: str, client: httpx.AsyncClient, resolver: Resolver) -> str:
+    for attempt in range(3):
+        try:
+            return await _tiktok_media_url(url, client, resolver)
+        except ReferenceDownloadError as exc:
+            if exc.code != "tiktok_resolution_failed" or attempt == 2:
+                raise
+            await asyncio.sleep(10)
+    raise AssertionError("unreachable")
 
 
 class ReferenceDownloadError(RuntimeError):
@@ -47,6 +104,32 @@ async def resolve_addresses(hostname: str, port: int) -> ResolverResult:
         type=socket.SOCK_STREAM,
     )
     return [record[4][0] for record in records if record[0] in {socket.AF_INET, socket.AF_INET6}]
+
+
+async def _doh_addresses(hostname: str, proxy: str, *, transport=None) -> ResolverResult:
+    """Restore the old downloader's proxy-side Cloudflare A-record lookup.
+
+    Fixed numeric bootstrap avoids local DNS. Failure never falls back to local
+    resolution; callers still validate/filter all returned addresses before use.
+    """
+    options = {"transport": transport} if transport is not None else {"proxy": proxy}
+    async with httpx.AsyncClient(**options, trust_env=False,
+                                 follow_redirects=False, timeout=None) as client:
+        async with client.stream("GET", "https://1.1.1.1/dns-query",
+                params={"name": hostname, "type": "A"}, headers={"Accept": "application/dns-json"}) as response:
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > 1024 * 1024:
+                    raise ValueError("DoH response too large")
+        payload = json.loads(body)
+    answers = payload.get("Answer") if isinstance(payload, dict) else None
+    addresses = [item["data"] for item in answers or []
+                 if isinstance(item, dict) and item.get("type") == 1 and isinstance(item.get("data"), str)]
+    if not addresses:
+        raise ValueError("DoH returned no A records")
+    return addresses
 
 
 def _invalid(message: str = "视频链接无效") -> ReferenceDownloadError:
@@ -86,7 +169,8 @@ async def _approved_target(url: str, resolver: Resolver) -> ApprovedTarget:
         raw_addresses: ResolverResult = [numeric_host]
     except ValueError:
         try:
-            result = resolver(ascii_hostname, port)
+            proxy = configured_proxy(scheme) if resolver is resolve_addresses else None
+            result = _doh_addresses(ascii_hostname, proxy) if proxy else resolver(ascii_hostname, port)
             raw_addresses = await result if inspect.isawaitable(result) else result
         except Exception as exc:
             raise _invalid("视频链接无法解析") from exc
@@ -101,7 +185,10 @@ async def _approved_target(url: str, resolver: Resolver) -> ApprovedTarget:
         raise _invalid("视频链接无法解析") from exc
     if not addresses:
         raise _invalid("视频链接无法解析")
-    if any(not address.is_global or address.is_multicast for address in addresses):
+    # Pin only a safe candidate; an unusable sibling DNS answer need not
+    # invalidate the public addresses returned for the same hostname.
+    addresses = [address for address in addresses if address.is_global and not address.is_multicast]
+    if not addresses:
         raise ReferenceDownloadError(
             "reference_url_forbidden",
             "视频链接不能指向内部或非公网网络",
@@ -180,13 +267,17 @@ async def download_reference_url(
         async with (
             asyncio.timeout(timeout_s),
             httpx.AsyncClient(
-                transport=transport,
+                transport=transport if transport is not None else ReferenceTransport(),
                 trust_env=False,
                 follow_redirects=False,
                 timeout=timeout_s,
                 limits=httpx.Limits(max_keepalive_connections=0),
             ) as client,
         ):
+            if is_tiktok_page_url(current_url):
+                # Validate the user URL before sending it to the fixed parser.
+                await _approved_target(current_url, resolver)
+                current_url = await _resolve_tiktok_with_retries(current_url, client, resolver)
             while True:
                 target = await _approved_target(current_url, resolver)
                 async with client.stream(
