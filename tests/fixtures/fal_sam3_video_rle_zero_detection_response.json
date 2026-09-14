@@ -1,0 +1,13 @@
+{
+ "_comment": "fal-ai/sam-3-1/video-rle 真实零检出响应的精简 fixture（2026-09-15 项目 89f36eee49064013b7285fd566b692e3 段 0001 的落盘产物 object-detect-response-target-9ea5aaab.json 的 fal_response 字段；原件 278 帧全零检出，本文件保留头 4 帧原值未改）。与有检出形态（fal_sam3_video_rle_response.json，2026-09-14 校准调用）的真实差异：rle 每帧是空字符串 \"\"（不是 null）；顶层 boxes 整个为 null（不是列表）；metadata[i].box/score 全 null；scores/boundingbox_frames_zip 也是 null。零检出是正常结果（目标不在画面里），不是错误，解析必须产出空 detections 而不是抛错。",
+ "rle": ["", "", "", ""],
+ "boxes": null,
+ "metadata": [
+  {"index": 0, "score": null, "box": null},
+  {"index": 1, "score": null, "box": null},
+  {"index": 2, "score": null, "box": null},
+  {"index": 3, "score": null, "box": null}
+ ],
+ "scores": null,
+ "boundingbox_frames_zip": null
+}

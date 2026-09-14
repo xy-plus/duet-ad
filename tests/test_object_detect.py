@@ -700,6 +700,99 @@ def test_fal_sam3_frames_without_box_are_skipped(
     assert client.last_frames[1]["rle"] is None
 
 
+# --- 真实零检出形态（2026-09-15 项目 89f36eee 段 0001 落盘产物，见 fixture 注释）---
+_FAL_SAM3_ZERO_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "fal_sam3_video_rle_zero_detection_response.json"
+)
+_FAL_SAM3_ZERO_RESULT = json.loads(_FAL_SAM3_ZERO_FIXTURE.read_text(encoding="utf-8"))
+
+
+def test_fal_sam3_zero_detection_real_shape_returns_empty(
+    tmp_path: Path, video: Path
+) -> None:
+    """真实零检出形态（rle 全 ""、boxes null、metadata box 全 null）是正常结果：
+    返回空列表，不报错、不重提。"""
+    handler = _fal_queue_handler(_FAL_SAM3_ZERO_RESULT)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    assert client.detect(video, ["camera bag"]) == []
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    # 零检出的帧也在 last_frames 里（box 为 None、rle 为 ""），供二期完整消费。
+    assert len(client.last_frames) == len(_FAL_SAM3_ZERO_RESULT["rle"])
+    assert all(frame["box"] is None for frame in client.last_frames)
+    assert client.last_frames[0]["rle"] == ""
+
+
+def test_fal_sam3_boxes_key_missing_derives_from_metadata(
+    tmp_path: Path, video: Path
+) -> None:
+    """顶层 boxes 键整个缺失时从 metadata[i].box 派生（有检出校验证实
+    metadata[i].box == boxes[i]，同一来源）。"""
+    payload = {
+        "rle": [_FAL_SAM3_RESULT["rle"][0], _FAL_SAM3_RESULT["rle"][1]],
+        "metadata": [
+            {"index": 0, "score": None, "box": _FAL_SAM3_RESULT["boxes"][0]},
+            {"index": 1, "score": None, "box": _FAL_SAM3_RESULT["boxes"][1]},
+        ],
+    }
+    handler = _fal_queue_handler(payload)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["handbag"])
+    assert [detection.timestamp_s for detection in result] == [0.0, 0.5]
+    assert client.last_frames[0]["box"] == _FAL_SAM3_RESULT["boxes"][0]
+
+
+def test_fal_sam3_empty_string_rle_means_not_detected(
+    tmp_path: Path, video: Path
+) -> None:
+    """rle 空字符串 "" 与 null 同义 = 该帧未检出，即使同位置有 box 也不出检测。"""
+    payload = {
+        "rle": ["", _FAL_SAM3_RESULT["rle"][1]],
+        "boxes": [_FAL_SAM3_RESULT["boxes"][0], _FAL_SAM3_RESULT["boxes"][1]],
+        "metadata": [
+            {"index": 0, "score": None, "box": _FAL_SAM3_RESULT["boxes"][0]},
+            {"index": 1, "score": None, "box": _FAL_SAM3_RESULT["boxes"][1]},
+        ],
+    }
+    handler = _fal_queue_handler(payload)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["handbag"])
+    assert [detection.timestamp_s for detection in result] == [0.5]
+    assert client.last_frames[0]["rle"] == ""
+    assert client.last_frames[0]["box"] == _FAL_SAM3_RESULT["boxes"][0]
+
+
+def test_fal_sam3_rle_metadata_length_mismatch_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """rle/metadata 不等长 = 非预期形态：致命不重提，标记为确定性错误。"""
+    handler = _fal_queue_handler(
+        {
+            "rle": ["", ""],
+            "boxes": None,
+            "metadata": [{"index": 0, "score": None, "box": None}],
+        }
+    )
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["camera bag"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_fal_sam3_neither_boxes_nor_metadata_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """box 既不在 boxes 也不在 metadata = 无处取框：非预期形态，确定性致命。"""
+    handler = _fal_queue_handler({"rle": ["rle-a"], "boxes": None})
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handbag"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
 def test_fal_sam3_out_of_range_box_is_clamped(tmp_path: Path, video: Path) -> None:
     """cxcywh 越界（w 超出画面）钳到 [0,1]：x0<0→0、x1>1→1。"""
     result_payload = {
@@ -717,12 +810,12 @@ def test_fal_sam3_out_of_range_box_is_clamped(tmp_path: Path, video: Path) -> No
 def test_fal_sam3_rle_boxes_length_mismatch_is_fatal(
     tmp_path: Path, video: Path
 ) -> None:
-    """rle/boxes 不等长 = 非预期形态：致命不重提。"""
+    """rle/boxes 不等长 = 非预期形态：致命不重提，标记为确定性错误。"""
     handler = _fal_queue_handler({"rle": ["rle-a"], "boxes": []})
     client = _fal_client(_fal_settings(tmp_path), handler)
     with pytest.raises(ProviderFailure) as excinfo:
         client.detect(video, ["handbag"])
-    assert isinstance(excinfo.value.cause, ValueError)
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
 
 

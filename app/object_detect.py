@@ -26,9 +26,9 @@
   复用已上传文件句柄，不重复上传。
 - fal_sam3：fal.ai SAM 3.1 video-rle（默认 fal-ai/sam-3-1/video-rle），
   第一家专用检测模型（前 7 家通用 VLM）。
-  存储上传 + 队列提交/轮询；响应为 rle/boxes/metadata 三个等长列表、
-  下标 = 帧号（已按 2026-09-14 真实响应校准，与 OpenAPI 文档不符处以
-  段落头注释为准）；逐帧归一化 cxcywh box → xyxy 钳位，帧号 ÷ 视频 fps
+  存储上传 + 队列提交/轮询；响应为 rle/boxes/metadata 逐帧结构化数据、
+  下标 = 帧号（已按 2026-09-14 有检出与 2026-09-15 零检出两份真实响应
+  校准，形态对照与 OpenAPI 文档差异以 fal_sam3 段落头注释为准）；逐帧归一化 cxcywh box → xyxy 钳位，帧号 ÷ 视频 fps
   → timestamp_s；单目标直接归属（多目标形态未校准，detect 拒绝多
   targets）。score/RLE 不进契约（无对应字段），保留在落盘产物与
   ``last_frames`` 供二期。确定性模型不做"重试 = 重新推理"：
@@ -1164,8 +1164,20 @@ def _extract_gemini_json(text: str) -> Any:
 #   rle / boxes / metadata 三个等长列表，**下标 = 帧号**（rle 为 COCO RLE
 #   字符串，boxes 为归一化 cxcywh，metadata[i].index == i 且 box 与
 #   boxes[i] 同值、score 恒 null），另有 scores（恒 null）。
-# - 未检出的帧：rle 与 boxes 同位置为 null（真实响应 302 帧中 49 帧如此），
-#   是正常语义不是错误。
+# - 有检出响应里未检出的帧：rle 与 boxes 同位置为 null（2026-09-14 校准
+#   响应 302 帧中 49 帧如此），是正常语义不是错误。
+# - 两种真实响应形态对照（均下标=帧号、rle/metadata 等长）：
+#
+#   | 字段          | 有检出（2026-09-14 校准，fixture tests/fixtures/fal_sam3_video_rle_response.json） | 零检出（2026-09-15 真实落盘 object-detect-response-target-9ea5aaab.json，fixture tests/fixtures/fal_sam3_video_rle_zero_detection_response.json） |
+#   | ------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+#   | rle[i]        | 检出帧为非空 RLE 字符串，未检出帧为 null                      | 每帧都是空字符串 ""（不是 null）                              |
+#   | boxes         | 等长列表，检出帧为归一化 cxcywh，未检出帧为 null               | 顶层整个为 null（键在、值 null；也可能整个键缺失）             |
+#   | metadata[i]   | index==i，box 与 boxes[i] 同值（同一来源），score 恒 null      | index==i，box/score 全 null                                  |
+#   | scores        | null                                                         | null                                                         |
+#
+#   零检出是正常结果（目标不在画面里），解析产出空 detections 而不是抛错；
+#   boxes 缺失/null 时从 metadata[i].box 派生（同一来源，有检出校验证实
+#   相等）；rle 空字符串 "" 与 null 同义 = 该帧未检出。
 # - 多目标（逗号分隔 prompt）响应形态未校准：本次校准是单目标，多 prompt
 #   时是合并单列表还是分组没有真实数据；detect 拒绝多 targets（致命，
 #   不花钱），待有真实数据再放开。
@@ -1191,6 +1203,15 @@ def _probe_fps(video_path: Path) -> float:
 
 def _clamp01(value: float) -> float:
     return min(1.0, max(0.0, value))
+
+
+class UncalibratedResponseError(ValueError):
+    """fal 响应形态与已校准形态不符：确定性错误，重提只会得到同样结果。
+
+    pipeline 的错误分类（``Pipeline._retryable_node_error`` 与
+    mask-replaceable-objects 节点的 ``retry_if``）把本类型当作确定性
+    4xx 同级处理：致命、不进 never-fail 退避重试。
+    """
 
 
 class FalSam3GroundingClient:
@@ -1474,29 +1495,51 @@ class FalSam3GroundingClient:
     def _parse_result(
         self, payload: dict[str, Any], targets: list[str], fps: float
     ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
-        """真实形态：rle / boxes / metadata 三个等长列表，下标 = 帧号。
+        """真实形态：rle / boxes / metadata 按下标=帧号对齐（形态对照见段落头注释）。
 
-        无 box 的帧 = 该帧未检出（rle 同位置为 null），跳过不是错误；
-        列表缺失/不等长/metadata 错位 = 非预期形态，致命不重试。
-        targets 恰一个（detect 已在任何 HTTP 之前拒绝多目标）。
+        该帧未检出（box 为 null，或 rle 为 null/""）→ 跳过，不是错误；整段
+        零检出 → 空 detections，正常返回。boxes 缺失/null 时从
+        metadata[i].box 派生（同一来源）。列表缺失/类型不对/不等长/
+        metadata 错位/box 两处皆无 = 未校准形态，抛 UncalibratedResponseError
+        （确定性致命，不退避重试）。targets 恰一个（detect 已在任何 HTTP
+        之前拒绝多目标）。
         """
         rles = payload.get("rle")
-        boxes = payload.get("boxes")
-        if not isinstance(rles, list) or not isinstance(boxes, list):
-            raise ValueError(
-                "fal result must contain rle and boxes lists; "
-                "uncalibrated response shape"
-            )
-        if len(rles) != len(boxes):
-            raise ValueError(
-                "fal result rle/boxes length mismatch; uncalibrated response shape"
+        if not isinstance(rles, list):
+            raise UncalibratedResponseError(
+                "fal result must contain an rle list; uncalibrated response shape"
             )
         metadata_raw = payload.get("metadata")
         if metadata_raw is not None and (
             not isinstance(metadata_raw, list) or len(metadata_raw) != len(rles)
         ):
-            raise ValueError(
+            raise UncalibratedResponseError(
                 "fal result metadata length mismatch; uncalibrated response shape"
+            )
+        boxes_raw = payload.get("boxes")
+        if boxes_raw is None:
+            # 零检出真实形态：顶层 boxes 整个为 null/缺失，逐帧 box 只在
+            # metadata[i].box（与 boxes[i] 同一来源，有检出校验证实相等）。
+            if not isinstance(metadata_raw, list):
+                raise UncalibratedResponseError(
+                    "fal result has no box source (boxes and metadata both "
+                    "absent); uncalibrated response shape"
+                )
+            boxes: list[Any] = [
+                meta.get("box") if isinstance(meta, dict) else None
+                for meta in metadata_raw
+            ]
+        elif isinstance(boxes_raw, list):
+            if len(boxes_raw) != len(rles):
+                raise UncalibratedResponseError(
+                    "fal result rle/boxes length mismatch; "
+                    "uncalibrated response shape"
+                )
+            boxes = boxes_raw
+        else:
+            raise UncalibratedResponseError(
+                "fal result boxes must be a list or null; "
+                "uncalibrated response shape"
             )
         metadata: list[Any] = metadata_raw or [None] * len(rles)
         target = targets[0]
@@ -1504,13 +1547,14 @@ class FalSam3GroundingClient:
         frames: list[dict[str, Any]] = []
         for frame_index, rle in enumerate(rles):
             if rle is not None and not isinstance(rle, str):
-                raise ValueError(
-                    f"fal result frame {frame_index} rle must be a string or null"
+                raise UncalibratedResponseError(
+                    f"fal result frame {frame_index} rle must be a string or "
+                    "null; uncalibrated response shape"
                 )
             box = boxes[frame_index]
             meta = metadata[frame_index]
             if isinstance(meta, dict) and meta.get("index") != frame_index:
-                raise ValueError(
+                raise UncalibratedResponseError(
                     f"fal result metadata index mismatch at frame {frame_index}; "
                     "uncalibrated response shape"
                 )
@@ -1522,8 +1566,8 @@ class FalSam3GroundingClient:
                 "box": box,
                 "rle": rle,
             })
-            if box is None:
-                continue  # 该帧未检出（rle 同位置为 null）
+            if box is None or not rle:
+                continue  # 该帧未检出（box 为 null，或 rle 为 null/""——同义）
             bbox = self._cxcywh_to_xyxy(box, frame_index)
             if bbox is None:
                 continue  # 钳位后退化（零面积），无框可画
