@@ -468,9 +468,15 @@ class Pipeline:
         retry; input and business validation errors don't.  Moderation
         rejections also retry with backoff instead of failing the project."""
         if isinstance(exc, ProviderFailure):
-            # A recorded deterministic 4xx (e.g. a provider rejecting a
-            # corrupt upload with HTTP 400) can never succeed on retry:
-            # fail fast instead of looping until the disk or quota dies.
+            # A deterministic failure can never succeed on retry: fail fast
+            # instead of looping until the disk or quota dies.  Two kinds:
+            # a recorded deterministic 4xx (e.g. a provider rejecting a
+            # corrupt upload with HTTP 400), and a cause explicitly typed as
+            # deterministic (object_detect.UncalibratedResponseError: the
+            # provider returned an uncalibrated response shape, so re-issuing
+            # the identical request returns the same shape).
+            if isinstance(exc.cause, object_detect.UncalibratedResponseError):
+                return False
             return not cls._has_deterministic_client_error(exc.record)
         # A full disk (ENOSPC) is transient: the operator frees space and the
         # node must rerun, never kill the project.  Research-log writes are
@@ -5202,11 +5208,22 @@ class Pipeline:
     def _segment_replaced_object_targets(
         cls, element_index: dict[str, Any], segment_index: int
     ) -> list[str]:
-        """Descriptions of the OR-flagged entities to mask in this segment.
+        """Detection prompts of the OR-flagged entities to mask here.
 
-        The detection prompt must describe the object as it appears in the
-        source video, so the target text is the record's source description;
-        records without a usable one cannot be detected and are left out.
+        Detection runs on the SOURCE video, so each target must name the
+        source object with a short generic English label: long Chinese
+        descriptions detect poorly (measured: fal SAM 3 found nothing in
+        three segments with them, while the short label "handbag" hit 84%
+        of frames on the same video). Prefer the replacement's
+        ``detect_label``, which object-replace writes for exactly this
+        purpose. The detection artifact fingerprint contains the prompt,
+        so a label change naturally misses the cache and triggers a fresh
+        detection call — that is intended, not a cache bug.
+        Frozen indexes from before ``detect_label`` fall back to
+        ``source_visual_description`` so they stay resumable; the fallback
+        keeps the poor detection quality above and must never appear in
+        new outputs (the schema requires ``detect_label`` for entities).
+        Records with neither cannot be detected and are left out.
         """
         entities = element_index.get("entities")
         if not isinstance(entities, dict):
@@ -5218,6 +5235,10 @@ class Pipeline:
                 or not isinstance(record.get("replacement"), dict)
                 or not cls._appears_in_segment(record, segment_index)
             ):
+                continue
+            detect_label = record["replacement"].get("detect_label")
+            if isinstance(detect_label, str) and detect_label.strip():
+                targets.append(detect_label.strip())
                 continue
             description = record.get("source_visual_description")
             if isinstance(description, str) and description.strip():
@@ -5631,6 +5652,13 @@ class Pipeline:
                 def _object_mask_retry(exc: Exception) -> bool:
                     nonlocal object_mask_failures
                     object_mask_failures += 1
+                    # 确定性错误（fal 未校准响应形态：重提只会得到同样结果）
+                    # 一次尝试即降级，不退避重试——与
+                    # _retryable_node_error 对同一 cause 的分类一致。
+                    if isinstance(exc, ProviderFailure) and isinstance(
+                        exc.cause, object_detect.UncalibratedResponseError
+                    ):
+                        return False
                     return object_mask_failures < object_mask.OBJECT_MASK_MAX_ATTEMPTS
 
                 try:

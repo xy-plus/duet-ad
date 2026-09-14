@@ -35,6 +35,12 @@ description: 基于 video-maker 的稳定全局索引、全部分段视频描述
 7. 本节点不得决定、声明或重排 TILE、网格、槽位、图片顺序或 Image N；这些定位信息由后端依据冻结的全局索引机械分配。
 8. `reference_image_ids` 只约束对应的 `replacement.source=image_1` stable key。每条 `appearance_description` 只提取该 key 所列用户图中目标对象自身的可见外观，并按 `user_replacement_instruction` 解释多图；不得把输入编号重排为下游 Image N，也不得假设多图属于同一商品或同一视角。多个 key 可以复用同一组用户图的外观，但每格仍只绘制本 key 对应的单个元素。未绑定的其他 stable key 不得继承任何用户图的身份、外观、背景、风格或无关元素。
 
+## 检测标签
+
+1. 每个 entities stable key 的 `replacement` 必须输出 `detect_label`：下游检测器用它在源视频中定位并遮盖该对象，因此它描述的是源对象本身的通用类别，不是替换后的新外观。1–3 个词、全小写、单数的英文通用类别词，词间只用单个空格或连字符，如 "handbag"、"camera"、"strap"。
+2. 只写类别词：不得含品牌、颜色、材质、尺寸、数量、所有者或空间关系等修饰，不得写中文、句子或标点。标签必须能独立命中该类物体，不得依赖画面语境。
+3. `detect_label` 只属于 entities 的 `replacement`；people 和 scenes 不得输出该字段。
+
 ## 人物音色
 
 1. 为 `people` 中每个人物选择一个目录内存在的 `voice_id`；即使人物未匹配用户替换要求，也不得省略音色。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
@@ -11,8 +12,19 @@ from app.fusion_schema import canonical_input
 
 
 OBJECT_REPLACE_OUTPUT_NAME = "duet.object-replace-output"
+# detect_label 只进 entities 的 agent schema 和 normalize 的若存在校验，不
+# 改变传输绑定形状：版本保持 4，detect_label 引入前冻结的 v4 输出仍可被
+# normalize 放行（缺字段时由检测 target 派生环节回退源描述）。
 OBJECT_REPLACE_OUTPUT_VERSION = 4
 MAX_REFERENCE_AUDIO = 3
+
+# entities replacement 的 detect_label：1–3 个全小写英文词组成的通用物品
+# 类别标签（如 "handbag"、"camera strap"），是物体检测节点在源视频里定位
+# 被替换实体的 prompt。词数、字符集和长度写进正则本身，让 agent 写不出
+# 长句；skills/object-replace/SKILL.md「检测标签」一节是同一约束的语义面，
+# 两侧样例由测试锁定一致。
+DETECT_LABEL_PATTERN = r"^(?=.{1,41}$)[a-z]+(?:[ -][a-z]+){0,2}$"
+_DETECT_LABEL_RE = re.compile(DETECT_LABEL_PATTERN)
 
 _ELEMENT_CATEGORIES = ("people", "entities", "scenes")
 _INDEX_KEYS = {*_ELEMENT_CATEGORIES, "relations"}
@@ -137,12 +149,20 @@ def _replacement_object(
     *,
     sources: Collection[str],
     reference_image_ids: Sequence[str] | None = None,
+    detect_label: bool = False,
 ) -> dict[str, Any]:
     properties: dict[str, dict[str, Any]] = {
         "source": {"type": "string", "enum": sorted(sources)},
         "target_visual_description": {"type": "string"},
         "appearance_description": {"type": "string"},
     }
+    required = list(_REPLACEMENT_FIELDS)
+    if detect_label:
+        properties["detect_label"] = {
+            "type": "string",
+            "pattern": DETECT_LABEL_PATTERN,
+        }
+        required = [*required, "detect_label"]
     if reference_image_ids is not None:
         properties["reference_image_ids"] = {
             "type": "array",
@@ -151,7 +171,7 @@ def _replacement_object(
     return {
         "type": "object",
         "properties": properties,
-        "required": list(_REPLACEMENT_FIELDS),
+        "required": required,
         "additionalProperties": False,
     }
 
@@ -161,6 +181,7 @@ def _replacement_schema(
     allow_user_image_binding: bool,
     reference_image_ids: Sequence[str],
     voice_ids: Sequence[str] | None = None,
+    detect_label: bool = False,
 ) -> dict[str, Any]:
     replacement_sources = (
         _REPLACEMENT_SOURCES
@@ -172,6 +193,7 @@ def _replacement_schema(
         reference_image_ids=(
             reference_image_ids if reference_image_ids else None
         ),
+        detect_label=detect_label,
     )
     patch_properties: dict[str, dict[str, Any]] = {
         "matches_user_request": (
@@ -198,6 +220,7 @@ def _replacement_schema(
         image_patch_properties["replacement"] = _replacement_object(
             sources={"image_1"},
             reference_image_ids=reference_image_ids,
+            detect_label=detect_label,
         )
 
         generated_patch_properties = copy.deepcopy(patch_properties)
@@ -208,6 +231,7 @@ def _replacement_schema(
         generated_patch_properties["replacement"] = _replacement_object(
             sources={"generated_variant"},
             reference_image_ids=reference_image_ids,
+            detect_label=detect_label,
         )
         patch_schema["anyOf"] = [
             _closed_object(image_patch_properties),
@@ -244,6 +268,9 @@ def object_replace_schema(
                 allow_user_image_binding=allow_user_image_binding,
                 reference_image_ids=reference_image_ids,
                 voice_ids=catalog_ids if category == "people" else None,
+                # 只有 entities 会被派生成物体检测 target，detect_label 因此
+                # 只约束 entities；people/scenes 的封闭 schema 直接拒绝该字段。
+                detect_label=category == "entities",
             )
             properties[stable_id] = patch_schema
         category_schemas[category] = _closed_object(properties)
@@ -290,6 +317,15 @@ def _normalize_replacement(
         "target_visual_description": description,
         "appearance_description": appearance_description,
     }
+    if "detect_label" in value:
+        # 若存在必须可用：防 agent 写长句/中文，坏标签直接拒收重试；
+        # 缺失则放行（旧冻结产物），由检测 target 派生环节回退源描述。
+        detect_label = value["detect_label"]
+        if not isinstance(detect_label, str) or not _DETECT_LABEL_RE.fullmatch(
+            detect_label
+        ):
+            raise ValueError("object-replace detect label is invalid")
+        normalized["detect_label"] = detect_label
     if "reference_image_ids" not in value:
         return normalized
     # Normalize redundant model output only; configured IDs and frozen sheet

@@ -6926,6 +6926,24 @@ def test_retryable_node_error_covers_subprocess_and_process_failures() -> None:
     )
 
 
+def test_retryable_node_error_excludes_uncalibrated_fal_response() -> None:
+    """fal 未校准响应形态是确定性错误：重提只会得到同样结果，不进 never-fail
+    退避（与确定性 4xx 同级，非瞬时故障）。"""
+    assert not Pipeline._retryable_node_error(
+        ProviderFailure(
+            {"reused_cache": "/x.json"},
+            [],
+            object_detect.UncalibratedResponseError(
+                "fal result rle/boxes length mismatch; uncalibrated response shape"
+            ),
+        )
+    )
+    # 普通 ValueError cause 的 ProviderFailure 保持瞬时语义（自我愈合退避）。
+    assert Pipeline._retryable_node_error(
+        ProviderFailure({}, [], ValueError("transient parse failure"))
+    )
+
+
 def test_node_retries_subprocess_timeouts_until_success(tmp_path: Path) -> None:
     pipeline, log = _node_pipeline(tmp_path, "request-timeout-retry")
     calls = 0
@@ -7102,6 +7120,80 @@ def test_h3_segment_with_a_replaced_object_masks_objects(
     assert output == {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
 
 
+def test_segment_replaced_object_targets_prefers_detect_label_then_falls_back(
+) -> None:
+    element_index = {
+        "entities": {
+            # 新产物：短英文 detect_label 直接做检测 prompt。
+            "entity-01": {
+                "source_visual_description": "一段很长的中文源描述",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replacement": {"source": "image_1", "detect_label": "handbag"},
+            },
+            # 旧冻结产物：没有 detect_label，回退 source_visual_description。
+            "entity-02": {
+                "source_visual_description": "legacy source description",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replacement": {"source": "generated_variant"},
+            },
+            # 两者都不可用的记录无法检测，保持旧行为跳过。
+            "entity-03": {
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+                "replacement": {"source": "generated_variant"},
+            },
+            # 未替换或不在本段的记录不产生 target。
+            "entity-04": {
+                "source_visual_description": "other segment",
+                "occurrences": [{"segment_index": 2, "frame_orders": [1]}],
+                "replacement": {
+                    "source": "generated_variant",
+                    "detect_label": "strap",
+                },
+            },
+            "entity-05": {
+                "source_visual_description": "kept prop",
+                "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+            },
+        },
+    }
+
+    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
+        "handbag",
+        "legacy source description",
+    ]
+    assert Pipeline._segment_replaced_object_targets(element_index, 2) == [
+        "strap",
+    ]
+
+
+def test_h3_segment_object_mask_targets_use_the_detect_label(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    enhanced_index["entities"]["entity-01"]["replacement"]["detect_label"] = (
+        "scarf"
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert muted == segment_dir / "source-objects-masked.mp4"
+    assert object_calls == [(
+        segment_dir / "source-faces-masked.mp4",
+        segment_dir / "source-objects-masked.mp4",
+        ["scarf"],
+    )]
+
+
 def test_h3_segment_without_replaced_object_skips_object_mask(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
@@ -7195,6 +7287,47 @@ def test_object_mask_failure_degrades_to_face_masked_reference(
         f"attempt-{index}"
         for index in range(1, object_mask.OBJECT_MASK_MAX_ATTEMPTS + 1)
     ]
+
+
+def test_object_mask_uncalibrated_fal_response_degrades_without_retry(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """fal 未校准响应形态是确定性错误：节点一次尝试即降级，不退避重试。"""
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+
+    def uncalibrated_mask(
+        _source: Path, _destination: Path, _targets: list[str], **_kwargs: Any,
+    ) -> None:
+        raise ProviderFailure(
+            {"reused_cache": "/x.json"},
+            [],
+            object_detect.UncalibratedResponseError(
+                "fal result must contain an rle list; uncalibrated response shape"
+            ),
+        )
+
+    monkeypatch.setattr(object_mask, "mask_objects", uncalibrated_mask)
+
+    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    segment_dir = project / "work" / "segments" / "0001"
+    assert muted == segment_dir / "source-faces-masked.mp4"
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "object_mask_degraded" in trace
+    assert '"attempts": 1' in trace
+    attempts = (
+        project / "logs" / "mask-replaceable-objects" / "segment-0001"
+    ).iterdir()
+    assert sorted(path.name for path in attempts) == ["attempt-1"]
 
 
 def test_h3_object_mask_node_collects_detect_artifacts(

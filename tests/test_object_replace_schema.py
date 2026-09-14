@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 
 from app.fusion_schema import canonical_input
 from app.object_replace_schema import (
+    DETECT_LABEL_PATTERN,
     MAX_REFERENCE_AUDIO,
     OBJECT_REPLACE_OUTPUT_NAME,
     OBJECT_REPLACE_OUTPUT_VERSION,
@@ -304,6 +306,12 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
         assert category_schema["additionalProperties"] is False
         assert list(category_schema["properties"]) == list(element_index[category])
         assert category_schema["required"] == list(element_index[category])
+        expected_replacement_required = [
+            "source",
+            "target_visual_description",
+            "appearance_description",
+            *(["detect_label"] if category == "entities" else []),
+        ]
         for patch_schema in category_schema["properties"].values():
             assert patch_schema["additionalProperties"] is False
             replacement_object = patch_schema["properties"]["replacement"]
@@ -318,11 +326,14 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
             assert replacement_object["properties"][
                 "appearance_description"
             ] == {"type": "string"}
-            assert replacement_object["required"] == [
-                "source",
-                "target_visual_description",
-                "appearance_description",
-            ]
+            assert replacement_object["required"] == expected_replacement_required
+            if category == "entities":
+                assert replacement_object["properties"]["detect_label"] == {
+                    "type": "string",
+                    "pattern": DETECT_LABEL_PATTERN,
+                }
+            else:
+                assert "detect_label" not in replacement_object["properties"]
             if category == "people":
                 assert patch_schema["properties"]["voice_id"]["anyOf"] == [
                     {"type": "string", "enum": VOICE_IDS},
@@ -344,6 +355,19 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
             assert generated_branch["properties"]["replacement"]["properties"][
                 "source"
             ]["enum"] == ["generated_variant"]
+            for branch in (image_branch, generated_branch):
+                branch_replacement = branch["properties"]["replacement"]
+                assert (
+                    branch_replacement["required"]
+                    == expected_replacement_required
+                )
+                if category == "entities":
+                    assert branch_replacement["properties"]["detect_label"] == {
+                        "type": "string",
+                        "pattern": DETECT_LABEL_PATTERN,
+                    }
+                else:
+                    assert "detect_label" not in branch_replacement["properties"]
 
 
 def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
@@ -370,6 +394,7 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
                 "source",
                 "target_visual_description",
                 "appearance_description",
+                *(["detect_label"] if category == "entities" else []),
             ]
             assert replacement["properties"]["reference_image_ids"] == (
                 expected_reference_ids
@@ -379,6 +404,93 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
                 "reference_image_ids"
             ] == expected_reference_ids
             assert generated_branch["properties"]["replacement"]["properties"]["reference_image_ids"] == expected_reference_ids
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["handbag", "camera", "strap", "camera strap", "camera-strap", "a"],
+)
+def test_normalizer_accepts_a_short_generic_detect_label(label: str) -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"]["entity-01"]["replacement"]["detect_label"] = label
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    replacement = normalized["entities"]["entity-01"]["replacement"]
+    assert replacement["detect_label"] == label
+    merged = merge_object_replace_index(element_index, normalized, {})
+    assert (
+        merged["entities"]["entity-01"]["replacement"]["detect_label"] == label
+    )
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Handbag",
+        "the small black leather camera handbag",
+        "黑色相机包",
+        "handbag!",
+        " handbag",
+        "handbag ",
+        "hand  bag",
+        "x" * 42,
+        "",
+        1,
+        None,
+    ],
+)
+def test_normalizer_rejects_an_unusable_detect_label(label: Any) -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"]["entity-01"]["replacement"]["detect_label"] = label
+
+    with pytest.raises(ValueError, match="detect label is invalid"):
+        _normalize(value, digest=digest, element_index=element_index)
+
+
+def test_normalizer_tolerates_a_missing_detect_label_for_legacy_outputs() -> None:
+    # 旧冻结产物（detect_label 引入前）没有该字段：normalize 必须继续放行，
+    # 由检测 target 派生环节回退 source_visual_description。
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+
+    for patch in normalized["entities"].values():
+        assert "detect_label" not in patch["replacement"]
+    merged = merge_object_replace_index(element_index, normalized, {})
+    for record in merged["entities"].values():
+        assert "detect_label" not in record["replacement"]
+
+
+def test_skill_defines_the_same_detect_label_contract_as_the_schema() -> None:
+    skill = (
+        Path(__file__).resolve().parents[1]
+        / "skills" / "object-replace" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    for rule in (
+        "`detect_label`",
+        "源对象",
+        "1–3 个词",
+        "全小写",
+        "单数",
+        "通用类别词",
+        "handbag",
+        "不得含品牌、颜色、材质",
+        "people 和 scenes 不得输出该字段",
+    ):
+        assert rule in skill
+    # 代码侧正则与 SKILL 语义约束必须锁在同一批样例上。
+    for label in ("handbag", "camera", "strap", "camera strap"):
+        assert re.fullmatch(DETECT_LABEL_PATTERN, label)
+    for label in ("a red leather handbag", "Handbag", "黑色相机包"):
+        assert not re.fullmatch(DETECT_LABEL_PATTERN, label)
 
 
 @pytest.mark.parametrize("source, references, expected", [
