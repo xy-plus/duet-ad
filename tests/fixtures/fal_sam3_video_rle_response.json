@@ -1,0 +1,26 @@
+{
+  "_comment": "fal-ai/sam-3/video-rle 队列结果的罐头响应（校准入口）。fal 文档的 Output 节只声明 video 与 boundingbox_frames_zip；逐帧结构化字段按 SAM3VideoObjectFrame(frame_index+objects[SAM3ObjectMask{track_id,rle}]) 与 MaskMetadata(index,score,box 归一化 cxcywh) 的最合理结构假设，顶层字段名 frames/metadata 以首次真实响应校准——校准时只改本文件与 app/object_detect.py 的 FAL_SAM3_FRAMES_KEY / FAL_SAM3_METADATA_KEY。测试视频为 2 fps × 4 帧（320x240）。",
+  "video": {"url": "https://fal.test/files/output.mp4"},
+  "frames": [
+    {
+      "frame_index": 0,
+      "objects": [
+        {"track_id": 1, "label": "bottle", "rle": "rle-f0-t1", "score": 0.9, "box": [0.25, 0.5, 0.2, 0.4]},
+        {"track_id": 2, "label": "cup", "rle": "rle-f0-t2", "score": 0.8, "box": [0.75, 0.5, 0.1, 0.2]}
+      ]
+    },
+    {
+      "frame_index": 1,
+      "objects": [
+        {"track_id": 1, "label": "bottle", "rle": "rle-f1-t1", "score": 0.7, "box": [0.5, 0.5, 1.2, 0.6]}
+      ]
+    },
+    {"frame_index": 2, "objects": []},
+    {
+      "frame_index": 3,
+      "objects": [
+        {"track_id": 2, "label": "cup", "rle": "rle-f3-t2", "score": 0.6, "box": null}
+      ]
+    }
+  ]
+}

@@ -13,6 +13,7 @@ from app import object_detect
 from app.config import Settings, get_settings
 from app.object_detect import (
     DoubaoGroundingClient,
+    FalSam3GroundingClient,
     ObjectDetection,
     available_providers,
     select_provider,
@@ -268,11 +269,12 @@ def test_doubao_detect_rejects_oversized_inline_video(
 # --- 注册表与选择函数 ---
 
 
-def test_registry_reserves_seven_provider_names() -> None:
+def test_registry_reserves_eight_provider_names() -> None:
     assert tuple(object_detect.PROVIDER_REGISTRY) == (
-        "doubao", "qwen", "glm", "hunyuan", "kimi", "step", "gemini",
+        "doubao", "qwen", "glm", "hunyuan", "kimi", "step", "gemini", "fal_sam3",
     )
     assert object_detect.PROVIDER_REGISTRY["doubao"] is DoubaoGroundingClient
+    assert object_detect.PROVIDER_REGISTRY["fal_sam3"] is FalSam3GroundingClient
 
 
 def test_available_providers_skips_missing_key_and_unimplemented(
@@ -363,6 +365,97 @@ def _gemini_contract_handler(text: str):
     return handler
 
 
+# --- fal_sam3（fal.ai SAM 3 video-rle）罐头响应与队列 mock ---
+# 罐头响应是唯一校准入口：tests/fixtures/fal_sam3_video_rle_response.json，
+# 逐帧 objects（track_id + label + rle + score + 归一化 cxcywh box），
+# 2 对象 × 4 帧（2 fps），含越界 box（钳位）、空 objects 帧、box=null 帧。
+_FAL_SAM3_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "fal_sam3_video_rle_response.json"
+)
+_FAL_SAM3_RESULT = json.loads(_FAL_SAM3_FIXTURE.read_text(encoding="utf-8"))
+
+# 期望的契约转换结果：cxcywh → xyxy（越界钳到 [0,1]），frame_index ÷ fps(=2)
+# → timestamp_s，label 回映射 targets，box 为 null 的对象跳过；按
+# (timestamp_s, label) 排序。
+_FAL_SAM3_EXPECTED = [
+    ObjectDetection("bottle", 0.0, (0.15, 0.3, 0.35, 0.7)),
+    ObjectDetection("cup", 0.0, (0.7, 0.4, 0.8, 0.6)),
+    ObjectDetection("bottle", 0.5, (0.0, 0.2, 1.0, 0.8)),
+]
+
+
+def _fal_settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "fal_sam3_api_key": "fal-secret",
+        "fal_sam3_api_base": "https://fal.test/fal-ai/sam-3",
+        "fal_sam3_model": "video-rle",
+        "provider_poll_interval_s": 0.01,
+    }
+    values.update(overrides)
+    return _settings(tmp_path, **values)
+
+
+def _fal_queue_handler(
+    result: object,
+    *,
+    observed: dict[str, object] | None = None,
+    statuses: tuple[str, ...] = ("IN_PROGRESS", "COMPLETED"),
+    submit_status: int = 200,
+) -> object:
+    """fal 存储上传（initiate → PUT）+ 队列提交/轮询/取结果全链路 mock。"""
+    state = {"polls": 0, "submits": 0, "uploads": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/storage/upload/initiate":
+            state["uploads"] += 1
+            assert request.headers["authorization"] == "Key fal-secret"
+            body = json.loads(request.content)
+            assert body["file_name"] == "clip.mp4"
+            assert body["content_type"] == "video/mp4"
+            return httpx.Response(
+                200,
+                json={
+                    "upload_url": "https://fal.test/upload/presigned",
+                    "file_url": "https://fal.test/files/clip.mp4",
+                },
+            )
+        if request.method == "PUT" and path == "/upload/presigned":
+            assert request.headers["content-type"] == "video/mp4"
+            assert request.content
+            return httpx.Response(200)
+        if request.method == "POST" and path == "/fal-ai/sam-3/video-rle":
+            state["submits"] += 1
+            assert request.headers["authorization"] == "Key fal-secret"
+            if observed is not None:
+                observed["submit_body"] = json.loads(request.content)
+            if submit_status != 200:
+                return httpx.Response(submit_status, json={"detail": "rejected"})
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "req-1",
+                    "status_url": (
+                        "https://fal.test/fal-ai/sam-3/video-rle"
+                        "/requests/req-1/status"
+                    ),
+                    "response_url": (
+                        "https://fal.test/fal-ai/sam-3/video-rle/requests/req-1"
+                    ),
+                },
+            )
+        if request.method == "GET" and path.endswith("/requests/req-1/status"):
+            status = statuses[min(state["polls"], len(statuses) - 1)]
+            state["polls"] += 1
+            return httpx.Response(200, json={"status": status, "request_id": "req-1"})
+        if request.method == "GET" and path.endswith("/requests/req-1"):
+            return httpx.Response(200, json=result)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    handler.state = state  # type: ignore[attr-defined]
+    return handler
+
+
 CONTRACT_CASES: dict[str, dict[str, object]] = {
     "doubao": {
         "settings": {
@@ -421,6 +514,15 @@ CONTRACT_CASES: dict[str, dict[str, object]] = {
         "response_text": _GEMINI_GOOD,
         "flow": "gemini",
     },
+    "fal_sam3": {
+        "settings": {
+            "fal_sam3_api_key": "fal-secret",
+            "fal_sam3_api_base": "https://fal.test/fal-ai/sam-3",
+            "fal_sam3_model": "video-rle",
+            "provider_poll_interval_s": 0.01,
+        },
+        "flow": "fal_sam3",
+    },
 }
 
 
@@ -433,6 +535,8 @@ def test_unified_contract(provider_name: str, tmp_path: Path, video: Path) -> No
 
     if case.get("flow") == "gemini":
         handler = _gemini_contract_handler(str(case["response_text"]))
+    elif case.get("flow") == "fal_sam3":
+        handler = _fal_queue_handler(_FAL_SAM3_RESULT)
     else:
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -511,3 +615,383 @@ def test_get_settings_object_detect_env_unset(monkeypatch: pytest.MonkeyPatch) -
     settings = get_settings()
     assert settings.object_detect_providers == ()
     assert settings.doubao_api_key is None
+
+
+# ==== fal_sam3（fal.ai SAM 3 video-rle）====
+
+
+def _fal_client(settings: Settings, handler) -> FalSam3GroundingClient:
+    return FalSam3GroundingClient(settings, transport=httpx.MockTransport(handler))
+
+
+def test_fal_sam3_detect_full_flow(tmp_path: Path, video: Path) -> None:
+    """上传 → 提交 → 轮询 → 解析全链路；cxcywh→xyxy、帧号→秒、空帧跳过。"""
+    observed: dict[str, object] = {}
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT, observed=observed)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["bottle", "cup"])
+    assert result == _FAL_SAM3_EXPECTED
+    submit_body = observed["submit_body"]
+    assert submit_body == {
+        "video_url": "https://fal.test/files/clip.mp4",
+        "prompt": "bottle, cup",
+        "detection_threshold": 0.3,
+    }
+    # 掩码 RLE 本期不消费，但逐对象解析记录（含 track_id/rle/score）保留在
+    # 实例上供二期使用；box=null 的第 3 帧对象也在其中。
+    assert [entry["rle"] for entry in client.last_frames] == [
+        "rle-f0-t1", "rle-f0-t2", "rle-f1-t1", "rle-f3-t2",
+    ]
+    assert client.last_frames[1]["track_id"] == 2
+    assert client.last_frames[1]["score"] == 0.8
+    assert client.last_frames[3]["box"] is None
+
+
+def test_fal_sam3_single_target_prompt_and_label(
+    tmp_path: Path, video: Path
+) -> None:
+    observed: dict[str, object] = {}
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT, observed=observed)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["bottle"])
+    submit_body = observed["submit_body"]
+    assert submit_body["prompt"] == "bottle"  # type: ignore[index]
+    assert {detection.label for detection in result} == {"bottle"}
+
+
+def test_fal_sam3_empty_result_is_not_retried(tmp_path: Path, video: Path) -> None:
+    """专用检测模型的空结果是确定答案：返回空列表，不重提（省钱纪律）。"""
+    handler = _fal_queue_handler({"frames": []})
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    assert client.detect(video, ["bottle"]) == []
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_fal_sam3_frames_without_box_are_skipped(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["bottle"])
+    assert [detection.timestamp_s for detection in result] == [0.0, 0.5]
+
+
+def test_fal_sam3_unknown_label_is_skipped(tmp_path: Path, video: Path) -> None:
+    """label 无法回映射到任何 target 的对象跳过（记日志），不挡其它对象。"""
+    result_payload = {
+        "frames": [
+            {
+                "frame_index": 0,
+                "objects": [
+                    {"track_id": 1, "label": "truck", "rle": "rle-x",
+                     "score": 0.9, "box": [0.5, 0.5, 0.2, 0.2]},
+                    {"track_id": 2, "label": "bottle", "rle": "rle-b",
+                     "score": 0.8, "box": [0.25, 0.5, 0.2, 0.4]},
+                ],
+            }
+        ]
+    }
+    handler = _fal_queue_handler(result_payload)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["bottle"])
+    assert result == [ObjectDetection("bottle", 0.0, (0.15, 0.3, 0.35, 0.7))]
+
+
+def test_fal_sam3_multi_target_without_labels_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """多目标而响应不带 label：无法归因，属响应形态假设失配，直接致命（校准）。"""
+    result_payload = {
+        "frames": [
+            {
+                "frame_index": 0,
+                "objects": [
+                    {"track_id": 1, "rle": "rle-a",
+                     "score": 0.9, "box": [0.5, 0.5, 0.2, 0.2]},
+                ],
+            }
+        ]
+    }
+    handler = _fal_queue_handler(result_payload)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle", "cup"])
+    assert isinstance(excinfo.value.cause, ValueError)
+
+
+def test_fal_sam3_metadata_fallback_for_box_and_score(
+    tmp_path: Path, video: Path
+) -> None:
+    """对象本体不带 box/score 时，按全局平铺顺序从 MaskMetadata 补齐。"""
+    result_payload = {
+        "frames": [
+            {"frame_index": 0, "objects": [{"track_id": 1, "rle": "rle-a"}]},
+            {"frame_index": 1, "objects": [{"track_id": 1, "rle": "rle-b"}]},
+        ],
+        "metadata": [
+            {"index": 0, "score": 0.9, "box": [0.5, 0.5, 0.2, 0.2]},
+            {"index": 1, "score": None, "box": None},
+        ],
+    }
+    handler = _fal_queue_handler(result_payload)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    result = client.detect(video, ["bottle"])
+    assert result == [ObjectDetection("bottle", 0.0, (0.4, 0.4, 0.6, 0.6))]
+    assert client.last_frames[1]["score"] is None
+
+
+def test_fal_sam3_poll_timeout_raises_provider_failure(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _fal_queue_handler(
+        _FAL_SAM3_RESULT, statuses=("IN_PROGRESS",)
+    )
+    settings = _fal_settings(
+        tmp_path, provider_poll_interval_s=0.0, provider_poll_timeout_s=0.0
+    )
+    client = _fal_client(settings, handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, TimeoutError)
+
+
+def test_fal_sam3_task_error_is_fatal(tmp_path: Path, video: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/storage/upload/initiate":
+            return httpx.Response(
+                200,
+                json={
+                    "upload_url": "https://fal.test/upload/presigned",
+                    "file_url": "https://fal.test/files/clip.mp4",
+                },
+            )
+        if request.method == "PUT" and path == "/upload/presigned":
+            return httpx.Response(200)
+        if request.method == "POST" and path == "/fal-ai/sam-3/video-rle":
+            return httpx.Response(200, json={"request_id": "req-1"})
+        if request.method == "GET" and path.endswith("/status"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "COMPLETED",
+                    "request_id": "req-1",
+                    "error": "runner exploded",
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _fal_client(
+        _fal_settings(tmp_path), handler
+    )
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+
+
+def test_fal_sam3_submit_client_error_is_fatal_without_retry(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT, submit_status=422)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_fal_sam3_submit_without_request_id_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/storage/upload/initiate":
+            return httpx.Response(
+                200,
+                json={
+                    "upload_url": "https://fal.test/upload/presigned",
+                    "file_url": "https://fal.test/files/clip.mp4",
+                },
+            )
+        if request.method == "PUT" and path == "/upload/presigned":
+            return httpx.Response(200)
+        if request.method == "POST" and path == "/fal-ai/sam-3/video-rle":
+            return httpx.Response(200, json={"queue_position": 0})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+
+
+def test_fal_sam3_malformed_box_is_fatal_without_resubmit(
+    tmp_path: Path, video: Path
+) -> None:
+    """确定性模型的畸形结果重提只会得到同样的结果：直接致命，不再花钱。"""
+    bad = {
+        "frames": [
+            {
+                "frame_index": 0,
+                "objects": [
+                    {"track_id": 1, "label": "bottle", "rle": "rle-bad",
+                     "score": 0.9, "box": [0.1, 0.2, 0.3]},
+                ],
+            }
+        ]
+    }
+    handler = _fal_queue_handler(bad)
+    client = _fal_client(_fal_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, ValueError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_fal_sam3_requires_api_key(tmp_path: Path, video: Path) -> None:
+    client = _fal_client(
+        _fal_settings(tmp_path, fal_sam3_api_key=None),
+        lambda request: httpx.Response(200),
+    )
+    with pytest.raises(ValueError, match="fal_sam3 API key"):
+        client.detect(video, ["bottle"])
+
+
+def test_fal_sam3_empty_targets_return_empty(tmp_path: Path, video: Path) -> None:
+    client = _fal_client(
+        _fal_settings(tmp_path), lambda request: httpx.Response(200)
+    )
+    assert client.detect(video, []) == []
+
+
+def test_available_providers_skips_fal_sam3_without_key(tmp_path: Path) -> None:
+    settings = _fal_settings(
+        tmp_path,
+        object_detect_providers=("fal_sam3",),
+        fal_sam3_api_key=None,
+    )
+    assert available_providers(settings) == []
+
+
+def test_select_provider_returns_fal_sam3_client(tmp_path: Path) -> None:
+    settings = _fal_settings(tmp_path, object_detect_providers=("fal_sam3",))
+    client = select_provider(settings)
+    assert isinstance(client, FalSam3GroundingClient)
+
+
+# --- fal_sam3 产物落盘与复用（fal 调用很贵，成功结果绝不重复请求）---
+
+
+def test_fal_sam3_cache_reuse_skips_http(tmp_path: Path, video: Path) -> None:
+    """二次 detect 命中同指纹产物：不发任何 HTTP，结果与首次一致。"""
+    cache_path = tmp_path / "work" / "object-detect-fal-sam3.json"
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    client = FalSam3GroundingClient(
+        _fal_settings(tmp_path),
+        transport=httpx.MockTransport(handler),
+        cache_path=cache_path,
+    )
+    first = client.detect(video, ["bottle", "cup"])
+    assert first == _FAL_SAM3_EXPECTED
+    assert cache_path.is_file()
+    cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert cached["fal_response"] == _FAL_SAM3_RESULT
+    assert cached["fingerprint"]["prompt"] == "bottle, cup"
+    assert cached["fingerprint"]["detection_threshold"] == 0.3
+    assert len(cached["fingerprint"]["video_sha256"]) == 64
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    reused = FalSam3GroundingClient(
+        _fal_settings(tmp_path),
+        transport=httpx.MockTransport(fail_handler),
+        cache_path=cache_path,
+    )
+    assert reused.detect(video, ["bottle", "cup"]) == first
+    assert [entry["rle"] for entry in reused.last_frames] == [
+        "rle-f0-t1", "rle-f0-t2", "rle-f1-t1", "rle-f3-t2",
+    ]
+
+
+def test_fal_sam3_cache_fingerprint_mismatch_refetches(
+    tmp_path: Path, video: Path
+) -> None:
+    """targets/阈值/视频任一变化都算新任务：指纹不匹配则重新调用。"""
+    cache_path = tmp_path / "object-detect-fal-sam3.json"
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    client = FalSam3GroundingClient(
+        _fal_settings(tmp_path),
+        transport=httpx.MockTransport(handler),
+        cache_path=cache_path,
+    )
+    client.detect(video, ["bottle", "cup"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    client.detect(video, ["bottle"])
+    assert handler.state["submits"] == 2  # type: ignore[attr-defined]
+
+
+def test_fal_sam3_corrupt_cache_refetches(tmp_path: Path, video: Path) -> None:
+    cache_path = tmp_path / "object-detect-fal-sam3.json"
+    cache_path.write_text("not json", encoding="utf-8")
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    client = FalSam3GroundingClient(
+        _fal_settings(tmp_path),
+        transport=httpx.MockTransport(handler),
+        cache_path=cache_path,
+    )
+    assert client.detect(video, ["bottle", "cup"]) == _FAL_SAM3_EXPECTED
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+# --- fal_sam3 配置校验 ---
+
+
+def test_settings_fal_sam3_threshold_defaults(tmp_path: Path) -> None:
+    settings = _fal_settings(tmp_path)
+    assert settings.fal_sam3_threshold == 0.3
+    assert settings.fal_sam3_api_key == "fal-secret"
+    assert settings.fal_sam3_api_base == "https://fal.test/fal-ai/sam-3"
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.1, 1.5, True, "0.3"])
+def test_settings_rejects_invalid_fal_sam3_threshold(
+    tmp_path: Path, threshold: object
+) -> None:
+    with pytest.raises(ValueError, match="FAL_SAM3_THRESHOLD"):
+        _fal_settings(tmp_path, fal_sam3_threshold=threshold)
+
+
+def test_settings_rejects_invalid_fal_proxy(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="FAL_PROXY"):
+        _fal_settings(tmp_path, fal_proxy="socks5://127.0.0.1:7897")
+    with pytest.raises(ValueError, match="FAL_PROXY"):
+        _fal_settings(tmp_path, fal_proxy="not a url")
+
+
+def test_settings_accepts_fal_proxy(tmp_path: Path) -> None:
+    settings = _fal_settings(tmp_path, fal_proxy="http://127.0.0.1:7897")
+    assert settings.fal_proxy == "http://127.0.0.1:7897"
+
+
+def test_get_settings_reads_fal_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.setenv("FAL_KEY", "  fal-key ")
+    monkeypatch.setenv("FAL_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("FAL_SAM3_THRESHOLD", "0.2")
+    settings = get_settings()
+    assert settings.fal_sam3_api_key == "fal-key"
+    assert settings.fal_proxy == "http://127.0.0.1:7897"
+    assert settings.fal_sam3_threshold == 0.2
+    assert settings.fal_sam3_api_base == "https://queue.fal.run/fal-ai/sam-3"
+    assert settings.fal_sam3_model == "video-rle"
+
+
+def test_get_settings_fal_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.delenv("FAL_PROXY", raising=False)
+    monkeypatch.delenv("FAL_SAM3_THRESHOLD", raising=False)
+    settings = get_settings()
+    assert settings.fal_sam3_api_key is None
+    assert settings.fal_proxy is None
+    assert settings.fal_sam3_threshold == 0.3

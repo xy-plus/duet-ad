@@ -16,7 +16,7 @@ SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MULTIREF_MODES = frozenset({"composed", "direct"})
 
-# 已知 7 家视频理解 provider；注册表与实现在 app/object_detect.py，
+# 已知 8 家视频理解 provider；注册表与实现在 app/object_detect.py，
 # 两处清单必须保持一致（object_detect.py 断言）。
 DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 # 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
@@ -37,6 +37,11 @@ STEP_API_BASE = "https://api.stepfun.com/v1"
 STEP_GROUNDING_MODEL = "step-3.7-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
 GEMINI_MODEL = "gemini-2.5-flash"
+# fal.ai SAM 3 video-rle：队列 base 含端点路径，model 为端点末段，
+# 提交 URL = <base>/<model>。凭证环境变量名沿用 fal 平台统一约定 FAL_KEY
+# （不是 FAL_SAM3_API_KEY），映射见 _PROVIDER_KEY_ENV。
+FAL_SAM3_API_BASE = "https://queue.fal.run/fal-ai/sam-3"
+FAL_SAM3_MODEL = "video-rle"
 # (名称, 默认 API base, 默认模型) 驱动 Settings 校验与 get_settings 的环境
 # 变量读取（<NAME>_API_KEY / <NAME>_API_BASE / <NAME>_MODEL）。
 _OBJECT_DETECT_PROVIDER_SPECS: tuple[tuple[str, str, str], ...] = (
@@ -47,13 +52,17 @@ _OBJECT_DETECT_PROVIDER_SPECS: tuple[tuple[str, str, str], ...] = (
     ("kimi", KIMI_API_BASE, KIMI_GROUNDING_MODEL),
     ("step", STEP_API_BASE, STEP_GROUNDING_MODEL),
     ("gemini", GEMINI_API_BASE, GEMINI_MODEL),
+    ("fal_sam3", FAL_SAM3_API_BASE, FAL_SAM3_MODEL),
 )
 OBJECT_DETECT_PROVIDER_NAMES = tuple(
     name for name, _base, _model in _OBJECT_DETECT_PROVIDER_SPECS
 )
-# GEMINI_PROXY 只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
+# 凭证环境变量名与 <NAME>_API_KEY 约定不一致的 provider（fal 统一用 FAL_KEY）；
+# 校验报错文案与 get_settings 读取都用这里的名字。
+_PROVIDER_KEY_ENV = {"fal_sam3": "FAL_KEY"}
+# 代理只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
 # Scheme 白名单见 __post_init__。
-_GEMINI_PROXY_SCHEMES = frozenset({"http", "https"})
+_PROXY_SCHEMES = frozenset({"http", "https"})
 
 
 @dataclass(frozen=True)
@@ -99,7 +108,7 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
-    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。名称必须是已知 7 家
+    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。名称必须是已知 8 家
     # 之一（OBJECT_DETECT_PROVIDER_NAMES），名称与选择一律不出现在公开 API。
     object_detect_providers: tuple[str, ...] = ()
     # 每家的 <name>_api_key 缺省 None 表示未配置（该 provider 不启用）；
@@ -125,6 +134,15 @@ class Settings:
     gemini_api_key: str | None = field(default=None, repr=False)
     gemini_api_base: str = GEMINI_API_BASE
     gemini_model: str = GEMINI_MODEL
+    fal_sam3_api_key: str | None = field(default=None, repr=False)
+    fal_sam3_api_base: str = FAL_SAM3_API_BASE
+    fal_sam3_model: str = FAL_SAM3_MODEL
+    # 国内直连 fal.run 不通时需代理，本机一般为 http://127.0.0.1:7897；
+    # None = 直连。
+    fal_proxy: str | None = None
+    # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高）；
+    # 合法区间 (0, 1]，加载期校验。
+    fal_sam3_threshold: float = 0.3
     # 国内直连 generativelanguage.googleapis.com 不通时需代理，
     # 本机一般为 http://127.0.0.1:7897；None = 直连。
     gemini_proxy: str | None = None
@@ -270,18 +288,19 @@ class Settings:
             )
         for name in OBJECT_DETECT_PROVIDER_NAMES:
             env_prefix = name.upper()
+            key_env = _PROVIDER_KEY_ENV.get(name, f"{env_prefix}_API_KEY")
             key = getattr(self, f"{name}_api_key")
             if key is not None:
                 if not isinstance(key, str) or not key.strip():
                     raise ValueError(
-                        f"{env_prefix}_API_KEY must be a non-empty value or unset"
+                        f"{key_env} must be a non-empty value or unset"
                     )
                 key = key.strip()
                 if (
                     not key.isascii()
                     or any(not 0x21 <= ord(character) <= 0x7E for character in key)
                 ):
-                    raise ValueError(f"{env_prefix}_API_KEY must be header-safe ASCII")
+                    raise ValueError(f"{key_env} must be header-safe ASCII")
                 object.__setattr__(self, f"{name}_api_key", key)
             base = getattr(self, f"{name}_api_base")
             base = base.strip().rstrip("/") if isinstance(base, str) else ""
@@ -299,25 +318,38 @@ class Settings:
             if not _MODEL_ID_RE.fullmatch(model):
                 raise ValueError(f"{env_prefix}_MODEL must be a valid model identifier")
             object.__setattr__(self, f"{name}_model", model)
-        gemini_proxy = self.gemini_proxy
-        if gemini_proxy is not None:
-            if not isinstance(gemini_proxy, str) or not gemini_proxy.strip():
-                raise ValueError("GEMINI_PROXY must be a non-empty value or unset")
-            gemini_proxy = gemini_proxy.strip()
+        for proxy_env, proxy_value in (
+            ("GEMINI_PROXY", self.gemini_proxy),
+            ("FAL_PROXY", self.fal_proxy),
+        ):
+            if proxy_value is None:
+                continue
+            if not isinstance(proxy_value, str) or not proxy_value.strip():
+                raise ValueError(f"{proxy_env} must be a non-empty value or unset")
+            proxy_value = proxy_value.strip()
             try:
-                proxy_url = urlsplit(gemini_proxy)
+                proxy_url = urlsplit(proxy_value)
             except ValueError as exc:
                 raise ValueError(
-                    "GEMINI_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                    f"{proxy_env} must be a proxy URL, e.g. http://127.0.0.1:7897"
                 ) from exc
             if (
-                proxy_url.scheme not in _GEMINI_PROXY_SCHEMES
+                proxy_url.scheme not in _PROXY_SCHEMES
                 or not proxy_url.netloc
             ):
                 raise ValueError(
-                    "GEMINI_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                    f"{proxy_env} must be a proxy URL, e.g. http://127.0.0.1:7897"
                 )
-            object.__setattr__(self, "gemini_proxy", gemini_proxy)
+            object.__setattr__(self, proxy_env.lower(), proxy_value)
+        threshold = self.fal_sam3_threshold
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or not 0.0 < float(threshold) <= 1.0
+        ):
+            raise ValueError("FAL_SAM3_THRESHOLD must be a number in (0, 1]")
+        object.__setattr__(self, "fal_sam3_threshold", float(threshold))
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -338,7 +370,10 @@ def get_settings() -> Settings:
     for name, default_base, default_model in _OBJECT_DETECT_PROVIDER_SPECS:
         env_prefix = name.upper()
         provider_fields[f"{name}_api_key"] = (
-            os.environ.get(f"{env_prefix}_API_KEY", "").strip() or None
+            os.environ.get(
+                _PROVIDER_KEY_ENV.get(name, f"{env_prefix}_API_KEY"), ""
+            ).strip()
+            or None
         )
         provider_fields[f"{name}_api_base"] = os.environ.get(
             f"{env_prefix}_API_BASE", default_base
@@ -346,6 +381,12 @@ def get_settings() -> Settings:
         provider_fields[f"{name}_model"] = os.environ.get(
             f"{env_prefix}_MODEL", default_model
         ).strip()
+    try:
+        fal_sam3_threshold = float(
+            os.environ.get("FAL_SAM3_THRESHOLD", "0.3").strip()
+        )
+    except ValueError as exc:
+        raise ValueError("FAL_SAM3_THRESHOLD must be a number in (0, 1]") from exc
     return Settings(
         access_token=access_token,
         multiref_mode=multiref_mode,
@@ -402,4 +443,6 @@ def get_settings() -> Settings:
         ),
         **provider_fields,
         gemini_proxy=os.environ.get("GEMINI_PROXY", "").strip() or None,
+        fal_proxy=os.environ.get("FAL_PROXY", "").strip() or None,
+        fal_sam3_threshold=fal_sam3_threshold,
     )

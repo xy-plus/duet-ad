@@ -322,3 +322,42 @@ def test_mask_objects_requires_a_provider_when_no_detector_is_injected(
         object_mask.mask_objects(source, destination, ["mug"])
 
     assert not destination.exists()
+
+
+class _CacheableDetector(_SparseDetector):
+    """Test seam mirroring the fal_sam3 with_cache hook."""
+
+    def __init__(self, detections: list[ObjectDetection]) -> None:
+        super().__init__(detections)
+        self.cache_paths: list[Path] = []
+
+    def with_cache(self, cache_path: Path) -> "_CacheableDetector":
+        self.cache_paths.append(cache_path)
+        return self
+
+
+def test_mask_objects_passes_detect_cache_to_cacheable_detector(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=2)
+    detector = _CacheableDetector([])
+    cache = tmp_path / "object-detect-response.json"
+    object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["mug"],
+        detector=detector, detect_cache=cache,
+    )
+    assert detector.cache_paths == [cache]
+
+
+def test_mask_objects_detect_cache_ignored_by_plain_detector(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=2)
+    detector = _SparseDetector([])
+    object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["mug"],
+        detector=detector, detect_cache=tmp_path / "object-detect-response.json",
+    )
+    assert detector.calls == [(source, ["mug"])]

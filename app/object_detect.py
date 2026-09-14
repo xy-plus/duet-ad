@@ -1,4 +1,4 @@
-"""物品检测 provider 层：7 家视频理解模型平行可插拔，对外同一接口契约。
+"""物品检测 provider 层：8 家平行可插拔，对外同一接口契约。
 
 接口契约（所有 provider 必须严格遵守，pipeline 只面向本契约，不感知具体厂家）：
 
@@ -12,7 +12,7 @@
   transport 错误、502/503/504、解析失败/坐标越界/无合法框；4xx 立即致命。
 - 单目标粒度：某目标重试上限内仍无合法框 → 跳过该目标记日志，不挡其它目标。
 
-已实现的 7 家与格式差异（endpoint/模型默认值见 app/config.py 的
+已实现的 8 家与格式差异（endpoint/模型默认值见 app/config.py 的
 ``_OBJECT_DETECT_PROVIDER_SPECS``，各家输出一律归一化到 0–1 后进入统一契约）：
 
 - doubao：火山方舟，OpenAI 兼容；``<bbox>x1 y1 x2 y2</bbox>``，0–1000 归一化。
@@ -24,6 +24,15 @@
 - gemini：File API 上传 + generateContent（非 OpenAI 兼容），``box_2d``
   0–1000 归一化；国内需 GEMINI_PROXY 代理；一次 detect 内重试与多目标
   复用已上传文件句柄，不重复上传。
+- fal_sam3：fal.ai SAM 3 video-rle，第一家专用检测模型（前 7 家通用 VLM）。
+  存储上传 + 队列提交/轮询，一次提交覆盖全部 targets（prompt 逗号分隔）；
+  逐帧归一化 cxcywh box → xyxy 钳位，frame_index ÷ 视频 fps → timestamp_s，
+  label 回映射 targets；track_id/score/RLE 不进契约（无对应字段），保留在
+  落盘产物与 ``last_frames`` 供二期。确定性模型不做"重试 = 重新推理"：
+  空结果即确定答案、畸形结果直接致命（重提只会得到同样结果，白花钱）。
+  国内需 FAL_PROXY 代理。fal 原始响应落盘为 JSON 产物（cache_path 由
+  pipeline 经 object_mask 注入），同项目重试/续跑指纹匹配直接复用，绝不
+  重复调用。
 
 缺 key 语义（与人脸节点"model is missing 才致命"对齐）：
 ``object_detect_providers`` 未配置（空）或所列 provider 全部缺 key → 物品
@@ -47,8 +56,8 @@
    ``OpenAICompatibleGroundingClient``，只需设 ``provider_name = "<name>"``
    并实现 ``parse_response(text, target)``（坐标一律归一化到 0–1 后交给
    ``ObjectDetection`` 校验，非法条目抛 ValueError 计入重试）；上传方式或
-   提示词不同再覆写 ``_video_content_part`` / ``_prompt``。Gemini 单独实现
-   （File API 上传 + generateContent），不继承基类但满足同一 detect 契约。
+   提示词不同再覆写 ``_video_content_part`` / ``_prompt``。Gemini（File API）
+   与 fal_sam3（队列轮询）各自单独实现，不继承基类但满足同一 detect 契约。
 3. 在 ``PROVIDER_REGISTRY`` 把 ``"<name>": None`` 换成新 client 类
    （None = 已预留未实现，不进可选列表）。
 4. ``tests/test_object_detect.py``：把该家正常响应样例注册进
@@ -59,9 +68,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1133,6 +1145,439 @@ def _extract_gemini_json(text: str) -> Any:
     raise ValueError("model output does not contain a JSON object or array")
 
 
+# ==== fal_sam3（fal.ai SAM 3 video-rle）独立实现：存储上传 + 队列轮询 ====
+# 第一家专用检测模型（前 7 家是通用 VLM）：一次提交覆盖全部 targets
+# （prompt 逗号分隔），不按目标重试——确定性模型的空结果就是确定答案，
+# 畸形结果重提只会得到同样的结果，两者都不重提（省钱纪律）。
+# 流程：fal CDN 两步上传（initiate 拿预签名 PUT URL）→ POST 队列提交拿
+# request_id → GET status 轮询（PROVIDER_POLL_INTERVAL_S /
+# PROVIDER_POLL_TIMEOUT_S 语义）→ GET 取结果。
+# 逐帧结构化输出的顶层字段名未经真实响应校准：fal 文档 Output 节只声明
+# video 与 boundingbox_frames_zip，这里按 SAM3VideoObjectFrame
+# （frame_index + objects[SAM3ObjectMask{track_id, rle}]）与 MaskMetadata
+# （index + score + 归一化 cxcywh box）假设最合理结构。校准入口 =
+# 罐头 fixture tests/fixtures/fal_sam3_video_rle_response.json +
+# 下面两个字段名常量。video_url 也接受 base64 data URI，但大视频会显著
+# 拖慢请求（base64 膨胀约 33% 且随请求体传输），仅作存储不可用时的兜底，
+# 未实现。
+FAL_SAM3_FRAMES_KEY = "frames"
+FAL_SAM3_METADATA_KEY = "metadata"
+FAL_STORAGE_UPLOAD_URL = (
+    "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3"
+)
+_FAL_QUEUED_STATUSES = frozenset({"IN_QUEUE", "IN_PROGRESS"})
+
+
+def _probe_fps(video_path: Path) -> float:
+    """cv2.VideoCapture 读视频帧率；读不到（不可解码）抛 ValueError。"""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+    finally:
+        capture.release()
+    if fps <= 0:
+        raise ValueError(f"cannot read fps from video: {video_path}")
+    return fps
+
+
+def _clamp01(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+class FalSam3GroundingClient:
+    """fal.ai SAM 3 video-rle：逐帧 track_id + RLE + 归一化 cxcywh box。
+
+    满足同一 detect 契约但不继承任何基类（队列模式与单次推理完全不同）。
+    产物复用：``cache_path`` 指向项目 work 目录里的 JSON 产物，内容是
+    {fingerprint, fal_response}；指纹（视频 sha256 + prompt + 阈值 + 模型）
+    匹配时直接复用 fal 原始响应，不发任何 HTTP（fal 调用很贵，同一项目
+    重试/续跑绝不重复调用）。契约没有 track_id/score 的对应字段，它们与
+    RLE 一起保留在落盘产物和 ``last_frames`` 里，供二期消费。
+    """
+
+    provider_name = "fal_sam3"
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.BaseTransport | None = None,
+        cache_path: Path | None = None,
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self.cache_path = cache_path
+        self.last_frames: list[dict[str, Any]] = []
+
+    def with_cache(self, cache_path: Path) -> "FalSam3GroundingClient":
+        """返回挂同一 settings/transport、带产物复用路径的新实例。"""
+        return FalSam3GroundingClient(
+            self.settings, transport=self.transport, cache_path=cache_path
+        )
+
+    def detect(
+        self, video_path: Path, targets: list[str]
+    ) -> list[ObjectDetection]:
+        if any(not isinstance(target, str) or not target.strip() for target in targets):
+            raise ValueError("object detect targets must be non-empty strings")
+        if not targets:
+            return []
+        api_key = self.settings.fal_sam3_api_key
+        if not api_key:
+            raise ValueError(
+                "fal_sam3 API key is not configured; "
+                "this provider must not be selected"
+            )
+        content = Path(video_path).read_bytes()
+        if not content:
+            raise ValueError(f"object detect video input is empty: {video_path}")
+        fps = _probe_fps(video_path)
+        prompt = ", ".join(target.strip() for target in targets)
+        fingerprint = {
+            "video_sha256": hashlib.sha256(content).hexdigest(),
+            "prompt": prompt,
+            "detection_threshold": self.settings.fal_sam3_threshold,
+            "model": self.settings.fal_sam3_model,
+        }
+        payload = self._load_cache(fingerprint)
+        if payload is None:
+            payload, record = self._run_flow(api_key, video_path, content, prompt)
+            self._store_cache(fingerprint, payload)
+        else:
+            record = {"reused_cache": str(self.cache_path)}
+        try:
+            detections, self.last_frames = self._parse_result(payload, targets, fps)
+        except (ValueError, TypeError, KeyError) as exc:
+            # 解析失败对确定性模型是致命的（重提只会得到同样结果），
+            # 包成 ProviderFailure 与契约对齐，并带上已收集的流程证据。
+            raise ProviderFailure(record, [], exc) from exc
+        return detections
+
+    # --- 产物落盘与复用 ---
+
+    def _load_cache(self, fingerprint: dict[str, Any]) -> dict[str, Any] | None:
+        if self.cache_path is None:
+            return None
+        try:
+            cached = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(cached, dict) or cached.get("fingerprint") != fingerprint:
+            return None
+        payload = cached.get("fal_response")
+        if not isinstance(payload, dict):
+            return None
+        _LOGGER.info(
+            "object detect provider fal_sam3: reusing cached fal response %s",
+            self.cache_path,
+        )
+        return payload
+
+    def _store_cache(self, fingerprint: dict[str, Any], payload: Any) -> None:
+        if self.cache_path is None:
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.cache_path.with_name(self.cache_path.name + ".tmp")
+            temp.write_text(
+                json.dumps(
+                    {"fingerprint": fingerprint, "fal_response": payload},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temp, self.cache_path)
+        except OSError:
+            # 产物写盘失败不能让检测本身失败（结果已经在内存里）。
+            _LOGGER.warning(
+                "object detect provider fal_sam3: cache write failed: %s",
+                self.cache_path,
+                exc_info=True,
+            )
+
+    # --- fal 队列流程（每步 HTTP 走 providers._send 语义） ---
+
+    def _run_flow(
+        self, api_key: str, video_path: Path, content: bytes, prompt: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        record: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.settings.request_timeout_s,
+            "transport": self.transport,
+        }
+        if self.settings.fal_proxy:
+            client_kwargs["proxy"] = self.settings.fal_proxy
+        try:
+            with httpx.Client(**client_kwargs) as client:
+                file_url = self._upload(client, api_key, video_path, content, record)
+                request_id, status_url, response_url = self._submit(
+                    client, api_key, file_url, prompt, record
+                )
+                payload = self._poll_result(
+                    client, api_key, request_id, status_url, response_url, record
+                )
+                return payload, record
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    @staticmethod
+    def _headers(api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Key {api_key}"}
+
+    def _upload(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        video_path: Path,
+        content: bytes,
+        record: dict[str, Any],
+    ) -> str:
+        response, record["upload_initiate"] = providers._send(
+            client,
+            "POST",
+            FAL_STORAGE_UPLOAD_URL,
+            headers={**self._headers(api_key), "Content-Type": "application/json"},
+            json_body={
+                "file_name": Path(video_path).name,
+                "content_type": "video/mp4",
+            },
+        )
+        providers._ensure_success(response, record["upload_initiate"])
+        body = providers._json_body(response)
+        upload_url = body.get("upload_url") if isinstance(body, dict) else None
+        file_url = body.get("file_url") if isinstance(body, dict) else None
+        if (
+            not isinstance(upload_url, str)
+            or not upload_url
+            or not isinstance(file_url, str)
+            or not file_url
+        ):
+            raise ValueError("fal storage initiate response lacks upload_url/file_url")
+        put_response, record["upload_put"] = providers._send(
+            client,
+            "PUT",
+            upload_url,
+            headers={"Content-Type": "video/mp4"},
+            content=content,
+        )
+        providers._ensure_success(put_response, record["upload_put"])
+        return file_url
+
+    def _submit(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        file_url: str,
+        prompt: str,
+        record: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        submit_url = (
+            f"{self.settings.fal_sam3_api_base}/{self.settings.fal_sam3_model}"
+        )
+        body = {
+            "video_url": file_url,
+            "prompt": prompt,
+            "detection_threshold": self.settings.fal_sam3_threshold,
+        }
+        response, record["submit"] = providers._send(
+            client,
+            "POST",
+            submit_url,
+            headers={**self._headers(api_key), "Content-Type": "application/json"},
+            json_body=body,
+        )
+        providers._ensure_success(response, record["submit"])
+        payload = providers._json_body(response)
+        request_id = payload.get("request_id") if isinstance(payload, dict) else None
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("fal submit response has no request_id")
+        status_url = payload.get("status_url")
+        response_url = payload.get("response_url")
+        if not isinstance(status_url, str) or not status_url:
+            status_url = f"{submit_url}/requests/{request_id}/status"
+        if not isinstance(response_url, str) or not response_url:
+            response_url = f"{submit_url}/requests/{request_id}"
+        return request_id, status_url, response_url
+
+    def _poll_result(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        request_id: str,
+        status_url: str,
+        response_url: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        record["polls"] = []
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        while True:
+            response, exchange = providers._send(
+                client, "GET", status_url, headers=self._headers(api_key)
+            )
+            record["polls"].append(exchange)
+            providers._ensure_success(response, exchange)
+            body = providers._json_body(response)
+            if not isinstance(body, dict):
+                raise ValueError("fal status response must be an object")
+            error = body.get("error")
+            if error:
+                raise ValueError(f"fal task {request_id} failed: {error}")
+            status = str(body.get("status") or "").upper()
+            if status == "COMPLETED":
+                break
+            if status not in _FAL_QUEUED_STATUSES:
+                raise ValueError(
+                    f"fal task {request_id} has unknown status {status!r}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"fal task {request_id} timed out")
+            time.sleep(self.settings.provider_poll_interval_s)
+        response, record["result"] = providers._send(
+            client, "GET", response_url, headers=self._headers(api_key)
+        )
+        providers._ensure_success(response, record["result"])
+        payload = providers._json_body(response)
+        if not isinstance(payload, dict):
+            raise ValueError("fal result response must be an object")
+        return payload
+
+    # --- 响应解析（字段名以首次真实响应校准，见段落头注释） ---
+
+    def _parse_result(
+        self, payload: dict[str, Any], targets: list[str], fps: float
+    ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
+        frames_raw = payload.get(FAL_SAM3_FRAMES_KEY)
+        if frames_raw is None:
+            raise ValueError(
+                f"fal result has no {FAL_SAM3_FRAMES_KEY!r} field; the assumed "
+                "response shape does not match, recalibrate against the fixture"
+            )
+        if not isinstance(frames_raw, list):
+            raise ValueError(f"fal result {FAL_SAM3_FRAMES_KEY!r} must be a list")
+        metadata_raw = payload.get(FAL_SAM3_METADATA_KEY)
+        metadata = metadata_raw if isinstance(metadata_raw, list) else []
+        target_lookup = {target.strip().lower(): target for target in targets}
+        detections: list[ObjectDetection] = []
+        frames: list[dict[str, Any]] = []
+        position = 0
+        for frame_position, frame in enumerate(frames_raw):
+            if not isinstance(frame, dict):
+                raise ValueError(f"fal result frame {frame_position} must be an object")
+            frame_index = frame.get("frame_index")
+            if frame_index is None:
+                frame_index = frame_position
+            if (
+                isinstance(frame_index, bool)
+                or not isinstance(frame_index, int)
+                or frame_index < 0
+            ):
+                raise ValueError(
+                    f"fal result frame {frame_position} has an invalid frame_index"
+                )
+            objects = frame.get("objects") or []
+            if not isinstance(objects, list):
+                raise ValueError(
+                    f"fal result frame {frame_position} objects must be a list"
+                )
+            for entry in objects:
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"fal result object {position} must be an object"
+                    )
+                meta = metadata[position] if position < len(metadata) else None
+                if not isinstance(meta, dict):
+                    meta = {}
+                position += 1
+                box = entry.get("box")
+                if box is None:
+                    box = meta.get("box")
+                score = entry.get("score")
+                if score is None:
+                    score = meta.get("score")
+                label = entry.get("label")
+                if label is None:
+                    label = meta.get("label")
+                frames.append({
+                    "frame_index": frame_index,
+                    "track_id": entry.get("track_id"),
+                    "label": label,
+                    "score": score,
+                    "box": box,
+                    "rle": entry.get("rle"),
+                })
+                if box is None:
+                    continue  # 该帧此对象无检出
+                target = self._map_label(label, targets, target_lookup, position)
+                if target is None:
+                    continue
+                bbox = self._cxcywh_to_xyxy(box, position)
+                if bbox is None:
+                    continue  # 钳位后退化（零面积），无框可画
+                detections.append(
+                    ObjectDetection(
+                        label=target,
+                        timestamp_s=frame_index / fps,
+                        bbox_xyxy_normalized=bbox,
+                    )
+                )
+        detections.sort(key=lambda item: (item.timestamp_s, item.label))
+        return detections, frames
+
+    def _map_label(
+        self,
+        label: Any,
+        targets: list[str],
+        target_lookup: dict[str, str],
+        position: int,
+    ) -> str | None:
+        """把 fal 返回的 label 回映射到 targets；无法映射的跳过（记日志）。
+
+        响应完全不带 label 时：单目标全部归该目标；多目标无法归因，
+        属响应形态假设失配，抛 ValueError 触发校准。
+        """
+        if isinstance(label, str) and label.strip():
+            target = target_lookup.get(label.strip().lower())
+            if target is None:
+                _LOGGER.warning(
+                    "object detect provider fal_sam3: object %d label %r maps to "
+                    "no target; skipped",
+                    position - 1,
+                    label,
+                )
+                return None
+            return target
+        if len(targets) == 1:
+            return targets[0]
+        raise ValueError(
+            "fal result objects carry no label; cannot attribute tracks to "
+            "multiple targets, recalibrate against the fixture"
+        )
+
+    @staticmethod
+    def _cxcywh_to_xyxy(
+        box: Any, position: int
+    ) -> tuple[float, float, float, float] | None:
+        """归一化 cxcywh → xyxy，越界钳到 [0,1]；畸形抛 ValueError，退化返回 None。"""
+        if (
+            not isinstance(box, (list, tuple))
+            or len(box) != 4
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in box
+            )
+        ):
+            raise ValueError(f"fal result object {position - 1} has an invalid box")
+        cx, cy, width, height = (float(value) for value in box)
+        x0 = _clamp01(cx - width / 2)
+        y0 = _clamp01(cy - height / 2)
+        x1 = _clamp01(cx + width / 2)
+        y1 = _clamp01(cy + height / 2)
+        if not x0 < x1 or not y0 < y1:
+            return None
+        return (x0, y0, x1, y1)
+
+
 # 名称 → client 类；None = 已预留未实现（不进可选列表）。
 # 与 config.OBJECT_DETECT_PROVIDER_NAMES 必须一一对应。
 PROVIDER_REGISTRY: dict[str, type | None] = {
@@ -1143,6 +1588,7 @@ PROVIDER_REGISTRY: dict[str, type | None] = {
     "kimi": KimiGroundingClient,
     "step": StepGroundingClient,
     "gemini": GeminiGroundingClient,
+    "fal_sam3": FalSam3GroundingClient,  # fal.ai SAM 3 video-rle，专用检测模型
 }
 
 if set(PROVIDER_REGISTRY) != set(OBJECT_DETECT_PROVIDER_NAMES):

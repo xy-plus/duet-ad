@@ -166,11 +166,15 @@ def mask_objects(
     targets: list[str],
     *,
     detector: Any | None = None,
+    detect_cache: Path | None = None,
 ) -> dict[str, Any]:
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
-    omitted, the first available configured provider is used."""
+    omitted, the first available configured provider is used.
+    ``detect_cache`` 是检测原始响应的落盘产物路径（项目 work 目录内）；
+    支持产物复用的 provider（with_cache 钩子，如 fal_sam3）命中指纹时直接
+    复用、不再发起付费调用，其它 provider 忽略该参数。"""
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
@@ -186,6 +190,8 @@ def mask_objects(
         raise ObjectMaskError("object mask source metadata is incomplete")
     if detector is None and targets:
         detector = _production_detector()
+    if detect_cache is not None and hasattr(detector, "with_cache"):
+        detector = detector.with_cache(detect_cache)
     detections = detector.detect(source, targets) if targets else []
     boxes_by_frame = _frame_boxes(detections, fps)
     destination.parent.mkdir(parents=True, exist_ok=True)
