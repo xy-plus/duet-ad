@@ -1,5 +1,5 @@
 {
-  "_comment": "fal-ai/sam-3/video-rle 队列结果的罐头响应（校准入口）。fal 文档的 Output 节只声明 video 与 boundingbox_frames_zip；逐帧结构化字段按 SAM3VideoObjectFrame(frame_index+objects[SAM3ObjectMask{track_id,rle}]) 与 MaskMetadata(index,score,box 归一化 cxcywh) 的最合理结构假设，顶层字段名 frames/metadata 以首次真实响应校准——校准时只改本文件与 app/object_detect.py 的 FAL_SAM3_FRAMES_KEY / FAL_SAM3_METADATA_KEY。测试视频为 2 fps × 4 帧（320x240）。",
+  "_comment": "fal-ai/sam-3-1/video-rle 队列结果的罐头响应（校准入口）。fal 文档的 Output 节只声明 video 与 boundingbox_frames_zip；逐帧结构化字段按 SAM3VideoObjectFrame(frame_index+objects[SAM3ObjectMask{track_id,rle}]) 与 MaskMetadata(index,score,box 归一化 cxcywh) 的最合理结构假设，顶层字段名 frames/metadata 以首次真实响应校准——校准时只改本文件与 app/object_detect.py 的 FAL_SAM3_FRAMES_KEY / FAL_SAM3_METADATA_KEY。测试视频为 2 fps × 4 帧（320x240）。",
   "video": {"url": "https://fal.test/files/output.mp4"},
   "frames": [
     {

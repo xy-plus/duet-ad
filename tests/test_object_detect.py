@@ -981,7 +981,7 @@ def test_get_settings_reads_fal_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.fal_sam3_api_key == "fal-key"
     assert settings.fal_proxy == "http://127.0.0.1:7897"
     assert settings.fal_sam3_threshold == 0.2
-    assert settings.fal_sam3_api_base == "https://queue.fal.run/fal-ai/sam-3"
+    assert settings.fal_sam3_api_base == "https://queue.fal.run/fal-ai/sam-3-1"
     assert settings.fal_sam3_model == "video-rle"
 
 

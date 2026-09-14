@@ -24,7 +24,8 @@
 - gemini：File API 上传 + generateContent（非 OpenAI 兼容），``box_2d``
   0–1000 归一化；国内需 GEMINI_PROXY 代理；一次 detect 内重试与多目标
   复用已上传文件句柄，不重复上传。
-- fal_sam3：fal.ai SAM 3 video-rle，第一家专用检测模型（前 7 家通用 VLM）。
+- fal_sam3：fal.ai SAM 3.1 video-rle（默认 fal-ai/sam-3-1/video-rle），
+  第一家专用检测模型（前 7 家通用 VLM）。
   存储上传 + 队列提交/轮询，一次提交覆盖全部 targets（prompt 逗号分隔）；
   逐帧归一化 cxcywh box → xyxy 钳位，frame_index ÷ 视频 fps → timestamp_s，
   label 回映射 targets；track_id/score/RLE 不进契约（无对应字段），保留在
@@ -1145,7 +1146,7 @@ def _extract_gemini_json(text: str) -> Any:
     raise ValueError("model output does not contain a JSON object or array")
 
 
-# ==== fal_sam3（fal.ai SAM 3 video-rle）独立实现：存储上传 + 队列轮询 ====
+# ==== fal_sam3（fal.ai SAM 3.1 video-rle）独立实现：存储上传 + 队列轮询 ====
 # 第一家专用检测模型（前 7 家是通用 VLM）：一次提交覆盖全部 targets
 # （prompt 逗号分隔），不按目标重试——确定性模型的空结果就是确定答案，
 # 畸形结果重提只会得到同样的结果，两者都不重提（省钱纪律）。
@@ -1375,6 +1376,7 @@ class FalSam3GroundingClient:
         submit_url = (
             f"{self.settings.fal_sam3_api_base}/{self.settings.fal_sam3_model}"
         )
+        # 可选的 max_num_objects（sam-3-1 新增）不传：用 fal 文档默认 16。
         body = {
             "video_url": file_url,
             "prompt": prompt,

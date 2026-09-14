@@ -37,10 +37,12 @@ STEP_API_BASE = "https://api.stepfun.com/v1"
 STEP_GROUNDING_MODEL = "step-3.7-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
 GEMINI_MODEL = "gemini-2.5-flash"
-# fal.ai SAM 3 video-rle：队列 base 含端点路径，model 为端点末段，
+# fal.ai SAM 3.1 video-rle：队列 base 含端点路径，model 为端点末段，
 # 提交 URL = <base>/<model>。凭证环境变量名沿用 fal 平台统一约定 FAL_KEY
 # （不是 FAL_SAM3_API_KEY），映射见 _PROVIDER_KEY_ENV。
-FAL_SAM3_API_BASE = "https://queue.fal.run/fal-ai/sam-3"
+# 端点从 sam-3 升级到 sam-3-1（schema 一致，仅多一个可选 max_num_objects，
+# 默认 16）；仍可用 FAL_SAM3_API_BASE 配回旧端点。
+FAL_SAM3_API_BASE = "https://queue.fal.run/fal-ai/sam-3-1"
 FAL_SAM3_MODEL = "video-rle"
 # (名称, 默认 API base, 默认模型) 驱动 Settings 校验与 get_settings 的环境
 # 变量读取（<NAME>_API_KEY / <NAME>_API_BASE / <NAME>_MODEL）。
