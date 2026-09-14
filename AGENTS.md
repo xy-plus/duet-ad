@@ -11,6 +11,7 @@
 - 失败发生在 Picsart submit 之前（无 submit 痕迹）→ `POST /api/conversations/{id}/resume-pre-picsart`（body `{"confirm": true}`），复用分段、抽帧、分析、翻译、索引、图版等全部前置产物。
 - 已有冻结的 H3 前置产物 → `POST /api/conversations/{id}/resume-picsart`（`{"confirm": true}`），只重提 H3。
 - `submission_unknown`（Picsart submit 结果未知、无 task ID）仍会挡住续跑：先与供应商人工对账，确认未建任务/未扣费后，把 `state.json` 里 `picsart_submission_receipts` 对应回执的 `status` 从 `unknown` 改为 `rejected`，再走 resume-picsart。Seedream 侧的 rejected/submission_unknown 回执不需要人工处理：续跑会自动重置该 sheet 回执并重提（记 `seedream_receipt_reset`）。
+- **已成功/已提交但需要修改冻结上游产物后重跑**（如注入 detect_label 修检测目标）：stock 门禁会拒（resume-pre-picsart 拒有 Picsart 痕迹的项目，resume-picsart 逐字重放旧 prompt）。手术流程（案例：项目 89f36eee，2026-09-15）：① 备份 state.json，移出 logs/picsart-* 与 output/（改名留存不删除）；② state.json 删 `picsart_submission_receipts`、`h3_prepared_artifacts`，status 改 failed（error 记操作原因）；③ 改 `enhanced_element_index`（state 与 work/ 下两份同步）；④ 因索引变化须沿图版哈希链重钉（用 app 自身函数重算，禁止手拼）：spec 的 `enhanced_element_index_sha256`、`upstream_bindings`（`_replacement_sheet_upstream_bindings`）、整个 spec（`build_replacement_sheet_spec`）、`spec_sha256` 两处、work/global-reference-sheet/spec.json 落盘、seedream.spec 回执（sha256/size）、h3_reference_images 里的 spec_sha256；⑤ 本地离线跑 `_load_pre_picsart_resume` 验证门禁全通后再调 API；⑥ 重启后端加载新代码后 `resume-pre-picsart {"confirm": true}`。
 
 只有续跑门禁明确拒绝且无法对账时，才新建项目重跑。
 
