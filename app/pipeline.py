@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 from app import media
+from app import artifact_retention
 from app import face_mask
 from app import object_detect
 from app import object_mask
@@ -2722,6 +2723,28 @@ class Pipeline:
             error=None,
         )
         log.event("pipeline_succeeded", output=final)
+        self._prune_artifacts_after_success(project, log)
+
+    def _prune_artifacts_after_success(
+        self,
+        project: Path,
+        log: ResearchLog,
+    ) -> None:
+        """Lean-retention cleanup after the terminal success state is durable.
+
+        Runs inline in the pipeline worker thread, which is already
+        asynchronous to the API request; pruning failures are logged and can
+        never fail the project (app/artifact_retention.py).
+        """
+        settings = getattr(self, "settings", None)
+        if settings is None or settings.artifact_retention != "lean":
+            return
+        try:
+            state = self.store.read(project.name)
+        except Exception as exc:
+            log.event("artifact_prune_failed", error=str(exc))
+            return
+        artifact_retention.prune_after_success(project, state=state, log=log)
 
     def _replace_dialogue_audio_track(
         self,
@@ -4550,6 +4573,7 @@ class Pipeline:
                 error=None,
             )
             log.event("picsart_resume_succeeded", output=final)
+            self._prune_artifacts_after_success(project, log)
         except Exception as exc:
             log.event("picsart_resume_failed", error=str(exc))
             self._persist_failure(

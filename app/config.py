@@ -15,6 +15,7 @@ SEEDREAM_PRO_MODEL = "doubao-seedream-5-0-pro-260628"
 SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MULTIREF_MODES = frozenset({"composed", "direct"})
+ARTIFACT_RETENTION_MODES = frozenset({"full", "lean"})
 
 # 物品检测只走 fal.ai SAM 3.1 video-rle（实现见 app/object_detect.py）：
 # 队列 base 含端点路径，model 为端点末段，提交 URL = <base>/<model>。
@@ -39,6 +40,11 @@ class Settings:
     # 顺序传图"。不存在第三条旧单图链路：上传 1 张图就是所选模式的 1 图情形。
     # 本开关不进前端、不进公开 API 参数与响应。
     multiref_mode: str = "direct"
+    # 落盘保留级别（裁剪实现见 app/artifact_retention.py）：full = 测试期
+    # 全量落盘（缺省，不设环境变量时维持现状）；lean = 生产模式，成功项目
+    # 完成后幂等清掉节点媒体副本与抽帧/代理图，指纹缓存、回执、state、
+    # 成片全部保留，失败项目不裁。
+    artifact_retention: str = "full"
     data_dir: Path = ROOT / "data"
     public_base_url: str = ""
     picsart_api_key: str = ""
@@ -91,6 +97,8 @@ class Settings:
             object.__setattr__(self, "access_token", token)
         if self.multiref_mode not in MULTIREF_MODES:
             raise ValueError("MULTIREF_MODE must be composed or direct")
+        if self.artifact_retention not in ARTIFACT_RETENTION_MODES:
+            raise ValueError("ARTIFACT_RETENTION must be full or lean")
         seedream_key = (
             self.seedream_api_key.strip()
             if isinstance(self.seedream_api_key, str)
@@ -285,6 +293,10 @@ def get_settings() -> Settings:
         raise RuntimeError("DEEPSEEK_API_KEY must be set to a non-empty value")
     # 缺省默认 direct；显式设置的合法性由 Settings.__post_init__ 校验。
     multiref_mode = os.environ.get("MULTIREF_MODE", "").strip().lower() or "direct"
+    # 缺省默认 full（测试期现状）；生产启动脚本显式写 lean。
+    artifact_retention = (
+        os.environ.get("ARTIFACT_RETENTION", "").strip().lower() or "full"
+    )
     try:
         fal_sam3_threshold = float(
             os.environ.get("FAL_SAM3_THRESHOLD", "0.3").strip()
@@ -294,6 +306,7 @@ def get_settings() -> Settings:
     return Settings(
         access_token=access_token,
         multiref_mode=multiref_mode,
+        artifact_retention=artifact_retention,
         data_dir=Path(os.environ.get("DATA_DIR", str(ROOT / "data"))).resolve(),
         public_base_url=os.environ.get("PUBLIC_BASE_URL", ""),
         picsart_api_key=os.environ.get("PICSART_API_KEY", ""),

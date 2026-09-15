@@ -15,6 +15,10 @@ set +a
 # Experiment data stays inside the object-mask worktree; never touch the
 # release/production data directories.
 export DATA_DIR=/home/xy/duet-ad1-h3-max-r2v-object-mask/data
+# 落盘保留级别（app/artifact_retention.py）：本实例仍是测试期，显式 full
+# 保持全量落盘；生产上线时启动脚本应显式改为 lean（成功项目完成后幂等
+# 清理节点媒体副本与抽帧，指纹缓存/回执/state/成片保留）。
+export ARTIFACT_RETENTION=full
 # Public v1 API enabled on this test port for external-API acceptance runs
 # (same clients file as production; paid runs still require explicit user approval).
 export PUBLIC_API_ENABLED=1
