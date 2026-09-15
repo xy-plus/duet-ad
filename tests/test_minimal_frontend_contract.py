@@ -135,9 +135,13 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     assert "自动改写原视频台词，或描述一段口播由 AI 直接生成" in dialogue
     assert 'id="script-input"' not in html
     assert "script-input" not in source
+    output_section = visible.split(
+        'aria-labelledby="output-title"', 1
+    )[1].split("</section>", 1)[0]
+    assert 'id="replacement-instruction"' in output_section
     assert re.findall(r'<textarea\b[^>]*\bid="([^"]+)"', visible) == [
-        "dialogue-brief",
         "replacement-instruction",
+        "dialogue-brief",
     ]
     assert 'name="voice-mode"' not in visible
     assert 'name="dialogue-mode"' not in visible
