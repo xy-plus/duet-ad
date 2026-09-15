@@ -138,10 +138,24 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     output_section = visible.split(
         'aria-labelledby="output-title"', 1
     )[1].split("</section>", 1)[0]
-    assert 'id="replacement-instruction"' in output_section
+    # 显示字幕合并在生成配置 section 内；指定替换是独立的第四个 setup-section。
+    assert 'id="add-subtitles"' in output_section
+    assert 'id="subtitle-hint"' in output_section
+    assert 'id="replacement-instruction"' not in output_section
+    assert (
+        '<section class="setup-section optional-section" '
+        'aria-labelledby="replacement-title">'
+    ) in visible
+    replacement_section = visible.split(
+        'aria-labelledby="replacement-title"', 1
+    )[1].split("</section>", 1)[0]
+    assert 'id="replacement-instruction"' in replacement_section
+    assert visible.index('aria-labelledby="dialogue-title"') < visible.index(
+        'aria-labelledby="replacement-title"'
+    )
     assert re.findall(r'<textarea\b[^>]*\bid="([^"]+)"', visible) == [
-        "replacement-instruction",
         "dialogue-brief",
+        "replacement-instruction",
     ]
     assert 'name="voice-mode"' not in visible
     assert 'name="dialogue-mode"' not in visible
