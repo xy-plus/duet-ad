@@ -119,7 +119,7 @@
               <span class="setup-step">2</span>
               <div>
                 <h2 id="output-title">生成配置</h2>
-                <p>选择新视频的画幅与清晰度</p>
+                <p>选择新视频的画幅、清晰度与替换项</p>
               </div>
             </div>
             <div class="output-config-grid">
@@ -132,6 +132,25 @@
                 <legend>清晰度</legend>
                 <label><input type="radio" name="resolution" value="768p" checked><span>高清 768p</span></label>
                 <label><input type="radio" name="resolution" value="480p"><span>标准 480p</span></label>
+              </fieldset>
+              <fieldset class="config-cell">
+                <legend>字幕</legend>
+                <label class="subtitle-option" for="add-subtitles">
+                  <input id="add-subtitles" type="checkbox" aria-describedby="subtitle-hint">
+                  <span>显示字幕</span>
+                </label>
+                <p id="subtitle-hint" class="field-hint">在最终成片上叠加台词字幕</p>
+              </fieldset>
+              <fieldset class="config-cell">
+                <legend id="replacement-title">指定替换</legend>
+                <div class="replacement-inputs">
+                  <button type="button" id="replacement-select" class="reference-image-button">上传参考图（最多 4 张）</button>
+                  <div id="replacement-image-list" class="reference-image-list" aria-live="polite" hidden></div>
+                  <label class="sr-only" for="replacement-instruction">替换说明</label>
+                  <textarea id="replacement-instruction" class="setup-textarea" rows="3" maxlength="1000"
+                            placeholder="例如：把画面中的白色水杯替换成参考图中的产品杯"></textarea>
+                </div>
+                <p id="replacement-hint" class="field-hint">参考图与替换说明需要一起提供</p>
               </fieldset>
             </div>
           </section>
@@ -180,32 +199,6 @@
                        placeholder="例如：中文、英语、日语" autocomplete="off">
               </div>
             </fieldset>
-          </section>
-
-          <section class="setup-section optional-section">
-            <label class="subtitle-option" for="add-subtitles">
-              <input id="add-subtitles" type="checkbox" aria-describedby="subtitle-hint">
-              <span>显示字幕</span>
-            </label>
-            <p id="subtitle-hint" class="field-hint">在最终成片上叠加台词字幕</p>
-          </section>
-
-          <section class="setup-section optional-section" aria-labelledby="replacement-title">
-            <div class="setup-heading">
-              <span class="setup-step is-optional">可选</span>
-              <div>
-                <h2 id="replacement-title">指定替换</h2>
-                <p>用参考图和一句话说明要替换的内容</p>
-              </div>
-            </div>
-            <div class="replacement-inputs">
-              <button type="button" id="replacement-select" class="reference-image-button">上传参考图（最多 4 张）</button>
-              <div id="replacement-image-list" class="reference-image-list" aria-live="polite" hidden></div>
-              <label class="sr-only" for="replacement-instruction">替换说明</label>
-              <textarea id="replacement-instruction" class="setup-textarea" rows="3" maxlength="1000"
-                        placeholder="例如：把画面中的白色水杯替换成参考图中的产品杯"></textarea>
-            </div>
-            <p id="replacement-hint" class="field-hint">参考图与替换说明需要一起提供</p>
           </section>
 
           <p id="creation-service-status" class="creation-service-status" aria-live="polite">正在连接生成服务…</p>
