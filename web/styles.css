@@ -1004,6 +1004,8 @@ input, textarea { font-family: inherit; }
   gap: 10px;
   cursor: pointer;
 }
+/* 与上方画幅/清晰度方框拉开距离：间隔 = 容器宽度的 10% */
+.output-config-grid + .subtitle-option { margin-top: 10%; }
 .subtitle-option input {
   appearance: auto;
   width: 20px;
