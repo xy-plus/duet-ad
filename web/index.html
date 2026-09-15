@@ -171,7 +171,8 @@
               <legend>最终视频语种</legend>
               <div class="language-switch">
                 <label class="language-option">
-                  <input type="radio" name="target-language-mode" value="same" checked>
+                  <input type="radio" name="target-language-mode" value="same" checked
+                         aria-describedby="same-language-hint">
                   <span>与原视频相同</span>
                 </label>
                 <label class="language-option">
@@ -179,6 +180,7 @@
                   <span>其他</span>
                 </label>
               </div>
+              <p id="same-language-hint" class="field-hint">西班牙语、法语、德语等拉丁字母语种会被识别为英语，如需这些语种请选择「其他」并填写</p>
               <div id="translation-fields" class="translation-fields" hidden>
                 <label for="lang-input">其他语种</label>
                 <input id="lang-input" class="lang-input" type="text" maxlength="80" disabled

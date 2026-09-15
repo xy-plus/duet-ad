@@ -201,6 +201,19 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     other_attrs = _target_language_mode_attrs(dialogue, "other")
     assert re.search(r"\bchecked\b", same_attrs) is not None
     assert re.search(r"\bchecked\b", other_attrs) is None
+    assert 'aria-describedby="same-language-hint"' in same_attrs
+
+    hint = re.search(
+        r'<p\b(?P<attrs>[^>]*)id="same-language-hint"(?P<tail>[^>]*)>',
+        visible,
+        flags=re.DOTALL,
+    )
+    assert hint is not None
+    hint_attrs = hint.group("attrs") + hint.group("tail")
+    assert 'class="field-hint"' in hint_attrs
+    assert "hidden" not in hint_attrs
+    assert "拉丁字母语种" in dialogue
+    assert "英语" in dialogue
 
     fields = re.search(
         r'<div\b(?P<attrs>[^>]*)id="translation-fields"(?P<tail>[^>]*)>',
@@ -227,6 +240,7 @@ def test_creation_form_defaults_to_link_and_same_source_language():
     sync_controls = _function_source(source, "syncTargetLanguageControls")
     assert 'targetLanguageMode() === "other"' in sync_controls
     assert '$("translation-fields").hidden = !isOther' in sync_controls
+    assert '$("same-language-hint").hidden = isOther' in sync_controls
     assert '$("lang-input").required = isOther' in sync_controls
     assert (
         '$("lang-input").disabled = state.uploading || state.viewingSubmittedConfig || !isOther'

@@ -1432,6 +1432,7 @@ function selectedTargetLanguage() {
 function syncTargetLanguageControls() {
   const isOther = targetLanguageMode() === "other";
   $("translation-fields").hidden = !isOther;
+  $("same-language-hint").hidden = isOther;
   $("lang-input").required = isOther;
   $("lang-input").disabled = state.uploading || state.viewingSubmittedConfig || !isOther;
 }
