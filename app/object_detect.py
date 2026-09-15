@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,18 +149,26 @@ class UncalibratedResponseError(ValueError):
 class FalSam3GroundingClient:
     """fal.ai SAM 3.1 video-rle：逐帧 RLE + 归一化 cxcywh box（下标=帧号）。
 
-    产物复用：``cache_path`` 指向项目 work 目录里的 JSON 产物，内容是
-    {fingerprint, fal_response}；指纹（视频 sha256 + prompt + 阈值 + 模型）
-    匹配时直接复用 fal 原始响应，不发任何 HTTP（fal 调用很贵，同一项目
-    重试/续跑绝不重复调用）。契约没有 score 的对应字段，score 与 RLE
-    一起保留在落盘产物和 ``last_frames`` 里，供二期消费。
+    产物复用：fal 原始响应以 {fingerprint, fal_response} 落盘，指纹（视频
+    sha256 + prompt + 阈值 + 模型）匹配时直接复用，不发任何 HTTP（fal 按
+    调用计费，同一指纹绝不重复付费）。缓存布局（2026-09-15 起）是**实例级
+    共享目录** ``<DATA_DIR>/shared/object-detect-cache/
+    object-detect-response-<指纹 sha256>.json``：同视频同 prompt 跨项目零
+    HTTP（实测两轮不同项目指纹逐字节相同、fal 响应确定性相同，项目级缓存
+    让第二轮白调 8 次）。只写实例级（同目录唯一临时文件 + os.replace 原子
+    写，并发项目同指纹不会写出半截文件）；``cache_path`` 指向的旧版项目级
+    缓存（work/segments/000N/object-detect-response-<slug>.json）仅作回退
+    读，不再写入、不做迁移。契约没有 score 的对应字段，score 与 RLE 一起
+    保留在落盘产物和 ``last_frames`` 里，供二期消费。
 
-    落盘纪律（2026-09-15 用户定）：全量落盘（原始响应每字段保留）是
-    **测试期**策略——用存储换"绝不重复付费"；部署生产时按价值裁剪，
-    裁剪点有两处：① 本类的 cache 产物（复用必需，保留，但可只留
-    解析所需字段）；② pipeline 节点 output-media 收编的原始响应
-    JSON（生产可不收编大字段，只留统计）。裁剪时搜索本注释锚点
-    "落盘纪律"。
+    落盘纪律（2026-09-15 用户定，同日更新为实例级共享布局）：全量落盘
+    （原始响应每字段保留）是**测试期**策略——用存储换"绝不重复付费"；
+    部署生产时按价值裁剪，裁剪点有两处：① 本类的共享 cache 产物（复用
+    必需，保留——生产上它正是跨项目省钱的核心，可只留解析所需字段）；
+    ② pipeline 节点 output-media 收编的原始响应 JSON（生产可不收编大
+    字段，只留统计）。共享目录在 DATA_DIR 下、项目目录之外，
+    artifact_retention 的 lean 裁剪只作用于项目目录、天然不碰它。裁剪时
+    搜索本注释锚点 "落盘纪律"。
     """
 
     provider_name = "fal_sam3"
@@ -176,7 +185,7 @@ class FalSam3GroundingClient:
         self.last_frames: list[dict[str, Any]] = []
 
     def with_cache(self, cache_path: Path) -> "FalSam3GroundingClient":
-        """返回挂同一 settings/transport、带产物复用路径的新实例。"""
+        """返回挂同一 settings/transport、带旧版项目级回退读路径的新实例。"""
         return FalSam3GroundingClient(
             self.settings, transport=self.transport, cache_path=cache_path
         )
@@ -212,12 +221,10 @@ class FalSam3GroundingClient:
             "detection_threshold": self.settings.fal_sam3_threshold,
             "model": self.settings.fal_sam3_model,
         }
-        payload = self._load_cache(fingerprint)
+        payload, record = self._load_cache(fingerprint)
         if payload is None:
             payload, record = self._run_flow(api_key, video_path, content, prompt)
             self._store_cache(fingerprint, payload)
-        else:
-            record = {"reused_cache": str(self.cache_path)}
         try:
             detections, self.last_frames = self._parse_result(payload, targets, fps)
         except (ValueError, TypeError, KeyError) as exc:
@@ -226,13 +233,27 @@ class FalSam3GroundingClient:
             raise ProviderFailure(record, [], exc) from exc
         return detections
 
-    # --- 产物落盘与复用 ---
+    # --- 产物落盘与复用（实例级共享缓存 + 旧版项目级回退读） ---
 
-    def _load_cache(self, fingerprint: dict[str, Any]) -> dict[str, Any] | None:
-        if self.cache_path is None:
-            return None
+    def _shared_cache_path(self, fingerprint: dict[str, Any]) -> Path:
+        """实例级共享缓存路径：文件名 = 指纹规范 JSON 的 sha256。"""
+        canonical = json.dumps(
+            fingerprint, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return (
+            self.settings.data_dir
+            / "shared"
+            / "object-detect-cache"
+            / f"object-detect-response-{digest}.json"
+        )
+
+    def _load_cache_file(
+        self, path: Path, fingerprint: dict[str, Any]
+    ) -> dict[str, Any] | None:
         try:
-            cached = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            cached = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         if not isinstance(cached, dict) or cached.get("fingerprint") != fingerprint:
@@ -242,29 +263,53 @@ class FalSam3GroundingClient:
             return None
         _LOGGER.info(
             "object detect provider fal_sam3: reusing cached fal response %s",
-            self.cache_path,
+            path,
         )
         return payload
 
+    def _load_cache(
+        self, fingerprint: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """先查实例级共享缓存，再回退查旧版项目级 ``cache_path``（只读）。"""
+        shared = self._shared_cache_path(fingerprint)
+        payload = self._load_cache_file(shared, fingerprint)
+        if payload is not None:
+            return payload, {"reused_cache": str(shared)}
+        if self.cache_path is not None and self.cache_path != shared:
+            payload = self._load_cache_file(self.cache_path, fingerprint)
+            if payload is not None:
+                return payload, {"reused_cache": str(self.cache_path)}
+        return None, {}
+
     def _store_cache(self, fingerprint: dict[str, Any], payload: Any) -> None:
-        if self.cache_path is None:
-            return
+        """只写实例级共享缓存，原子写：同目录唯一临时文件 + os.replace，
+        并发项目同指纹也不会写出半截文件（内容相同，最后一个 rename 胜出）。"""
+        path = self._shared_cache_path(fingerprint)
+        temp: Path | None = None
         try:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temp = self.cache_path.with_name(self.cache_path.name + ".tmp")
-            temp.write_text(
-                json.dumps(
-                    {"fingerprint": fingerprint, "fal_response": payload},
-                    ensure_ascii=False,
-                ),
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
                 encoding="utf-8",
-            )
-            os.replace(temp, self.cache_path)
+                dir=path.parent,
+                prefix=".object-detect-response-",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp = Path(handle.name)
+                json.dump(
+                    {"fingerprint": fingerprint, "fal_response": payload},
+                    handle,
+                    ensure_ascii=False,
+                )
+            os.replace(temp, path)
         except OSError:
             # 产物写盘失败不能让检测本身失败（结果已经在内存里）。
+            if temp is not None:
+                temp.unlink(missing_ok=True)
             _LOGGER.warning(
                 "object detect provider fal_sam3: cache write failed: %s",
-                self.cache_path,
+                path,
                 exc_info=True,
             )
 

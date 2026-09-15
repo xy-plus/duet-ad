@@ -515,8 +515,8 @@ def _fal_mock_handler(state: dict[str, int]):
 
 
 def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> None:
-    """真实 fal client（mock HTTP）：2 target = 2 提交 + 2 产物文件；
-    二次运行命中指纹零 HTTP，且结果一致。"""
+    """真实 fal client（mock HTTP）：2 target = 2 提交；fal 响应缓存写实例级
+    共享目录（不写项目目录）；另一个项目目录同指纹二次运行零 HTTP。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=2)
     artifacts = tmp_path / "segment"
@@ -531,7 +531,10 @@ def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> Non
     )
     assert state["submits"] == 2
     assert state["uploads"] == 2
-    response_files = sorted(artifacts.glob("object-detect-response-*.json"))
+    # 项目目录只留解析后的 detections；fal 响应缓存只在实例级共享目录。
+    assert sorted(artifacts.glob("object-detect-response-*.json")) == []
+    shared_dir = tmp_path / "shared" / "object-detect-cache"
+    response_files = sorted(shared_dir.glob("object-detect-response-*.json"))
     assert len(response_files) == 2
     for path in response_files:
         cached = json.loads(path.read_text(encoding="utf-8"))
@@ -551,6 +554,6 @@ def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> Non
     )
     stats2 = object_mask.mask_objects(
         source, tmp_path / "out2.mp4", ["handbag", "bottle"],
-        detector=reused, detect_artifacts_dir=artifacts,
+        detector=reused, detect_artifacts_dir=tmp_path / "other-project-segment",
     )
     assert stats2["blocks_total"] == stats["blocks_total"]

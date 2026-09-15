@@ -5836,10 +5836,12 @@ class Pipeline:
                 # provider is rejected earlier by Settings validation.
                 object_masked = segment_dir / "source-objects-masked.mp4"
                 # 检测产物落盘目录 = 段 work 目录（跨节点重试与
-                # resume-pre-picsart 续跑存活）：fal 原始响应按 target 一个
-                # JSON（object-detect-response-<slug>.json，命中指纹即零
-                # HTTP），解析后的契约 detections 收 object-detections.json，
-                # 全部计入下面 output-media 的节点产物清单。
+                # resume-pre-picsart 续跑存活）：解析后的契约 detections 收
+                # object-detections.json，计入下面 output-media 的节点产物
+                # 清单。fal 原始响应的指纹缓存写实例级共享目录
+                # <DATA_DIR>/shared/object-detect-cache/（跨项目同指纹零
+                # HTTP，见 object_detect 的落盘纪律注释），段目录下的
+                # object-detect-response-<slug>.json 仅作旧版缓存回退读。
                 detect_artifacts_dir = segment_dir
                 object_mask_failures = 0
 

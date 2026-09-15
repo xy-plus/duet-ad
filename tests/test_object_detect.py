@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
 import json
 from pathlib import Path
 
@@ -516,21 +518,53 @@ def test_select_provider_returns_none_without_key(tmp_path: Path) -> None:
 
 
 # --- fal_sam3 产物落盘与复用（fal 调用很贵，成功结果绝不重复请求）---
+# 缓存布局（2026-09-15 起）：实例级共享目录
+# <DATA_DIR>/shared/object-detect-cache/object-detect-response-<指纹sha256>.json，
+# 跨项目同指纹零 HTTP；只写实例级（原子写），项目 work 目录里的旧版
+# object-detect-response-<slug>.json 仅作回退读，不再写入、不做迁移。
 
 
-def test_fal_sam3_cache_reuse_skips_http(tmp_path: Path, video: Path) -> None:
-    """二次 detect 命中同指纹产物：不发任何 HTTP，结果与首次一致。"""
-    cache_path = tmp_path / "work" / "object-detect-fal-sam3.json"
+def _shared_cache_files(settings: Settings) -> list[Path]:
+    directory = settings.data_dir / "shared" / "object-detect-cache"
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob("object-detect-response-*.json"))
+
+
+def _legacy_cache_payload(video: Path, prompt: str) -> dict[str, object]:
+    return {
+        "fingerprint": {
+            "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest(),
+            "prompt": prompt,
+            "detection_threshold": 0.3,
+            "model": "video-rle",
+        },
+        "fal_response": _FAL_SAM3_RESULT,
+    }
+
+
+def test_fal_sam3_shared_cache_cross_project_reuse(
+    tmp_path: Path, video: Path
+) -> None:
+    """实例级共享：项目 A 的 fal 响应落进 DATA_DIR/shared，项目 B 同指纹
+    （同视频同 prompt）零 HTTP 复用；项目 work 目录不再写缓存文件。"""
+    settings = _fal_settings(tmp_path)
+    project_a_cache = (
+        tmp_path / "projects" / "a" / "work" / "segments" / "0001"
+        / "object-detect-response-target-a.json"
+    )
     handler = _fal_queue_handler(_FAL_SAM3_RESULT)
     client = FalSam3GroundingClient(
-        _fal_settings(tmp_path),
+        settings,
         transport=httpx.MockTransport(handler),
-        cache_path=cache_path,
+        cache_path=project_a_cache,
     )
     first = client.detect(video, ["handbag"])
     assert first == _FAL_SAM3_EXPECTED
-    assert cache_path.is_file()
-    cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert not project_a_cache.exists()  # 只写实例级共享目录
+    shared = _shared_cache_files(settings)
+    assert len(shared) == 1
+    cached = json.loads(shared[0].read_text(encoding="utf-8"))
     assert cached["fal_response"] == _FAL_SAM3_RESULT
     assert cached["fingerprint"]["prompt"] == "handbag"
     assert cached["fingerprint"]["detection_threshold"] == 0.3
@@ -539,10 +573,14 @@ def test_fal_sam3_cache_reuse_skips_http(tmp_path: Path, video: Path) -> None:
     def fail_handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
+    project_b_cache = (
+        tmp_path / "projects" / "b" / "work" / "segments" / "0001"
+        / "object-detect-response-target-b.json"
+    )
     reused = FalSam3GroundingClient(
-        _fal_settings(tmp_path),
+        settings,
         transport=httpx.MockTransport(fail_handler),
-        cache_path=cache_path,
+        cache_path=project_b_cache,
     )
     assert reused.detect(video, ["handbag"]) == first
     assert [entry["rle"] for entry in reused.last_frames] == _FAL_SAM3_RESULT["rle"]
@@ -565,6 +603,34 @@ def test_fal_sam3_cache_fingerprint_mismatch_refetches(
     assert handler.state["submits"] == 2  # type: ignore[attr-defined]
 
 
+def test_fal_sam3_legacy_project_cache_fallback(
+    tmp_path: Path, video: Path
+) -> None:
+    """兼容期：旧版项目级缓存（work/segments 下的
+    object-detect-response-<slug>.json）仍作回退读，命中即零 HTTP；
+    回退命中只做读取，不向共享目录迁移。"""
+    settings = _fal_settings(tmp_path)
+    legacy = (
+        tmp_path / "projects" / "a" / "work" / "segments" / "0001"
+        / "object-detect-response-target-deadbeef.json"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        json.dumps(_legacy_cache_payload(video, "handbag")), encoding="utf-8"
+    )
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = FalSam3GroundingClient(
+        settings,
+        transport=httpx.MockTransport(fail_handler),
+        cache_path=legacy,
+    )
+    assert client.detect(video, ["handbag"]) == _FAL_SAM3_EXPECTED
+    assert _shared_cache_files(settings) == []
+
+
 def test_fal_sam3_corrupt_cache_refetches(tmp_path: Path, video: Path) -> None:
     cache_path = tmp_path / "object-detect-fal-sam3.json"
     cache_path.write_text("not json", encoding="utf-8")
@@ -576,6 +642,76 @@ def test_fal_sam3_corrupt_cache_refetches(tmp_path: Path, video: Path) -> None:
     )
     assert client.detect(video, ["handbag"]) == _FAL_SAM3_EXPECTED
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_fal_sam3_corrupt_shared_cache_refetches(
+    tmp_path: Path, video: Path
+) -> None:
+    """共享缓存文件损坏：按未命中处理重新调用，并把共享文件写回完整内容。"""
+    settings = _fal_settings(tmp_path)
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    client = FalSam3GroundingClient(
+        settings, transport=httpx.MockTransport(handler)
+    )
+    client.detect(video, ["handbag"])
+    shared = _shared_cache_files(settings)
+    assert len(shared) == 1
+    shared[0].write_text("not json", encoding="utf-8")
+    assert client.detect(video, ["handbag"]) == _FAL_SAM3_EXPECTED
+    assert handler.state["submits"] == 2  # type: ignore[attr-defined]
+    cached = json.loads(shared[0].read_text(encoding="utf-8"))
+    assert cached["fal_response"] == _FAL_SAM3_RESULT
+
+
+def test_fal_sam3_shared_cache_write_is_atomic(
+    tmp_path: Path, video: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """写缓存 = 同目录唯一临时文件 + os.replace：replace 时临时文件已是完整
+    合法 JSON（同目录 rename 才原子），replace 后无任何临时残留。"""
+    settings = _fal_settings(tmp_path)
+    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    client = FalSam3GroundingClient(
+        settings, transport=httpx.MockTransport(handler)
+    )
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = object_detect.os.replace
+
+    def spy_replace(src: object, dst: object) -> None:
+        src_path, dst_path = Path(str(src)), Path(str(dst))
+        assert src_path != dst_path
+        assert src_path.parent == dst_path.parent
+        payload = json.loads(src_path.read_text(encoding="utf-8"))
+        assert payload["fal_response"] == _FAL_SAM3_RESULT
+        replacements.append((src_path, dst_path))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(object_detect.os, "replace", spy_replace)
+    client.detect(video, ["handbag"])
+    assert len(replacements) == 1
+    temp, target = replacements[0]
+    assert not temp.exists()
+    assert target.is_file()
+    assert list(target.parent.glob("*.tmp")) == []
+
+
+def test_fal_sam3_shared_cache_concurrent_writers_leave_valid_file(
+    tmp_path: Path, video: Path
+) -> None:
+    """并发项目同指纹同时写缓存：rename 原子性保证最终文件完整合法，
+    不留半截文件或临时残留。"""
+    settings = _fal_settings(tmp_path)
+    transport = httpx.MockTransport(_fal_queue_handler(_FAL_SAM3_RESULT))
+    clients = [
+        FalSam3GroundingClient(settings, transport=transport) for _ in range(4)
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda c: c.detect(video, ["handbag"]), clients))
+    assert results == [_FAL_SAM3_EXPECTED] * 4
+    shared = _shared_cache_files(settings)
+    assert len(shared) == 1
+    cached = json.loads(shared[0].read_text(encoding="utf-8"))
+    assert cached["fal_response"] == _FAL_SAM3_RESULT
+    assert list(shared[0].parent.glob("*.tmp")) == []
 
 
 # --- fal_sam3 配置校验 ---

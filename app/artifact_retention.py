@@ -13,9 +13,12 @@ lean 只删两类纯冗余（原文件仍在 inputs/work/output，JSON 证据一
    analysis-keyframes），失败续跑会自动重抽。
 
 绝不删除：state.json、logs 下所有 JSON（含 submit accepted 证据与
-picsart/seedream 回执）、inputs/、output/ 成片、fal 指纹缓存
-object-detect-response-*.json（续跑零 HTTP 复用），以及 state.json 里
-以项目相对路径引用的任何文件（整个目录含被引用文件时跳过该目录）。
+picsart/seedream 回执）、inputs/、output/ 成片、项目内遗留的旧版 fal
+指纹缓存 object-detect-response-*.json（续跑零 HTTP 回退读），以及
+state.json 里以项目相对路径引用的任何文件（整个目录含被引用文件时
+跳过该目录）。fal 指纹缓存自 2026-09-15 起写实例级共享目录
+<DATA_DIR>/shared/object-detect-cache/（跨项目复用，省钱核心）——本
+模块只裁项目目录，天然不碰共享目录。
 """
 
 from __future__ import annotations

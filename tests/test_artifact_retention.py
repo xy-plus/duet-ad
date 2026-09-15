@@ -168,6 +168,26 @@ def test_prune_is_idempotent(tmp_path: Path) -> None:
     assert not second["errors"]
 
 
+def test_prune_never_touches_shared_object_detect_cache(tmp_path: Path) -> None:
+    """实例级共享缓存 <DATA_DIR>/shared/object-detect-cache/ 是跨项目复用的
+    省钱核心（fal 按调用计费）：裁剪只作用于项目目录，共享目录一根汗毛不动。"""
+    project, state = _build_project(tmp_path)
+    shared = tmp_path / "shared" / "object-detect-cache"
+    shared.mkdir(parents=True)
+    cached_response = shared / "object-detect-response-deadbeef.json"
+    cached_response.write_text(
+        '{"fingerprint": {}, "fal_response": {}}', encoding="utf-8",
+    )
+    summary = prune_project(project, state=state)
+    assert summary["removed_files"] > 0
+    assert not summary["errors"]
+    assert cached_response.is_file()
+    assert json.loads(cached_response.read_text(encoding="utf-8")) == {
+        "fingerprint": {},
+        "fal_response": {},
+    }
+
+
 def test_prune_refuses_failed_project(tmp_path: Path) -> None:
     project, state = _build_project(tmp_path, status="failed")
     with pytest.raises(ValueError, match="succeeded"):

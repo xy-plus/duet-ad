@@ -185,9 +185,11 @@ def _detect_all(
     detector: Any,
     artifacts_dir: Path | None,
 ) -> list[ObjectDetection]:
-    """fal 端点单 target：N 个 target = N 次独立 detect，每次一个独立产物
-    文件 object-detect-response-<slug>.json，各自指纹复用；某 target 无检出
-    记日志跳过，不影响其它 target。"""
+    """fal 端点单 target：N 个 target = N 次独立 detect；fal 原始响应缓存
+    在实例级共享目录（见 object_detect 的落盘纪律注释），各自指纹复用，
+    跨项目同指纹零 HTTP；某 target 无检出记日志跳过，不影响其它 target。
+    artifacts_dir 下的 object-detect-response-<slug>.json 路径只作旧版
+    项目级缓存的回退读钩子，不再写入。"""
     detections: list[ObjectDetection] = []
     for target in targets:
         client = detector
@@ -220,9 +222,11 @@ def mask_objects(
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
     omitted, the production fal SAM-3 client is used (requires FAL_KEY).
     ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
-    fal client 的 with_cache 钩子把原始响应按 target 写到
-    object-detect-response-<slug>.json，命中指纹即零 HTTP；
-    解析后的契约 detections 写 object-detections.json（见 _detect_all）。"""
+    解析后的契约 detections 写 object-detections.json（见 _detect_all）；
+    fal 原始响应的指纹缓存写实例级共享目录
+    <DATA_DIR>/shared/object-detect-cache/（跨项目命中即零 HTTP，见
+    object_detect 的落盘纪律注释），with_cache 传入的本目录
+    object-detect-response-<slug>.json 仅作旧版项目级缓存的回退读。"""
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
