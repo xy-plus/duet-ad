@@ -1,5 +1,29 @@
 # 对外 API v1 客户快速迁移指南与差异清单
 
+## 多参考图（2026-09-15，合同版本 1.3.0）
+
+本次新增多参考图能力：同一 multipart 字段 `replacement_image` 可重复传入 2～4 张图片，配合一条 `replacement_instruction` 对全部参考图生效。默认行为不变；单图调用一字不改即可继续使用，旧调用无需修改。
+
+| 位置 | 客户适配 |
+|---|---|
+| `POST /api/v1/video-generations` | 需要多图时重复传入 `replacement_image` 字段，共 2～4 张；单图请求保持原写法 |
+| `POST /api/v1/video-generations/quotes` | 同样支持重复图片字段；报价冻结全部图片及其顺序，更改任一图片、数量、顺序或说明时使用新 Key 重新报价 |
+| `POST /api/v1/video-generations/quotes/{quote_id}/confirm` | 仍只发送 JSON `{"confirm":true}`，不重传或修改参考图和说明 |
+| `GET /api/v1/video-generations/capabilities` | 读取 `replacement_image.max_images`，当前为 `4`；每张仍限 JPEG、PNG、WebP 和 10 MiB |
+| 创建和报价请求校验 | 图片与说明仍须成对提供；超过 4 张返回 `422 invalid_create_request` |
+
+最小多图创建示例：
+
+```bash
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Idempotency-Key: multiref_order_20260915_000001' \
+  --form 'source_video=@/home/xy/api-input/source.mp4' \
+  --form 'replacement_image=@/home/xy/api-input/reference-1.jpg' \
+  --form 'replacement_image=@/home/xy/api-input/reference-2.png' \
+  --form 'replacement_instruction=使用图 1 和图 2 中的商品作为替换参考'
+```
+
 ## 字幕开关补充（2026-09-10，合同版本保持 1.2.0）
 
 本次增加可选 `add_subtitles` 参数，用于在最终成片叠加台词字幕；默认 `false`，旧调用无需修改。接口路径、报价确认流程、积分算法及轮询下载方式不变。

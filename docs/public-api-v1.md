@@ -4,6 +4,8 @@ Duet API 用于提交视频生成任务，并在任务完成后返回最终视�
 
 本合同版本 `1.2.0` 新增报价与确认接口，支持先展示预计积分、用户确认后再执行。原有直接创建、查询、下载和账户接口保持兼容。
 
+本合同版本 `1.3.0` 新增多参考图：同一 `replacement_image` multipart 字段可重复传入 2～4 张图片；单图调用和其他既有行为保持兼容。
+
 生成请求支持可选字幕开关 `add_subtitles`，默认关闭；开启后在最终成片中叠加台词字幕。直接创建和报价都支持该参数，已有调用省略它即可保持原行为。
 
 视频生成通常需要数分钟，因此接口采用异步模式：创建任务后立即返回任务 ID；接入方使用任务 ID 查询状态；成功后再下载视频。
@@ -12,8 +14,8 @@ Duet API 用于提交视频生成任务，并在任务完成后返回最终视�
 
 | 项目 | 值 |
 |---|---|
-| 合同版本 | `1.2.0` |
-| 文档更新日期 | `2026-09-10` |
+| 合同版本 | `1.3.0` |
+| 文档更新日期 | `2026-09-15` |
 | 联调环境 | `https://8.166.140.227:3211` |
 | API 前缀 | `/api/v1` |
 | 鉴权 | HTTP Bearer API Key |
@@ -353,7 +355,7 @@ Content-Disposition: form-data; name="replacement_instruction"
 
 | 参数 | 类型 | 必填 | 默认值 | 可选值或约束 | 说明 |
 |---|---|---:|---|---|---|
-| `source_video` | binary | 条件必填 | 无 | MP4、MOV、WebM；最大 500 MiB；最长 300 秒 | 上传原视频；与 `source_video_url` 必须二选一 |
+| `source_video` | binary | 条件必填 | 无 | MP4、MOV、WebM；最大 500 MiB；最长 300 秒 | 上传原视频；与 `source_video_url` 必须二选一。文件名无可用扩展名时，multipart `Content-Type` 为 `video/mp4`、`video/quicktime` 或 `video/webm` 也可识别 |
 | `source_video_url` | string | 条件必填 | 无 | 无用户名密码的公网 HTTPS URL | 由服务端下载原视频；与 `source_video` 必须二选一 |
 | `aspect_ratio` | string | 否 | `9:16` | `9:16`、`16:9` | 输出画幅 |
 | `resolution` | string | 否 | `768p` | `768p`、`480p` | 输出清晰度 |
@@ -362,7 +364,7 @@ Content-Disposition: form-data; name="replacement_instruction"
 | `dialogue_mode` | string | 否 | `auto_rewrite` | `auto_rewrite`、`generate` | 台词模式；`auto_rewrite` 翻译并自然改写原台词，`generate` 按 `dialogue_brief` 描述自动生成台词 |
 | `dialogue_brief` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 口播台词的内容描述；`dialogue_mode` 为 `generate` 时必填，其余模式不允许提供 |
 | `replacement_image` | binary，可重复 | 条件必填 | 无 | 1–4 张 JPEG、PNG、WebP，每张最大 10 MiB；按 multipart 出现顺序编号 | 参考图，不预设图片类型或用途；必须与 `replacement_instruction` 同时提供，单图客户端无需变更 |
-| `replacement_instruction` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 描述如何使用参考图；必须与 `replacement_image` 同时提供 |
+| `replacement_instruction` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 描述如何使用参考图；一条说明对全部参考图生效，必须与 `replacement_image` 同时提供 |
 
 本接口没有 Path 或 Query 参数。仅 `replacement_image` 允许重复 1–4 次；其他未知或重复字段、超过 4 张图、同时提供两个视频来源或只提供参考图组合中的一个字段，都会返回 `422`。不使用参考图时同时省略图片和说明。
 
@@ -938,7 +940,7 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 | `422` | `dialogue_brief_too_long` | 台词描述超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
 | `422` | `replacement_instruction_too_long` | 替换说明超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
 | `422` | `invalid_source_video_url` | URL 不符合公网 HTTPS 规则或无法访问 | 修改 URL |
-| `422` | `invalid_create_request` | 包含未知或重复字段 | 只提交文档列出的字段一次 |
+| `422` | `invalid_create_request` | 包含未知或重复字段，或 `replacement_image` 超过 4 张 | 仅重复提交 `replacement_image`，且最多 4 张；其他字段各提交一次 |
 | `422` | `invalid_generation_request` | 生成参数组合无效 | 根据能力接口重新提交参数 |
 | `422` | `invalid_request` | 请求字段类型或结构不符合 v1 合同 | 按字段定义修正请求 |
 | `422` | `invalid_confirm_request` | 确认 JSON 损坏、重复字段或不严格等于 `{"confirm":true}` | 修正后确认原报价 |
