@@ -35,7 +35,10 @@ from app.pipeline import (
     SAME_AS_SOURCE_LANGUAGE,
     TRANSLATION_SCHEMA,
     _NO_REUSABLE_OUTPUT,
+    _dialogue_language_display,
+    _resolve_dialogue_language,
     _validate_dialogue_generation_shape,
+    _validate_dialogue_language,
     _validate_translation_shape,
 )
 from app.providers import CodexProcessError, ProviderFailure, ProviderResult
@@ -2496,9 +2499,11 @@ def test_dialogue_generation_node_carries_brief_and_segment_context(
         log,
         "deepseek-dialogue-generation",
         "project",
-        pipeline._dialogue_generation_payload("介绍产品", "中文", prepared),
+        pipeline._dialogue_generation_payload("介绍产品", "中文", prepared, "中文"),
         [],
-        lambda: pipeline._dialogue_generation_request("介绍产品", "中文", prepared),
+        lambda: pipeline._dialogue_generation_request(
+            "介绍产品", "中文", prepared, "中文",
+        ),
         transform=lambda value: pipeline._normalize_generated_dialogue(
             value, prepared,
         ),
@@ -2518,7 +2523,11 @@ def test_dialogue_generation_node_carries_brief_and_segment_context(
     }
     assert "# dialogue-writer" in call["instruction"]
     assert "台词语言为中文" in call["instruction"]
-    assert call["validator"] is _validate_dialogue_generation_shape
+    call["validator"]({"lines": [{"segment_index": 1, "text": "中文台词"}]})
+    with pytest.raises(ValueError, match="中文"):
+        call["validator"]({
+            "lines": [{"segment_index": 1, "text": "this is fully english output"}],
+        })
     # 段内多条按字数比例切分：第一句 6 字、第二句 3 字，共 9 字切 5 秒。
     assert generated == [
         {"start_s": 0.0, "end_s": pytest.approx(5.0 * 6 / 9), "text": "第一句台词呀"},
@@ -2552,12 +2561,153 @@ def test_dialogue_generation_same_language_still_calls_deepseek(
     )
 
     result = pipeline._dialogue_generation_request(
-        "介绍产品", SAME_AS_SOURCE_LANGUAGE, _generation_prepared(),
+        "介绍产品", SAME_AS_SOURCE_LANGUAGE, _generation_prepared(), "英语",
     )
 
     assert result.value == {"lines": [{"segment_index": 1, "text": "口播"}]}
     assert len(deepseek.calls) == 1
-    assert "没有源台词可抄" in deepseek.calls[0]["instruction"]
+    assert "台词语言为英语（与原视频相同）" in deepseek.calls[0]["instruction"]
+
+
+# ------------------------------------------- dialogue language resolution
+
+
+def test_resolve_dialogue_language_passes_through_concrete_target() -> None:
+    assert _resolve_dialogue_language("日语", [], "介绍产品") == "日语"
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        ([{"text": "Welcome back to the channel"}], "英语"),
+        # 品牌词/营销词是拉丁字母，不得把英文台词误判成别的语言。
+        ([{"text": "Y2K JovenPara just dropped"}], "英语"),
+        ([{"text": "欢迎来到我们的频道"}], "中文"),
+        ([{"text": "今日は良い天気ですね"}], "日语"),
+        ([{"text": "안녕하세요 여러분"}], "韩语"),
+    ],
+)
+def test_resolve_dialogue_language_follows_source_dialogue_script(
+    lines: list[dict[str, Any]], expected: str,
+) -> None:
+    # 中文 brief 不得盖过源台词文本的字符集证据。
+    assert (
+        _resolve_dialogue_language(SAME_AS_SOURCE_LANGUAGE, lines, "介绍产品")
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("brief", "expected"),
+    [("介绍产品", "中文"), ("promote the new drop", "英语")],
+)
+def test_resolve_dialogue_language_without_dialogue_falls_back_to_brief(
+    brief: str, expected: str,
+) -> None:
+    assert (
+        _resolve_dialogue_language(SAME_AS_SOURCE_LANGUAGE, [], brief)
+        == expected
+    )
+
+
+def test_resolve_dialogue_language_without_any_signal_raises() -> None:
+    with pytest.raises(ValueError, match="具体语种"):
+        _resolve_dialogue_language(SAME_AS_SOURCE_LANGUAGE, [], "123 !!!")
+
+
+def test_dialogue_language_display_annotates_same_as_source() -> None:
+    assert _dialogue_language_display(
+        SAME_AS_SOURCE_LANGUAGE, [{"text": "Welcome back"}],
+    ) == "英语（与原视频相同）"
+    assert _dialogue_language_display("中文", [{"text": "Welcome back"}]) == "中文"
+    # 无台词时语言没有消费者，保留占位语义，不得凭空捏造语种。
+    assert (
+        _dialogue_language_display(SAME_AS_SOURCE_LANGUAGE, [])
+        == SAME_AS_SOURCE_LANGUAGE
+    )
+
+
+def test_dialogue_generation_payload_replaces_placeholder_with_concrete_language() -> (
+    None
+):
+    payload = Pipeline._dialogue_generation_payload(
+        "介绍产品", SAME_AS_SOURCE_LANGUAGE, _generation_prepared(), "英语",
+    )
+    assert payload["target_language"] != SAME_AS_SOURCE_LANGUAGE
+    assert payload["target_language"] == "英语（与原视频相同）"
+
+
+def test_dialogue_generation_same_language_resolves_concrete_language(
+    tmp_path: Path,
+) -> None:
+    deepseek = _RecordingDeepSeek({"lines": [{"segment_index": 1, "text": "口播"}]})
+    store = ProjectStore(tmp_path / "projects")
+    store.create(
+        _effective_request(dialogue_mode="generate", brief="介绍产品"),
+        "request-generate-resolved-language",
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=deepseek,
+        mediakit=object(),
+        picsart=object(),
+    )
+
+    pipeline._dialogue_generation_request(
+        "介绍产品", SAME_AS_SOURCE_LANGUAGE, _generation_prepared(), "英语",
+    )
+
+    assert len(deepseek.calls) == 1
+    call = deepseek.calls[0]
+    assert "台词语言为英语（与原视频相同）" in call["instruction"]
+    assert "brief 与画面描述的语言不得影响台词语言" in call["instruction"]
+    assert call["payload"]["target_language"] == "英语（与原视频相同）"
+    call["validator"]({
+        "lines": [{"segment_index": 1, "text": "Y2K is back with JovenPara"}],
+    })
+    with pytest.raises(ValueError, match="英语"):
+        call["validator"]({
+            "lines": [
+                {"segment_index": 1, "text": "欢迎来到我们的频道今天介绍新品"},
+            ],
+        })
+
+
+# ------------------------------------------- dialogue language validation
+
+
+def test_validate_dialogue_language_rejects_clear_contradiction() -> None:
+    with pytest.raises(ValueError, match="英语"):
+        _validate_dialogue_language(
+            {"lines": [{"segment_index": 1, "text": "欢迎来到我们的频道，今天介绍新品"}]},
+            "英语",
+        )
+
+
+def test_validate_dialogue_language_allows_brand_words_in_english() -> None:
+    _validate_dialogue_language(
+        {"lines": [{"segment_index": 1, "text": "Y2K is back, JovenPara just dropped a new collection"}]},
+        "英语（与原视频相同）",
+    )
+
+
+def test_validate_dialogue_language_allows_chinese_with_brand_words() -> None:
+    _validate_dialogue_language(
+        {"lines": [{"segment_index": 1, "text": "Y2K 风格强势回归，JovenPara 新品刚刚上架"}]},
+        "中文",
+    )
+
+
+def test_validate_dialogue_language_fails_open_when_undecidable() -> None:
+    # 映射不到字符集的语种不做语言门禁。
+    _validate_dialogue_language(
+        {"lines": [{"segment_index": 1, "text": "欢迎来到我们的频道，今天介绍新品"}]},
+        "法语",
+    )
+    # 文本太短、证据不足时放行，绝不误杀。
+    _validate_dialogue_language({"lines": [{"segment_index": 1, "text": "OK"}]}, "中文")
 
 
 @pytest.mark.parametrize(
@@ -2631,6 +2781,8 @@ def test_continue_after_prepared_selects_dialogue_node_by_mode(
     assert [node for node, _inputs in calls] == [expected_node]
     if mode == "generate":
         assert calls[0][1]["brief"] == "介绍产品"
+        # spoken_lines 为空时回退到 brief 的字符集判定语种，绝不喂裸占位符。
+        assert calls[0][1]["target_language"] == "中文（与原视频相同）"
         assert calls[0][1]["duration_s"] == 8.0
         assert [
             segment["visual_prompt"] for segment in calls[0][1]["segments"]

@@ -28,6 +28,7 @@ from app.pipeline import (
     R2V_SKILL,
     Pipeline,
     SAME_AS_SOURCE_LANGUAGE,
+    _resolve_dialogue_language,
     _validate_dialogue_generation_shape,
     _validate_translation_shape,
 )
@@ -133,8 +134,14 @@ def test_deepseek_dialogue_generation(
     if not pipeline_instance.settings.deepseek_api_key:
         pytest.skip("DEEPSEEK_API_KEY is not set")
     prepared = payload["segments"]
+    # Fixtures predate per-project voice_lines; a bare placeholder in an old
+    # fixture resolves from the brief, exactly like a no-dialogue project.
+    resolved_language = _resolve_dialogue_language(
+        payload["target_language"], [], payload["brief"],
+    )
     result = pipeline_instance._dialogue_generation_request(
         payload["brief"], payload["target_language"], prepared,
+        resolved_language,
     )
     _validate_dialogue_generation_shape(result.value)
     generated = Pipeline._normalize_generated_dialogue(result.value, prepared)

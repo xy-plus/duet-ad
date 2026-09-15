@@ -137,6 +137,161 @@ def _validate_dialogue_generation_shape(value: dict[str, Any]) -> None:
     ):
         raise ValueError("dialogue generation output is invalid")
 
+
+def _script_family(ch: str) -> str | None:
+    cp = ord(ch)
+    if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or 0xF900 <= cp <= 0xFAFF:
+        return "han"
+    if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF:
+        return "kana"
+    if 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F:
+        return "hangul"
+    if "a" <= ch <= "z" or "A" <= ch <= "Z":
+        return "latin"
+    return None
+
+
+_SCRIPT_LANGUAGE = {"han": "中文", "kana": "日语", "hangul": "韩语", "latin": "英语"}
+_LANGUAGE_FAMILY = {language: family for family, language in _SCRIPT_LANGUAGE.items()}
+
+
+def _dominant_script_language(text: str) -> str | None:
+    """Classify text by script evidence; None when there is no letter evidence.
+
+    whisper.cpp runs with ``-l auto`` and does detect a language, but
+    media.transcribe only persists the transcript lines into state, so the
+    transcript text itself is the strongest available language signal.
+    Kana and hangul are exclusive to Japanese/Korean, so their presence is
+    diagnostic (a decorative の in Chinese copy stays Chinese because its
+    kana volume is dwarfed by han). Han vs latin is decided by majority.
+    Latin-script languages all classify as 英语; that is the documented
+    limit of this heuristic (digits, punctuation and emoji carry no
+    signal)."""
+    counts: dict[str, int] = {}
+    for ch in text:
+        family = _script_family(ch)
+        if family is not None:
+            counts[family] = counts.get(family, 0) + 1
+    if not counts:
+        return None
+    kana = counts.get("kana", 0)
+    hangul = counts.get("hangul", 0)
+    han = counts.get("han", 0)
+    latin = counts.get("latin", 0)
+    if kana and kana * 2 >= han and kana >= latin:
+        return "日语"
+    if hangul and hangul * 2 >= han and hangul >= latin:
+        return "韩语"
+    if han and han >= latin:
+        return "中文"
+    if latin:
+        return "英语"
+    return None
+
+
+def _resolve_dialogue_language(
+    target_language: str,
+    voice_lines: list[dict[str, Any]],
+    brief: str,
+) -> str:
+    """Resolve the dialogue language deterministically for DeepSeek.
+
+    A concrete target passes through unchanged. The same-as-source
+    placeholder inherits the language of the source transcript's dominant
+    script; when the source video has no dialogue there is nothing to
+    inherit, so the brief's dominant script decides (a brief written in
+    Chinese almost always wants Chinese narration). With no signal at all
+    the ambiguity is raised instead of silently guessed."""
+    if target_language != SAME_AS_SOURCE_LANGUAGE:
+        return target_language
+    source_text = " ".join(
+        str(line.get("text") or "")
+        for line in voice_lines
+        if isinstance(line, dict)
+    )
+    language = _dominant_script_language(source_text)
+    if language is not None:
+        return language
+    language = _dominant_script_language(brief)
+    if language is not None:
+        return language
+    raise ValueError(
+        f"target_language 为“{SAME_AS_SOURCE_LANGUAGE}”，但源视频无台词且 "
+        "brief 无法判定语种；请把 target_language 改为具体语种"
+    )
+
+
+def _dialogue_language_display(
+    target_language: str, sample_lines: list[dict[str, Any]],
+) -> str:
+    """Concrete, annotated language label for model payloads and logs.
+
+    Same-as-source is annotated with the actual dialogue text's language so
+    no model ever sees the bare placeholder; with no dialogue at all the
+    language has no consumer, so the placeholder passes through unchanged
+    rather than inventing a language."""
+    if target_language != SAME_AS_SOURCE_LANGUAGE:
+        return target_language
+    text = " ".join(
+        str(line.get("text") or "")
+        for line in sample_lines
+        if isinstance(line, dict)
+    )
+    language = _dominant_script_language(text)
+    if language is None:
+        return target_language
+    return f"{language}（{SAME_AS_SOURCE_LANGUAGE}）"
+
+
+# Language-consistency gate for generated dialogue: fail-open by design.
+# It only rejects a clear contradiction (the wrong script dominates the
+# output), never borderline mixes, so normal output can never loop the
+# JSON repair cycle forever.
+_DIALOGUE_LANGUAGE_MIN_LETTERS = 8
+_DIALOGUE_LANGUAGE_DOMINANCE = 0.7
+
+
+def _validate_dialogue_language(
+    value: dict[str, Any], expected_language: str,
+) -> None:
+    """Reject generated dialogue whose dominant script contradicts the target.
+
+    Only fires on an unambiguous mismatch (wrong script family at
+    >= _DIALOGUE_LANGUAGE_DOMINANCE of >= _DIALOGUE_LANGUAGE_MIN_LETTERS
+    script letters); brand words, numbers and mixed text pass through, and
+    target languages without a script mapping are not gated at all."""
+    expected_family = next(
+        (
+            family
+            for language, family in _LANGUAGE_FAMILY.items()
+            if language in expected_language
+        ),
+        None,
+    )
+    if expected_family is None:
+        return
+    lines = value.get("lines")
+    items = lines if isinstance(lines, list) else []
+    counts: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        for ch in item["text"]:
+            family = _script_family(ch)
+            if family is not None:
+                counts[family] = counts.get(family, 0) + 1
+    total = sum(counts.values())
+    if total < _DIALOGUE_LANGUAGE_MIN_LETTERS:
+        return
+    dominant_family = max(counts, key=counts.get)
+    if dominant_family == expected_family:
+        return
+    if counts[dominant_family] / total >= _DIALOGUE_LANGUAGE_DOMINANCE:
+        raise ValueError(
+            f"台词语言应为{expected_language}，但输出以"
+            f"{_SCRIPT_LANGUAGE[dominant_family]}为主；请用指定语言重写全部台词"
+        )
+
 PICSART_RECEIPT_VERSION = 2
 H3_PREPARED_ARTIFACTS_VERSION = 7
 REPLACEMENT_SHEET_VERSION = 4
@@ -1156,7 +1311,9 @@ class Pipeline:
                 }
                 for item in sorted(prepared, key=lambda value: int(value["index"]))
             ],
-            "target_language": target_language,
+            "target_language": _dialogue_language_display(
+                target_language, translated_lines,
+            ),
             "translated_dialogue": translated_lines,
             "user_replacement_instruction": user_instruction,
             "has_user_image": user_reference is not None,
@@ -2283,17 +2440,20 @@ class Pipeline:
         target_language = request["dialogue"]["target_language"]
         if request["dialogue"]["mode"] == "generate":
             brief = request["dialogue"]["brief"]
+            resolved_language = _resolve_dialogue_language(
+                target_language, spoken_lines, brief,
+            )
             self._progress(project_id, 43, "dialogue-generation")
             translated_lines = self._node(
                 log,
                 "deepseek-dialogue-generation",
                 "project",
                 self._dialogue_generation_payload(
-                    brief, target_language, prepared,
+                    brief, target_language, prepared, resolved_language,
                 ),
                 [],
                 lambda: self._dialogue_generation_request(
-                    brief, target_language, prepared,
+                    brief, target_language, prepared, resolved_language,
                 ),
                 transform=lambda value: self._normalize_generated_dialogue(
                     value, prepared,
@@ -5029,6 +5189,7 @@ class Pipeline:
         brief: str,
         target_language: str,
         prepared: list[dict[str, Any]],
+        resolved_language: str,
     ) -> dict[str, Any]:
         segments = [
             {
@@ -5040,9 +5201,16 @@ class Pipeline:
             for item in prepared
         ]
         duration_s = segments[-1]["end_s"] if segments else 0.0
+        # The model must see a concrete language; the same-as-source
+        # placeholder is kept only as an annotation for log readability.
+        language_label = (
+            f"{resolved_language}（{SAME_AS_SOURCE_LANGUAGE}）"
+            if target_language == SAME_AS_SOURCE_LANGUAGE
+            else resolved_language
+        )
         return {
             "brief": brief,
-            "target_language": target_language,
+            "target_language": language_label,
             "duration_s": duration_s,
             "segments": segments,
         }
@@ -5052,26 +5220,34 @@ class Pipeline:
         brief: str,
         target_language: str,
         prepared: list[dict[str, Any]],
+        resolved_language: str,
     ) -> ProviderResult[Any]:
         skill = DIALOGUE_WRITER_SKILL.read_text(encoding="utf-8")
         if target_language == SAME_AS_SOURCE_LANGUAGE:
             language_instruction = (
-                "台词语言使用源视频画面的原始语言；"
-                "target_language 的占位值只表示语言不变，没有源台词可抄。"
+                f"台词语言为{resolved_language}（与原视频相同）；"
+                "brief 与画面描述的语言不得影响台词语言。"
             )
         else:
-            language_instruction = f"台词语言为{target_language}。"
+            language_instruction = f"台词语言为{resolved_language}。"
         instruction = (
             skill
             + "\n\n本次执行口播台词生成；"
             + language_instruction
             + "最终输出严格遵循本次注入的 JSON Schema。"
         )
+
+        def _validate(value: dict[str, Any]) -> None:
+            _validate_dialogue_generation_shape(value)
+            _validate_dialogue_language(value, resolved_language)
+
         return self.deepseek.complete_structured(
             instruction,
-            self._dialogue_generation_payload(brief, target_language, prepared),
+            self._dialogue_generation_payload(
+                brief, target_language, prepared, resolved_language,
+            ),
             DIALOGUE_GENERATION_SCHEMA,
-            validator=_validate_dialogue_generation_shape,
+            validator=_validate,
         )
 
     @staticmethod
