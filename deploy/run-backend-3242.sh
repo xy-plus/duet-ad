@@ -15,8 +15,10 @@ set +a
 # Experiment data stays inside the object-mask worktree; never touch the
 # release/production data directories.
 export DATA_DIR=/home/xy/duet-ad1-h3-max-r2v-object-mask/data
-# Internal API only; the paid public v1 API stays exclusive to production.
-export PUBLIC_API_ENABLED=0
+# Public v1 API enabled on this test port for external-API acceptance runs
+# (same clients file as production; paid runs still require explicit user approval).
+export PUBLIC_API_ENABLED=1
+export PUBLIC_API_CLIENTS_FILE=/home/xy/.config/duet-ad1-h3-r2v/public-api-clients.json
 # Asset URLs must resolve back to THIS instance: 3241 is a dedicated public
 # port fronted by the experiment caddy (same cert as production 3211).
 export PUBLIC_BASE_URL=https://8.166.140.227:3241
