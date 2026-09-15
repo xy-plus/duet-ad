@@ -25,7 +25,8 @@
       "fit_mode": "auto",
       "optimize_image": true,
       "remove_subtitle": true,
-      "remove_logo": true
+      "remove_logo": true,
+      "add_subtitles": false
     },
     "dialogue": {
       "modes": ["auto_rewrite", "generate"],
@@ -42,6 +43,7 @@
       "supported": true,
       "accept": ["image/jpeg", "image/png", "image/webp"],
       "max_bytes": 10485760,
+      "max_images": 4,
       "max_instruction_chars": 1000
     }
   }
@@ -60,7 +62,7 @@
 | `file` | 条件必填 | 本地上传；与 `reference_url` 二选一 |
 | `client_request_id` | 是 | 创建请求幂等键 |
 | `generation_request` | 是 | 下述 JSON 字符串 |
-| `replacement_image` | 条件必填 | 仅在提供替换说明时上传 |
+| `replacement_image` | 条件必填 | 仅在提供替换说明时上传；多图时重复传该字段 |
 
 上表五个字段构成当前客户端创建输入；服务端内部字段不属于公开合同。
 
@@ -106,6 +108,8 @@
   }
 }
 ```
+
+需要多张参考图时，在同一个 multipart 请求中重复传 `replacement_image` 字段，共 2 至 4 张；每张不超过 10 MB，格式限 `image/jpeg`、`image/png`、`image/webp`。`replacement_guidance` 仍只有一份，对全部参考图生效。
 
 必要约束只有：
 
@@ -182,6 +186,8 @@
 
 `creation_input.version` 必须严格等于整数 `1`；`source.mode` 只能是 `link` 或 `upload`，并携带对应示例中的精确字段。`replacement_image` 未提供时必须为 `null`；提供时必须与冻结输入回执一致。`preview_url` 固定指向当前项目的鉴权只读接口 `GET /api/conversations/{id}/creation-input/replacement-image`，不得接受路径参数、覆盖或重新提交素材。
 
+多图创建时 `creation_input` 额外携带 `replacement_images` 数组，与上传顺序一致；`replacement_image` 保持为首图投影不变。数组每项的 `preview_url` 指向同一形式的鉴权只读接口 `GET /api/conversations/{id}/creation-input/replacement-images/{index}`，`index` 从 1 开始。冻结的请求指纹回执 `input_receipt.version` 单图（含无参考图）为 `1`，与线上 v1 逐位兼容；多图为 `2`，并携带全部参考图的哈希回执。
+
 `GET /api/conversations` 和 `GET /api/conversations/{id}` 都需要返回：
 
 ```json
@@ -205,12 +211,15 @@
 
 | HTTP | code | 条件 |
 | --- | --- | --- |
+| 400 | `invalid_client_request_id` | 幂等键为空或超过 64 个字符 |
 | 400 | `source_exactly_one_required` | 视频来源不是恰好一个 |
 | 409 | `client_request_id_conflict` | 同一幂等键对应不同输入 |
+| 413 | `upload_too_large` | 上传的视频或参考图超过大小限制 |
+| 415 | `unsupported_replacement_image` | 参考图格式不支持 |
+| 422 | `invalid_creation_form` | 创建字段未知、重复，或参考图超过 4 张 |
 | 422 | `invalid_generation_request` | JSON 结构或固定配置错误 |
 | 422 | `target_language_required` | 最终语种为空 |
 | 422 | `replacement_pair_required` | 参考图与说明未成对提供 |
-| 413/415 | `invalid_replacement_image` | 图片超限或格式不支持 |
 
 校验失败不得创建项目或调用付费服务。
 
