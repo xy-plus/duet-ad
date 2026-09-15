@@ -24,8 +24,7 @@
 ## 部署
 
 - 主工作区服务：3301（caddy 前端）→ 3302（后端），`systemctl --user restart duet-ad1-h3-max-r2v.service`。
-- 生产：3211（caddy，含对外 v1 API）→ 3212（后端），服务 `duet-ad1-h3-max-r2v-release{,-caddy}.service`。3212 后端实际跑 online 工作树 `/home/xy/duet-ad1-h3-max-r2v-online`（分支 `online/pre-adaptation`），DATA_DIR 指向 `/home/xy/duet-ad1-h3-max-r2v-release/data`；3211 caddy 用 release 树的 `deploy/caddy-3211.json` 纯反代 3212，web 静态文件由后端进程从代码树 `web/` 提供。
-- 今晚上线（2026-09-15）后 3212 切到实验分支 `experiment/object-gray-mask-multiref`（工作树 `/home/xy/duet-ad1-h3-max-r2v-object-mask`），步骤见该树 `deploy/production-cutover-3212.md`；上线后由实施者更新本节为新的代码树真相。
+- 生产：3211（caddy，含对外 v1 API）→ 3212（后端），服务 `duet-ad1-h3-max-r2v-release{,-caddy}.service`。3212 后端跑本工作树（分支 `experiment/object-gray-mask-multiref`，2026-09-16 由 online 树切入，runbook 见 `deploy/production-cutover-3212.md`，回滚锚点 online 树 HEAD `fff908d` + unit 备份 `~/.config/systemd/user/duet-ad1-h3-max-r2v-release.service.pre-cutover-20260915`），DATA_DIR 指向 `/home/xy/duet-ad1-h3-max-r2v-release/data`；3211 caddy 用 release 树的 `deploy/caddy-3211.json` 纯反代 3212，web 静态文件由后端进程从本树 `web/` 提供。online 树 `/home/xy/duet-ad1-h3-max-r2v-online` 保留不动作回滚锚点。
 - 重启服务会掐断在飞项目：重启后标 `process_restarted`，但满足续跑门禁的项目会在服务启动时自动排队续跑（记 `auto_resumed_after_restart`；无 accepted 提交日志佐证的 `submission_started` 回执自动降级为 rejected 后走 resume-picsart 等效路径）。部署前仍应先确认没有在跑的项目，避免浪费在飞任务的进度与费用。
 
 ## 工作方式
