@@ -2499,7 +2499,7 @@ def test_dialogue_generation_node_carries_brief_and_segment_context(
         log,
         "deepseek-dialogue-generation",
         "project",
-        pipeline._dialogue_generation_payload("介绍产品", "中文", prepared, "中文"),
+        pipeline._dialogue_generation_payload("介绍产品", prepared, "中文"),
         [],
         lambda: pipeline._dialogue_generation_request(
             "介绍产品", "中文", prepared, "中文",
@@ -2566,7 +2566,7 @@ def test_dialogue_generation_same_language_still_calls_deepseek(
 
     assert result.value == {"lines": [{"segment_index": 1, "text": "口播"}]}
     assert len(deepseek.calls) == 1
-    assert "台词语言为英语（与原视频相同）" in deepseek.calls[0]["instruction"]
+    assert "台词语言为英语" in deepseek.calls[0]["instruction"]
 
 
 # ------------------------------------------- dialogue language resolution
@@ -2615,26 +2615,23 @@ def test_resolve_dialogue_language_without_any_signal_raises() -> None:
         _resolve_dialogue_language(SAME_AS_SOURCE_LANGUAGE, [], "123 !!!")
 
 
-def test_dialogue_language_display_annotates_same_as_source() -> None:
+def test_dialogue_language_display_returns_concrete_language_only() -> None:
     assert _dialogue_language_display(
         SAME_AS_SOURCE_LANGUAGE, [{"text": "Welcome back"}],
-    ) == "英语（与原视频相同）"
+    ) == "英语"
     assert _dialogue_language_display("中文", [{"text": "Welcome back"}]) == "中文"
-    # 无台词时语言没有消费者，保留占位语义，不得凭空捏造语种。
-    assert (
-        _dialogue_language_display(SAME_AS_SOURCE_LANGUAGE, [])
-        == SAME_AS_SOURCE_LANGUAGE
-    )
+    # 无台词时语言没有消费者：给空串，不捏造语种，也绝不把占位符喂给模型。
+    assert _dialogue_language_display(SAME_AS_SOURCE_LANGUAGE, []) == ""
 
 
 def test_dialogue_generation_payload_replaces_placeholder_with_concrete_language() -> (
     None
 ):
     payload = Pipeline._dialogue_generation_payload(
-        "介绍产品", SAME_AS_SOURCE_LANGUAGE, _generation_prepared(), "英语",
+        "介绍产品", _generation_prepared(), "英语",
     )
-    assert payload["target_language"] != SAME_AS_SOURCE_LANGUAGE
-    assert payload["target_language"] == "英语（与原视频相同）"
+    assert payload["target_language"] == "英语"
+    assert SAME_AS_SOURCE_LANGUAGE not in json.dumps(payload, ensure_ascii=False)
 
 
 def test_dialogue_generation_same_language_resolves_concrete_language(
@@ -2661,9 +2658,15 @@ def test_dialogue_generation_same_language_resolves_concrete_language(
 
     assert len(deepseek.calls) == 1
     call = deepseek.calls[0]
-    assert "台词语言为英语（与原视频相同）" in call["instruction"]
+    assert "台词语言为英语；" in call["instruction"]
     assert "brief 与画面描述的语言不得影响台词语言" in call["instruction"]
-    assert call["payload"]["target_language"] == "英语（与原视频相同）"
+    assert call["payload"]["target_language"] == "英语"
+    # 回归：进入 complete_structured 的文本不得含占位符/注解字样——模型看
+    # 不到原视频，“与原视频相同”对它是无信息量的噪声。
+    model_facing = call["instruction"] + json.dumps(
+        call["payload"], ensure_ascii=False,
+    )
+    assert SAME_AS_SOURCE_LANGUAGE not in model_facing
     call["validator"]({
         "lines": [{"segment_index": 1, "text": "Y2K is back with JovenPara"}],
     })
@@ -2689,7 +2692,7 @@ def test_validate_dialogue_language_rejects_clear_contradiction() -> None:
 def test_validate_dialogue_language_allows_brand_words_in_english() -> None:
     _validate_dialogue_language(
         {"lines": [{"segment_index": 1, "text": "Y2K is back, JovenPara just dropped a new collection"}]},
-        "英语（与原视频相同）",
+        "英语",
     )
 
 
@@ -2782,7 +2785,7 @@ def test_continue_after_prepared_selects_dialogue_node_by_mode(
     if mode == "generate":
         assert calls[0][1]["brief"] == "介绍产品"
         # spoken_lines 为空时回退到 brief 的字符集判定语种，绝不喂裸占位符。
-        assert calls[0][1]["target_language"] == "中文（与原视频相同）"
+        assert calls[0][1]["target_language"] == "中文"
         assert calls[0][1]["duration_s"] == 8.0
         assert [
             segment["visual_prompt"] for segment in calls[0][1]["segments"]

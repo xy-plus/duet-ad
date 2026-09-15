@@ -224,12 +224,13 @@ def _resolve_dialogue_language(
 def _dialogue_language_display(
     target_language: str, sample_lines: list[dict[str, Any]],
 ) -> str:
-    """Concrete, annotated language label for model payloads and logs.
+    """Concrete language label for model payloads.
 
-    Same-as-source is annotated with the actual dialogue text's language so
-    no model ever sees the bare placeholder; with no dialogue at all the
-    language has no consumer, so the placeholder passes through unchanged
-    rather than inventing a language."""
+    Models never see the source video, so the same-as-source placeholder is
+    noise to them: it is always resolved to a concrete language here (the
+    "与原视频相同" provenance stays in state.json's effective_request). With
+    no dialogue at all the language has no consumer, so the label is empty
+    rather than an invented language."""
     if target_language != SAME_AS_SOURCE_LANGUAGE:
         return target_language
     text = " ".join(
@@ -239,8 +240,8 @@ def _dialogue_language_display(
     )
     language = _dominant_script_language(text)
     if language is None:
-        return target_language
-    return f"{language}（{SAME_AS_SOURCE_LANGUAGE}）"
+        return ""
+    return language
 
 
 # Language-consistency gate for generated dialogue: fail-open by design.
@@ -2449,7 +2450,7 @@ class Pipeline:
                 "deepseek-dialogue-generation",
                 "project",
                 self._dialogue_generation_payload(
-                    brief, target_language, prepared, resolved_language,
+                    brief, prepared, resolved_language,
                 ),
                 [],
                 lambda: self._dialogue_generation_request(
@@ -5187,7 +5188,6 @@ class Pipeline:
     @staticmethod
     def _dialogue_generation_payload(
         brief: str,
-        target_language: str,
         prepared: list[dict[str, Any]],
         resolved_language: str,
     ) -> dict[str, Any]:
@@ -5201,16 +5201,12 @@ class Pipeline:
             for item in prepared
         ]
         duration_s = segments[-1]["end_s"] if segments else 0.0
-        # The model must see a concrete language; the same-as-source
-        # placeholder is kept only as an annotation for log readability.
-        language_label = (
-            f"{resolved_language}（{SAME_AS_SOURCE_LANGUAGE}）"
-            if target_language == SAME_AS_SOURCE_LANGUAGE
-            else resolved_language
-        )
+        # The model never sees the source video, so only the concrete
+        # resolved language goes into the payload; the same-as-source
+        # provenance stays in state.json's effective_request.
         return {
             "brief": brief,
-            "target_language": language_label,
+            "target_language": resolved_language,
             "duration_s": duration_s,
             "segments": segments,
         }
@@ -5225,7 +5221,7 @@ class Pipeline:
         skill = DIALOGUE_WRITER_SKILL.read_text(encoding="utf-8")
         if target_language == SAME_AS_SOURCE_LANGUAGE:
             language_instruction = (
-                f"台词语言为{resolved_language}（与原视频相同）；"
+                f"台词语言为{resolved_language}；"
                 "brief 与画面描述的语言不得影响台词语言。"
             )
         else:
@@ -5243,9 +5239,7 @@ class Pipeline:
 
         return self.deepseek.complete_structured(
             instruction,
-            self._dialogue_generation_payload(
-                brief, target_language, prepared, resolved_language,
-            ),
+            self._dialogue_generation_payload(brief, prepared, resolved_language),
             DIALOGUE_GENERATION_SCHEMA,
             validator=_validate,
         )
