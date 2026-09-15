@@ -16,52 +16,13 @@ SEEDREAM_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MULTIREF_MODES = frozenset({"composed", "direct"})
 
-# 已知 8 家视频理解 provider；注册表与实现在 app/object_detect.py，
-# 两处清单必须保持一致（object_detect.py 断言）。
-DOUBAO_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
-# 模型 ID 以火山方舟控制台为准，改动时同步 DOUBAO_MODEL 环境变量。
-DOUBAO_GROUNDING_MODEL = "doubao-seed-2-1-pro-260628"
-QWEN_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-# 模型 ID 以阿里云百炼控制台为准，改动时同步 QWEN_MODEL 环境变量。
-QWEN_GROUNDING_MODEL = "qwen3-vl-plus"
-GLM_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
-GLM_GROUNDING_MODEL = "glm-4.5v"
-HUNYUAN_API_BASE = "https://api.hunyuan.cloud.tencent.com/v1"
-HUNYUAN_VISION_MODEL = "hunyuan-large-vision"
-KIMI_API_BASE = "https://api.moonshot.cn/v1"
-# k2.5/k3 不支持视频输入；模型 ID 以 Moonshot 控制台为准。
-KIMI_GROUNDING_MODEL = "kimi-k2.6"
-STEP_API_BASE = "https://api.stepfun.com/v1"
-# 模型 ID 以阶跃星辰控制台为准（Step-1.5V 起支持视频理解），改动时同步
-# STEP_MODEL 环境变量。
-STEP_GROUNDING_MODEL = "step-3.7-flash"
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
-GEMINI_MODEL = "gemini-2.5-flash"
-# fal.ai SAM 3.1 video-rle：队列 base 含端点路径，model 为端点末段，
-# 提交 URL = <base>/<model>。凭证环境变量名沿用 fal 平台统一约定 FAL_KEY
-# （不是 FAL_SAM3_API_KEY），映射见 _PROVIDER_KEY_ENV。
+# 物品检测只走 fal.ai SAM 3.1 video-rle（实现见 app/object_detect.py）：
+# 队列 base 含端点路径，model 为端点末段，提交 URL = <base>/<model>。
+# 凭证环境变量名沿用 fal 平台统一约定 FAL_KEY（不是 FAL_SAM3_API_KEY）。
 # 端点从 sam-3 升级到 sam-3-1（schema 一致，仅多一个可选 max_num_objects，
 # 默认 16）；仍可用 FAL_SAM3_API_BASE 配回旧端点。
 FAL_SAM3_API_BASE = "https://queue.fal.run/fal-ai/sam-3-1"
 FAL_SAM3_MODEL = "video-rle"
-# (名称, 默认 API base, 默认模型) 驱动 Settings 校验与 get_settings 的环境
-# 变量读取（<NAME>_API_KEY / <NAME>_API_BASE / <NAME>_MODEL）。
-_OBJECT_DETECT_PROVIDER_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("doubao", DOUBAO_API_BASE, DOUBAO_GROUNDING_MODEL),
-    ("qwen", QWEN_API_BASE, QWEN_GROUNDING_MODEL),
-    ("glm", GLM_API_BASE, GLM_GROUNDING_MODEL),
-    ("hunyuan", HUNYUAN_API_BASE, HUNYUAN_VISION_MODEL),
-    ("kimi", KIMI_API_BASE, KIMI_GROUNDING_MODEL),
-    ("step", STEP_API_BASE, STEP_GROUNDING_MODEL),
-    ("gemini", GEMINI_API_BASE, GEMINI_MODEL),
-    ("fal_sam3", FAL_SAM3_API_BASE, FAL_SAM3_MODEL),
-)
-OBJECT_DETECT_PROVIDER_NAMES = tuple(
-    name for name, _base, _model in _OBJECT_DETECT_PROVIDER_SPECS
-)
-# 凭证环境变量名与 <NAME>_API_KEY 约定不一致的 provider（fal 统一用 FAL_KEY）；
-# 校验报错文案与 get_settings 读取都用这里的名字。
-_PROVIDER_KEY_ENV = {"fal_sam3": "FAL_KEY"}
 # 代理只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
 # Scheme 白名单见 __post_init__。
 _PROXY_SCHEMES = frozenset({"http", "https"})
@@ -110,32 +71,8 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
-    # 有序启用列表；空 = 未配置 = 物品灰块节点不触发。名称必须是已知 8 家
-    # 之一（OBJECT_DETECT_PROVIDER_NAMES），名称与选择一律不出现在公开 API。
-    object_detect_providers: tuple[str, ...] = ()
-    # 每家的 <name>_api_key 缺省 None 表示未配置（该 provider 不启用）；
-    # 默认值来自 _OBJECT_DETECT_PROVIDER_SPECS。
-    doubao_api_key: str | None = field(default=None, repr=False)
-    doubao_api_base: str = DOUBAO_API_BASE
-    doubao_model: str = DOUBAO_GROUNDING_MODEL
-    qwen_api_key: str | None = field(default=None, repr=False)
-    qwen_api_base: str = QWEN_API_BASE
-    qwen_model: str = QWEN_GROUNDING_MODEL
-    glm_api_key: str | None = field(default=None, repr=False)
-    glm_api_base: str = GLM_API_BASE
-    glm_model: str = GLM_GROUNDING_MODEL
-    hunyuan_api_key: str | None = field(default=None, repr=False)
-    hunyuan_api_base: str = HUNYUAN_API_BASE
-    hunyuan_model: str = HUNYUAN_VISION_MODEL
-    kimi_api_key: str | None = field(default=None, repr=False)
-    kimi_api_base: str = KIMI_API_BASE
-    kimi_model: str = KIMI_GROUNDING_MODEL
-    step_api_key: str | None = field(default=None, repr=False)
-    step_api_base: str = STEP_API_BASE
-    step_model: str = STEP_GROUNDING_MODEL
-    gemini_api_key: str | None = field(default=None, repr=False)
-    gemini_api_base: str = GEMINI_API_BASE
-    gemini_model: str = GEMINI_MODEL
+    # fal SAM-3 物品检测；fal_sam3_api_key 缺省 None = 未配置（FAL_KEY 未设，
+    # 物品灰块节点不触发）。默认值来自上方 FAL_SAM3_API_BASE / FAL_SAM3_MODEL。
     fal_sam3_api_key: str | None = field(default=None, repr=False)
     fal_sam3_api_base: str = FAL_SAM3_API_BASE
     fal_sam3_model: str = FAL_SAM3_MODEL
@@ -145,9 +82,6 @@ class Settings:
     # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高）；
     # 合法区间 (0, 1]，加载期校验。
     fal_sam3_threshold: float = 0.3
-    # 国内直连 generativelanguage.googleapis.com 不通时需代理，
-    # 本机一般为 http://127.0.0.1:7897；None = 直连。
-    gemini_proxy: str | None = None
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -274,75 +208,58 @@ class Settings:
         if not isinstance(clients_file, Path):
             raise ValueError("PUBLIC_API_CLIENTS_FILE must be a filesystem path")
         object.__setattr__(self, "public_api_clients_file", clients_file)
-        if not isinstance(self.object_detect_providers, tuple) or any(
-            not isinstance(name, str) for name in self.object_detect_providers
-        ):
-            raise ValueError("OBJECT_DETECT_PROVIDERS must be a tuple of names")
-        unknown = [
-            name
-            for name in self.object_detect_providers
-            if name not in OBJECT_DETECT_PROVIDER_NAMES
-        ]
-        if unknown:
+        fal_key = self.fal_sam3_api_key
+        if fal_key is not None:
+            if not isinstance(fal_key, str) or not fal_key.strip():
+                raise ValueError("FAL_KEY must be a non-empty value or unset")
+            fal_key = fal_key.strip()
+            if (
+                not fal_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in fal_key)
+            ):
+                raise ValueError("FAL_KEY must be header-safe ASCII")
+            object.__setattr__(self, "fal_sam3_api_key", fal_key)
+        fal_base = (
+            self.fal_sam3_api_base.strip().rstrip("/")
+            if isinstance(self.fal_sam3_api_base, str)
+            else ""
+        )
+        try:
+            fal_base_url = urlsplit(fal_base)
+        except ValueError as exc:
             raise ValueError(
-                "OBJECT_DETECT_PROVIDERS has unknown provider names: "
-                + ", ".join(unknown)
-            )
-        for name in OBJECT_DETECT_PROVIDER_NAMES:
-            env_prefix = name.upper()
-            key_env = _PROVIDER_KEY_ENV.get(name, f"{env_prefix}_API_KEY")
-            key = getattr(self, f"{name}_api_key")
-            if key is not None:
-                if not isinstance(key, str) or not key.strip():
-                    raise ValueError(
-                        f"{key_env} must be a non-empty value or unset"
-                    )
-                key = key.strip()
-                if (
-                    not key.isascii()
-                    or any(not 0x21 <= ord(character) <= 0x7E for character in key)
-                ):
-                    raise ValueError(f"{key_env} must be header-safe ASCII")
-                object.__setattr__(self, f"{name}_api_key", key)
-            base = getattr(self, f"{name}_api_base")
-            base = base.strip().rstrip("/") if isinstance(base, str) else ""
-            try:
-                base_url = urlsplit(base)
-            except ValueError as exc:
-                raise ValueError(
-                    f"{env_prefix}_API_BASE must be an HTTPS base URL"
-                ) from exc
-            if base_url.scheme != "https" or not base_url.netloc:
-                raise ValueError(f"{env_prefix}_API_BASE must be an HTTPS base URL")
-            object.__setattr__(self, f"{name}_api_base", base)
-            model = getattr(self, f"{name}_model")
-            model = model.strip() if isinstance(model, str) else ""
-            if not _MODEL_ID_RE.fullmatch(model):
-                raise ValueError(f"{env_prefix}_MODEL must be a valid model identifier")
-            object.__setattr__(self, f"{name}_model", model)
-        for proxy_env, proxy_value in (
-            ("GEMINI_PROXY", self.gemini_proxy),
-            ("FAL_PROXY", self.fal_proxy),
-        ):
-            if proxy_value is None:
-                continue
+                "FAL_SAM3_API_BASE must be an HTTPS base URL"
+            ) from exc
+        if fal_base_url.scheme != "https" or not fal_base_url.netloc:
+            raise ValueError("FAL_SAM3_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "fal_sam3_api_base", fal_base)
+        fal_model = (
+            self.fal_sam3_model.strip()
+            if isinstance(self.fal_sam3_model, str)
+            else ""
+        )
+        if not _MODEL_ID_RE.fullmatch(fal_model):
+            raise ValueError("FAL_SAM3_MODEL must be a valid model identifier")
+        object.__setattr__(self, "fal_sam3_model", fal_model)
+        proxy_value = self.fal_proxy
+        if proxy_value is not None:
             if not isinstance(proxy_value, str) or not proxy_value.strip():
-                raise ValueError(f"{proxy_env} must be a non-empty value or unset")
+                raise ValueError("FAL_PROXY must be a non-empty value or unset")
             proxy_value = proxy_value.strip()
             try:
                 proxy_url = urlsplit(proxy_value)
             except ValueError as exc:
                 raise ValueError(
-                    f"{proxy_env} must be a proxy URL, e.g. http://127.0.0.1:7897"
+                    "FAL_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
                 ) from exc
             if (
                 proxy_url.scheme not in _PROXY_SCHEMES
                 or not proxy_url.netloc
             ):
                 raise ValueError(
-                    f"{proxy_env} must be a proxy URL, e.g. http://127.0.0.1:7897"
+                    "FAL_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
                 )
-            object.__setattr__(self, proxy_env.lower(), proxy_value)
+            object.__setattr__(self, "fal_proxy", proxy_value)
         threshold = self.fal_sam3_threshold
         if (
             isinstance(threshold, bool)
@@ -368,21 +285,6 @@ def get_settings() -> Settings:
         raise RuntimeError("DEEPSEEK_API_KEY must be set to a non-empty value")
     # 缺省默认 direct；显式设置的合法性由 Settings.__post_init__ 校验。
     multiref_mode = os.environ.get("MULTIREF_MODE", "").strip().lower() or "direct"
-    provider_fields: dict[str, str | None] = {}
-    for name, default_base, default_model in _OBJECT_DETECT_PROVIDER_SPECS:
-        env_prefix = name.upper()
-        provider_fields[f"{name}_api_key"] = (
-            os.environ.get(
-                _PROVIDER_KEY_ENV.get(name, f"{env_prefix}_API_KEY"), ""
-            ).strip()
-            or None
-        )
-        provider_fields[f"{name}_api_base"] = os.environ.get(
-            f"{env_prefix}_API_BASE", default_base
-        ).strip()
-        provider_fields[f"{name}_model"] = os.environ.get(
-            f"{env_prefix}_MODEL", default_model
-        ).strip()
     try:
         fal_sam3_threshold = float(
             os.environ.get("FAL_SAM3_THRESHOLD", "0.3").strip()
@@ -438,13 +340,13 @@ def get_settings() -> Settings:
         # therefore cannot disable the single-worker store lock; tests may do
         # so only by constructing Settings explicitly.
         store_lock_enabled=True,
-        object_detect_providers=tuple(
-            name.strip().lower()
-            for name in os.environ.get("OBJECT_DETECT_PROVIDERS", "").split(",")
-            if name.strip()
-        ),
-        **provider_fields,
-        gemini_proxy=os.environ.get("GEMINI_PROXY", "").strip() or None,
+        fal_sam3_api_key=os.environ.get("FAL_KEY", "").strip() or None,
+        fal_sam3_api_base=os.environ.get(
+            "FAL_SAM3_API_BASE", FAL_SAM3_API_BASE
+        ).strip(),
+        fal_sam3_model=os.environ.get(
+            "FAL_SAM3_MODEL", FAL_SAM3_MODEL
+        ).strip(),
         fal_proxy=os.environ.get("FAL_PROXY", "").strip() or None,
         fal_sam3_threshold=fal_sam3_threshold,
     )

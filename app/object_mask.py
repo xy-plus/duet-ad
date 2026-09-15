@@ -2,7 +2,7 @@
 
 Mirrors app/face_mask.py: the OR-flagged objects must disappear from the
 reference video so H3 can only rebuild them from the supplied user images.
-A video-grounding provider (app/object_detect.py) locates each target at
+The fal SAM-3 detector (app/object_detect.py) locates each target at
 sparse timestamps; the gaps between anchor points are filled locally by
 linear interpolation, and a track that loses its object keeps painting the
 last known box for OBJECT_MASK_HOLD_FRAMES frames before disappearing.
@@ -13,9 +13,9 @@ H.264/yuv420p pipeline as the face mask.
 Pipeline integration (app/pipeline.py): the ``mask-replaceable-objects``
 node runs immediately after ``mask-reference-faces`` on the same reference
 video stream.  It triggers only when the segment has OR-flagged replaced
-objects (targets come from the OR output) AND at least one detection
-provider is available; no configured/available provider means the node is
-skipped entirely, like a segment without OR targets.  Persistent failure
+objects (targets come from the OR output) AND FAL_KEY is configured; a
+missing key means the node is skipped entirely, like a segment without OR
+targets.  Persistent failure
 within OBJECT_MASK_MAX_ATTEMPTS degrades to the unmasked video plus an
 ``object_mask_degraded`` log event instead of blocking the render (unlike
 the face mask, whose missing model stays fatal).  No new gates are added.
@@ -185,37 +185,26 @@ def _detect_all(
     detector: Any,
     artifacts_dir: Path | None,
 ) -> list[ObjectDetection]:
-    """按 provider 能力分发检测调用（注释即约束，不要对调两条路径）。
-
-    - ``single_target_only`` 的 provider（fal_sam3：多目标响应形态未校准，
-      detect 拒绝多 targets）：N 个 target = N 次独立 detect，每次一个独立
-      产物文件 object-detect-response-<slug>.json，各自指纹复用；某 target
-      无检出记日志跳过，不影响其它 target。
-    - 其它 provider（7 家 VLM 契约支持多目标）：一次 detect 调用全部
-      targets。VLM 没有产物复用钩子，artifacts_dir 对它们只产
-      object-detections.json。
-    """
-    if getattr(detector, "single_target_only", False):
-        detections: list[ObjectDetection] = []
-        for target in targets:
-            client = detector
-            if artifacts_dir is not None and hasattr(detector, "with_cache"):
-                client = detector.with_cache(
-                    artifacts_dir
-                    / f"object-detect-response-{_target_slug(target)}.json"
-                )
-            found = client.detect(source, [target])
-            if not found:
-                _LOGGER.warning(
-                    "object mask: target %r got no detections; other targets "
-                    "continue",
-                    target,
-                )
-            detections.extend(found)
-        return detections
-    if artifacts_dir is not None and hasattr(detector, "with_cache"):
-        detector = detector.with_cache(artifacts_dir / "object-detect-response.json")
-    return detector.detect(source, targets)
+    """fal 端点单 target：N 个 target = N 次独立 detect，每次一个独立产物
+    文件 object-detect-response-<slug>.json，各自指纹复用；某 target 无检出
+    记日志跳过，不影响其它 target。"""
+    detections: list[ObjectDetection] = []
+    for target in targets:
+        client = detector
+        if artifacts_dir is not None and hasattr(detector, "with_cache"):
+            client = detector.with_cache(
+                artifacts_dir
+                / f"object-detect-response-{_target_slug(target)}.json"
+            )
+        found = client.detect(source, [target])
+        if not found:
+            _LOGGER.warning(
+                "object mask: target %r got no detections; other targets "
+                "continue",
+                target,
+            )
+        detections.extend(found)
+    return detections
 
 
 def mask_objects(
@@ -229,10 +218,10 @@ def mask_objects(
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
-    omitted, the first available configured provider is used.
+    omitted, the production fal SAM-3 client is used (requires FAL_KEY).
     ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
-    支持产物复用的 provider（with_cache 钩子，如 fal_sam3）把原始响应按
-    target 写到 object-detect-response-<slug>.json，命中指纹即零 HTTP；
+    fal client 的 with_cache 钩子把原始响应按 target 写到
+    object-detect-response-<slug>.json，命中指纹即零 HTTP；
     解析后的契约 detections 写 object-detections.json（见 _detect_all）。"""
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")

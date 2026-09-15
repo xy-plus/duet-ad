@@ -4,7 +4,7 @@ set -euo pipefail
 # Experimental instance for the experiment/object-gray-mask-multiref branch.
 # Mirrors the production 3212 launcher: layered env sources, later wins.
 # Order matters: shared credentials first, main-workspace keys next, then the
-# worktree .env (FAL_KEY / MULTIREF_MODE / OBJECT_DETECT_PROVIDERS) overrides.
+# worktree .env (FAL_KEY / MULTIREF_MODE) overrides.
 set -a
 source /home/xy/.config/duet-ad1/service.env
 source /home/xy/.config/claude/deepseek.env

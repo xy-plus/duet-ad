@@ -22,7 +22,7 @@ from app.object_mask import (
 
 class _SparseDetector:
     """Test seam mirroring the production client contract: one detect() call
-    per video returning sparse timestamped ObjectDetection entries."""
+    per target returning sparse timestamped ObjectDetection entries."""
 
     def __init__(self, detections: list[ObjectDetection]) -> None:
         self.detections = detections
@@ -363,9 +363,7 @@ def test_mask_objects_requires_a_provider_when_no_detector_is_injected(
 
 
 class _SingleTargetDetector:
-    """Test seam mirroring fal_sam3: single_target_only + with_cache hook."""
-
-    single_target_only = True
+    """Test seam mirroring fal_sam3: per-target detect + with_cache hook."""
 
     def __init__(self, detections_by_target: dict[str, list[ObjectDetection]]) -> None:
         self.detections_by_target = detections_by_target
@@ -377,15 +375,15 @@ class _SingleTargetDetector:
         return self
 
     def detect(self, video_path: Path, targets: list[str]) -> list[ObjectDetection]:
-        assert len(targets) == 1, "single_target_only detector got multi targets"
+        assert len(targets) == 1, "fal-style detector got multi targets"
         self.calls.append((video_path, list(targets)))
         return list(self.detections_by_target.get(targets[0], []))
 
 
-def test_mask_objects_splits_single_target_only_detector_per_target(
+def test_mask_objects_splits_detection_per_target(
     tmp_path: Path,
 ) -> None:
-    """fal 型 provider：N target = N 次独立 detect + 各自产物文件，合并盖块。"""
+    """fal 端点单 target：N target = N 次独立 detect + 各自产物文件，合并盖块。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=3)
     detector = _SingleTargetDetector({
@@ -430,24 +428,6 @@ def test_mask_objects_single_target_empty_detection_does_not_block_others(
     assert stats["blocks_total"] > 0
     assert stats["targets"]["ghost"] == {"detections": 0, "detected_frames": 0}
     assert stats["targets"]["mug"]["detections"] == 1
-
-
-def test_mask_objects_multi_target_detector_called_once(
-    tmp_path: Path,
-) -> None:
-    """VLM 型 provider（无 single_target_only）：一次调用全部 targets。"""
-    source = tmp_path / "source-muted.mp4"
-    _solid_video(source, frames=2)
-    detector = _SparseDetector([_detection(0.0, (0.1, 0.1, 0.4, 0.4))])
-    artifacts = tmp_path / "segment"
-    object_mask.mask_objects(
-        source, tmp_path / "out.mp4", ["mug", "scarf"],
-        detector=detector, detect_artifacts_dir=artifacts,
-    )
-    assert detector.calls == [(source, ["mug", "scarf"])]
-    # VLM 无产物复用钩子：只有解析后的 detections JSON，无响应产物文件。
-    assert (artifacts / "object-detections.json").is_file()
-    assert not list(artifacts.glob("object-detect-response*.json"))
 
 
 def test_mask_objects_stats_breakdown(tmp_path: Path) -> None:

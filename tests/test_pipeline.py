@@ -7078,7 +7078,7 @@ def _prepare_h3_object_mask_fixture(
 
     monkeypatch.setattr(object_mask, "mask_objects", fake_mask_objects)
     monkeypatch.setattr(
-        object_detect, "available_providers", lambda _settings: ["doubao"]
+        object_detect, "available_providers", lambda _settings: ["fal_sam3"]
     )
     return (
         pipeline, project, item, enhanced_index, replacement_sheet, object_calls,
