@@ -70,6 +70,12 @@ def _plain_ass_text(text: str) -> str:
     )
 
 
+def _char_weight(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
 def _wrapped_text(text: str, columns: int) -> str:
     # Explicit wrapping also supports libass builds without libunibreak.
     # Prefer word boundaries; split uninterrupted CJK or very long words.
@@ -77,15 +83,13 @@ def _wrapped_text(text: str, columns: int) -> str:
     current = ""
     width = 0
     for char in _plain_ass_text(text):
-        weight = 0 if unicodedata.combining(char) else (
-            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-        )
+        weight = _char_weight(char)
         if current and width + weight > columns:
             split = current.rfind(" ")
             if split > len(current) // 2:
                 rows.append(current[:split])
                 current = current[split + 1:]
-                width = sum(2 if unicodedata.east_asian_width(c) in {"W", "F"} else 1 for c in current)
+                width = sum(_char_weight(c) for c in current)
             else:
                 rows.append(current.rstrip())
                 current = ""
@@ -95,6 +99,48 @@ def _wrapped_text(text: str, columns: int) -> str:
     if current.strip():
         rows.append(current.strip())
     return r"\N".join(rows)
+
+
+# A cue never shows more than two rows at once; longer text is split in time.
+MAX_ROWS = 2
+
+
+def _split_cue(start_cs: int, end_cs: int, rows: list[str]) -> list[tuple[int, int, str]]:
+    """Split wrapped rows into contiguous sub-cues of at most MAX_ROWS rows.
+
+    The window is divided proportionally to each chunk's East Asian character
+    weight (same weighting as _wrapped_text). Boundaries are shared between
+    neighbours, so chunks tile [start_cs, end_cs] without gaps or overlap.
+    """
+    window = end_cs - start_cs
+    # Each chunk needs at least 1cs to display at all. A window shorter than
+    # the chunk count is pathological (seconds of text in a centisecond); fall
+    # back to fewer, taller chunks rather than dropping text or emitting
+    # empty windows, accepting more than MAX_ROWS rows in that case only.
+    chunk_count = min(-(-len(rows) // MAX_ROWS), window)
+    if chunk_count <= 1:
+        return [(start_cs, end_cs, r"\N".join(rows))]
+    per, extra = divmod(len(rows), chunk_count)
+    groups: list[list[str]] = []
+    index = 0
+    for i in range(chunk_count):
+        size = per + (1 if i < extra else 0)
+        groups.append(rows[index:index + size])
+        index += size
+    weights = [max(1, sum(_char_weight(c) for row in group for c in row)) for group in groups]
+    total = sum(weights)
+    events: list[tuple[int, int, str]] = []
+    boundary, cumulative = start_cs, 0
+    for i, (group, weight) in enumerate(zip(groups, weights)):
+        remaining = chunk_count - i - 1
+        cumulative += weight
+        # Round-half-up of the ideal proportional boundary, clamped so every
+        # remaining chunk keeps at least 1cs inside the original window.
+        ideal = start_cs + (window * cumulative + total // 2) // total
+        next_boundary = end_cs if not remaining else min(max(ideal, boundary + 1), end_cs - remaining)
+        events.append((boundary, next_boundary, r"\N".join(group)))
+        boundary = next_boundary
+    return events
 
 
 def _timestamp(centiseconds: int) -> str:
@@ -120,16 +166,16 @@ def _ass_document(cues: Sequence[Mapping[str, object]], info: Mapping[str, Any])
         start_cs, end_cs = math.ceil(start * 100), math.floor(end * 100)
         if end_cs > start_cs and _plain_ass_text(cue["text"]):
             prepared.append((start_cs, end_cs, cue["text"]))
-    minimum_font = max(12, round(min(width, height) * 0.028))
-    while True:
-        columns = max(8, int((width - margin * 2) / (font_size * 0.60)))
-        wrapped = [_wrapped_text(text, columns) for _, _, text in prepared]
-        rows = max((len(text.split(r"\N")) for text in wrapped), default=0)
-        if rows <= 4 and rows * font_size * 1.5 <= height * 0.30:
-            break
-        if font_size <= minimum_font:
-            raise media.MediaError("subtitle text exceeds readable caption area; shorten the dialogue line")
+    # Long text is split in time below, so shrinking only needs to fit two
+    # rows vertically (ultrawide frames); the cap is a hard guarantee.
+    while font_size > 12 and MAX_ROWS * font_size * 1.5 > height * 0.30:
         font_size -= 1
+    if MAX_ROWS * font_size * 1.5 > height * 0.30:
+        raise media.MediaError("subtitle caption area too small for legible captions")
+    columns = max(8, int((width - margin * 2) / (font_size * 0.60)))
+    events: list[tuple[int, int, str]] = []
+    for start_cs, end_cs, text in prepared:
+        events.extend(_split_cue(start_cs, end_cs, _wrapped_text(text, columns).split(r"\N")))
     document = (
         "[Script Info]\nScriptType: v4.00+\n"
         f"PlayResX: {width}\nPlayResY: {height}\n"
@@ -139,9 +185,9 @@ def _ass_document(cues: Sequence[Mapping[str, object]], info: Mapping[str, Any])
         f"Style: Default,Noto Sans CJK SC,{font_size},&H00FFFFFF,&H00FFFFFF,&H00101010,&H80000000,0,0,0,0,100,100,0,0,1,{max(1, font_size / 16):.2f},0,2,{margin},{margin},{bottom},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-    for (start_cs, end_cs, _), text in zip(prepared, wrapped):
+    for start_cs, end_cs, text in events:
         document += f"Dialogue: 0,{_timestamp(start_cs)},{_timestamp(end_cs)},Default,,0,0,0,,{text}\n"
-    return document, len(prepared)
+    return document, len(events)
 
 
 def _require_font() -> None:
