@@ -764,6 +764,47 @@ def test_picsart_submit_and_poll_are_split_and_poll_one_task(
     ]
 
 
+def test_picsart_client_uses_configured_proxy_and_ignores_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_kwargs: list[dict[str, object]] = []
+    real_client = httpx.Client
+
+    def client_factory(*args: object, **kwargs: object) -> httpx.Client:
+        client_kwargs.append(dict(kwargs))
+        # Record the configured proxy while keeping this unit test on its
+        # MockTransport; httpx routes proxy-bearing clients outside that mock.
+        effective_kwargs = dict(kwargs)
+        effective_kwargs.pop("proxy", None)
+        return real_client(*args, **effective_kwargs)
+
+    monkeypatch.setattr(providers.httpx, "Client", client_factory)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"response": {"id": "task-proxy"}}
+            if request.url.path.endswith("/submit")
+            else {"response": {"status": "COMPLETED", "result": {"video": {"url": "https://cdn.test/video.mp4"}}}},
+        )
+        if request.url.host == "picsart.test"
+        else httpx.Response(200, content=b"video"),
+    )
+    client = PicsartClient(
+        _settings(tmp_path, picsart_proxy="http://127.0.0.1:7897"), transport,
+    )
+
+    submitted = client.submit(
+        prompt="prompt", video_url="https://assets.test/source.mp4", image_urls=None,
+        duration=5, resolution="768p", aspect_ratio="16:9",
+    )
+    client.poll(submitted.value)
+    client.download("https://cdn.test/video.mp4", tmp_path / "video.mp4")
+
+    assert len(client_kwargs) == 3
+    assert all(kwargs["trust_env"] is False for kwargs in client_kwargs)
+    assert all(kwargs["proxy"] == "http://127.0.0.1:7897" for kwargs in client_kwargs)
+
+
 @pytest.mark.parametrize("image_urls", [None, []])
 def test_picsart_advanced_request_omits_empty_optional_inputs(
     tmp_path: Path, image_urls: list[str] | None

@@ -1160,6 +1160,18 @@ class PicsartClient:
         self.settings = settings
         self.transport = transport
 
+    def _http_client_kwargs(self, **kwargs: Any) -> dict[str, Any]:
+        """Keep Picsart traffic isolated from ambient proxy environment."""
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.settings.request_timeout_s,
+            "transport": self.transport,
+            "trust_env": False,
+            **kwargs,
+        }
+        if self.settings.picsart_proxy is not None:
+            client_kwargs["proxy"] = self.settings.picsart_proxy
+        return client_kwargs
+
     def submit(
         self,
         *,
@@ -1214,7 +1226,7 @@ class PicsartClient:
         body = {"params": params}
         record: dict[str, Any] | None = None
         try:
-            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+            with httpx.Client(**self._http_client_kwargs()) as client:
                 try:
                     response, record = _send(
                         client,
@@ -1257,7 +1269,7 @@ class PicsartClient:
         )
         deadline = time.monotonic() + self.settings.provider_poll_timeout_s
         try:
-            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+            with httpx.Client(**self._http_client_kwargs()) as client:
                 while True:
                     try:
                         response, exchange = _send(
@@ -1302,9 +1314,7 @@ class PicsartClient:
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             with httpx.Client(
-                timeout=self.settings.request_timeout_s,
-                transport=self.transport,
-                follow_redirects=True,
+                **self._http_client_kwargs(follow_redirects=True)
             ) as client:
                 response, record = _send(client, "GET", url)
             if response.history:

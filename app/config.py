@@ -24,9 +24,11 @@ ARTIFACT_RETENTION_MODES = frozenset({"full", "lean"})
 # 默认 16）；仍可用 FAL_SAM3_API_BASE 配回旧端点。
 FAL_SAM3_API_BASE = "https://queue.fal.run/fal-ai/sam-3-1"
 FAL_SAM3_MODEL = "video-rle"
-# 代理只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
+# fal 代理只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
 # Scheme 白名单见 __post_init__。
 _PROXY_SCHEMES = frozenset({"http", "https"})
+# Picsart 直连可能受 DNS 污染；允许与 httpx 兼容的 SOCKS5 代理。
+_PICSART_PROXY_SCHEMES = _PROXY_SCHEMES | frozenset({"socks5"})
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,8 @@ class Settings:
     public_base_url: str = ""
     picsart_api_key: str = ""
     picsart_api_base: str = "https://api.picsart.com"
+    # 直连 Picsart 受 DNS 污染影响时可设代理；None = 直连。
+    picsart_proxy: str | None = None
     autodl_api_key: str = field(default="", repr=False)
     autodl_api_base: str = "https://autodl.art"
     seedream_api_key: str = field(default="", repr=False)
@@ -268,6 +272,28 @@ class Settings:
                     "FAL_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
                 )
             object.__setattr__(self, "fal_proxy", proxy_value)
+        picsart_proxy_value = self.picsart_proxy
+        if picsart_proxy_value is not None:
+            if (
+                not isinstance(picsart_proxy_value, str)
+                or not picsart_proxy_value.strip()
+            ):
+                raise ValueError("PICSART_PROXY must be a non-empty value or unset")
+            picsart_proxy_value = picsart_proxy_value.strip()
+            try:
+                picsart_proxy_url = urlsplit(picsart_proxy_value)
+            except ValueError as exc:
+                raise ValueError(
+                    "PICSART_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                ) from exc
+            if (
+                picsart_proxy_url.scheme not in _PICSART_PROXY_SCHEMES
+                or not picsart_proxy_url.netloc
+            ):
+                raise ValueError(
+                    "PICSART_PROXY must be a proxy URL, e.g. http://127.0.0.1:7897"
+                )
+            object.__setattr__(self, "picsart_proxy", picsart_proxy_value)
         threshold = self.fal_sam3_threshold
         if (
             isinstance(threshold, bool)
@@ -311,6 +337,7 @@ def get_settings() -> Settings:
         public_base_url=os.environ.get("PUBLIC_BASE_URL", ""),
         picsart_api_key=os.environ.get("PICSART_API_KEY", ""),
         picsart_api_base=os.environ.get("PICSART_API_BASE", "https://api.picsart.com").rstrip("/"),
+        picsart_proxy=os.environ.get("PICSART_PROXY", "").strip() or None,
         autodl_api_key=(
             os.environ.get("AUTODL_ART_TOKEN")
             or os.environ.get("AUTODL_TOKEN", "")
