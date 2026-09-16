@@ -563,6 +563,10 @@ class _FlowDeepSeek:
                                 "appearance_description": (
                                     f"isolated replacement entity {stable_id}"
                                 ),
+                                # Current object-replace outputs require a
+                                # short lowercase English detection target for
+                                # every entity replacement.
+                                "detect_label": "handbag",
                             },
                         }
                         for stable_id in category_schemas["entities"]
