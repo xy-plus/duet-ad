@@ -8,6 +8,7 @@ import stat
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -7407,6 +7408,40 @@ def test_h3_prompt_introduces_one_unified_mask_block_clause(
     )
     assert "(128,128,128)" not in prompt
     assert prompt.index("(64,64,64)") < prompt.index("FACE REPLACEMENT")
+    frozen = (
+        project / "work" / "segments" / "0001" / "h3_prompt.txt"
+    ).read_text(encoding="utf-8")
+    assert frozen == prompt
+
+
+def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    pipeline.settings = replace(
+        pipeline.settings, object_mask_block_opacity=0.9,
+    )
+
+    _item, prompt, _muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert prompt.startswith(
+        "Semi-transparent dark gray (64,64,64) blocks mask faces of people "
+        "to replace and replaceable objects. The faint source imagery "
+        "showing through the blocks serves ONLY as position, motion, and "
+        "composition reference: never reconstruct, enhance, sharpen, or "
+        "copy anything visible through the blocks; never draw or restore "
+        "what they hide: rebuild people naturally from their descriptions, "
+        "and rebuild objects only from the provided reference images."
+    )
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
     ).read_text(encoding="utf-8")

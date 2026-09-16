@@ -5902,6 +5902,20 @@ class Pipeline:
                     "descriptions, and rebuild objects only from the provided "
                     "reference images.\n\n"
                 )
+                if self.settings.object_mask_block_opacity < 1.0:
+                    # 半透明灰块时把设计意图说死：透出的残影只是位置/运动/构图
+                    # 锚点，否则模型会把淡残留当成暗光真实画面去增强重建。
+                    mask_block = (
+                        "Semi-transparent dark gray (64,64,64) blocks mask "
+                        "faces of people to replace and replaceable objects. "
+                        "The faint source imagery showing through the blocks "
+                        "serves ONLY as position, motion, and composition "
+                        "reference: never reconstruct, enhance, sharpen, or "
+                        "copy anything visible through the blocks; never draw "
+                        "or restore what they hide: rebuild people naturally "
+                        "from their descriptions, and rebuild objects only "
+                        "from the provided reference images.\n\n"
+                    )
             overlay_targets = []
             if processing["remove_subtitle"]:
                 overlay_targets.append(
