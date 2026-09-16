@@ -116,6 +116,34 @@ _FAL_SAM3_EXPECTED = [
     if box is not None
 ]
 
+# 2026-09-16 的唯一一次真实多目标（``face, necklace``）校准调用的精简
+# 头 8 帧。响应仍为单个逐帧 rle/box/metadata 序列，完全没有 label、target
+# id 或嵌套对象列表，故它只可解析为一个完整 prompt 的不可归因检测组。
+_FAL_SAM3_MULTI_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "fal_sam3_video_rle_multi_target_response.json"
+)
+_FAL_SAM3_MULTI_RESULT = json.loads(
+    _FAL_SAM3_MULTI_FIXTURE.read_text(encoding="utf-8")
+)
+_FAL_SAM3_MULTI_EXPECTED = [
+    ObjectDetection(
+        "face, necklace",
+        index / 2.0,
+        (
+            _clamp01(box[0] - box[2] / 2),
+            _clamp01(box[1] - box[3] / 2),
+            _clamp01(box[0] + box[2] / 2),
+            _clamp01(box[1] + box[3] / 2),
+        ),
+    )
+    for index, (rle, box) in enumerate(
+        zip(_FAL_SAM3_MULTI_RESULT["rle"], _FAL_SAM3_MULTI_RESULT["boxes"])
+    )
+    if rle and box is not None
+]
+
 
 def _fal_settings(tmp_path: Path, **overrides: object) -> Settings:
     values: dict[str, object] = {
@@ -217,16 +245,27 @@ def test_fal_sam3_detect_full_flow(tmp_path: Path, video: Path) -> None:
     assert client.last_frames[0]["box"] == _FAL_SAM3_RESULT["boxes"][0]
 
 
-def test_fal_sam3_multi_target_is_refused_before_any_http(
+def test_fal_sam3_multi_target_uses_one_comma_separated_request(
     tmp_path: Path, video: Path
 ) -> None:
-    """多目标响应形态未校准：detect 直接拒绝，零 HTTP（不花钱、不猜归因）。"""
-    handler = _fal_queue_handler(_FAL_SAM3_RESULT)
+    """真实 multi fixture：多个 target 合成一个 prompt，只上传/提交一次；
+    无归属字段时 label 保留完整 prompt，不能把框猜测归给 face 或 necklace。"""
+    observed: dict[str, object] = {}
+    handler = _fal_queue_handler(_FAL_SAM3_MULTI_RESULT, observed=observed)
     client = _fal_client(_fal_settings(tmp_path), handler)
-    with pytest.raises(ValueError, match="multi-target"):
-        client.detect(video, ["bottle", "cup"])
-    assert handler.state["submits"] == 0  # type: ignore[attr-defined]
-    assert handler.state["uploads"] == 0  # type: ignore[attr-defined]
+    result = client.detect(video, ["face", "necklace"])
+    assert result == _FAL_SAM3_MULTI_EXPECTED
+    assert observed["submit_body"] == {
+        "video_url": "https://fal.test/files/clip.mp4",
+        "prompt": "face, necklace",
+        "detection_threshold": 0.3,
+    }
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    assert handler.state["uploads"] == 1  # type: ignore[attr-defined]
+    assert {frame["label"] for frame in client.last_frames} == {"face, necklace"}
+    assert [entry["rle"] for entry in client.last_frames] == (
+        _FAL_SAM3_MULTI_RESULT["rle"]
+    )
 
 
 def test_fal_sam3_empty_result_is_not_retried(tmp_path: Path, video: Path) -> None:

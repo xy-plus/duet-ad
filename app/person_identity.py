@@ -13,11 +13,15 @@ from typing import Any
 import cv2
 import numpy as np
 
-from app import face_mask
-
 SCHEMA_VERSION = "1.0"
 MODEL_SHA256 = "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[1] / "models/face_recognition_sface_2021dec.onnx"
+DETECTOR_MODEL_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "models" / "face_detection_yunet_2023mar.onnx"
+)
+DETECTION_THRESHOLD = 0.73
+NMS_THRESHOLD = 0.3
 PARAMETERS = {"sample_gap_s": .251, "track_gap_s": .501,
               "local_cosine": .20, "identity_cosine": .363,
               "ambiguity_margin": .05, "quality_score": .75,
@@ -27,8 +31,8 @@ PARAMETERS = {"sample_gap_s": .251, "track_gap_s": .501,
 def model_fingerprints() -> dict[str, Any]:
     model = Path(os.environ.get("PERSON_IDENTITY_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
     return {"algorithm": "yunet-sface-compatible-track-groups-v2", "opencv": cv2.__version__,
-            "recognizer_sha256": _sha(model), "detector_sha256": _sha(face_mask.MODEL_PATH),
-            "detection_threshold": face_mask.SCORE_THRESHOLD, "parameters": dict(PARAMETERS)}
+            "recognizer_sha256": _sha(model), "detector_sha256": _sha(DETECTOR_MODEL_PATH),
+            "detection_threshold": DETECTION_THRESHOLD, "parameters": dict(PARAMETERS)}
 
 
 def _sha(path: Path) -> str | None:
@@ -218,11 +222,11 @@ def analyze_person_identity(frames: list[dict], *, source: dict | None = None) -
               "model_fingerprints": model_fingerprints(), "status": "skipped",
               "persons": [], "observations": [], "unresolved": []}
     model = Path(os.environ.get("PERSON_IDENTITY_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
-    if not model.is_absolute() or result["model_fingerprints"]["recognizer_sha256"] != MODEL_SHA256 or not face_mask.MODEL_PATH.is_file():
+    if not model.is_absolute() or result["model_fingerprints"]["recognizer_sha256"] != MODEL_SHA256 or not DETECTOR_MODEL_PATH.is_file():
         return {**result, "reason": "person_identity_model_unavailable_or_invalid"}
     try:
-        detector = cv2.FaceDetectorYN.create(str(face_mask.MODEL_PATH), "", (320,320), face_mask.SCORE_THRESHOLD,
-                                           face_mask.NMS_THRESHOLD, 5000, cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
+        detector = cv2.FaceDetectorYN.create(str(DETECTOR_MODEL_PATH), "", (320,320), DETECTION_THRESHOLD,
+                                           NMS_THRESHOLD, 5000, cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
         recognizer = cv2.FaceRecognizerSF.create(str(model), "", cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
         observations = []
         for frame_number, frame in enumerate(frames):

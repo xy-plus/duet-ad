@@ -62,7 +62,6 @@ NODES = [
     "whisper-asr",
     "yamnet",
     "spoken-dialogue-filter",
-    "mask-reference-faces",
     "mute-reference-video",
     "assemble-dialogue-track",
     "replace-audio-track",

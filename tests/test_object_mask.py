@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,8 +22,8 @@ from app.object_mask import (
 
 
 class _SparseDetector:
-    """Test seam mirroring the production client contract: one detect() call
-    per target returning sparse timestamped ObjectDetection entries."""
+    """Test seam mirroring the production client: one group detect() call
+    returning sparse timestamped ObjectDetection entries."""
 
     def __init__(self, detections: list[ObjectDetection]) -> None:
         self.detections = detections
@@ -362,72 +363,75 @@ def test_mask_objects_requires_a_provider_when_no_detector_is_injected(
     assert not destination.exists()
 
 
-class _SingleTargetDetector:
-    """Test seam mirroring fal_sam3: per-target detect + with_cache hook."""
+class _GroupDetector:
+    """Test seam mirroring fal_sam3: one multi-target detect + cache hook."""
 
-    def __init__(self, detections_by_target: dict[str, list[ObjectDetection]]) -> None:
-        self.detections_by_target = detections_by_target
+    def __init__(self, detections: list[ObjectDetection]) -> None:
+        self.detections = detections
         self.calls: list[tuple[Path, list[str]]] = []
         self.cache_paths: list[Path] = []
 
-    def with_cache(self, cache_path: Path) -> "_SingleTargetDetector":
+    def with_cache(self, cache_path: Path) -> "_GroupDetector":
         self.cache_paths.append(cache_path)
         return self
 
     def detect(self, video_path: Path, targets: list[str]) -> list[ObjectDetection]:
-        assert len(targets) == 1, "fal-style detector got multi targets"
         self.calls.append((video_path, list(targets)))
-        return list(self.detections_by_target.get(targets[0], []))
+        return list(self.detections)
 
 
-def test_mask_objects_splits_detection_per_target(
+def test_mask_objects_detects_multiple_targets_in_one_request(
     tmp_path: Path,
 ) -> None:
-    """fal 端点单 target：N target = N 次独立 detect + 各自产物文件，合并盖块。"""
+    """多 target 只调用一次 detect，项目级 fallback 也只保留一个 prompt 路径。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=3)
-    detector = _SingleTargetDetector({
-        "mug": [_detection(0.0, (0.1, 0.1, 0.4, 0.4))],
-        "scarf": [_detection(1.0, (0.5, 0.5, 0.9, 0.9), label="scarf")],
-    })
+    detector = _GroupDetector([
+        _detection(0.0, (0.1, 0.1, 0.4, 0.4), label="mug, scarf"),
+        _detection(1.0, (0.5, 0.5, 0.9, 0.9), label="mug, scarf"),
+    ])
     artifacts = tmp_path / "segment"
     stats = object_mask.mask_objects(
         source, tmp_path / "out.mp4", ["mug", "scarf"],
         detector=detector, detect_artifacts_dir=artifacts,
     )
-    assert detector.calls == [(source, ["mug"]), (source, ["scarf"])]
+    assert detector.calls == [(source, ["mug", "scarf"])]
     assert detector.cache_paths == [
-        artifacts / f"object-detect-response-{object_mask._target_slug('mug')}.json",
-        artifacts / f"object-detect-response-{object_mask._target_slug('scarf')}.json",
+        artifacts / "object-detect-response.json",
     ]
     detections_file = artifacts / "object-detections.json"
     assert detections_file.is_file()
     payload = json.loads(detections_file.read_text(encoding="utf-8"))
     assert payload["targets"] == ["mug", "scarf"]
-    assert [entry["label"] for entry in payload["detections"]] == ["mug", "scarf"]
+    assert [entry["label"] for entry in payload["detections"]] == [
+        "mug, scarf", "mug, scarf"
+    ]
     assert stats["targets"] == {
-        "mug": {"detections": 1, "detected_frames": 1},
-        "scarf": {"detections": 1, "detected_frames": 1},
+        "mug, scarf": {"detections": 2, "detected_frames": 2},
     }
 
 
-def test_mask_objects_single_target_empty_detection_does_not_block_others(
-    tmp_path: Path,
+def test_mask_objects_multi_target_empty_detection_is_one_group_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """某 target 无检出：记日志跳过，其它 target 照常盖块。"""
+    """无 per-target 标注，整体零检出只能作为一个 target group 记日志。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=3)
-    detector = _SingleTargetDetector({
-        "mug": [_detection(0.0, (0.1, 0.1, 0.4, 0.4))],
-        "ghost": [],
-    })
+    detector = _GroupDetector([])
+    caplog.set_level(logging.WARNING, logger="app.object_mask")
     stats = object_mask.mask_objects(
         source, tmp_path / "out.mp4", ["mug", "ghost"],
         detector=detector, detect_artifacts_dir=tmp_path / "segment",
     )
-    assert stats["blocks_total"] > 0
-    assert stats["targets"]["ghost"] == {"detections": 0, "detected_frames": 0}
-    assert stats["targets"]["mug"]["detections"] == 1
+    assert detector.calls == [(source, ["mug", "ghost"])]
+    assert stats["blocks_total"] == 0
+    assert stats["targets"] == {
+        "mug, ghost": {"detections": 0, "detected_frames": 0}
+    }
+    assert any(
+        "target group 'mug, ghost' got no detections" in message
+        for message in caplog.messages
+    )
 
 
 def test_mask_objects_stats_breakdown(tmp_path: Path) -> None:
@@ -495,7 +499,6 @@ def _fal_mock_handler(state: dict[str, int]):
         if request.method == "POST" and path == "/fal-ai/sam-3-1/video-rle":
             state["submits"] += 1
             body = json.loads(request.content)
-            assert "," not in body["prompt"], "fal 单目标限制被穿透"
             state.setdefault("prompts", []).append(body["prompt"])
             return httpx.Response(
                 200,
@@ -515,8 +518,8 @@ def _fal_mock_handler(state: dict[str, int]):
 
 
 def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> None:
-    """真实 fal client（mock HTTP）：2 target = 2 提交；fal 响应缓存写实例级
-    共享目录（不写项目目录）；另一个项目目录同指纹二次运行零 HTTP。"""
+    """真实 fal client（mock HTTP）：2 target 合成一个提交，原始响应缓存写
+    实例级共享目录（不写项目目录）；另一个项目目录同指纹二次运行零 HTTP。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=2)
     artifacts = tmp_path / "segment"
@@ -529,13 +532,14 @@ def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> Non
         source, tmp_path / "out.mp4", ["handbag", "bottle"],
         detector=client, detect_artifacts_dir=artifacts,
     )
-    assert state["submits"] == 2
-    assert state["uploads"] == 2
+    assert state["submits"] == 1
+    assert state["uploads"] == 1
+    assert state["prompts"] == ["handbag, bottle"]
     # 项目目录只留解析后的 detections；fal 响应缓存只在实例级共享目录。
     assert sorted(artifacts.glob("object-detect-response-*.json")) == []
     shared_dir = tmp_path / "shared" / "object-detect-cache"
     response_files = sorted(shared_dir.glob("object-detect-response-*.json"))
-    assert len(response_files) == 2
+    assert len(response_files) == 1
     for path in response_files:
         cached = json.loads(path.read_text(encoding="utf-8"))
         # 原始响应字段一个不丢（rle/boxes/metadata 原样）。
@@ -543,7 +547,8 @@ def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> Non
         assert set(cached["fingerprint"]) == {
             "video_sha256", "prompt", "detection_threshold", "model",
         }
-    assert stats["blocks_total"] == 4  # 2 target × (帧 0 锚点 + 帧 1 续盖)
+        assert cached["fingerprint"]["prompt"] == "handbag, bottle"
+    assert stats["blocks_total"] == 2  # 1 union box × (帧 0 锚点 + 帧 1 续盖)
 
     def fail_handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected request {request.method} {request.url}")

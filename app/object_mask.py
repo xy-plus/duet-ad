@@ -1,39 +1,25 @@
-"""Deterministic gray-block masking of replaceable objects in the H3 reference video.
+"""Deterministic SAM gray-block masking for H3 reference videos.
 
-Mirrors app/face_mask.py: the OR-flagged objects must disappear from the
-reference video so H3 can only rebuild them from the supplied user images.
-The fal SAM-3 detector (app/object_detect.py) locates each target at
-sparse timestamps; the gaps between anchor points are filled locally by
-linear interpolation, and a track that loses its object keeps painting the
-last known box for OBJECT_MASK_HOLD_FRAMES frames before disappearing.
-The block is a solid deep gray (64,64,64), deliberately distinct from the
-face gray (128,128,128); the output goes through the same mp4v -> ffmpeg
-H.264/yuv420p pipeline as the face mask.
+fal SAM-3 receives all requested objects and, when a person is replaced,
+``face`` in one comma-separated prompt.  Its calibrated multi-target response
+is a single unlabelled per-frame union, so every returned box is painted with
+the same solid deep gray (64,64,64).  Sparse anchors are filled by local linear
+interpolation; a track that loses its box is held for
+``OBJECT_MASK_HOLD_FRAMES`` frames.  The output uses the usual mp4v -> ffmpeg
+H.264/yuv420p pipeline.
 
-Pipeline integration (app/pipeline.py): the ``mask-replaceable-objects``
-node runs immediately after ``mask-reference-faces`` on the same reference
-video stream.  It triggers only when the segment has OR-flagged replaced
-objects (targets come from the OR output) AND FAL_KEY is configured; a
-missing key means the node is skipped entirely, like a segment without OR
-targets.  Persistent failure
-within OBJECT_MASK_MAX_ATTEMPTS degrades to the unmasked video plus an
-``object_mask_degraded`` log event instead of blocking the render (unlike
-the face mask, whose missing model stays fatal).  No new gates are added.
-
-Two-block convention surfaced to H3 via the fusion/H3 prompts: mid gray
-(128,128,128) covers source faces, deep gray (64,64,64) covers replaced
-objects; H3 must not redraw block contents and must fill them from the
-supplied reference images.  The object part of the prompt appears only
-when this node actually produced masking for the segment (frozen per
-segment, so resumes stay consistent).
+Pipeline integration (app/pipeline.py): ``mask-replaceable-objects`` consumes
+the muted source directly.  It runs only when there are targets and FAL_KEY is
+configured.  A persistent failure degrades to the unmasked video plus an
+``object_mask_degraded`` log event; no new gate is added.  H3 receives one
+frozen instruction that the deep-gray blocks conceal faces and replaceable
+objects, and may reconstruct them only from the descriptions/reference images.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -55,13 +41,6 @@ OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
 
 class ObjectMaskError(RuntimeError):
     """Object detection or masking could not be completed deterministically."""
-
-
-def _target_slug(target: str) -> str:
-    """检测产物文件名的 target 段：可读前缀 + 短哈希，确定且防碰撞。"""
-    readable = re.sub(r"[^a-z0-9]+", "-", target.lower()).strip("-")[:40].strip("-")
-    digest = hashlib.sha1(target.encode("utf-8")).hexdigest()[:8]
-    return f"{readable or 'target'}-{digest}"
 
 
 def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
@@ -185,27 +164,22 @@ def _detect_all(
     detector: Any,
     artifacts_dir: Path | None,
 ) -> list[ObjectDetection]:
-    """fal 端点单 target：N 个 target = N 次独立 detect；fal 原始响应缓存
-    在实例级共享目录（见 object_detect 的落盘纪律注释），各自指纹复用，
-    跨项目同指纹零 HTTP；某 target 无检出记日志跳过，不影响其它 target。
-    artifacts_dir 下的 object-detect-response-<slug>.json 路径只作旧版
-    项目级缓存的回退读钩子，不再写入。"""
-    detections: list[ObjectDetection] = []
-    for target in targets:
-        client = detector
-        if artifacts_dir is not None and hasattr(detector, "with_cache"):
-            client = detector.with_cache(
-                artifacts_dir
-                / f"object-detect-response-{_target_slug(target)}.json"
-            )
-        found = client.detect(source, [target])
-        if not found:
-            _LOGGER.warning(
-                "object mask: target %r got no detections; other targets "
-                "continue",
-                target,
-            )
-        detections.extend(found)
+    """One SAM request covers all targets, avoiding a second paid invocation.
+
+    The raw fal response cache is keyed by the complete comma-separated prompt.
+    The project-local fallback is therefore one prompt-level path rather than a
+    per-target path.  SAM does not label boxes by target in a multi-target
+    response, so an empty result is meaningful only for the whole target group.
+    """
+    client = detector
+    if artifacts_dir is not None and hasattr(detector, "with_cache"):
+        client = detector.with_cache(artifacts_dir / "object-detect-response.json")
+    detections = client.detect(source, targets)
+    if not detections:
+        _LOGGER.warning(
+            "object mask: target group %r got no detections",
+            ", ".join(target.strip() for target in targets),
+        )
     return detections
 
 
@@ -226,7 +200,8 @@ def mask_objects(
     fal 原始响应的指纹缓存写实例级共享目录
     <DATA_DIR>/shared/object-detect-cache/（跨项目命中即零 HTTP，见
     object_detect 的落盘纪律注释），with_cache 传入的本目录
-    object-detect-response-<slug>.json 仅作旧版项目级缓存的回退读。"""
+    object-detect-response.json 仅作项目级缓存的回退读。多目标的 SAM 结果
+    无目标归属；其 detection label 是完整 prompt，所有框仍统一遮盖。"""
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
@@ -333,13 +308,18 @@ def mask_objects(
     stats["interpolated_frames"] = (
         stats["frames_with_block"] - stats["anchor_frames"] - stats["hold_frames"]
     )
+    labels = list(dict.fromkeys(detection.label for detection in detections))
+    if not labels:
+        labels = [", ".join(target.strip() for target in targets)] if targets else []
     stats["targets"] = {
-        target: {
-            "detections": sum(1 for d in detections if d.label == target),
+        label: {
+            "detections": sum(1 for detection in detections if detection.label == label),
             "detected_frames": len({
-                round(d.timestamp_s * fps) for d in detections if d.label == target
+                round(detection.timestamp_s * fps)
+                for detection in detections
+                if detection.label == label
             } & painted),
         }
-        for target in targets
+        for label in labels
     }
     return stats

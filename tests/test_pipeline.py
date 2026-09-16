@@ -13,7 +13,6 @@ from typing import Any
 
 import pytest
 
-from app import face_mask
 from app import media
 from app import object_detect
 from app import object_mask
@@ -27,7 +26,6 @@ from app.pipeline import (
     DIALOGUE_GENERATION_SCHEMA,
     H3_PREPARED_ARTIFACTS_VERSION,
     PICSART_RECEIPT_VERSION,
-    FACE_MASK_MAX_ATTEMPTS,
     Pipeline,
     PicsartTaskHungError,
     PreparedPicsartRequest,
@@ -880,12 +878,6 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
         destination.write_bytes(source.read_bytes())
         return {"stdout": "", "stderr": ""}
 
-    def mask_faces(
-        source: Path, destination: Path, **_kwargs: Any,
-    ) -> dict[str, Any]:
-        destination.write_bytes(source.read_bytes() + b"-masked")
-        return {"frames": 1, "frames_with_face": 1, "faces_total": 1}
-
     def trim(source: Path, duration_s: float, destination: Path) -> dict[str, Any]:
         events.append(f"trim-{duration_s}")
         destination.write_bytes(source.read_bytes())
@@ -964,7 +956,6 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
     )
     monkeypatch.setattr(media, "localize_dialogue", localize, raising=False)
     monkeypatch.setattr(media, "mute", mute)
-    monkeypatch.setattr(face_mask, "mask_faces", mask_faces)
     monkeypatch.setattr(media, "trim_24fps", trim, raising=False)
     monkeypatch.setattr(media, "concat", concat)
     monkeypatch.setattr(
@@ -1069,15 +1060,12 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         "trim-4.2",
         "trim-5.0",
     ]
-    # Both segments have replaced people: every reference video is
-    # face-masked before submission.
-    assert sorted(
-        scope.name
-        for scope in (project / "logs" / "mask-reference-faces").iterdir()
-    ) == ["segment-0001", "segment-0002"]
+    # No FAL key is configured in this test, so the unified SAM masking node
+    # never runs and the original muted reference is submitted.
+    assert not (project / "logs" / "mask-replaceable-objects").exists()
     assert [
         path.name for path in registered
-    ].count("source-faces-masked.mp4") == 2
+    ].count("source-muted.mp4") == 2
 
     visual_calls = [
         call for call in deepseek.structured_calls
@@ -1561,14 +1549,6 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     monkeypatch.setattr(
         media, "mute", lambda input_path, target: target.write_bytes(input_path.read_bytes()),
     )
-    monkeypatch.setattr(
-        face_mask,
-        "mask_faces",
-        lambda input_path, target, **_kwargs: (
-            target.write_bytes(input_path.read_bytes() + b"-masked")
-            or {"frames": 1, "frames_with_face": 1, "faces_total": 1}
-        ),
-    )
     sheet_image = project / "work" / "reference-sheet.png"
     sheet_image.write_bytes(b"sheet-pixels")
     replacement_sheet = {
@@ -1614,15 +1594,11 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     )
 
     assert result_item["index"] == 1
-    assert result_prompt.startswith(
-        "Medium gray (128,128,128) blocks mask source faces"
-    )
+    assert result_prompt.startswith("FACE REPLACEMENT IS MANDATORY")
     assert "FACE REPLACEMENT IS MANDATORY" in result_prompt
-    assert result_prompt.index("(128,128,128)") < result_prompt.index(
-        "FACE REPLACEMENT"
-    )
+    assert "(64,64,64)" not in result_prompt
     assert "Preserve the source motion" in result_prompt
-    assert result_muted == segment_dir / "source-faces-masked.mp4"
+    assert result_muted == segment_dir / "source-muted.mp4"
     assert len(fusion_input_sha256) == 64
     assert len(calls) == 1
     assert calls[0]["payload"]["segment_index"] == 1
@@ -1638,13 +1614,8 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert calls[0]["schema"]["additionalProperties"] is False
     assert calls[0]["images"] == [sheet_image]
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
-    assert prompt.startswith(
-        "Medium gray (128,128,128) blocks mask source faces"
-    )
+    assert prompt.startswith("FACE REPLACEMENT IS MANDATORY")
     assert "FACE REPLACEMENT IS MANDATORY" in prompt
-    assert prompt.index("(128,128,128)") < prompt.index(
-        "FACE REPLACEMENT IS MANDATORY"
-    )
     assert prompt.index("FACE REPLACEMENT IS MANDATORY") < prompt.index(
         "Preserve the source motion"
     )
@@ -5532,16 +5503,15 @@ def test_current_first_submit_resume_rejects_ambiguous_submission_evidence(
     assert provider_calls == []
 
 
-def _prepare_h3_mask_fixture(
+def _prepare_h3_person_fixture(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> tuple[
     Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
-    list[tuple[Path, Path]],
 ]:
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
-        _effective_request(), "face-mask",
+        _effective_request(), "person-mask",
     )
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -5614,50 +5584,7 @@ def _prepare_h3_mask_fixture(
         "mute",
         lambda input_path, target: target.write_bytes(input_path.read_bytes()),
     )
-    mask_calls: list[tuple[Path, Path]] = []
-
-    def fake_mask_faces(
-        source_path: Path, destination: Path, **_kwargs: Any,
-    ) -> dict[str, Any]:
-        mask_calls.append((source_path, destination))
-        destination.write_bytes(source_path.read_bytes() + b"-masked")
-        return {"frames": 1, "frames_with_face": 1, "faces_total": 1}
-
-    monkeypatch.setattr(face_mask, "mask_faces", fake_mask_faces)
-    return (
-        pipeline, project, item, enhanced_index, replacement_sheet, mask_calls,
-    )
-
-
-def test_h3_segment_with_a_replaced_person_masks_faces(
-    tmp_path: Path, monkeypatch: Any,
-) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
-        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
-    )
-    segment_dir = project / "work" / "segments" / "0001"
-
-    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
-        project,
-        item,
-        enhanced_index,
-        replacement_sheet,
-        _effective_request(),
-        ResearchLog(project),
-    )
-
-    assert muted == segment_dir / "source-faces-masked.mp4"
-    assert muted.read_bytes() == b"source-masked"
-    assert mask_calls == [
-        (segment_dir / "source-muted.mp4", muted),
-    ]
-    output = json.loads(
-        (
-            project / "logs" / "mask-reference-faces" / "segment-0001"
-            / "attempt-1" / "output.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert output == {"frames": 1, "frames_with_face": 1, "faces_total": 1}
+    return pipeline, project, item, enhanced_index, replacement_sheet
 
 
 def _dialogue_audio_fixture(
@@ -6246,8 +6173,8 @@ def test_picsart_segment_uses_the_dialogue_slice_as_audio_1(
 def test_h3_segment_without_a_replaced_person_keeps_the_muted_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
-        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    pipeline, project, item, enhanced_index, replacement_sheet = (
+        _prepare_h3_person_fixture(tmp_path, monkeypatch)
     )
     # The replaced person never appears in segment 1.
     enhanced_index["people"]["person-01"]["occurrences"] = [
@@ -6265,11 +6192,10 @@ def test_h3_segment_without_a_replaced_person_keeps_the_muted_reference(
     )
 
     assert muted == segment_dir / "source-muted.mp4"
-    assert mask_calls == []
-    assert not (segment_dir / "source-faces-masked.mp4").exists()
+    assert not (segment_dir / "source-objects-masked.mp4").exists()
 
 
-def test_masked_reference_is_frozen_and_resumed(
+def test_object_masked_reference_is_frozen_and_resumed(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
@@ -6279,12 +6205,12 @@ def test_masked_reference_is_frozen_and_resumed(
     segment_dir = project / "work" / "segments" / "0001"
     segment_dir.mkdir(parents=True, exist_ok=True)
     source = segment_dir / "source.mp4"
-    masked = segment_dir / "source-faces-masked.mp4"
+    masked = segment_dir / "source-objects-masked.mp4"
     source.write_bytes(b"source")
     masked.write_bytes(b"masked")
     (segment_dir / "h3_prompt.txt").write_text("prompt", encoding="utf-8")
     mute_log = (
-        project / "logs" / "mask-reference-faces" / "segment-0001" / "attempt-1"
+        project / "logs" / "mask-replaceable-objects" / "segment-0001" / "attempt-1"
     )
     mute_log.mkdir(parents=True)
     (mute_log / "output.json").write_text("{}", encoding="utf-8")
@@ -6359,7 +6285,7 @@ def test_masked_reference_is_frozen_and_resumed(
 
     manifest = store.read(project_id)["h3_prepared_artifacts"]
     assert manifest["segments"]["1"]["muted_video"]["path"] == (
-        "work/segments/0001/source-faces-masked.mp4"
+        "work/segments/0001/source-objects-masked.mp4"
     )
 
     pipeline.validate_r2v_resume(project_id)
@@ -6377,7 +6303,7 @@ def test_masked_reference_is_frozen_and_resumed(
     )
 
     assert prepared.muted == masked.resolve()
-    assert [path.name for path in registered] == ["source-faces-masked.mp4"]
+    assert [path.name for path in registered] == ["source-objects-masked.mp4"]
 
 
 def test_freeze_binds_dialogue_track_and_resume_requires_it(
@@ -7076,9 +7002,6 @@ def test_retryable_node_error_covers_subprocess_and_process_failures() -> None:
     assert Pipeline._retryable_node_error(CodexProcessError("codex exited"))
     assert Pipeline._retryable_node_error(ValueError("bad input"))
     assert Pipeline._retryable_node_error(AssertionError("leftover"))
-    assert not Pipeline._retryable_node_error(
-        face_mask.FaceMaskError("could not open video: x")
-    )
 
 
 def test_retryable_node_error_excludes_uncalibrated_fal_response() -> None:
@@ -7117,75 +7040,6 @@ def test_node_retries_subprocess_timeouts_until_success(tmp_path: Path) -> None:
     ).is_file()
 
 
-def test_face_mask_failure_degrades_to_unmasked_reference(
-    tmp_path: Path, monkeypatch: Any,
-) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, mask_calls = (
-        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
-    )
-
-    def broken_mask(_source: Path, _destination: Path, **_kwargs: Any) -> None:
-        raise face_mask.FaceMaskError("could not open video: source-muted.mp4")
-
-    monkeypatch.setattr(face_mask, "mask_faces", broken_mask)
-
-    _item, _prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
-        project,
-        item,
-        enhanced_index,
-        replacement_sheet,
-        _effective_request(),
-        ResearchLog(project),
-    )
-
-    # Masking is load-bearing but must never block the render: after
-    # FACE_MASK_MAX_ATTEMPTS failures the unmasked reference is used and a
-    # prominent degradation event is logged.
-    segment_dir = project / "work" / "segments" / "0001"
-    assert muted == segment_dir / "source-muted.mp4"
-    assert mask_calls == []  # the patched mask_faces replaced the fake
-    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
-    assert "face_mask_degraded" in trace
-    assert '"attempts": 3' in trace
-    attempts = (
-        project / "logs" / "mask-reference-faces" / "segment-0001"
-    ).iterdir()
-    assert sorted(path.name for path in attempts) == [
-        f"attempt-{index}" for index in range(1, FACE_MASK_MAX_ATTEMPTS + 1)
-    ]
-
-
-def test_face_mask_missing_model_stays_fatal(
-    tmp_path: Path, monkeypatch: Any,
-) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _mask_calls = (
-        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
-    )
-    calls = 0
-
-    def missing_model(_source: Path, _destination: Path, **_kwargs: Any) -> None:
-        nonlocal calls
-        calls += 1
-        raise face_mask.FaceMaskError("face detection model is missing")
-
-    monkeypatch.setattr(face_mask, "mask_faces", missing_model)
-
-    # A missing detection model is a configuration error: no retry, no
-    # degrade — the segment fails loudly.
-    with pytest.raises(face_mask.FaceMaskError, match="model is missing"):
-        pipeline._prepare_h3_segment(
-            project,
-            item,
-            enhanced_index,
-            replacement_sheet,
-            _effective_request(),
-            ResearchLog(project),
-        )
-    assert calls == 1
-    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
-    assert "face_mask_degraded" not in trace
-
-
 def _prepare_h3_object_mask_fixture(
     tmp_path: Path,
     monkeypatch: Any,
@@ -7193,8 +7047,8 @@ def _prepare_h3_object_mask_fixture(
     Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
     list[tuple[Path, Path, list[str]]],
 ]:
-    pipeline, project, item, enhanced_index, replacement_sheet, _face_calls = (
-        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    pipeline, project, item, enhanced_index, replacement_sheet = (
+        _prepare_h3_person_fixture(tmp_path, monkeypatch)
     )
     enhanced_index["entities"] = {
         "entity-01": {
@@ -7217,15 +7071,13 @@ def _prepare_h3_object_mask_fixture(
     ) -> dict[str, Any]:
         object_calls.append((source_path, destination, list(targets)))
         destination.write_bytes(source_path.read_bytes() + b"-objects-masked")
-        # 模仿真实 mask_objects 的产物落盘：每 target 一个响应 JSON +
+        # 模仿真实 mask_objects 的产物落盘：合并 prompt 的一个响应 JSON +
         # 解析后的 detections JSON，供节点 output-media 收编。
         artifacts_dir = kwargs.get("detect_artifacts_dir")
         if artifacts_dir is not None:
-            for target in targets:
-                (
-                    artifacts_dir
-                    / f"object-detect-response-{object_mask._target_slug(target)}.json"
-                ).write_text("{}", encoding="utf-8")
+            (artifacts_dir / "object-detect-response.json").write_text(
+                "{}", encoding="utf-8",
+            )
             (artifacts_dir / "object-detections.json").write_text(
                 "{}", encoding="utf-8"
             )
@@ -7240,7 +7092,7 @@ def _prepare_h3_object_mask_fixture(
     )
 
 
-def test_h3_segment_with_a_replaced_object_masks_objects(
+def test_h3_segment_masks_replaced_objects_and_faces_in_one_sam_node(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
@@ -7257,14 +7109,14 @@ def test_h3_segment_with_a_replaced_object_masks_objects(
         ResearchLog(project),
     )
 
-    # The object mask chains on the face-masked stream and takes its target
-    # descriptions from the OR replacement bindings.
+    # The unified SAM mask consumes the muted stream and receives frozen OR
+    # labels plus the deterministic face target in one invocation.
     assert muted == segment_dir / "source-objects-masked.mp4"
-    assert muted.read_bytes() == b"source-masked-objects-masked"
+    assert muted.read_bytes() == b"source-objects-masked"
     assert object_calls == [(
-        segment_dir / "source-faces-masked.mp4",
+        segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["the red scarf around the neck"],
+        ["the red scarf around the neck", "face"],
     )]
     output = json.loads(
         (
@@ -7343,13 +7195,13 @@ def test_h3_segment_object_mask_targets_use_the_detect_label(
 
     assert muted == segment_dir / "source-objects-masked.mp4"
     assert object_calls == [(
-        segment_dir / "source-faces-masked.mp4",
+        segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["scarf"],
+        ["scarf", "face"],
     )]
 
 
-def test_h3_segment_without_replaced_object_skips_object_mask(
+def test_h3_segment_with_only_a_replaced_person_masks_its_face(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
@@ -7372,9 +7224,12 @@ def test_h3_segment_without_replaced_object_skips_object_mask(
         ResearchLog(project),
     )
 
-    assert muted == segment_dir / "source-faces-masked.mp4"
-    assert object_calls == []
-    assert not (project / "logs" / "mask-replaceable-objects").exists()
+    assert muted == segment_dir / "source-objects-masked.mp4"
+    assert object_calls == [(
+        segment_dir / "source-muted.mp4",
+        segment_dir / "source-objects-masked.mp4",
+        ["face"],
+    )]
 
 
 def test_h3_segment_object_mask_skipped_without_available_provider(
@@ -7399,12 +7254,12 @@ def test_h3_segment_object_mask_skipped_without_available_provider(
         ResearchLog(project),
     )
 
-    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert muted == segment_dir / "source-muted.mp4"
     assert object_calls == []
     assert not (project / "logs" / "mask-replaceable-objects").exists()
 
 
-def test_object_mask_failure_degrades_to_face_masked_reference(
+def test_object_mask_failure_degrades_to_muted_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
@@ -7427,10 +7282,10 @@ def test_object_mask_failure_degrades_to_face_masked_reference(
         ResearchLog(project),
     )
 
-    # Persistent object-mask failures degrade to the reference stream without
-    # object blocks (face masking still applied) and log a prominent event.
+    # Persistent SAM-mask failures degrade to the muted reference stream and
+    # log a prominent event.
     segment_dir = project / "work" / "segments" / "0001"
-    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert muted == segment_dir / "source-muted.mp4"
     assert object_calls == []  # the patched mask_objects replaced the fake
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "object_mask_degraded" in trace
@@ -7475,7 +7330,7 @@ def test_object_mask_uncalibrated_fal_response_degrades_without_retry(
     )
 
     segment_dir = project / "work" / "segments" / "0001"
-    assert muted == segment_dir / "source-faces-masked.mp4"
+    assert muted == segment_dir / "source-muted.mp4"
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "object_mask_degraded" in trace
     assert '"attempts": 1' in trace
@@ -7488,7 +7343,7 @@ def test_object_mask_uncalibrated_fal_response_degrades_without_retry(
 def test_h3_object_mask_node_collects_detect_artifacts(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    """节点产物清单：output-media 收盖块视频 + 每 target 响应 JSON +
+    """节点产物清单：output-media 收盖块视频 + 合并 prompt 响应 JSON +
     解析 detections JSON（input-media 收输入视频，沿用既有节点纪律）。"""
     pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
@@ -7513,24 +7368,22 @@ def test_h3_object_mask_node_collects_detect_artifacts(
     )
 
     targets = [call[2] for call in object_calls][0]
-    assert targets == ["the red scarf around the neck", "the leather wallet"]
+    assert targets == ["the red scarf around the neck", "the leather wallet", "face"]
     attempt = (
         project / "logs" / "mask-replaceable-objects" / "segment-0001"
         / "attempt-1"
     )
     input_media = sorted(path.name for path in (attempt / "input-media").iterdir())
-    assert input_media == ["001-source-faces-masked.mp4"]
+    assert input_media == ["001-source-muted.mp4"]
     output_media = sorted(path.name for path in (attempt / "output-media").iterdir())
-    slugs = sorted(object_mask._target_slug(target) for target in targets)
     assert output_media == [
         "001-source-objects-masked.mp4",
-        f"002-object-detect-response-{slugs[0]}.json",
-        f"003-object-detect-response-{slugs[1]}.json",
-        "004-object-detections.json",
+        "002-object-detect-response.json",
+        "003-object-detections.json",
     ]
 
 
-def test_h3_prompt_introduces_both_mask_block_colors(
+def test_h3_prompt_introduces_one_unified_mask_block_clause(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
@@ -7546,10 +7399,13 @@ def test_h3_prompt_introduces_both_mask_block_colors(
         ResearchLog(project),
     )
 
-    assert prompt.startswith("Medium gray (128,128,128) blocks mask source faces")
-    assert "Dark gray (64,64,64) blocks mask replaced objects" in prompt
-    assert prompt.index("(128,128,128)") < prompt.index("(64,64,64)")
-    assert "never draw" in prompt
+    assert prompt.startswith(
+        "Dark gray (64,64,64) blocks mask faces of people to replace and "
+        "replaceable objects; never draw or restore what they hide: rebuild "
+        "people naturally from their descriptions, and rebuild objects only "
+        "from the provided reference images."
+    )
+    assert "(128,128,128)" not in prompt
     assert prompt.index("(64,64,64)") < prompt.index("FACE REPLACEMENT")
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
@@ -7560,8 +7416,8 @@ def test_h3_prompt_introduces_both_mask_block_colors(
 def test_h3_prompt_object_block_clause_absent_without_object_masking(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
-        _prepare_h3_mask_fixture(tmp_path, monkeypatch)
+    pipeline, project, item, enhanced_index, replacement_sheet = (
+        _prepare_h3_person_fixture(tmp_path, monkeypatch)
     )
 
     _item, prompt, _muted, _fusion_sha256 = pipeline._prepare_h3_segment(
@@ -7573,7 +7429,7 @@ def test_h3_prompt_object_block_clause_absent_without_object_masking(
         ResearchLog(project),
     )
 
-    assert prompt.startswith("Medium gray (128,128,128) blocks mask source faces")
+    assert prompt.startswith("FACE REPLACEMENT IS MANDATORY")
     assert "(64,64,64)" not in prompt
 
 
@@ -7602,7 +7458,6 @@ def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
 
     # Degraded object masking produced no dark gray blocks, so the frozen
     # prompt must not claim they exist (resume replays this file verbatim).
-    assert "(128,128,128)" in prompt
     assert "(64,64,64)" not in prompt
 
 
@@ -7634,10 +7489,9 @@ def test_h3_prompt_object_block_clause_absent_when_no_block_was_painted(
 
     # Zero painted blocks means the reference stream carries no dark gray
     # block: the prompt must not claim one exists, and the pointlessly
-    # re-encoded identical video must not replace the face-masked stream.
+    # re-encoded identical video must not replace the muted stream.
     segment_dir = project / "work" / "segments" / "0001"
-    assert muted == segment_dir / "source-faces-masked.mp4"
-    assert "(128,128,128)" in prompt
+    assert muted == segment_dir / "source-muted.mp4"
     assert "(64,64,64)" not in prompt
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "object_mask_no_blocks" in trace
@@ -7662,8 +7516,7 @@ def test_h3_prompt_object_block_clause_without_a_replaced_person(
 
     segment_dir = project / "work" / "segments" / "0001"
     assert muted == segment_dir / "source-objects-masked.mp4"
-    assert "(128,128,128)" not in prompt
-    assert prompt.startswith("Dark gray (64,64,64) blocks mask replaced objects")
+    assert prompt.startswith("Dark gray (64,64,64) blocks mask faces of people")
 
 
 def test_h3_task_hang_limit_resubmits_with_fresh_identity(

@@ -8,9 +8,11 @@
   不作为 detect 返回形态。
 - ``ObjectDetection``：``{label, timestamp_s, bbox_xyxy_normalized}``；bbox 为
   0–1 浮点、相对帧宽/高，构造时校验（坐标 ∈[0,1]、x0<x1、y0<y1、timestamp≥0）。
-- 单目标粒度：fal 端点一次只检一个 target（多目标响应形态未校准，detect
-  在任何 HTTP 之前拒绝多 targets）；N 个 target 由 object_mask 拆成 N 次独立
-  detect，某 target 零检出/失败只跳过该 target、不中断其它 target。
+- 多目标粒度：fal 端点的一次请求接受逗号分隔的 targets，``detect`` 将它们
+  原顺序拼为一个 prompt，只发一次请求。已校准的响应仍是一套按帧对齐的
+  rle/boxes/metadata，**没有每框所属 target 的字段**；因此多目标结果的
+  ``ObjectDetection.label`` 是实际发送的完整 prompt（例如 ``"face, necklace"``），
+  表示不可归因的合并检测组，而不是猜测性地归给任一 target。
 
 为什么只剩 fal SAM-3 一家（2026-09-15 用户拍板）：此前平行接入的 7 家 VLM
 （doubao/qwen/glm/hunyuan/kimi/step/gemini）输出文本 bbox，无法确定性转成
@@ -82,8 +84,8 @@ class ObjectDetection:
 
 
 # ==== fal_sam3（fal.ai SAM 3.1 video-rle）：存储上传 + 队列轮询 ====
-# 一次提交一个 target，不按目标重试——确定性模型的空结果就是确定答案，
-# 畸形结果重提只会得到同样的结果，两者都不重提（省钱纪律）。
+# 一次提交可含逗号分隔的多个 target，不按目标重试——确定性模型的空结果就是
+# 确定答案，畸形结果重提只会得到同样的结果，两者都不重提（省钱纪律）。
 # 流程：fal CDN 两步上传（initiate 拿预签名 PUT URL）→ POST 队列提交拿
 # request_id → GET status 轮询（PROVIDER_POLL_INTERVAL_S /
 # PROVIDER_POLL_TIMEOUT_S 语义）→ GET 取结果。
@@ -110,9 +112,12 @@ class ObjectDetection:
 #   零检出是正常结果（目标不在画面里），解析产出空 detections 而不是抛错；
 #   boxes 缺失/null 时从 metadata[i].box 派生（同一来源，有检出校验证实
 #   相等）；rle 空字符串 "" 与 null 同义 = 该帧未检出。
-# - 多目标（逗号分隔 prompt）响应形态未校准：本次校准是单目标，多 prompt
-#   时是合并单列表还是分组没有真实数据；detect 拒绝多 targets（致命，
-#   不花钱），待有真实数据再放开。
+# - 多目标（逗号分隔 prompt）响应已按 2026-09-16 真实校准调用确认：仍为
+#   一套 rle/boxes/metadata 按帧号对齐的合并列表，并无 target/label 字段或
+#   第二维分组。也就是说盒子和 RLE 只能作为整条 prompt 的联合检测处理，
+#   不能臆测其归属；详见
+#   data-verify/fal-sam31-multitarget-calib-20260916/README.md 与精简 fixture
+#   tests/fixtures/fal_sam3_video_rle_multi_target_response.json。
 # video_url 也接受 base64 data URI，但大视频会显著拖慢请求（base64 膨胀
 # 约 33% 且随请求体传输），仅作存储不可用时的兜底，未实现。
 FAL_STORAGE_UPLOAD_URL = (
@@ -202,13 +207,6 @@ class FalSam3GroundingClient:
             raise ValueError(
                 "fal_sam3 API key is not configured; "
                 "the object mask node must not run"
-            )
-        if len(targets) > 1:
-            # 多目标响应形态未校准（2026-09-14 校准调用是单目标）：拒绝执行，
-            # 在任何 HTTP 之前失败，不花钱、不猜测归因。
-            raise ValueError(
-                "fal_sam3 multi-target response shape is not calibrated; "
-                "pass exactly one target"
             )
         content = Path(video_path).read_bytes()
         if not content:
@@ -473,8 +471,9 @@ class FalSam3GroundingClient:
         零检出 → 空 detections，正常返回。boxes 缺失/null 时从
         metadata[i].box 派生（同一来源）。列表缺失/类型不对/不等长/
         metadata 错位/box 两处皆无 = 未校准形态，抛 UncalibratedResponseError
-        （确定性致命，不退避重试）。targets 恰一个（detect 已在任何 HTTP
-        之前拒绝多目标）。
+        （确定性致命，不退避重试）。多 target 的真实响应没有归属字段，故每个
+        检测的 label 是实际发送的完整逗号分隔 prompt，代表一个不可拆分的
+        合并检测组；这避免将 face 或物品框猜测归给错误的 target。
         """
         rles = payload.get("rle")
         if not isinstance(rles, list):
@@ -514,7 +513,7 @@ class FalSam3GroundingClient:
                 "uncalibrated response shape"
             )
         metadata: list[Any] = metadata_raw or [None] * len(rles)
-        target = targets[0]
+        prompt = ", ".join(target.strip() for target in targets)
         detections: list[ObjectDetection] = []
         frames: list[dict[str, Any]] = []
         for frame_index, rle in enumerate(rles):
@@ -533,7 +532,7 @@ class FalSam3GroundingClient:
             score = meta.get("score") if isinstance(meta, dict) else None
             frames.append({
                 "frame_index": frame_index,
-                "label": target,
+                "label": prompt,
                 "score": score,
                 "box": box,
                 "rle": rle,
@@ -545,7 +544,7 @@ class FalSam3GroundingClient:
                 continue  # 钳位后退化（零面积），无框可画
             detections.append(
                 ObjectDetection(
-                    label=target,
+                    label=prompt,
                     timestamp_s=frame_index / fps,
                     bbox_xyxy_normalized=bbox,
                 )

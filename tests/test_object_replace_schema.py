@@ -22,6 +22,7 @@ from app.object_replace_schema import (
 
 
 VOICE_IDS = ["voice-a", "voice-b", "voice-c", "voice-d"]
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _element(description: str) -> dict[str, Any]:
@@ -119,9 +120,8 @@ def test_planning_context_freezes_all_keys_and_removes_only_item_hints() -> None
 
 
 def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> None:
-    skill = (
-        Path("/home/xy/duet-ad1-h3-max-r2v-production-candidate/skills/object-replace/SKILL.md")
-        .read_text(encoding="utf-8")
+    skill = (ROOT / "skills" / "object-replace" / "SKILL.md").read_text(
+        encoding="utf-8"
     )
 
     for rule in (
@@ -167,9 +167,9 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
 
 
 def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None:
-    skill = Path(
-        "/home/xy/duet-ad1-h3-max-r2v-production-candidate/skills/h3-max-r2v-prompt/SKILL.md"
-    ).read_text(encoding="utf-8")
+    skill = (ROOT / "skills" / "h3-max-r2v-prompt" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
 
     assert "只服从 `authoritative_constraints` 编译出的安全不变量" in skill
     assert "不得用 raw `preserve` 恢复源身份或外观" in skill

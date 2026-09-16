@@ -17,7 +17,6 @@ from urllib.parse import urlsplit
 
 from app import media
 from app import artifact_retention
-from app import face_mask
 from app import object_detect
 from app import object_mask
 from app import subtitles
@@ -314,9 +313,6 @@ _PICSART_FETCH_FAILURE_MARKERS = (
     "unreachable",
     "validationerror",
 )
-# Face masking keeps H3 identity takeover working, so it retries a few times
-# before degrading to the unmasked reference (never blocking the render).
-FACE_MASK_MAX_ATTEMPTS = 3
 
 
 class PicsartTaskHungError(RuntimeError):
@@ -5774,64 +5770,20 @@ class Pipeline:
                 lambda: media.mute(item["source"], muted),
                 lambda _value: [muted],
             )
-            if self._segment_has_replaced_person(element_index, index):
-                # Mask every source face so H3 must take the face from its
-                # tile.  Masking is load-bearing for identity takeover, so it
-                # retries a few times; persistent failures degrade to the
-                # unmasked reference instead of blocking the render.  Only a
-                # missing detection model (a configuration error) stays fatal.
-                masked = segment_dir / "source-faces-masked.mp4"
-                mask_failures = 0
-
-                def _mask_retry(exc: Exception) -> bool:
-                    nonlocal mask_failures
-                    mask_failures += 1
-                    if (
-                        isinstance(exc, face_mask.FaceMaskError)
-                        and "model is missing" in str(exc)
-                    ):
-                        return False
-                    return mask_failures < FACE_MASK_MAX_ATTEMPTS
-
-                try:
-                    self._node(
-                        log,
-                        "mask-reference-faces",
-                        scope,
-                        {"source": muted, "output": masked},
-                        [muted],
-                        lambda: face_mask.mask_faces(muted, masked),
-                        lambda _value: [masked],
-                        retry_if=_mask_retry,
-                    )
-                except Exception as exc:
-                    if (
-                        isinstance(exc, face_mask.FaceMaskError)
-                        and "model is missing" in str(exc)
-                    ):
-                        raise
-                    log.event(
-                        "face_mask_degraded",
-                        scope=scope,
-                        attempts=mask_failures,
-                        error=str(exc),
-                        impact=(
-                            "source faces stay visible in the reference "
-                            "video; H3 identity takeover is weakened"
-                        ),
-                    )
-                else:
-                    muted = masked
             objects_masked = False
             object_targets = self._segment_replaced_object_targets(
                 element_index, index
             )
+            if self._segment_has_replaced_person(element_index, index):
+                # SAM accepts a comma-separated multi-target prompt.  Keep
+                # this deterministic face target last, after the frozen OR
+                # detect labels, so every required block comes from one fal
+                # request rather than separate paid detections.
+                object_targets.append("face")
             if object_targets and object_detect.available_providers(self.settings):
-                # Unlike the face mask (whose missing model stays fatal), the
-                # object mask node degrades on ANY failure: the except below
-                # catches Exception, so after the node's own retries the
-                # render continues on the stream without object blocks.  No
-                # configured provider means the node never runs (the
+                # This unified SAM node degrades on ANY failure: after the
+                # node's own retries the render continues on the unmasked
+                # stream. No configured provider means it never runs (the
                 # missing-key case); a misconfigured explicitly enabled
                 # provider is rejected earlier by Settings validation.
                 object_masked = segment_dir / "source-objects-masked.mp4"
@@ -5841,7 +5793,7 @@ class Pipeline:
                 # 清单。fal 原始响应的指纹缓存写实例级共享目录
                 # <DATA_DIR>/shared/object-detect-cache/（跨项目同指纹零
                 # HTTP，见 object_detect 的落盘纪律注释），段目录下的
-                # object-detect-response-<slug>.json 仅作旧版缓存回退读。
+                # object-detect-response.json 仅作项目级缓存的回退读。
                 detect_artifacts_dir = segment_dir
                 object_mask_failures = 0
 
@@ -5889,8 +5841,8 @@ class Pipeline:
                         attempts=object_mask_failures,
                         error=str(exc),
                         impact=(
-                            "replaceable objects stay visible in the "
-                            "reference video; H3 may copy the source object "
+                            "replaceable faces and objects stay visible in "
+                            "the reference video; H3 may copy their source "
                             "appearance"
                         ),
                     )
@@ -5912,12 +5864,9 @@ class Pipeline:
                                 "block exists in the reference video"
                             ),
                         )
-            # The prompt is assembled only after the mask nodes so the dark
-            # gray object clause matches what the reference stream actually
-            # contains: it appears only when the object mask node painted at
-            # least one block.  (The medium gray face clause still follows
-            # masks_faces even when the face mask degraded — pre-existing
-            # behavior of the face path, not covered by this guarantee.)
+            # The prompt is assembled only after the mask node so its unified
+            # dark-gray clause matches what the reference stream actually
+            # contains: it appears only when SAM painted at least one block.
             # The frozen h3_prompt.txt is replayed verbatim on resume,
             # keeping the decision stable.
             processing = self._validated_effective_request(request)["processing"]
@@ -5940,20 +5889,16 @@ class Pipeline:
                     "correct.\n\n"
                 )
             mask_block = ""
-            if masks_faces:
-                # 灰块说明放最前（primacy 效应下开头约束遵守度最高）；
-                # 压到最短，给 Agent 生成的长提示词留预算。
-                # 换脸要求由紧随其后的 FACE REPLACEMENT 块承载。
-                mask_block += (
-                    "Medium gray (128,128,128) blocks mask source faces; "
-                    "never draw or restore what they hide. Replace them with "
-                    "the face provided below.\n\n"
-                )
             if objects_masked:
-                mask_block += (
-                    "Dark gray (64,64,64) blocks mask replaced objects; "
-                    "never draw or restore what they hide. Rebuild them from "
-                    "the bound reference images.\n\n"
+                # Keep the compact mask instruction first (primacy effect),
+                # and leave the following FACE REPLACEMENT block to carry
+                # identity-reference binding details.
+                mask_block = (
+                    "Dark gray (64,64,64) blocks mask faces of people to "
+                    "replace and replaceable objects; never draw or restore "
+                    "what they hide: rebuild people naturally from their "
+                    "descriptions, and rebuild objects only from the provided "
+                    "reference images.\n\n"
                 )
             overlay_targets = []
             if processing["remove_subtitle"]:

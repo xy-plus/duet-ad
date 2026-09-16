@@ -5,7 +5,7 @@ download/trim）之外的所有节点。**全部通过才发起 E2E。**
 
 所有输入都是老项目对应节点真实出现过的输入（`data/projects/<id>/logs/
 <node>/<scope>/attempt-N/input.json` + `input-media/`），没有 mock 数据；
-测试调用管线里该节点对应的真实函数（`app.media` / `app.face_mask` /
+测试调用管线里该节点对应的真实函数（`app.media` /
 `app.replacement_sheet` / DeepSeek / Seedream / AutoDL 客户端），不是重发
 整个 pipeline。
 
@@ -26,7 +26,7 @@ input-media/, output.json}`，`boundary/` 子集收失败 attempt 和失败项�
 fixture 的来源项目、attempt 和当时 input/output 的 sha256（字段格式见
 `tests/fixtures/node-replays.manifest.template.json`）。
 
-本地模型文件（whisper.cpp 权重、YAMNet/YuNet）不复制，replay 时从宿主机
+本地模型文件（whisper.cpp 权重、YAMNet）不复制，replay 时从宿主机
 规范路径解析，manifest 里记 `skipped_media`。
 
 ## 2. 运行

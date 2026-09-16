@@ -2,9 +2,9 @@
 
 Every test loads a harvested ``input.json`` + ``input-media/`` that the node
 actually consumed in a historical project, calls the same ``app.media`` /
-``app.face_mask`` / ``app.replacement_sheet`` function the pipeline node
-wraps, and asserts the output passes the node's own validation and the gate
-its downstream consumer applies.
+``app.replacement_sheet`` function the pipeline node wraps, and asserts the
+output passes the node's own validation and the gate its downstream consumer
+applies.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from app import face_mask, media
+from app import media
 from app.pipeline import Pipeline
 from app.replacement_sheet import (
     materialize_replacement_sheet_inputs,
@@ -303,23 +303,6 @@ def test_mute_reference_video(fixture: Fixture, tmp_path: Path) -> None:
     assert info["duration_s"] > 0
 
 
-@pytest.mark.parametrize(
-    "fixture",
-    _params("mask-reference-faces"),
-    ids=_ids(_params("mask-reference-faces")),
-)
-def test_mask_reference_faces(fixture: Fixture, tmp_path: Path) -> None:
-    source = fixture.media[0]
-    destination = tmp_path / "masked.mp4"
-    result = face_mask.mask_faces(source, destination)
-    assert destination.is_file()
-    source_info = media.probe(source)
-    masked_info = media.probe(destination)
-    assert masked_info["width"] == source_info["width"]
-    assert masked_info["height"] == source_info["height"]
-    assert isinstance(result, dict)
-
-
 # -------------------------------------------------------- dialogue track
 
 
@@ -418,13 +401,8 @@ def test_replacement_sheet_inputs(fixture: Fixture, tmp_path: Path) -> None:
     assert canvas.is_file()
     assert canvas.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert result["prompt"].strip()
-    # Downstream gate: the Seedream submit binding must reproduce byte-exact.
-    seedream = sibling_fixture(fixture, "seedream-reference-submit")
-    if seedream is not None:
-        receipts = seedream.input["input_receipts"]
-        assert sha256_file(canvas) == receipts[0]["sha256"]
-        # Historical prompt/receipt SHA is verified in current_sheet_replay;
-        # current prompt uses this version's instructions with the same spec.
+    # Historical prompt/receipt SHA is verified in current_sheet_replay;
+    # current prompt uses this version's instructions with the same spec.
 
 
 @pytest.mark.parametrize(
