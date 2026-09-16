@@ -104,14 +104,36 @@ def test_apply_object_block_opacity_one_is_the_original_solid_fill() -> None:
         (0.90, (59, 60, 61)),
     ],
 )
-def test_apply_object_block_blends_the_original_by_opacity(
+def test_apply_object_block_blends_the_blurred_source_by_opacity(
     opacity: float, expected: tuple[int, int, int],
 ) -> None:
     frame = np.array([[[10, 20, 30]]], dtype=np.uint8)
+    blurred = np.array([[[20, 30, 40]]], dtype=np.uint8)
 
-    object_mask._apply_object_block(frame, (0, 0, 1, 1), opacity=opacity)
+    object_mask._apply_object_block(
+        frame, (0, 0, 1, 1), opacity=opacity, blurred_frame=blurred
+    )
 
-    assert tuple(frame[0, 0]) == expected
+    assert tuple(frame[0, 0]) == tuple(
+        np.rint(np.array(OBJECT_BLOCK_FILL) * opacity + blurred[0, 0] * (1 - opacity))
+        .astype(np.uint8)
+    )
+
+
+def test_apply_object_block_uses_gaussian_blur_not_original_pixels() -> None:
+    original = np.zeros((5, 5, 3), dtype=np.uint8)
+    original[2, 2] = (200, 100, 50)
+    blurred = cv2.GaussianBlur(original, (3, 3), 0)
+    frame = original.copy()
+
+    object_mask._apply_object_block(
+        frame, (2, 2, 3, 3), opacity=0.5, blurred_frame=blurred
+    )
+
+    expected = np.rint(np.array(OBJECT_BLOCK_FILL) * 0.5 + blurred[2, 2] * 0.5).astype(np.uint8)
+    original_mix = np.rint(np.array(OBJECT_BLOCK_FILL) * 0.5 + original[2, 2] * 0.5).astype(np.uint8)
+    assert np.array_equal(frame[2, 2], expected)
+    assert not np.array_equal(frame[2, 2], original_mix)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")

@@ -145,6 +145,7 @@ def _apply_object_block(
     box: tuple[int, int, int, int],
     *,
     opacity: float,
+    blurred_frame: np.ndarray | None = None,
 ) -> None:
     """Mix the deep-gray block into the box in place.
 
@@ -156,9 +157,11 @@ def _apply_object_block(
     if opacity == 1.0:
         region[:] = OBJECT_BLOCK_FILL
         return
+    if blurred_frame is None:
+        raise ObjectMaskError("blurred frame is required for a translucent object block")
     fill = np.asarray(OBJECT_BLOCK_FILL, dtype=np.float64)
     region[:] = np.rint(
-        fill * opacity + region.astype(np.float64) * (1.0 - opacity)
+        fill * opacity + blurred_frame[y0:y1, x0:x1].astype(np.float64) * (1.0 - opacity)
     ).astype(np.uint8)
 
 
@@ -205,6 +208,7 @@ def mask_objects(
     detector: Any | None = None,
     detect_artifacts_dir: Path | None = None,
     block_opacity: float = 1.0,
+    block_blur: int = 31,
 ) -> dict[str, Any]:
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
@@ -218,7 +222,9 @@ def mask_objects(
     object-detect-response.json 仅作项目级缓存的回退读。多目标的 SAM 结果
     无目标归属；其 detection label 是完整 prompt，所有框仍统一遮盖。
     ``block_opacity`` controls the fill contribution and defaults to the
-    original fully opaque behavior. """
+    original fully opaque behavior.  For translucent blocks, ``block_blur``
+    controls the Gaussian kernel applied once per source frame before its
+    blurred residual is mixed into every block on that frame. """
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
@@ -231,6 +237,8 @@ def mask_objects(
     ):
         raise ObjectMaskError("object mask block opacity must be a number in (0, 1]")
     block_opacity = float(block_opacity)
+    if isinstance(block_blur, bool) or not isinstance(block_blur, int) or block_blur < 1 or block_blur % 2 != 1:
+        raise ObjectMaskError("object mask block blur must be a positive odd integer")
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise ObjectMaskError(f"could not open video: {source}")
@@ -303,8 +311,15 @@ def mask_objects(
             stats["blocks_total"] += len(boxes)
             if boxes:
                 stats["frames_with_block"] += 1
+            blurred_frame = (
+                cv2.GaussianBlur(frame, (block_blur, block_blur), 0)
+                if boxes and block_opacity < 1.0
+                else None
+            )
             for box in boxes:
-                _apply_object_block(frame, box, opacity=block_opacity)
+                _apply_object_block(
+                    frame, box, opacity=block_opacity, blurred_frame=blurred_frame
+                )
             writer.write(frame)
             frame_index += 1
         capture.release()

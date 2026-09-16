@@ -9,12 +9,14 @@ def _settings(
     *,
     picsart_proxy: str | None = None,
     object_mask_block_opacity: float = 1.0,
+    object_mask_block_blur: int = 31,
 ) -> Settings:
     return Settings(
         access_token="test",
         public_base_url="https://settings.test",
         picsart_proxy=picsart_proxy,
         object_mask_block_opacity=object_mask_block_opacity,
+        object_mask_block_blur=object_mask_block_blur,
     )
 
 
@@ -48,6 +50,21 @@ def test_settings_defaults_object_mask_block_opacity_to_solid() -> None:
     assert _settings().object_mask_block_opacity == 1.0
 
 
+def test_settings_defaults_object_mask_block_blur() -> None:
+    assert _settings().object_mask_block_blur == 31
+
+
+@pytest.mark.parametrize("blur", [1, 3, 31])
+def test_settings_accepts_positive_odd_object_mask_block_blur(blur: int) -> None:
+    assert _settings(object_mask_block_blur=blur).object_mask_block_blur == blur
+
+
+@pytest.mark.parametrize("blur", [0, -1, 2, 32, True])
+def test_settings_rejects_invalid_object_mask_block_blur(blur: int) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_BLOCK_BLUR"):
+        _settings(object_mask_block_blur=blur)
+
+
 @pytest.mark.parametrize("opacity", [0.05, 0.9, 0.95, 1, 1.0])
 def test_settings_accepts_object_mask_block_opacity(opacity: float) -> None:
     assert _settings(object_mask_block_opacity=opacity).object_mask_block_opacity == float(
@@ -69,3 +86,11 @@ def test_get_settings_reads_object_mask_block_opacity_env(
     monkeypatch.setenv("OBJECT_MASK_BLOCK_OPACITY", "0.95")
 
     assert get_settings().object_mask_block_opacity == pytest.approx(0.95)
+
+
+def test_get_settings_reads_object_mask_block_blur_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_BLOCK_BLUR", "15")
+
+    assert get_settings().object_mask_block_blur == 15

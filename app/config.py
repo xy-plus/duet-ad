@@ -94,6 +94,8 @@ class Settings:
     fal_sam3_threshold: float = 0.3
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0
+    # 泄漏残影的高斯模糊核，仅在 opacity<1 时生效；必须为正奇数像素。
+    object_mask_block_blur: int = 31
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -318,6 +320,14 @@ class Settings:
         object.__setattr__(
             self, "object_mask_block_opacity", float(object_mask_block_opacity)
         )
+        object_mask_block_blur = self.object_mask_block_blur
+        if (
+            isinstance(object_mask_block_blur, bool)
+            or not isinstance(object_mask_block_blur, int)
+            or object_mask_block_blur < 1
+            or object_mask_block_blur % 2 != 1
+        ):
+            raise ValueError("OBJECT_MASK_BLOCK_BLUR must be a positive odd integer")
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -352,6 +362,12 @@ def get_settings() -> Settings:
         raise ValueError(
             "OBJECT_MASK_BLOCK_OPACITY must be a number in (0, 1]"
         ) from exc
+    try:
+        object_mask_block_blur = int(
+            os.environ.get("OBJECT_MASK_BLOCK_BLUR", "31").strip()
+        )
+    except ValueError as exc:
+        raise ValueError("OBJECT_MASK_BLOCK_BLUR must be a positive odd integer") from exc
     return Settings(
         access_token=access_token,
         multiref_mode=multiref_mode,
@@ -413,4 +429,5 @@ def get_settings() -> Settings:
         fal_proxy=os.environ.get("FAL_PROXY", "").strip() or None,
         fal_sam3_threshold=fal_sam3_threshold,
         object_mask_block_opacity=object_mask_block_opacity,
+        object_mask_block_blur=object_mask_block_blur,
     )

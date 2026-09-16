@@ -7582,7 +7582,7 @@ def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
 
     assert prompt.startswith(
         "Semi-transparent dark gray (64,64,64) blocks mask faces of people "
-        "to replace and replaceable objects. The faint source imagery "
+        "to replace and replaceable objects. The faint blurred source imagery "
         "showing through the blocks serves ONLY as position, motion, and "
         "composition reference: never reconstruct, enhance, sharpen, or "
         "copy anything visible through the blocks; never draw or restore "

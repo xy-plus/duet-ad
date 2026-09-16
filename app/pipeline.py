@@ -6123,12 +6123,14 @@ class Pipeline:
                             "output": object_masked,
                             "targets": object_targets,
                             "block_opacity": self.settings.object_mask_block_opacity,
+                            "block_blur": self.settings.object_mask_block_blur,
                         },
                         [muted],
                         lambda: object_mask.mask_objects(
                             muted, object_masked, object_targets,
                             detect_artifacts_dir=detect_artifacts_dir,
                             block_opacity=self.settings.object_mask_block_opacity,
+                            block_blur=self.settings.object_mask_block_blur,
                         ),
                         lambda _value: [
                             path
@@ -6212,7 +6214,7 @@ class Pipeline:
                     mask_block = (
                         "Semi-transparent dark gray (64,64,64) blocks mask "
                         "faces of people to replace and replaceable objects. "
-                        "The faint source imagery showing through the blocks "
+                        "The faint blurred source imagery showing through the blocks "
                         "serves ONLY as position, motion, and composition "
                         "reference: never reconstruct, enhance, sharpen, or "
                         "copy anything visible through the blocks; never draw "
