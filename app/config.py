@@ -92,6 +92,8 @@ class Settings:
     # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高）；
     # 合法区间 (0, 1]，加载期校验。
     fal_sam3_threshold: float = 0.3
+    # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
+    object_mask_block_opacity: float = 1.0
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -303,6 +305,19 @@ class Settings:
         ):
             raise ValueError("FAL_SAM3_THRESHOLD must be a number in (0, 1]")
         object.__setattr__(self, "fal_sam3_threshold", float(threshold))
+        object_mask_block_opacity = self.object_mask_block_opacity
+        if (
+            isinstance(object_mask_block_opacity, bool)
+            or not isinstance(object_mask_block_opacity, (int, float))
+            or not math.isfinite(float(object_mask_block_opacity))
+            or not 0.0 < float(object_mask_block_opacity) <= 1.0
+        ):
+            raise ValueError(
+                "OBJECT_MASK_BLOCK_OPACITY must be a number in (0, 1]"
+            )
+        object.__setattr__(
+            self, "object_mask_block_opacity", float(object_mask_block_opacity)
+        )
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -329,6 +344,14 @@ def get_settings() -> Settings:
         )
     except ValueError as exc:
         raise ValueError("FAL_SAM3_THRESHOLD must be a number in (0, 1]") from exc
+    try:
+        object_mask_block_opacity = float(
+            os.environ.get("OBJECT_MASK_BLOCK_OPACITY", "1.0").strip()
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "OBJECT_MASK_BLOCK_OPACITY must be a number in (0, 1]"
+        ) from exc
     return Settings(
         access_token=access_token,
         multiref_mode=multiref_mode,
@@ -389,4 +412,5 @@ def get_settings() -> Settings:
         ).strip(),
         fal_proxy=os.environ.get("FAL_PROXY", "").strip() or None,
         fal_sam3_threshold=fal_sam3_threshold,
+        object_mask_block_opacity=object_mask_block_opacity,
     )

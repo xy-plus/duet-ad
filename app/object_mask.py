@@ -2,8 +2,8 @@
 
 fal SAM-3 receives all requested objects and, when a person is replaced,
 ``face`` in one comma-separated prompt.  Its calibrated multi-target response
-is a single unlabelled per-frame union, so every returned box is painted with
-the same solid deep gray (64,64,64).  Sparse anchors are filled by local linear
+is a single unlabelled per-frame union, so every returned box receives the
+same deep gray (64,64,64) block.  Sparse anchors are filled by local linear
 interpolation; a track that loses its box is held for
 ``OBJECT_MASK_HOLD_FRAMES`` frames.  The output uses the usual mp4v -> ffmpeg
 H.264/yuv420p pipeline.
@@ -34,7 +34,7 @@ from app.object_detect import ObjectDetection, select_provider
 
 _LOGGER = logging.getLogger(__name__)
 
-OBJECT_BLOCK_FILL = (64, 64, 64)  # solid deep gray (BGR) filling the object box
+OBJECT_BLOCK_FILL = (64, 64, 64)  # deep gray (BGR) mixed into the object box
 OBJECT_MASK_HOLD_FRAMES = 12  # frames a lost object keeps its last known box
 OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
 
@@ -141,11 +141,25 @@ def _pixel_box(
 
 
 def _apply_object_block(
-    frame: np.ndarray, box: tuple[int, int, int, int]
+    frame: np.ndarray,
+    box: tuple[int, int, int, int],
+    *,
+    opacity: float,
 ) -> None:
-    """Fill the box in place with a solid deep gray that erases the object."""
+    """Mix the deep-gray block into the box in place.
+
+    ``opacity=1.0`` deliberately retains the direct assignment so the default
+    behavior remains byte-for-byte identical to the original solid block.
+    """
     x0, y0, x1, y1 = box
-    frame[y0:y1, x0:x1] = OBJECT_BLOCK_FILL
+    region = frame[y0:y1, x0:x1]
+    if opacity == 1.0:
+        region[:] = OBJECT_BLOCK_FILL
+        return
+    fill = np.asarray(OBJECT_BLOCK_FILL, dtype=np.float64)
+    region[:] = np.rint(
+        fill * opacity + region.astype(np.float64) * (1.0 - opacity)
+    ).astype(np.uint8)
 
 
 def _production_detector() -> Any:
@@ -190,6 +204,7 @@ def mask_objects(
     *,
     detector: Any | None = None,
     detect_artifacts_dir: Path | None = None,
+    block_opacity: float = 1.0,
 ) -> dict[str, Any]:
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
@@ -201,11 +216,21 @@ def mask_objects(
     <DATA_DIR>/shared/object-detect-cache/（跨项目命中即零 HTTP，见
     object_detect 的落盘纪律注释），with_cache 传入的本目录
     object-detect-response.json 仅作项目级缓存的回退读。多目标的 SAM 结果
-    无目标归属；其 detection label 是完整 prompt，所有框仍统一遮盖。"""
+    无目标归属；其 detection label 是完整 prompt，所有框仍统一遮盖。
+    ``block_opacity`` controls the fill contribution and defaults to the
+    original fully opaque behavior. """
     if not isinstance(source, Path) or not source.is_file():
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
         raise ObjectMaskError("object mask targets must be non-empty strings")
+    if (
+        isinstance(block_opacity, bool)
+        or not isinstance(block_opacity, (int, float))
+        or not np.isfinite(float(block_opacity))
+        or not 0.0 < float(block_opacity) <= 1.0
+    ):
+        raise ObjectMaskError("object mask block opacity must be a number in (0, 1]")
+    block_opacity = float(block_opacity)
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise ObjectMaskError(f"could not open video: {source}")
@@ -279,7 +304,7 @@ def mask_objects(
             if boxes:
                 stats["frames_with_block"] += 1
             for box in boxes:
-                _apply_object_block(frame, box)
+                _apply_object_block(frame, box, opacity=block_opacity)
             writer.write(frame)
             frame_index += 1
         capture.release()

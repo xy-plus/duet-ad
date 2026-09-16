@@ -5818,11 +5818,13 @@ class Pipeline:
                             "source": muted,
                             "output": object_masked,
                             "targets": object_targets,
+                            "block_opacity": self.settings.object_mask_block_opacity,
                         },
                         [muted],
                         lambda: object_mask.mask_objects(
                             muted, object_masked, object_targets,
                             detect_artifacts_dir=detect_artifacts_dir,
+                            block_opacity=self.settings.object_mask_block_opacity,
                         ),
                         lambda _value: [
                             path

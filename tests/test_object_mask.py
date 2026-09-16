@@ -86,6 +86,34 @@ def _detection(
     )
 
 
+def test_apply_object_block_opacity_one_is_the_original_solid_fill() -> None:
+    frame = np.array([[[10, 20, 30], [40, 50, 60]]], dtype=np.uint8)
+
+    object_mask._apply_object_block(frame, (0, 0, 2, 1), opacity=1.0)
+
+    assert np.array_equal(
+        frame,
+        np.array([[OBJECT_BLOCK_FILL, OBJECT_BLOCK_FILL]], dtype=np.uint8),
+    )
+
+
+@pytest.mark.parametrize(
+    ("opacity", "expected"),
+    [
+        (0.95, (61, 62, 62)),
+        (0.90, (59, 60, 61)),
+    ],
+)
+def test_apply_object_block_blends_the_original_by_opacity(
+    opacity: float, expected: tuple[int, int, int],
+) -> None:
+    frame = np.array([[[10, 20, 30]]], dtype=np.uint8)
+
+    object_mask._apply_object_block(frame, (0, 0, 1, 1), opacity=opacity)
+
+    assert tuple(frame[0, 0]) == expected
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
 def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
     tmp_path: Path,
