@@ -14,8 +14,8 @@ set +a
 export DATA_DIR=/home/xy/duet-ad1-h3-max-r2v-object-mask/data-mask-opacity-9999
 export ARTIFACT_RETENTION=full
 # 仅内部 API 验证，不开对外 v1 API。
-# 灰块不透明度 A/B：本实例 0.9999（留 0.01% 原画面）。
-export OBJECT_MASK_BLOCK_OPACITY=0.9999
+# 灰块不透明度 A/B：本实例 0.99（留 1% 原画面），配合半透明提示词。
+export OBJECT_MASK_BLOCK_OPACITY=0.99
 export PUBLIC_BASE_URL=https://8.166.140.227:3271
 export OPENCV_FOR_THREADS_NUM=2
 export OMP_NUM_THREADS=2
