@@ -134,17 +134,17 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "同类但不同实例",
         "所有可见实体都必须替换",
         "同一个 stable key 在不同图片、不同分段",
-        "必须把 Image 1 约束到用户语义要求覆盖的一个或多个既有 stable key",
+        "非空 `user_replacement_instruction` 与非空 `user_reference_images` 同时存在时，把用户图约束到语义匹配的既有 stable key",
         "不得只任选一个",
         "不按关键词机械决定数量",
-        "共享参考图不等于这些对象是同一实体",
-        "这两个字段必须双向一致",
-        "没有 Image 1 或用户替换要求为空时",
-        "不得将绑定自动传播到无关对象、持有者、背景或仅有关联的组件",
-        "其余必换 key 仍各自使用 `generated_variant`",
+        "共享参考不等于同一实体",
+        "每个 key 只列定义自身目标外观的图",
+        "没有用户图或用户替换要求为空时",
+        "不得把绑定传播给无关对象、持有者、背景或关联组件",
+        "其余记录设 `matches_user_request=false`，使用 `generated_variant`",
         "缺失或 `null` 属于结构不完整",
         "后端不对描述做审美判断",
-        "stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点",
+        "完整且逐字一致的 stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点",
         "`appearance_description` 只写当前 stable key 自身内在、可见的新外观",
         "动作和关系只能写在此字段",
         "只出现该 stable key 本身",
@@ -152,7 +152,7 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "不得出现持有者、操作者、配套对象、被作用对象",
         "必须排除索引人物、动物、可移动实体、前景商品",
         "不得决定、声明或重排 TILE",
-        "未绑定的其他 stable key 不得继承 Image 1",
+        "未绑定的其他 stable key 不得继承任何用户图的身份、外观、背景、风格或无关元素",
     ):
         assert rule in skill
     for obsolete_or_specific_rule in (
@@ -174,8 +174,8 @@ def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None
     assert "只服从 `authoritative_constraints` 编译出的安全不变量" in skill
     assert "不得用 raw `preserve` 恢复源身份或外观" in skill
     assert "同时遵守对象的 `preserve`" not in skill
-    assert "至少一个有效用户图绑定" in skill
-    assert "所有对应 stable key" in skill
+    assert "对 `replacement.source=image_1` 的 stable key，权威块会列出它唯一可用的用户图编号" in skill
+    assert "不得扩散给未绑定 stable key" in skill
     assert "唯一绑定" not in skill
 
 
