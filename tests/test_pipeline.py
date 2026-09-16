@@ -5373,6 +5373,25 @@ def test_h3_prep_resume_gate_accepts_reusable_upstream_without_h3_manifest(
     pipeline.validate_h3_prep_resume(project_id)
 
 
+def test_h3_prep_resume_gate_accepts_succeeded_project(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    store, project_id, _project, _items, _seedream = (
+        _frozen_current_after_global_preflight_failure(tmp_path, monkeypatch)
+    )
+    store.update(project_id, status="succeeded")
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        codex=object(), deepseek=object(), mediakit=object(), picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+
+    pipeline.validate_h3_prep_resume(project_id)
+
+
 def test_h3_prep_resume_invalidates_only_h3_local_artifacts(
     tmp_path: Path,
     monkeypatch: Any,

@@ -490,6 +490,46 @@ def test_failed_project_h3_prep_resume_requires_confirmation_and_uses_its_own_op
         assert app.state.pipeline.resumed == []
 
 
+def test_succeeded_project_h3_prep_resume_supersedes_old_output(
+    tmp_path: Path,
+):
+    app = create_app(
+        settings(tmp_path),
+        pipeline_factory=lambda _settings, store, _register_asset: ResumablePipeline(store),
+    )
+    project_id, project, _state = app.state.store.create({}, "h3-prep-succeeded-request")
+    old_output = project / "output" / "generated.mp4"
+    old_output.parent.mkdir(exist_ok=True)
+    old_output.write_bytes(b"old-video")
+    app.state.store.update(
+        project_id,
+        status="succeeded",
+        has_video=True,
+        output_path="output/generated.mp4",
+        project_progress={"status": "succeeded", "percent": 100, "stage": "completed"},
+        generation={"status": "succeeded", "stage": "completed", "error": None},
+    )
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            f"/api/conversations/{project_id}/resume-h3-prep",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+        assert accepted.status_code == 202
+        terminal = wait_for_status(client, project_id, "succeeded")
+        assert terminal["has_video"] is True
+        assert app.state.pipeline.h3_prep_validated == [project_id]
+        assert app.state.pipeline.h3_prep_resumed == [project_id]
+
+    events = [json.loads(line) for line in (project / "logs" / "trace.jsonl").read_text().splitlines()]
+    assert any(
+        event["event"] == "h3_prep_output_superseded"
+        and event["previous_output"] == "output/generated.mp4"
+        for event in events
+    )
+
+
 def test_create_uses_exact_recovery_shape_fixed_paths_and_four_public_statuses(tmp_path: Path):
     app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
     with TestClient(app) as client:

@@ -4503,11 +4503,11 @@ class Pipeline:
         )
         status = state.get("status")
         stage = (state.get("project_progress") or {}).get("stage")
-        if status != "failed" and not (
+        if status not in {"failed", "succeeded"} and not (
             status == "queued" and stage == "h3_prep_resume_queued"
         ):
             raise ValueError(
-                "only a failed or explicitly queued project can resume H3 preparation"
+                "only a failed, succeeded, or explicitly queued project can resume H3 preparation"
             )
         _source_input, replacement = self._stored_input_paths(project, state)
         raw_segments = self._validated_stored_segments(

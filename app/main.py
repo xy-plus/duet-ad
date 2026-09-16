@@ -1013,8 +1013,12 @@ def create_app(
         store = _store(request)
         with app.state.resume_lock:
             state = _read_project(store, project_id)
-            if state.get("status") != "failed":
-                raise _error(409, "project_not_failed", "只有失败项目可以重新准备 H3")
+            if state.get("status") not in {"failed", "succeeded"}:
+                raise _error(
+                    409,
+                    "project_not_resumable",
+                    "只有失败或已成功项目可以重新准备 H3",
+                )
             try:
                 app.state.pipeline.validate_h3_prep_resume(project_id)
             except (FileNotFoundError, TypeError, ValueError, OSError):
@@ -1023,6 +1027,12 @@ def create_app(
                     "h3_prep_resume_not_ready",
                     "项目缺少可安全复用的前置产物",
                 ) from None
+            if state.get("status") == "succeeded":
+                ResearchLog(store.path(project_id)).event(
+                    "h3_prep_output_superseded",
+                    previous_output=state.get("output_path"),
+                    reason="explicit succeeded-project H3 preparation rerun",
+                )
             state = store.update(
                 project_id,
                 status="queued",
