@@ -330,8 +330,12 @@ def test_submitting_with_durable_response_marker_replays_after_crash(tmp_path: P
     assert destination.read_bytes() == _PNG
 
 
-def test_transport_ambiguity_is_terminal_and_never_reposts(tmp_path: Path) -> None:
+def test_transport_ambiguity_is_terminal_and_never_reposts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     calls = 0
+    sleeps: list[float] = []
+    monkeypatch.setattr(seedream, "retry_sleep", sleeps.append)
     receipt_path = tmp_path / "receipt.json"
 
     def ambiguous(request: httpx.Request) -> httpx.Response:
@@ -352,6 +356,7 @@ def test_transport_ambiguity_is_terminal_and_never_reposts(tmp_path: Path) -> No
     assert first.value.__context__ is None
     # Bounded retry: first attempt + 2 retries before declaring ambiguity.
     assert calls == 3
+    assert sleeps == [2.0, 5.0]
     assert [
         entry["error"]["type"] for entry in first.value.record["attempts"]
     ] == ["ReadTimeout"] * 3
@@ -1022,10 +1027,14 @@ def test_replay_received_rejects_tampered_frozen_request_binding(
     assert not destination.exists()
 
 
-def test_generate_retries_connect_error_then_succeeds(tmp_path: Path) -> None:
+def test_generate_retries_connect_error_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     destination = tmp_path / "sheet.png"
     receipt_path = tmp_path / "seedream-receipt.json"
     calls = 0
+    sleeps: list[float] = []
+    monkeypatch.setattr(seedream, "retry_sleep", sleeps.append)
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
@@ -1046,6 +1055,7 @@ def test_generate_retries_connect_error_then_succeeds(tmp_path: Path) -> None:
     assert result.value == destination
     assert destination.read_bytes() == _PNG
     assert calls == 2
+    assert sleeps == [10.0]
     attempts = result.record["attempts"]
     assert [entry["attempt"] for entry in attempts] == [1, 2]
     assert attempts[0]["error"]["type"] == "ConnectError"

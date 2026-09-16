@@ -20,10 +20,12 @@ import numpy as np
 
 from app.config import Settings
 from app.providers import (
+    CONNECTION_RETRY_BACKOFF_S,
     RETRY_BACKOFF_S,
     RETRYABLE_STATUSES,
     ProviderFailure,
     ProviderResult,
+    is_connection_transport_error,
     is_retryable_transport_error,
     retry_sleep,
 )
@@ -1030,13 +1032,17 @@ class SeedreamClient:
         transport_error_type: str | None = None
         client: httpx.Client | None = None
         send_attempts: list[dict[str, Any]] = []
-        max_send_attempts = len(RETRY_BACKOFF_S) + 1
+        attempt_number = 0
+        connection_phase = True
+        connection_retries = 0
+        ambiguous_retries = 0
         try:
             client = httpx.Client(
                 timeout=httpx.Timeout(self.settings.seedream_timeout_s),
                 transport=self.transport,
             )
-            for attempt_number in range(1, max_send_attempts + 1):
+            while True:
+                attempt_number += 1
                 try:
                     response = client.post(
                         endpoint,
@@ -1056,20 +1062,33 @@ class SeedreamClient:
                             },
                         }
                     )
-                    if (
-                        is_retryable_transport_error(exc)
-                        and attempt_number < max_send_attempts
-                    ):
-                        _LOGGER.warning(
-                            "Seedream POST attempt %d/%d failed with %s: %s; retrying in %gs",
-                            attempt_number,
-                            max_send_attempts,
-                            type(exc).__name__,
-                            exc,
-                            RETRY_BACKOFF_S[attempt_number - 1],
-                        )
-                        retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
-                        continue
+                    if is_retryable_transport_error(exc):
+                        if is_connection_transport_error(exc) and connection_phase:
+                            backoff_s = CONNECTION_RETRY_BACKOFF_S
+                            retry_index = connection_retries
+                            connection_retries += 1
+                        else:
+                            # After a possibly transmitted POST, retain the
+                            # existing short retry budget to avoid broadening
+                            # duplicate-submission risk.
+                            connection_phase = False
+                            backoff_s = RETRY_BACKOFF_S
+                            retry_index = ambiguous_retries
+                            ambiguous_retries += 1
+                        if retry_index < len(backoff_s):
+                            max_send_attempts = (
+                                attempt_number + len(backoff_s) - retry_index
+                            )
+                            _LOGGER.warning(
+                                "Seedream POST attempt %d/%d failed with %s: %s; retrying in %gs",
+                                attempt_number,
+                                max_send_attempts,
+                                type(exc).__name__,
+                                exc,
+                                backoff_s[retry_index],
+                            )
+                            retry_sleep(backoff_s[retry_index])
+                            continue
                     unknown_receipt = {
                         **submitting_receipt,
                         "status": "submission_unknown",
@@ -1087,20 +1106,26 @@ class SeedreamClient:
                             "status_code": response.status_code,
                         }
                     )
-                    if (
-                        response.status_code in RETRYABLE_STATUSES
-                        and attempt_number < max_send_attempts
-                    ):
-                        _LOGGER.warning(
-                            "Seedream POST attempt %d/%d returned HTTP %d; retrying in %gs",
-                            attempt_number,
-                            max_send_attempts,
-                            response.status_code,
-                            RETRY_BACKOFF_S[attempt_number - 1],
-                        )
-                        retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
-                        response = None
-                        continue
+                    if response.status_code in RETRYABLE_STATUSES:
+                        connection_phase = False
+                        retry_index = ambiguous_retries
+                        ambiguous_retries += 1
+                        if retry_index < len(RETRY_BACKOFF_S):
+                            max_send_attempts = (
+                                attempt_number
+                                + len(RETRY_BACKOFF_S)
+                                - retry_index
+                            )
+                            _LOGGER.warning(
+                                "Seedream POST attempt %d/%d returned HTTP %d; retrying in %gs",
+                                attempt_number,
+                                max_send_attempts,
+                                response.status_code,
+                                RETRY_BACKOFF_S[retry_index],
+                            )
+                            retry_sleep(RETRY_BACKOFF_S[retry_index])
+                            response = None
+                            continue
                 break
         except BaseException:
             try:

@@ -1499,7 +1499,7 @@ def test_deepseek_retries_remote_protocol_error_then_succeeds(tmp_path: Path) ->
     assert attempts[0]["error"]["type"] == "RemoteProtocolError"
 
 
-def test_transport_failure_is_retried_twice_with_backoff_then_raises(
+def test_connect_failure_uses_long_backoff_then_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
@@ -1515,12 +1515,12 @@ def test_transport_failure_is_retried_twice_with_backoff_then_raises(
     with pytest.raises(ProviderFailure, match="unreachable") as caught:
         client.complete_structured("instruction", {"input": 1}, {"type": "object"})
 
-    assert calls == 3
-    assert sleeps == [2.0, 5.0]
+    assert calls == 6
+    assert sleeps == list(providers.CONNECTION_RETRY_BACKOFF_S)
     assert caught.value.record["response"] is None
     attempts = caught.value.record["attempts"]
-    assert [entry["attempt"] for entry in attempts] == [1, 2, 3]
-    assert [entry["error"]["type"] for entry in attempts] == ["ConnectError"] * 3
+    assert [entry["attempt"] for entry in attempts] == [1, 2, 3, 4, 5, 6]
+    assert [entry["error"]["type"] for entry in attempts] == ["ConnectError"] * 6
 
 
 def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
@@ -1599,6 +1599,37 @@ def test_client_errors_are_not_retried(tmp_path: Path) -> None:
     assert calls == 1
     assert caught.value.record["outcome"] == "rejected"
     assert "attempts" not in caught.value.record
+
+
+def test_read_timeout_keeps_short_backoff_and_unknown_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("ambiguous", request=request)
+
+    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
+    with pytest.raises(ProviderFailure) as caught:
+        client.submit(
+            prompt="prompt",
+            video_url="https://assets.test/source.mp4",
+            image_urls=None,
+            duration=5,
+            resolution="768p",
+            aspect_ratio="16:9",
+        )
+
+    assert calls == 3
+    assert sleeps == list(providers.RETRY_BACKOFF_S)
+    assert caught.value.record["outcome"] == "unknown"
+    assert [
+        entry["error"]["type"] for entry in caught.value.record["attempts"]
+    ] == ["ReadTimeout"] * 3
 
 
 def test_mediakit_erase_retries_each_stage_call(tmp_path: Path) -> None:
@@ -1707,7 +1738,7 @@ def test_deepseek_retries_remote_protocol_error_then_succeeds(tmp_path: Path) ->
     assert attempts[0]["error"]["type"] == "RemoteProtocolError"
 
 
-def test_transport_failure_is_retried_twice_with_backoff_then_raises(
+def test_connect_failure_uses_long_backoff_then_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
@@ -1723,12 +1754,12 @@ def test_transport_failure_is_retried_twice_with_backoff_then_raises(
     with pytest.raises(ProviderFailure, match="unreachable") as caught:
         client.complete_structured("instruction", {"input": 1}, {"type": "object"})
 
-    assert calls == 3
-    assert sleeps == [2.0, 5.0]
+    assert calls == 6
+    assert sleeps == list(providers.CONNECTION_RETRY_BACKOFF_S)
     assert caught.value.record["response"] is None
     attempts = caught.value.record["attempts"]
-    assert [entry["attempt"] for entry in attempts] == [1, 2, 3]
-    assert [entry["error"]["type"] for entry in attempts] == ["ConnectError"] * 3
+    assert [entry["attempt"] for entry in attempts] == [1, 2, 3, 4, 5, 6]
+    assert [entry["error"]["type"] for entry in attempts] == ["ConnectError"] * 6
 
 
 def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
@@ -1807,4 +1838,3 @@ def test_client_errors_are_not_retried(tmp_path: Path) -> None:
     assert calls == 1
     assert caught.value.record["outcome"] == "rejected"
     assert "attempts" not in caught.value.record
-

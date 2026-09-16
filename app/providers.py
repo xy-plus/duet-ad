@@ -28,14 +28,22 @@ from app.config import Settings
 T = TypeVar("T")
 _MISSING = object()
 _LOGGER = logging.getLogger(__name__)
-# Bounded retry for transient network failures: first attempt + 2 retries,
+# Bounded retry for ambiguous network failures: first attempt + 2 retries,
 # backing off 2s then 5s.  Only transport errors and gateway statuses are
 # retried; 4xx and other definite answers are final on the first attempt.
 RETRY_BACKOFF_S = (2.0, 5.0)
+# A TCP connection error proves that this attempt did not reach the provider,
+# so it is safe to wait out a short network outage without risking a duplicate
+# paid submission.  Do not use this schedule for errors after a connection has
+# been established: those may have transmitted the request.
+CONNECTION_RETRY_BACKOFF_S = (10.0, 30.0, 60.0, 120.0, 300.0)
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
-_RETRYABLE_TRANSPORT_ERRORS = (
+_CONNECTION_TRANSPORT_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
+)
+_RETRYABLE_TRANSPORT_ERRORS = (
+    *_CONNECTION_TRANSPORT_ERRORS,
     httpx.ReadTimeout,
     httpx.WriteTimeout,
     httpx.PoolTimeout,
@@ -161,6 +169,12 @@ def is_retryable_transport_error(exc: BaseException) -> bool:
     return isinstance(exc, _RETRYABLE_TRANSPORT_ERRORS)
 
 
+def is_connection_transport_error(exc: BaseException) -> bool:
+    """Whether an HTTP attempt failed before a TCP connection was established."""
+
+    return isinstance(exc, _CONNECTION_TRANSPORT_ERRORS)
+
+
 def retry_sleep(seconds: float) -> None:
     """Backoff seam between retries; tests replace it to avoid real sleeps."""
 
@@ -185,9 +199,13 @@ def _send(
     if content is not None:
         kwargs["content"] = content
     request = client.build_request(method, url, **kwargs)
-    max_attempts = len(RETRY_BACKOFF_S) + 1
     attempts: list[dict[str, Any]] = []
-    for attempt_number in range(1, max_attempts + 1):
+    attempt_number = 0
+    connection_phase = True
+    connection_retries = 0
+    ambiguous_retries = 0
+    while True:
+        attempt_number += 1
         try:
             response = client.send(request)
         except _RETRYABLE_TRANSPORT_ERRORS as exc:
@@ -195,7 +213,19 @@ def _send(
             exchange["attempt"] = attempt_number
             exchange["error"] = {"type": type(exc).__name__, "message": str(exc)}
             attempts.append(exchange)
-            if attempt_number < max_attempts:
+            if is_connection_transport_error(exc) and connection_phase:
+                backoff_s = CONNECTION_RETRY_BACKOFF_S
+                retry_index = connection_retries
+                connection_retries += 1
+            else:
+                # Once a request could have crossed the network, every later
+                # retry stays on the short, duplicate-safe schedule.
+                connection_phase = False
+                backoff_s = RETRY_BACKOFF_S
+                retry_index = ambiguous_retries
+                ambiguous_retries += 1
+            if retry_index < len(backoff_s):
+                max_attempts = attempt_number + len(backoff_s) - retry_index
                 _LOGGER.warning(
                     "provider %s %s attempt %d/%d failed with %s: %s; retrying in %gs",
                     method,
@@ -204,9 +234,9 @@ def _send(
                     max_attempts,
                     type(exc).__name__,
                     exc,
-                    RETRY_BACKOFF_S[attempt_number - 1],
+                    backoff_s[retry_index],
                 )
-                retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
+                retry_sleep(backoff_s[retry_index])
                 continue
             failure = _transport_record(request, request_body)
             failure["attempts"] = attempts
@@ -223,22 +253,29 @@ def _send(
         exchange = response_record(response, request_body=request_body)
         exchange["attempt"] = attempt_number
         attempts.append(exchange)
-        if response.status_code in RETRYABLE_STATUSES and attempt_number < max_attempts:
-            _LOGGER.warning(
-                "provider %s %s attempt %d/%d returned HTTP %d; retrying in %gs",
-                method,
-                url,
-                attempt_number,
-                max_attempts,
-                response.status_code,
-                RETRY_BACKOFF_S[attempt_number - 1],
-            )
-            retry_sleep(RETRY_BACKOFF_S[attempt_number - 1])
-            continue
+        if response.status_code in RETRYABLE_STATUSES:
+            # A gateway response is an ambiguous, post-transport outcome;
+            # retain its historical two short retries even if preceding
+            # connection failures were harmless.
+            connection_phase = False
+            retry_index = ambiguous_retries
+            ambiguous_retries += 1
+            if retry_index < len(RETRY_BACKOFF_S):
+                max_attempts = attempt_number + len(RETRY_BACKOFF_S) - retry_index
+                _LOGGER.warning(
+                    "provider %s %s attempt %d/%d returned HTTP %d; retrying in %gs",
+                    method,
+                    url,
+                    attempt_number,
+                    max_attempts,
+                    response.status_code,
+                    RETRY_BACKOFF_S[retry_index],
+                )
+                retry_sleep(RETRY_BACKOFF_S[retry_index])
+                continue
         if len(attempts) > 1:
             return response, {**exchange, "attempts": attempts}
         return response, exchange
-    raise AssertionError("unreachable")
 
 
 def _ensure_success(
