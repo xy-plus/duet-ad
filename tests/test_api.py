@@ -144,6 +144,8 @@ class ResumablePipeline:
         self.resumed: list[str] = []
         self.pre_validated: list[str] = []
         self.pre_resumed: list[str] = []
+        self.h3_prep_validated: list[str] = []
+        self.h3_prep_resumed: list[str] = []
 
     def run(self, _project_id: str) -> None:
         raise AssertionError("full pipeline must not run during Picsart resume")
@@ -154,12 +156,19 @@ class ResumablePipeline:
     def validate_pre_picsart_resume(self, project_id: str) -> None:
         self.pre_validated.append(project_id)
 
+    def validate_h3_prep_resume(self, project_id: str) -> None:
+        self.h3_prep_validated.append(project_id)
+
     def resume_r2v(self, project_id: str) -> None:
         self.resumed.append(project_id)
         self._succeed(project_id)
 
     def resume_pre_picsart(self, project_id: str) -> None:
         self.pre_resumed.append(project_id)
+        self._succeed(project_id)
+
+    def resume_h3_prep(self, project_id: str) -> None:
+        self.h3_prep_resumed.append(project_id)
         self._succeed(project_id)
 
     def _succeed(self, project_id: str) -> None:
@@ -436,6 +445,47 @@ def test_failed_project_pre_picsart_resume_is_explicit_and_uses_its_own_operatio
         assert terminal["has_video"] is True
         assert app.state.pipeline.pre_validated == [project_id]
         assert app.state.pipeline.pre_resumed == [project_id]
+        assert app.state.pipeline.validated == []
+        assert app.state.pipeline.resumed == []
+
+
+def test_failed_project_h3_prep_resume_requires_confirmation_and_uses_its_own_operation(
+    tmp_path: Path,
+):
+    app = create_app(
+        settings(tmp_path),
+        pipeline_factory=lambda _settings, store, _register_asset: ResumablePipeline(store),
+    )
+    project_id, _project, _state = app.state.store.create({}, "h3-prep-resume-request")
+    app.state.store.update(
+        project_id,
+        status="failed",
+        project_progress={"status": "failed", "percent": 42, "stage": "pipeline_failed"},
+        generation={"status": "failed", "stage": "pipeline_failed", "error": "failed"},
+    )
+
+    with TestClient(app) as client:
+        unconfirmed = client.post(
+            f"/api/conversations/{project_id}/resume-h3-prep",
+            headers=AUTH,
+            json={"confirm": False},
+        )
+        assert unconfirmed.status_code == 400
+        assert unconfirmed.json()["detail"]["code"] == "confirmation_required"
+
+        accepted = client.post(
+            f"/api/conversations/{project_id}/resume-h3-prep",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+        assert accepted.status_code == 202
+        assert accepted.json()["project_progress"]["stage"] == "h3_prep_resume_queued"
+        terminal = wait_for_status(client, project_id, "succeeded")
+        assert terminal["has_video"] is True
+        assert app.state.pipeline.h3_prep_validated == [project_id]
+        assert app.state.pipeline.h3_prep_resumed == [project_id]
+        assert app.state.pipeline.pre_validated == []
+        assert app.state.pipeline.pre_resumed == []
         assert app.state.pipeline.validated == []
         assert app.state.pipeline.resumed == []
 

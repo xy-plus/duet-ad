@@ -4439,6 +4439,310 @@ class Pipeline:
             voice_references,
         )
 
+    def _audit_h3_prep_submission_reset(
+        self,
+        project: Path,
+        state: dict[str, Any],
+        segments: list[dict[str, Any]],
+    ) -> None:
+        """Prove that replacing the H3 preparation cannot hide a paid POST.
+
+        A new H3 preparation intentionally gets a new Picsart ledger, since
+        its request can differ from the old frozen one.  That is safe only
+        after the old ledger has been fully validated and none of its submits
+        is left in the fail-closed, unknown-outcome state.
+        """
+        raw_ledger = state.get("picsart_submission_receipts")
+        if raw_ledger is None:
+            if any(
+                path.is_dir()
+                for path in (project / "logs").glob("picsart*-submit")
+            ):
+                raise ValueError(
+                    "project has Picsart submission evidence without its receipt ledger"
+                )
+            return
+
+        # Receipt v2 binds to the old manifest.  Validate that binding before
+        # clearing either state field, so this explicit rerun never erases
+        # evidence of an unaccounted provider submission.
+        self._validated_h3_prepared_artifacts(project, state, segments)
+        ledger = self._validated_submission_receipts(state)
+        if ledger is None:  # Defensive: raw_ledger above was not None.
+            raise ValueError("Picsart submission receipt ledger is missing")
+        expected_segments = {str(item["index"]) for item in segments}
+        if set(ledger["segments"]) != expected_segments:
+            raise ValueError(
+                "H3 preparation requires a complete Picsart receipt ledger; "
+                "reconcile it before preparing again"
+            )
+        for item in segments:
+            # This retains the exact submission_started/unknown fail-closed
+            # semantics used by Picsart resume. Accepted and terminally
+            # failed runs are auditable and may be superseded by the caller's
+            # explicit changed-preparation request.
+            self._state_submission_task(state, int(item["index"]))
+
+    def _load_h3_prep_resume(
+        self,
+        project_id: str,
+    ) -> tuple[
+        Path,
+        list[dict[str, Any]],
+        Path | None,
+        dict[str, Any],
+        Path | None,
+        dict[str, Any],
+        str,
+    ]:
+        """Load trusted pre-H3 state without trusting prior H3 artifacts."""
+        project = self.store.path(project_id)
+        state = self.store.read(project_id)
+        request = self._validated_effective_request(
+            state.get("effective_request")
+        )
+        status = state.get("status")
+        stage = (state.get("project_progress") or {}).get("stage")
+        if status != "failed" and not (
+            status == "queued" and stage == "h3_prep_resume_queued"
+        ):
+            raise ValueError(
+                "only a failed or explicitly queued project can resume H3 preparation"
+            )
+        _source_input, replacement = self._stored_input_paths(project, state)
+        raw_segments = self._validated_stored_segments(
+            state, missing_message="project has no reusable segments",
+        )
+        enhanced_element_index = state.get("enhanced_element_index")
+        if not isinstance(enhanced_element_index, dict):
+            raise ValueError("stored enhanced element index is invalid")
+
+        # This checks the frozen replacement plan, its source-video receipts,
+        # object-replace bindings, and the completed Seedream artifact.  A
+        # prepared (not yet completed) sheet remains recoverable through the
+        # same Seedream receipt-reset path as resume-pre-picsart.
+        frozen_sheet = state.get("replacement_sheet")
+        if not isinstance(frozen_sheet, dict):
+            raise ValueError("stored replacement sheet state is invalid")
+        replacement_sheet_path = self._validated_stored_replacement_sheet(
+            project, state, allow_prepared=True,
+        )
+        sheet_status = frozen_sheet.get("status")
+        recovery_mode = (
+            "reuse"
+            if sheet_status in {"not_needed", "succeeded"}
+            else self._validated_prepared_seedream_attempt(project, frozen_sheet)
+        )
+        self._stored_voice_references(project, state)
+
+        prepared: list[dict[str, Any]] = []
+        for raw in raw_segments:
+            visual_prompt = raw.get("visual_prompt")
+            dialogue = raw.get("dialogue")
+            if (
+                not isinstance(visual_prompt, str)
+                or not isinstance(dialogue, list)
+                or any(not isinstance(line, dict) for line in dialogue)
+            ):
+                raise ValueError("stored H3 preparation segment content is invalid")
+            index = int(raw["index"])
+            source = project / "work" / "segments" / f"{index:04d}" / "source.mp4"
+            if not source.is_file() or source.is_symlink() or source.stat().st_size < 1:
+                raise FileNotFoundError("reusable segment source is missing")
+            if dialogue:
+                track = source.parent / "dialogue-track.wav"
+                if (
+                    not track.is_file()
+                    or track.is_symlink()
+                    or track.stat().st_size < 1
+                ):
+                    raise FileNotFoundError("reusable dialogue track is missing")
+            prepared.append({
+                **raw,
+                "source": source,
+                "status": "running",
+            })
+
+        self._audit_h3_prep_submission_reset(project, state, raw_segments)
+        return (
+            project,
+            prepared,
+            replacement,
+            frozen_sheet,
+            replacement_sheet_path,
+            enhanced_element_index,
+            recovery_mode,
+        )
+
+    def _invalidate_h3_prepared_artifacts(
+        self,
+        project_id: str,
+        project: Path,
+        prepared: list[dict[str, Any]],
+        log: ResearchLog,
+    ) -> None:
+        """Drop only products made after the trusted pre-H3 barrier.
+
+        The local detection JSON files are deliberately removed so the mask
+        node can render with its current options; object_detect's shared
+        fingerprint cache lives outside a project directory and is untouched.
+        """
+        self.store.update(
+            project_id,
+            h3_prepared_artifacts=None,
+            picsart_submission_receipts=None,
+        )
+        removed: list[str] = []
+        for item in prepared:
+            segment_dir = item["source"].parent
+            candidates = [
+                segment_dir / name
+                for name in (
+                    "source-muted.mp4",
+                    "source-objects-masked.mp4",
+                    "h3_prompt.txt",
+                )
+            ]
+            # output_media records every local object-detect*.json artifact;
+            # include legacy target-named fallbacks as well.  Do not recurse,
+            # unlink directories, or follow a malformed symlink.
+            candidates.extend(sorted(segment_dir.glob("object-detect*.json")))
+            seen: set[Path] = set()
+            for path in candidates:
+                if path in seen:
+                    continue
+                seen.add(path)
+                if not path.is_file() or path.is_symlink():
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                removed.append(path.relative_to(project).as_posix())
+        log.event(
+            "h3_prep_artifacts_invalidated",
+            removed_artifacts=removed,
+            shared_object_detect_cache_preserved=True,
+        )
+
+    def validate_h3_prep_resume(self, project_id: str) -> None:
+        self._load_h3_prep_resume(project_id)
+
+    def resume_h3_prep(self, project_id: str) -> None:
+        (
+            project,
+            prepared,
+            replacement,
+            frozen_sheet,
+            _replacement_sheet_path,
+            enhanced_element_index,
+            recovery_mode,
+        ) = self._load_h3_prep_resume(project_id)
+        request = self._validated_effective_request(
+            self.store.read(project_id).get("effective_request")
+        )
+        log = ResearchLog(project)
+        log.event("h3_prep_resume_started")
+        try:
+            replacement_sheet, replacement_sheet_path = self._resume_replacement_sheet(
+                project_id,
+                project,
+                frozen_sheet,
+                recovery_mode,
+                log,
+            )
+            self._invalidate_h3_prepared_artifacts(
+                project_id, project, prepared, log,
+            )
+            self._progress(
+                project_id,
+                57,
+                "h3-prep-resume",
+                segments=[self._public_segment(item) for item in prepared],
+            )
+            outputs = self._run_h3_segments(
+                project_id,
+                project,
+                prepared,
+                enhanced_element_index,
+                replacement,
+                replacement_sheet,
+                replacement_sheet_path,
+                request,
+                log,
+            )
+
+            final = project / "output" / "generated.mp4"
+            join_modes = self._validated_join_modes(prepared)
+            self._progress(
+                project_id,
+                95,
+                "stitch-h3-prep-resume",
+                segments=[self._public_segment(item) for item in prepared],
+            )
+            self._node(
+                log,
+                "stitch-h3-prep-resume",
+                "project",
+                {
+                    "segments": outputs,
+                    "target_durations": [item["duration_s"] for item in prepared],
+                    "join_modes": join_modes,
+                    "output": final,
+                },
+                outputs,
+                lambda: media.concat(
+                    outputs,
+                    final,
+                    target_durations=[item["duration_s"] for item in prepared],
+                    join_modes=join_modes,
+                ),
+                lambda _value: [final],
+            )
+            self._replace_dialogue_audio_track(project, prepared, final, log)
+            self._add_subtitles(project_id, project, final, request, log)
+            self.store.update(
+                project_id,
+                status="succeeded",
+                has_video=True,
+                output_path="output/generated.mp4",
+                project_progress={
+                    "status": "succeeded",
+                    "percent": 100,
+                    "stage": "completed",
+                },
+                generation={
+                    "status": "succeeded",
+                    "stage": "completed",
+                    "error": None,
+                },
+                segments=[
+                    {**self._public_segment(item), "status": "succeeded"}
+                    for item in prepared
+                ],
+                error=None,
+            )
+            log.event("h3_prep_resume_succeeded", output=final)
+            self._prune_artifacts_after_success(project, log)
+        except Exception as exc:
+            log.event("h3_prep_resume_failed", error=str(exc))
+            self._persist_failure(
+                project_id,
+                log,
+                stage="h3_prep_resume_failed",
+                code="h3_prep_resume_failed",
+                message="H3 准备段续跑失败",
+                min_percent=57,
+                extra_changes={
+                    "segments": [self._public_segment(item) for item in prepared],
+                    "project_progress": {
+                        "status": "failed",
+                        "percent": 57,
+                        "stage": "h3_prep_resume_failed",
+                    },
+                },
+            )
+
     def validate_r2v_resume(self, project_id: str) -> None:
         self._load_r2v_resume(project_id)
 

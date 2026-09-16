@@ -5348,6 +5348,153 @@ def _install_resume_output_media(monkeypatch: Any) -> None:
     monkeypatch.setattr(media, "concat", concat)
 
 
+def test_h3_prep_resume_gate_accepts_reusable_upstream_without_h3_manifest(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    store, project_id, _project, _items, _seedream = (
+        _frozen_current_after_global_preflight_failure(tmp_path, monkeypatch)
+    )
+    # H3 preparation is intentionally optional for this gate: a failed
+    # project may have reached the trusted replacement-sheet checkpoint but
+    # never frozen its H3 inputs.
+    store.update(project_id, h3_prepared_artifacts=None)
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        codex=object(),
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+
+    pipeline.validate_h3_prep_resume(project_id)
+
+
+def test_h3_prep_resume_invalidates_only_h3_local_artifacts(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    store, project_id, project, items, _seedream = (
+        _frozen_current_after_global_preflight_failure(tmp_path, monkeypatch)
+    )
+    shared_cache = (
+        tmp_path / "shared" / "object-detect-cache" / "stable-cache.json"
+    )
+    shared_cache.parent.mkdir(parents=True)
+    shared_cache.write_text('{"fal": "cached"}\n', encoding="utf-8")
+    for item in items:
+        segment_dir = item["source"].parent
+        (segment_dir / "source-objects-masked.mp4").write_bytes(b"masked")
+        (segment_dir / "object-detect-response.json").write_text(
+            '{"project": "fallback"}\n', encoding="utf-8",
+        )
+
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        codex=object(),
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+    observed: dict[str, Any] = {}
+
+    def fail_dialogue_audio(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("H3-prep resume must reuse dialogue audio")
+
+    def inspect_regenerated_h3(
+        _project_id: str,
+        resumed_project: Path,
+        prepared: list[dict[str, Any]],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[Path]:
+        state = store.read(project_id)
+        # The old manifest and receipt ledger must not bind a newly rendered
+        # prompt/video to a previous paid submission batch.
+        assert state.get("h3_prepared_artifacts") is None
+        assert state.get("picsart_submission_receipts") is None
+        assert [item["index"] for item in prepared] == [1, 2]
+        for item in prepared:
+            segment_dir = item["source"].parent
+            assert (segment_dir / "source.mp4").read_bytes().startswith(b"source-")
+            assert not (segment_dir / "source-muted.mp4").exists()
+            assert not (segment_dir / "source-objects-masked.mp4").exists()
+            assert not (segment_dir / "h3_prompt.txt").exists()
+        assert shared_cache.read_text(encoding="utf-8") == '{"fal": "cached"}\n'
+        observed["called"] = True
+        raise RuntimeError("stop after H3-prep invalidation inspection")
+
+    monkeypatch.setattr(pipeline, "_run_dialogue_audio", fail_dialogue_audio)
+    monkeypatch.setattr(pipeline, "_run_h3_segments", inspect_regenerated_h3)
+
+    # Resume methods record a new failed terminal state when the work itself
+    # fails; assertions above run after invalidation and before any new H3
+    # rendering or paid H3 submission.
+    pipeline.resume_h3_prep(project_id)
+
+    assert observed == {"called": True}
+    assert shared_cache.is_file()
+    assert store.read(project_id)["status"] == "failed"
+
+
+def test_h3_prep_resume_blocks_unknown_picsart_receipts_before_invalidation(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    store, project_id, project, items, _seedream = (
+        _frozen_current_after_global_preflight_failure(tmp_path, monkeypatch)
+    )
+    manifest = store.read(project_id)["h3_prepared_artifacts"]
+    preparation_sha256 = Pipeline._json_sha256(manifest)
+    store.update(
+        project_id,
+        picsart_submission_receipts={
+            "version": PICSART_RECEIPT_VERSION,
+            "segments": {
+                str(item["index"]): [{
+                    "segment_index": item["index"],
+                    "run_identity": "picsart",
+                    "request_sha256": str(item["index"]) * 64,
+                    "preparation_sha256": preparation_sha256,
+                    "status": "unknown",
+                    "task_id": None,
+                }]
+                for item in items
+            },
+        },
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        codex=object(),
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+        seedream=_RejectSeedream(),
+    )
+    state_before = (project / "state.json").read_bytes()
+    prompts_before = [
+        (item["source"].parent / "h3_prompt.txt").read_bytes()
+        for item in items
+    ]
+
+    with pytest.raises(ValueError, match="unknown"):
+        pipeline.resume_h3_prep(project_id)
+
+    assert (project / "state.json").read_bytes() == state_before
+    assert [
+        (item["source"].parent / "h3_prompt.txt").read_bytes()
+        for item in items
+    ] == prompts_before
+
+
 def test_current_manifest_without_submission_evidence_can_resume_first_batch(
     tmp_path: Path,
     monkeypatch: Any,

@@ -999,6 +999,54 @@ def create_app(
         return state
 
     @app.post(
+        "/api/conversations/{project_id}/resume-h3-prep",
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    async def resume_h3_prep(project_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            raise _error(400, "confirmation_required", "必须明确确认重新准备 H3")
+        store = _store(request)
+        with app.state.resume_lock:
+            state = _read_project(store, project_id)
+            if state.get("status") != "failed":
+                raise _error(409, "project_not_failed", "只有失败项目可以重新准备 H3")
+            try:
+                app.state.pipeline.validate_h3_prep_resume(project_id)
+            except (FileNotFoundError, TypeError, ValueError, OSError):
+                raise _error(
+                    409,
+                    "h3_prep_resume_not_ready",
+                    "项目缺少可安全复用的前置产物",
+                ) from None
+            state = store.update(
+                project_id,
+                status="queued",
+                has_video=False,
+                project_progress={
+                    "status": "queued",
+                    "percent": 0,
+                    "stage": "h3_prep_resume_queued",
+                },
+                generation={
+                    "status": "queued",
+                    "stage": "h3_prep_resume_queued",
+                    "error": None,
+                },
+                error=None,
+            )
+        task = asyncio.create_task(
+            asyncio.to_thread(pipeline_entry, project_id, "resume_h3_prep")
+        )
+        app.state.tasks.add(task)
+        task.add_done_callback(app.state.tasks.discard)
+        return state
+
+    @app.post(
         "/api/conversations/{project_id}/resume-picsart",
         status_code=202,
         dependencies=[Depends(require_auth)],
