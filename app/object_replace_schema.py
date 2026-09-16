@@ -12,9 +12,10 @@ from app.fusion_schema import canonical_input
 
 
 OBJECT_REPLACE_OUTPUT_NAME = "duet.object-replace-output"
-# detect_label 只进 entities 的 agent schema 和 normalize 的若存在校验，不
-# 改变传输绑定形状：版本保持 4，detect_label 引入前冻结的 v4 输出仍可被
-# normalize 放行（缺字段时由检测 target 派生环节回退源描述）。
+# detect_label 不改变传输绑定形状：版本保持 4。当前 Object Replace 节点
+# 总会传入 reference_image_ids（即使为空），因此 normalize 对该新产出强制
+# 标签；detect_label 引入前的冻结 v4 输出不会传此参数，仍可恢复并由检测
+# target 派生环节回退源描述。
 OBJECT_REPLACE_OUTPUT_VERSION = 4
 MAX_REFERENCE_AUDIO = 3
 
@@ -297,6 +298,7 @@ def _normalize_replacement(
     value: object,
     *,
     allowed_reference_image_ids: Collection[str] | None = None,
+    require_detect_label: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or not _REPLACEMENT_KEYS <= set(value):
         raise ValueError("object-replace replacement is invalid")
@@ -317,9 +319,11 @@ def _normalize_replacement(
         "target_visual_description": description,
         "appearance_description": appearance_description,
     }
-    if "detect_label" in value:
-        # 若存在必须可用：防 agent 写长句/中文，坏标签直接拒收重试；
-        # 缺失则放行（旧冻结产物），由检测 target 派生环节回退源描述。
+    if "detect_label" not in value:
+        if require_detect_label:
+            raise ValueError("object-replace detect label is missing")
+    else:
+        # 若存在必须可用：防 agent 写长句/中文，坏标签直接拒收重试。
         detect_label = value["detect_label"]
         if not isinstance(detect_label, str) or not _DETECT_LABEL_RE.fullmatch(
             detect_label
@@ -380,9 +384,16 @@ def normalize_object_replace(
     dialogue_line_count: int,
     reference_image_ids: Collection[str] | None = None,
 ) -> dict[str, Any]:
-    """Normalize the closed transport shape without judging model quality."""
+    """Normalize the closed transport shape without judging model quality.
+
+    ``reference_image_ids`` is supplied by every current Object Replace run,
+    including runs without a user image.  It is intentionally absent when
+    replaying a frozen v4 output from before ``detect_label`` existed, so it
+    also marks whether entity labels are mandatory.
+    """
     element_ids = _element_ids(element_index)
     catalog_ids = set(_catalog_ids(voice_ids))
+    require_entity_detect_labels = reference_image_ids is not None
     allowed_reference_image_ids = (
         _reference_image_ids(reference_image_ids, allow_empty=True)
         if reference_image_ids is not None else None
@@ -429,6 +440,9 @@ def normalize_object_replace(
             replacement = _normalize_replacement(
                 patch["replacement"],
                 allowed_reference_image_ids=allowed_reference_image_ids,
+                require_detect_label=(
+                    category == "entities" and require_entity_detect_labels
+                ),
             )
             uses_image_1 = replacement["source"] == "image_1"
             if uses_image_1:

@@ -214,14 +214,17 @@ def _output(
         "entities": {
             stable_id: {
                 "matches_user_request": stable_id == image_1_key,
-                "replacement": _replacement(
-                    (
-                        "image_1"
-                        if stable_id == image_1_key
-                        else "generated_variant"
+                "replacement": {
+                    **_replacement(
+                        (
+                            "image_1"
+                            if stable_id == image_1_key
+                            else "generated_variant"
+                        ),
+                        f"new appearance for {stable_id}",
                     ),
-                    f"new appearance for {stable_id}",
-                ),
+                    "detect_label": "object",
+                },
             }
             for stable_id in element_index["entities"]
         },
@@ -458,6 +461,8 @@ def test_normalizer_tolerates_a_missing_detect_label_for_legacy_outputs() -> Non
     element_index = _index()
     _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
     value = _output(element_index, digest)
+    for patch in value["entities"].values():
+        patch["replacement"].pop("detect_label")
 
     normalized = _normalize(value, digest=digest, element_index=element_index)
 
@@ -466,6 +471,61 @@ def test_normalizer_tolerates_a_missing_detect_label_for_legacy_outputs() -> Non
     merged = merge_object_replace_index(element_index, normalized, {})
     for record in merged["entities"].values():
         assert "detect_label" not in record["replacement"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda value: value["entities"]["entity-01"]["replacement"].pop(
+                "detect_label"
+            ),
+            "detect label is missing",
+        ),
+        (
+            lambda value: value["entities"]["entity-01"]["replacement"].update(
+                {"detect_label": "a red leather handbag"}
+            ),
+            "detect label is invalid",
+        ),
+    ],
+)
+def test_normalizer_rejects_missing_or_invalid_detect_label_for_current_outputs(
+    mutation: Any,
+    error: str,
+) -> None:
+    """Validator ValueError is fed back to the current agent retry loop."""
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    mutation(value)
+
+    with pytest.raises(ValueError, match=error):
+        _normalize(
+            value,
+            digest=digest,
+            element_index=element_index,
+            # Current Object Replace always supplies this argument, including
+            # the no-user-image case.  Legacy frozen v4 replay omits it.
+            reference_image_ids=[],
+        )
+
+
+def test_normalizer_current_output_does_not_require_detect_label_for_people() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+
+    normalized = _normalize(
+        _output(element_index, digest),
+        digest=digest,
+        element_index=element_index,
+        reference_image_ids=[],
+    )
+
+    assert all(
+        "detect_label" not in patch["replacement"]
+        for patch in normalized["people"].values()
+    )
 
 
 def test_skill_defines_the_same_detect_label_contract_as_the_schema() -> None:
@@ -481,6 +541,10 @@ def test_skill_defines_the_same_detect_label_contract_as_the_schema() -> None:
         "全小写",
         "单数",
         "通用类别词",
+        "每个有非空 `replacement` 的 entities stable key 都必须输出 `detect_label`",
+        "缺失即为无效输出",
+        "开放词汇检测器",
+        "必须能被开放词汇检测器识别",
         "handbag",
         "不得含品牌、颜色、材质",
         "people 和 scenes 不得输出该字段",
@@ -536,6 +600,7 @@ def test_normalizer_preserves_multiple_user_reference_ids_per_stable_key() -> No
         "matches_user_request": True,
         "replacement": {
             **_replacement("image_1", "entity-01"),
+            "detect_label": "object",
             "reference_image_ids": ["image_2"],
         },
     }
@@ -582,14 +647,17 @@ def test_normalizer_keeps_legacy_image_binding_without_reference_ids() -> None:
     [
         {
             **_replacement("generated_variant", "entity-01"),
+            "detect_label": "object",
             "reference_image_ids": ["image_9"],
         },
         {
             **_replacement("image_1", "entity-01"),
+            "detect_label": "object",
             "reference_image_ids": ["image_3"],
         },
         {
             **_replacement("image_1", "entity-01"),
+            "detect_label": "object",
             "reference_image_ids": ["image_9"],
         },
     ],
