@@ -4579,6 +4579,12 @@ def test_poll_http_4xx_is_not_provider_task_terminal_failure() -> None:
             "body": workflow_failed,
         }}],
     }) is True
+    assert Pipeline._poll_record_is_terminal_failure({
+        "polls": [{"response": {
+            "status_code": 503,
+            "body": workflow_failed,
+        }}],
+    }) is True
     for status_code in (404, 429, 500):
         assert Pipeline._poll_record_is_terminal_failure({
             "polls": [{"response": {
@@ -4588,12 +4594,18 @@ def test_poll_http_4xx_is_not_provider_task_terminal_failure() -> None:
         }) is False
     assert Pipeline._poll_record_is_terminal_failure({
         "polls": [{"response": {
-            "status_code": 422,
+            "status_code": 503,
             "body": {
                 "status": "error",
                 "reason": "validation_error",
                 "message": workflow_failed["message"],
             },
+        }}],
+    }) is False
+    assert Pipeline._poll_record_is_terminal_failure({
+        "polls": [{"response": {
+            "status_code": 503,
+            "body": {"status": "error"},
         }}],
     }) is False
 

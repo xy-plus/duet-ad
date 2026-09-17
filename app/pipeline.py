@@ -3497,11 +3497,12 @@ class Pipeline:
                 ):
                     return True
                 continue
-            # The workflow result endpoint also reports a completed task
-            # failure as this exact 422 envelope.  No other HTTP error proves
-            # that an accepted paid task is terminal.
+            # The workflow result endpoint reports completed task failure as
+            # this exact 422 or 503 envelope.  In particular, downstream
+            # MiniMax unavailability is observed as 503 with this reason;
+            # a bare 503 remains a transient failure, not a terminal task.
             if (
-                status_code == 422
+                status_code in (422, 503)
                 and isinstance(body, dict)
                 and str(body.get("status") or "").upper() == "ERROR"
                 and body.get("reason") == f"{PicsartClient.WORKFLOW}_failed"
