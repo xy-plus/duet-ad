@@ -132,7 +132,10 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "只有身体局部可见时",
         "服装保持颜色和风格但改变款式",
         "同类但不同实例",
-        "所有可见实体都必须替换",
+        "动物或其他活物",
+        "必须设 `replacement=null`",
+        "无生命实体规则不变",
+        "不生成变体，不写 `detect_label`，不进图版",
         "同一个 stable key 在不同图片、不同分段",
         "非空 `user_replacement_instruction` 与非空 `user_reference_images` 同时存在时，把用户图约束到语义匹配的既有 stable key",
         "不得只任选一个",
@@ -141,8 +144,9 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "每个 key 只列定义自身目标外观的图",
         "没有用户图或用户替换要求为空时",
         "不得把绑定传播给无关对象、持有者、背景或关联组件",
-        "其余记录设 `matches_user_request=false`，使用 `generated_variant`",
-        "缺失或 `null` 属于结构不完整",
+        "其余需要替换的记录设 `matches_user_request=false`，使用 `generated_variant`",
+        "people/scenes 的每个 stable key 的 `replacement` 必须非空",
+        "该 `null` key 仍必须出现在输出中（显式 `null`），不得省略",
         "后端不对描述做审美判断",
         "完整且逐字一致的 stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点",
         "`appearance_description` 只写当前 stable key 自身内在、可见的新外观",
@@ -156,6 +160,8 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
     ):
         assert rule in skill
     for obsolete_or_specific_rule in (
+        "所有可见实体都必须替换",
+        "缺失或 `null` 属于结构不完整",
         "至少选择两个",
         "其余确实无需替换",
         "手、手臂",
@@ -317,7 +323,12 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
         ]
         for patch_schema in category_schema["properties"].values():
             assert patch_schema["additionalProperties"] is False
-            replacement_object = patch_schema["properties"]["replacement"]
+            replacement_value = patch_schema["properties"]["replacement"]
+            if category == "entities":
+                assert replacement_value["anyOf"][1] == {"type": "null"}
+                replacement_object = replacement_value["anyOf"][0]
+            else:
+                replacement_object = replacement_value
             assert replacement_object["type"] == "object"
             assert replacement_object["additionalProperties"] is False
             assert replacement_object["properties"]["source"]["enum"] == [
@@ -343,7 +354,7 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
                     {"type": "null"},
                 ]
 
-            image_branch, generated_branch = patch_schema["anyOf"]
+            image_branch, generated_branch, *keep_branches = patch_schema["anyOf"]
             assert image_branch["additionalProperties"] is False
             assert image_branch["properties"]["matches_user_request"][
                 "enum"
@@ -358,6 +369,19 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
             assert generated_branch["properties"]["replacement"]["properties"][
                 "source"
             ]["enum"] == ["generated_variant"]
+            if category == "entities":
+                assert len(keep_branches) == 1
+                keep_branch = keep_branches[0]
+                assert keep_branch["additionalProperties"] is False
+                assert keep_branch["properties"]["matches_user_request"][
+                    "enum"
+                ] == [False]
+                assert keep_branch["properties"]["replacement"] == {
+                    "type": "null",
+                }
+                assert "detect_label" not in keep_branch["properties"]
+            else:
+                assert keep_branches == []
             for branch in (image_branch, generated_branch):
                 branch_replacement = branch["properties"]["replacement"]
                 assert (
@@ -392,7 +416,12 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
     }
     for category in ("people", "entities", "scenes"):
         for patch_schema in schema["properties"][category]["properties"].values():
-            replacement = patch_schema["properties"]["replacement"]
+            replacement_value = patch_schema["properties"]["replacement"]
+            replacement = (
+                replacement_value["anyOf"][0]
+                if category == "entities"
+                else replacement_value
+            )
             assert replacement["required"] == [
                 "source",
                 "target_visual_description",
@@ -402,11 +431,25 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
             assert replacement["properties"]["reference_image_ids"] == (
                 expected_reference_ids
             )
-            image_branch, generated_branch = patch_schema["anyOf"]
+            image_branch, generated_branch, *keep_branches = patch_schema["anyOf"]
             assert image_branch["properties"]["replacement"]["properties"][
                 "reference_image_ids"
             ] == expected_reference_ids
             assert generated_branch["properties"]["replacement"]["properties"]["reference_image_ids"] == expected_reference_ids
+            if category == "entities":
+                assert keep_branches == [{
+                    "type": "object",
+                    "properties": {
+                        "matches_user_request": {
+                            "type": "boolean", "enum": [False],
+                        },
+                        "replacement": {"type": "null"},
+                    },
+                    "required": ["matches_user_request", "replacement"],
+                    "additionalProperties": False,
+                }]
+            else:
+                assert keep_branches == []
 
 
 @pytest.mark.parametrize(
@@ -471,6 +514,57 @@ def test_normalizer_tolerates_a_missing_detect_label_for_legacy_outputs() -> Non
     merged = merge_object_replace_index(element_index, normalized, {})
     for record in merged["entities"].values():
         assert "detect_label" not in record["replacement"]
+
+
+def test_normalizer_and_merge_keep_an_explicit_null_entity_replacement() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"]["entity-02"] = {
+        "matches_user_request": False,
+        "replacement": None,
+    }
+
+    normalized = _normalize(value, digest=digest, element_index=element_index)
+    merged = merge_object_replace_index(element_index, normalized, {})
+
+    assert set(normalized["entities"]["entity-02"]) == {
+        "matches_user_request", "replacement",
+    }
+    assert normalized["entities"]["entity-02"]["replacement"] is None
+    assert merged["entities"]["entity-02"]["replacement"] is None
+
+
+@pytest.mark.parametrize("category", ["people", "scenes"])
+def test_normalizer_rejects_null_replacements_outside_entities(
+    category: str,
+) -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    stable_id = next(iter(value[category]))
+    value[category][stable_id]["replacement"] = None
+
+    with pytest.raises(ValueError, match="replacement is invalid"):
+        _normalize(value, digest=digest, element_index=element_index)
+
+
+def test_normalizer_requires_the_explicit_null_entity_key_and_rejects_a_match() -> None:
+    element_index = _index()
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    value = _output(element_index, digest)
+    value["entities"].pop("entity-02")
+
+    with pytest.raises(ValueError, match="element keys are invalid"):
+        _normalize(value, digest=digest, element_index=element_index)
+
+    value = _output(element_index, digest)
+    value["entities"]["entity-02"] = {
+        "matches_user_request": True,
+        "replacement": None,
+    }
+    with pytest.raises(ValueError, match="null replacement cannot match"):
+        _normalize(value, digest=digest, element_index=element_index)
 
 
 @pytest.mark.parametrize(
@@ -702,9 +796,17 @@ def test_schema_forbids_image_1_without_an_explicit_image_request(
             assert patch_schema["properties"]["matches_user_request"][
                 "enum"
             ] == [False]
-            assert patch_schema["properties"]["replacement"]["properties"][
+            replacement_value = patch_schema["properties"]["replacement"]
+            replacement = (
+                replacement_value["anyOf"][0]
+                if category == "entities"
+                else replacement_value
+            )
+            assert replacement["properties"][
                 "source"
             ]["enum"] == ["generated_variant"]
+            if category == "entities":
+                assert replacement_value["anyOf"][1] == {"type": "null"}
 
 
 def test_schema_accepts_an_empty_reference_list_without_a_user_image() -> None:
@@ -719,9 +821,13 @@ def test_schema_accepts_an_empty_reference_list_without_a_user_image() -> None:
 
     for category in ("people", "entities", "scenes"):
         for patch_schema in schema["properties"][category]["properties"].values():
-            assert "reference_image_ids" not in patch_schema["properties"][
-                "replacement"
-            ]["properties"]
+            replacement_value = patch_schema["properties"]["replacement"]
+            replacement = (
+                replacement_value["anyOf"][0]
+                if category == "entities"
+                else replacement_value
+            )
+            assert "reference_image_ids" not in replacement["properties"]
 
 
 @pytest.mark.parametrize(
@@ -1084,11 +1190,10 @@ def test_normalizer_accepts_exactly_one_matching_image_1_binding() -> None:
     ("category", "stable_id"),
     [
         ("people", "person-02"),
-        ("entities", "entity-02"),
         ("scenes", "scene-01"),
     ],
 )
-def test_normalizer_rejects_a_null_replacement_for_any_stable_key(
+def test_normalizer_rejects_a_null_replacement_for_people_and_scenes(
     category: str,
     stable_id: str,
 ) -> None:

@@ -183,6 +183,7 @@ def _replacement_schema(
     reference_image_ids: Sequence[str],
     voice_ids: Sequence[str] | None = None,
     detect_label: bool = False,
+    allow_null: bool = False,
 ) -> dict[str, Any]:
     replacement_sources = (
         _REPLACEMENT_SOURCES
@@ -196,13 +197,21 @@ def _replacement_schema(
         ),
         detect_label=detect_label,
     )
+    # The schema cannot determine whether an entity is a living animal.  It
+    # therefore admits explicit KEEP only for entities; the Object Replace
+    # instructions own the semantic rule that limits it to unrequested animals.
+    replacement_value: dict[str, Any] = (
+        {"anyOf": [replacement, {"type": "null"}]}
+        if allow_null
+        else replacement
+    )
     patch_properties: dict[str, dict[str, Any]] = {
         "matches_user_request": (
             {"type": "boolean"}
             if allow_user_image_binding
             else {"type": "boolean", "enum": [False]}
         ),
-        "replacement": replacement,
+        "replacement": replacement_value,
     }
     if voice_ids is not None:
         patch_properties["voice_id"] = {
@@ -234,10 +243,19 @@ def _replacement_schema(
             reference_image_ids=reference_image_ids,
             detect_label=detect_label,
         )
-        patch_schema["anyOf"] = [
+        patch_branches = [
             _closed_object(image_patch_properties),
             _closed_object(generated_patch_properties),
         ]
+        if allow_null:
+            keep_patch_properties = copy.deepcopy(patch_properties)
+            keep_patch_properties["matches_user_request"] = {
+                "type": "boolean",
+                "enum": [False],
+            }
+            keep_patch_properties["replacement"] = {"type": "null"}
+            patch_branches.append(_closed_object(keep_patch_properties))
+        patch_schema["anyOf"] = patch_branches
     return patch_schema
 
 
@@ -272,6 +290,7 @@ def object_replace_schema(
                 # 只有 entities 会被派生成物体检测 target，detect_label 因此
                 # 只约束 entities；people/scenes 的封闭 schema 直接拒绝该字段。
                 detect_label=category == "entities",
+                allow_null=category == "entities",
             )
             properties[stable_id] = patch_schema
         category_schemas[category] = _closed_object(properties)
@@ -299,7 +318,12 @@ def _normalize_replacement(
     *,
     allowed_reference_image_ids: Collection[str] | None = None,
     require_detect_label: bool = False,
-) -> dict[str, Any]:
+    allow_null: bool = False,
+) -> dict[str, Any] | None:
+    if value is None:
+        if allow_null:
+            return None
+        raise ValueError("object-replace replacement is invalid")
     if not isinstance(value, dict) or not _REPLACEMENT_KEYS <= set(value):
         raise ValueError("object-replace replacement is invalid")
     source = value["source"]
@@ -443,9 +467,14 @@ def normalize_object_replace(
                 require_detect_label=(
                     category == "entities" and require_entity_detect_labels
                 ),
+                allow_null=category == "entities",
             )
-            uses_image_1 = replacement["source"] == "image_1"
-            if uses_image_1:
+            if replacement is None:
+                if matches_user_request:
+                    raise ValueError(
+                        "object-replace null replacement cannot match user request"
+                    )
+            elif replacement["source"] == "image_1":
                 image_1_locations.append((category, stable_id))
             normalized_patch: dict[str, Any] = {
                 "matches_user_request": matches_user_request,
@@ -498,13 +527,21 @@ def merge_object_replace_index(
             matches_user_request = item["matches_user_request"]
             normalized_replacement = _normalize_replacement(
                 item["replacement"],
+                allow_null=category == "entities",
             )
-            merged[category][stable_id]["replacement"] = {
-                "reason": (
-                    "user_requested" if matches_user_request else "automatic"
-                ),
-                **normalized_replacement,
-            }
+            if normalized_replacement is None:
+                if matches_user_request:
+                    raise ValueError(
+                        "object-replace null replacement cannot match user request"
+                    )
+                merged[category][stable_id]["replacement"] = None
+            else:
+                merged[category][stable_id]["replacement"] = {
+                    "reason": (
+                        "user_requested" if matches_user_request else "automatic"
+                    ),
+                    **normalized_replacement,
+                }
             if category == "people":
                 voice_id = item["voice_id"]
                 if (

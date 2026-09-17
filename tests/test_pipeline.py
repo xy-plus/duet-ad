@@ -3131,6 +3131,43 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "cup logo faces the tray" in keep_relation_line
 
 
+def test_replacement_sheet_skips_a_null_entity_and_fusion_keeps_it() -> None:
+    index = {
+        "people": {},
+        "entities": {
+            "entity-01": {
+                "source_visual_description": "the cat beside the feeder",
+                "occurrences": [{"segment_index": 1}],
+                "replacement": None,
+            },
+            "entity-02": {
+                "source_visual_description": "the branded feeder",
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": "a new automatic pet feeder",
+                    "appearance_description": "one isolated new pet feeder",
+                },
+            },
+        },
+        "scenes": {},
+        "relations": {},
+    }
+
+    spec = build_replacement_sheet_spec(index)
+    assert [tile["stable_key"] for tile in spec["tiles"]] == ["entity-02"]
+    authority = Pipeline._fusion_authority_block(index, 1, {
+        "h3_image_reference": "Image 1",
+        "h3_reference_images": [],
+        "spec": spec,
+    })
+
+    assert "- entity-01 | KEEP | source: the cat beside the feeder" in authority
+    assert "- entity-01 | REPLACE |" not in authority
+    assert "- entity-02 | REPLACE |" in authority
+    assert "Image 1, TILE_01 (row 1, column 1)" in authority
+
+
 def test_fusion_authority_keeps_image_one_bound_to_its_matching_element() -> None:
     index = {
         "people": {
