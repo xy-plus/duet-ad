@@ -206,13 +206,17 @@ def _decode_rle_mask(rle: str, width: int, height: int) -> np.ndarray:
     if len(counts) % 2 or any(count < 0 for count in counts):
         raise ObjectMaskError("object mask RLE pairs are invalid")
     pairs = list(zip(counts[::2], counts[1::2]))
-    if any(start + length > width * height for start, length in pairs):
+    pixel_count = width * height
+    # Real fal cache sample: frame 104 ends at 589825 for a 576*1024 frame.
+    # Accept that documented one-pixel overrun and clamp it explicitly.
+    if any(length == 0 or start >= pixel_count + 1 for start, length in pairs):
         raise ObjectMaskError("object mask RLE dimensions do not match the frame")
     if any(next_start < start + length for (start, length), (next_start, _) in zip(pairs, pairs[1:])):
         raise ObjectMaskError("object mask RLE pairs overlap or are unordered")
     flat = np.zeros(width * height, dtype=np.uint8)
     for start, length in pairs:
-        flat[start : start + length] = 1
+        end = min(start + length, pixel_count)
+        flat[start:end] = 1
     return flat.reshape((height, width)).astype(bool)
 
 

@@ -167,7 +167,7 @@ def test_decode_rle_mask_uses_start_length_row_major_and_validates_dimensions() 
     mask = object_mask._decode_rle_mask("0 1 3 1", width=2, height=2)
     assert np.array_equal(mask, np.array([[True, False], [False, True]]))
     with pytest.raises(ObjectMaskError, match="dimensions do not match"):
-        object_mask._decode_rle_mask("4 1", width=2, height=2)
+        object_mask._decode_rle_mask("5 1", width=2, height=2)
 
 
 def test_decode_rle_mask_fixture_bbox_matches_metadata() -> None:
@@ -185,6 +185,12 @@ def test_decode_rle_mask_fixture_bbox_matches_metadata() -> None:
     union = (actual[2] - actual[0]) * (actual[3] - actual[1]) + (expected[2] - expected[0]) * (expected[3] - expected[1]) - intersection
     assert mask.sum() > 0
     assert intersection / union > 0.9
+
+
+def test_decode_rle_mask_clamps_real_fal_end_off_by_one() -> None:
+    # Final pair from experiment shared-cache response frame 104: end=589825.
+    mask = object_mask._decode_rle_mask("589563 262", width=576, height=1024)
+    assert mask.sum() == 261
 
 
 def test_apply_object_rle_mask_keeps_unmasked_pixels() -> None:
