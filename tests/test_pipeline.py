@@ -7356,6 +7356,30 @@ def test_segment_replaced_object_targets_prefers_detect_label_then_falls_back(
     ]
 
 
+def test_segment_replaced_object_targets_deduplicates_detect_labels_in_order() -> None:
+    element_index = {
+        "entities": {
+            "entity-01": {
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"detect_label": "cat food bag"},
+            },
+            "entity-02": {
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"detect_label": " cat food bag "},
+            },
+            "entity-03": {
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"detect_label": "pet feeder"},
+            },
+        },
+    }
+
+    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
+        "cat food bag",
+        "pet feeder",
+    ]
+
+
 def test_h3_segment_object_mask_targets_use_the_detect_label(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:

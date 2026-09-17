@@ -5711,9 +5711,10 @@ class Pipeline:
         three segments with them, while the short label "handbag" hit 84%
         of frames on the same video). Prefer the replacement's
         ``detect_label``, which object-replace writes for exactly this
-        purpose. The detection artifact fingerprint contains the prompt,
-        so a label change naturally misses the cache and triggers a fresh
-        detection call — that is intended, not a cache bug.
+        purpose. Targets are deduplicated in insertion order. The detection
+        artifact fingerprint contains the prompt, so label changes (including
+        deduplication) naturally miss the cache and trigger a fresh detection
+        call — that is intended, not a cache bug.
         Frozen indexes from before ``detect_label`` fall back to
         ``source_visual_description`` so they stay resumable; the fallback
         keeps the poor detection quality above and must never appear in
@@ -5738,7 +5739,7 @@ class Pipeline:
             description = record.get("source_visual_description")
             if isinstance(description, str) and description.strip():
                 targets.append(description.strip())
-        return targets
+        return list(dict.fromkeys(targets))
 
     @classmethod
     def _segment_has_replaced_object(
