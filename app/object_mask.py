@@ -3,8 +3,8 @@
 fal SAM-3 receives all requested objects and, when a person is replaced,
 ``face`` in one comma-separated prompt.  Its calibrated multi-target response
 is a single unlabelled per-frame union, so every returned box receives the
-same deep gray (64,64,64) block.  Sparse anchors are filled by local linear
-interpolation; a track that loses its box is held for
+same deep gray (64,64,64) block.  Sparse anchors first discard local area
+glitches, then are filled by local linear interpolation; a track that loses its box is held for
 ``OBJECT_MASK_HOLD_FRAMES`` frames.  The output uses the usual mp4v -> ffmpeg
 H.264/yuv420p pipeline.
 
@@ -37,6 +37,8 @@ _LOGGER = logging.getLogger(__name__)
 OBJECT_BLOCK_FILL = (64, 64, 64)  # deep gray (BGR) mixed into the object box
 OBJECT_MASK_HOLD_FRAMES = 12  # frames a lost object keeps its last known box
 OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
+OBJECT_MASK_GLITCH_WINDOW_FRAMES = 15
+OBJECT_MASK_GLITCH_AREA_RATIO = 0.6
 
 
 class ObjectMaskError(RuntimeError):
@@ -63,6 +65,27 @@ def _center_distance(
     a: tuple[float, float, float, float], b: tuple[float, float, float, float]
 ) -> float:
     return ((a[0] + a[2] - b[0] - b[2]) ** 2 + (a[1] + a[3] - b[1] - b[3]) ** 2) / 4.0
+
+
+def _without_glitch_anchors(
+    track: list[tuple[int, tuple[float, float, float, float]]],
+) -> list[tuple[int, tuple[float, float, float, float]]]:
+    """Remove short-lived area collapses before interpolating a track."""
+    retained = []
+    for frame_index, bbox in track:
+        nearby_areas = [
+            (nearby[1][2] - nearby[1][0]) * (nearby[1][3] - nearby[1][1])
+            for nearby in track
+            if abs(nearby[0] - frame_index) <= OBJECT_MASK_GLITCH_WINDOW_FRAMES
+        ]
+        median_area = float(np.median(nearby_areas))
+        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        # A tracked object's projection cannot collapse below 60% of its
+        # local median in one second and rebound; real recession is gradual,
+        # so the local median follows it instead of treating it as a glitch.
+        if area >= median_area * OBJECT_MASK_GLITCH_AREA_RATIO:
+            retained.append((frame_index, bbox))
+    return retained
 
 
 def _frame_boxes(
@@ -107,6 +130,9 @@ def _frame_boxes(
     boxes_by_frame: dict[int, list[tuple[float, float, float, float]]] = {}
     for label_tracks in tracks.values():
         for track in label_tracks:
+            track = _without_glitch_anchors(track)
+            if not track:
+                continue
             for (f0, b0), (f1, b1) in zip(track, track[1:]):
                 # The next interval re-owns its left anchor; ending each
                 # interval at f1 - 1 keeps every anchor frame painted once.

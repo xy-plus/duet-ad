@@ -86,6 +86,33 @@ def _detection(
     )
 
 
+def test_frame_boxes_discards_short_area_collapse_and_interpolates_over_it() -> None:
+    large = (0.0, 0.0, 1.0, 1.0)
+    strip = (0.0, 0.8, 1.0, 1.0)
+    detections = [
+        _detection(frame / 30, strip if 20 <= frame < 32 else large)
+        for frame in range(52)
+    ]
+
+    boxes = object_mask._frame_boxes(detections, fps=30.0)
+
+    for frame in range(20, 32):
+        x0, y0, x1, y1 = boxes[frame][0]
+        assert (x1 - x0) * (y1 - y0) == pytest.approx(1.0)
+
+
+def test_frame_boxes_keeps_gradual_area_change_anchors() -> None:
+    detections = [
+        _detection(frame / 30, (0.0, 0.0, 0.95 ** (frame / 2), 1.0))
+        for frame in range(50)
+    ]
+
+    boxes = object_mask._frame_boxes(detections, fps=30.0)
+
+    for frame, detection in enumerate(detections):
+        assert boxes[frame][0] == pytest.approx(detection.bbox_xyxy_normalized)
+
+
 def test_apply_object_block_opacity_one_is_the_original_solid_fill() -> None:
     frame = np.array([[[10, 20, 30], [40, 50, 60]]], dtype=np.uint8)
 
