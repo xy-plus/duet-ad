@@ -24,6 +24,10 @@ def test_settings_defaults_picsart_proxy_to_direct() -> None:
     assert _settings(picsart_proxy=None).picsart_proxy is None
 
 
+def test_settings_defaults_to_deepseek_flash() -> None:
+    assert _settings().deepseek_model == "deepseek-flash"
+
+
 @pytest.mark.parametrize(
     "proxy",
     ["http://127.0.0.1:7897", "https://proxy.example:443", "socks5://127.0.0.1:1080"],

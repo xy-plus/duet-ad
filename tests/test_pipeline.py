@@ -7417,6 +7417,35 @@ def test_segment_replaced_object_targets_deduplicates_detect_labels_in_order() -
     ]
 
 
+def test_segment_replaced_object_targets_skip_transient_physical_effects() -> None:
+    element_index = {
+        "entities": {
+            "entity-01": {
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"detect_label": "  MiSt  "},
+            },
+            "entity-02": {
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"detect_label": "steam"},
+            },
+            # Frozen indexes can still reach the description fallback.
+            "entity-03": {
+                "source_visual_description": "fog",
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"source": "generated_variant"},
+            },
+            "entity-04": {
+                "occurrences": [{"segment_index": 1}],
+                "replacement": {"detect_label": "cold pack"},
+            },
+        },
+    }
+
+    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
+        "cold pack"
+    ]
+
+
 def test_h3_segment_object_mask_targets_use_the_detect_label(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:

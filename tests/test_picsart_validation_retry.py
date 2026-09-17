@@ -22,7 +22,7 @@ def _failure_record(status_code, message=VALIDATION_MESSAGE):
     return {"polls": [{"response": {"status_code": status_code, "body": body}}]}
 
 
-@pytest.mark.parametrize("status_code", [422, 200])
+@pytest.mark.parametrize("status_code", [422, 200, 503])
 def test_terminal_request_validation_preserves_receipts_without_new_post(tmp_path, monkeypatch, status_code):
     class InvalidRequestPicsart(_FlowPicsart):
         def poll(self, task_id):
@@ -63,7 +63,7 @@ def test_other_terminal_failures_keep_existing_retry_policy(message):
     assert not Pipeline._poll_failure_is_request_validation(record)
 
 
-@pytest.mark.parametrize("status_code", [400, 403, 429, 500, 503])
+@pytest.mark.parametrize("status_code", [400, 403, 429, 500])
 def test_nonterminal_http_status_is_not_request_validation(status_code):
     record = _failure_record(422)
     record["polls"][0]["response"]["status_code"] = status_code

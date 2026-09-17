@@ -79,6 +79,32 @@ DIALOGUE_WRITER_SKILL = (
 SAME_AS_SOURCE_LANGUAGE = "与原视频相同"
 MASTER_EMPTY_ASR_SIGNAL = 51 / 256
 _NO_REUSABLE_OUTPUT: Any = object()
+# These labels describe transient or ambient physical phenomena, rather than
+# objects with an identity that needs replacement.  Object Replace normally
+# omits them; _segment_replaced_object_targets keeps this narrow exact-label
+# filter as defense in depth for imperfect or frozen planning output.
+_TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS = frozenset(
+    {
+        "mist",
+        "fog",
+        "smoke",
+        "steam",
+        "vapor",
+        "spray",
+        "splash",
+        "water",
+        "fire",
+        "flame",
+        "spark",
+        "ember",
+        "dust",
+        "particle",
+        "foam",
+        "bubble",
+        "glare",
+        "glow",
+    }
+)
 TRANSLATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -5715,6 +5741,9 @@ class Pipeline:
         artifact fingerprint contains the prompt, so label changes (including
         deduplication) naturally miss the cache and trigger a fresh detection
         call — that is intended, not a cache bug.
+        Transient physical-effect labels are excluded as defense in depth:
+        they carry no replaceable identity and must remain visible as Video 1
+        motion reference. Normal Object Replace planning already omits them.
         Frozen indexes from before ``detect_label`` fall back to
         ``source_visual_description`` so they stay resumable; the fallback
         keeps the poor detection quality above and must never appear in
@@ -5734,11 +5763,21 @@ class Pipeline:
                 continue
             detect_label = record["replacement"].get("detect_label")
             if isinstance(detect_label, str) and detect_label.strip():
-                targets.append(detect_label.strip())
+                normalized_label = detect_label.strip()
+                if (
+                    normalized_label.casefold()
+                    not in _TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS
+                ):
+                    targets.append(normalized_label)
                 continue
             description = record.get("source_visual_description")
             if isinstance(description, str) and description.strip():
-                targets.append(description.strip())
+                normalized_description = description.strip()
+                if (
+                    normalized_description.casefold()
+                    not in _TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS
+                ):
+                    targets.append(normalized_description)
         return list(dict.fromkeys(targets))
 
     @classmethod

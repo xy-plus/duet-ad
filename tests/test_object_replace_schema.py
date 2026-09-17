@@ -136,6 +136,9 @@ def test_skill_makes_the_deterministic_set_the_complete_replacement_plan() -> No
         "必须设 `replacement=null`",
         "无生命实体规则不变",
         "不生成变体，不写 `detect_label`，不进图版",
+        "瞬态/环境物理效果",
+        "无固定实体形态、无身份信息",
+        "不生成参考图版 tile，不写替换叙事",
         "同一个 stable key 在不同图片、不同分段",
         "非空 `user_replacement_instruction` 与非空 `user_reference_images` 同时存在时，把用户图约束到语义匹配的既有 stable key",
         "不得只任选一个",
@@ -182,6 +185,9 @@ def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None
     assert "同时遵守对象的 `preserve`" not in skill
     assert "对 `replacement.source=image_1` 的 stable key，权威块会列出它唯一可用的用户图编号" in skill
     assert "不得扩散给未绑定 stable key" in skill
+    assert "未被遮盖的瞬态/环境物理效果" in skill
+    assert "运动、出现时机、强度和轨迹" in skill
+    assert "不得重新编排其形态或出现时机" in skill
     assert "唯一绑定" not in skill
 
 
@@ -636,6 +642,8 @@ def test_skill_defines_the_same_detect_label_contract_as_the_schema() -> None:
         "单数",
         "通用类别词",
         "每个有非空 `replacement` 的 entities stable key 都必须输出 `detect_label`",
+        "瞬态/环境物理效果",
+        "不分配 `detect_label`",
         "缺失即为无效输出",
         "开放词汇检测器",
         "必须能被开放词汇检测器识别",

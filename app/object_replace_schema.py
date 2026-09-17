@@ -197,9 +197,9 @@ def _replacement_schema(
         ),
         detect_label=detect_label,
     )
-    # The schema cannot determine whether an entity is a living animal.  It
-    # therefore admits explicit KEEP only for entities; the Object Replace
-    # instructions own the semantic rule that limits it to unrequested animals.
+    # The schema cannot classify an entity as an unrequested animal or a
+    # transient physical effect. It therefore admits explicit KEEP only for
+    # entities; Object Replace instructions own those semantic restrictions.
     replacement_value: dict[str, Any] = (
         {"anyOf": [replacement, {"type": "null"}]}
         if allow_null

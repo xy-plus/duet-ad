@@ -93,10 +93,24 @@ def test_transport_schema_stays_closed_and_match_source_branches_stay_consistent
     assert entities["additionalProperties"] is False
     assert set(entities["properties"]) == {"entity-01", "entity-02", "entity-03"}
     for patch in entities["properties"].values():
-        pairs = {(branch["properties"]["matches_user_request"]["enum"][0],
-                  branch["properties"]["replacement"]["properties"]["source"]["enum"][0])
-                 for branch in patch["anyOf"]}
+        replacement_branches = [
+            branch
+            for branch in patch["anyOf"]
+            if branch["properties"]["replacement"].get("type") != "null"
+        ]
+        pairs = {
+            (
+                branch["properties"]["matches_user_request"]["enum"][0],
+                branch["properties"]["replacement"]["properties"]["source"]["enum"][0],
+            )
+            for branch in replacement_branches
+        }
         assert pairs == {(True, "image_1"), (False, "generated_variant")}
+        assert any(
+            branch["properties"]["matches_user_request"]["enum"] == [False]
+            and branch["properties"]["replacement"] == {"type": "null"}
+            for branch in patch["anyOf"]
+        )
 
 
 def test_legacy_normalizer_drops_unknown_keys_and_retains_match_tolerance():
