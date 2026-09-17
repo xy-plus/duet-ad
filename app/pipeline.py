@@ -5711,15 +5711,15 @@ class Pipeline:
         three segments with them, while the short label "handbag" hit 84%
         of frames on the same video). Prefer the replacement's
         ``detect_label``, which object-replace writes for exactly this
-        purpose. Targets are deduplicated in insertion order. The detection
-        artifact fingerprint contains the prompt, so label changes (including
-        deduplication) naturally miss the cache and trigger a fresh detection
-        call — that is intended, not a cache bug.
-        Frozen indexes from before ``detect_label`` fall back to
-        ``source_visual_description`` so they stay resumable; the fallback
-        keeps the poor detection quality above and must never appear in
-        new outputs (the schema requires ``detect_label`` for entities).
-        Records with neither cannot be detected and are left out.
+        purpose. Only entities with a non-empty ``reference_image_ids``
+        binding are masked: hiding an entity with no reference image to
+        replace only destroys H3's composition anchors (as in the segment
+        4/5 full-gray production incident). Targets are deduplicated in
+        insertion order. The detection artifact fingerprint contains the
+        prompt, so label changes (including deduplication) naturally miss the
+        cache and trigger a fresh detection call — that is intended, not a
+        cache bug. Unbound entities and legacy source-description fallbacks
+        are deliberately not detection targets.
         """
         entities = element_index.get("entities")
         if not isinstance(entities, dict):
@@ -5732,13 +5732,19 @@ class Pipeline:
                 or not cls._appears_in_segment(record, segment_index)
             ):
                 continue
-            detect_label = record["replacement"].get("detect_label")
+            replacement = record["replacement"]
+            reference_image_ids = replacement.get("reference_image_ids")
+            if not (
+                isinstance(reference_image_ids, list)
+                and any(
+                    isinstance(reference_id, str) and reference_id.strip()
+                    for reference_id in reference_image_ids
+                )
+            ):
+                continue
+            detect_label = replacement.get("detect_label")
             if isinstance(detect_label, str) and detect_label.strip():
                 targets.append(detect_label.strip())
-                continue
-            description = record.get("source_visual_description")
-            if isinstance(description, str) and description.strip():
-                targets.append(description.strip())
         return list(dict.fromkeys(targets))
 
     @classmethod
