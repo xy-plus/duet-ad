@@ -7241,8 +7241,6 @@ def _prepare_h3_object_mask_fixture(
                 "reason": "user_request",
                 "source": "image_1",
                 "target_visual_description": "a blue silk scarf",
-                "detect_label": "the red scarf around the neck",
-                "reference_image_ids": ["image_1"],
             },
         },
     }
@@ -7312,7 +7310,7 @@ def test_h3_segment_masks_replaced_objects_and_faces_in_one_sam_node(
     assert output == {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
 
 
-def test_segment_replaced_object_targets_requires_reference_binding(
+def test_segment_replaced_object_targets_prefers_detect_label_then_falls_back(
 ) -> None:
     element_index = {
         "entities": {
@@ -7320,13 +7318,9 @@ def test_segment_replaced_object_targets_requires_reference_binding(
             "entity-01": {
                 "source_visual_description": "一段很长的中文源描述",
                 "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
-                "replacement": {
-                    "source": "image_1",
-                    "detect_label": "handbag",
-                    "reference_image_ids": ["image_1"],
-                },
+                "replacement": {"source": "image_1", "detect_label": "handbag"},
             },
-            # 无绑定的旧冻结产物不应再消灭构图锚点。
+            # 旧冻结产物：没有 detect_label，回退 source_visual_description。
             "entity-02": {
                 "source_visual_description": "legacy source description",
                 "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
@@ -7344,7 +7338,6 @@ def test_segment_replaced_object_targets_requires_reference_binding(
                 "replacement": {
                     "source": "generated_variant",
                     "detect_label": "strap",
-                    "reference_image_ids": ["image_1"],
                 },
             },
             "entity-05": {
@@ -7356,6 +7349,7 @@ def test_segment_replaced_object_targets_requires_reference_binding(
 
     assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
         "handbag",
+        "legacy source description",
     ]
     assert Pipeline._segment_replaced_object_targets(element_index, 2) == [
         "strap",
@@ -7367,45 +7361,13 @@ def test_segment_replaced_object_targets_deduplicates_detect_labels_in_order() -
         "entities": {
             "entity-01": {
                 "occurrences": [{"segment_index": 1}],
-                "replacement": {
-                    "detect_label": "cat food bag",
-                    "reference_image_ids": ["image_1"],
-                },
+                "replacement": {"detect_label": "cat food bag"},
             },
             "entity-02": {
                 "occurrences": [{"segment_index": 1}],
-                "replacement": {
-                    "detect_label": " cat food bag ",
-                    "reference_image_ids": ["image_1"],
-                },
+                "replacement": {"detect_label": " cat food bag "},
             },
             "entity-03": {
-                "occurrences": [{"segment_index": 1}],
-                "replacement": {
-                    "detect_label": "pet feeder",
-                    "reference_image_ids": ["image_1"],
-                },
-            },
-        },
-    }
-
-    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
-        "cat food bag",
-        "pet feeder",
-    ]
-
-
-def test_segment_replaced_object_targets_skips_unbound_entities() -> None:
-    element_index = {
-        "entities": {
-            "entity-bound": {
-                "occurrences": [{"segment_index": 1}],
-                "replacement": {
-                    "detect_label": "cat food bag",
-                    "reference_image_ids": ["image_1"],
-                },
-            },
-            "entity-unbound": {
                 "occurrences": [{"segment_index": 1}],
                 "replacement": {"detect_label": "pet feeder"},
             },
@@ -7414,6 +7376,7 @@ def test_segment_replaced_object_targets_skips_unbound_entities() -> None:
 
     assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
         "cat food bag",
+        "pet feeder",
     ]
 
 
@@ -7599,8 +7562,6 @@ def test_h3_object_mask_node_collects_detect_artifacts(
             "reason": "user_request",
             "source": "image_1",
             "target_visual_description": "a canvas wallet",
-            "detect_label": "the leather wallet",
-            "reference_image_ids": ["image_1"],
         },
     }
 
