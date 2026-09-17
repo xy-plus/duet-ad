@@ -194,20 +194,26 @@ def _apply_object_block(
 
 
 def _decode_rle_mask(rle: str, width: int, height: int) -> np.ndarray:
-    """Decode fal's uncompressed COCO RLE into a height-by-width bool mask."""
+    """Decode fal's row-major ``(start, length)`` RLE into a bool mask.
+
+    The calibrated fixture's first frame yields bbox IoU 0.9958 with metadata
+    under C order, versus 0.2437 under Fortran order; fal is not COCO counts.
+    """
     try:
         counts = [int(value) for value in rle.split()]
     except (AttributeError, ValueError) as exc:
         raise ObjectMaskError("object mask RLE counts are invalid") from exc
-    if not counts or any(count < 0 for count in counts) or sum(counts) != width * height:
+    if len(counts) % 2 or any(count < 0 for count in counts):
+        raise ObjectMaskError("object mask RLE pairs are invalid")
+    pairs = list(zip(counts[::2], counts[1::2]))
+    if any(start + length > width * height for start, length in pairs):
         raise ObjectMaskError("object mask RLE dimensions do not match the frame")
+    if any(next_start < start + length for (start, length), (next_start, _) in zip(pairs, pairs[1:])):
+        raise ObjectMaskError("object mask RLE pairs overlap or are unordered")
     flat = np.zeros(width * height, dtype=np.uint8)
-    offset = 0
-    for index, count in enumerate(counts):
-        if index % 2:
-            flat[offset : offset + count] = 1
-        offset += count
-    return flat.reshape((height, width), order="F").astype(bool)
+    for start, length in pairs:
+        flat[start : start + length] = 1
+    return flat.reshape((height, width)).astype(bool)
 
 
 def _apply_object_rle_mask(frame: np.ndarray, mask: np.ndarray, *, opacity: float,

@@ -163,11 +163,28 @@ def test_apply_object_block_uses_gaussian_blur_not_original_pixels() -> None:
     assert not np.array_equal(frame[2, 2], original_mix)
 
 
-def test_decode_rle_mask_uses_fortran_order_and_validates_dimensions() -> None:
-    mask = object_mask._decode_rle_mask("0 1 2 1", width=2, height=2)
+def test_decode_rle_mask_uses_start_length_row_major_and_validates_dimensions() -> None:
+    mask = object_mask._decode_rle_mask("0 1 3 1", width=2, height=2)
     assert np.array_equal(mask, np.array([[True, False], [False, True]]))
     with pytest.raises(ObjectMaskError, match="dimensions do not match"):
-        object_mask._decode_rle_mask("0 1", width=2, height=2)
+        object_mask._decode_rle_mask("4 1", width=2, height=2)
+
+
+def test_decode_rle_mask_fixture_bbox_matches_metadata() -> None:
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures" / "fal_sam3_video_rle_response.json").read_text()
+    )
+    mask = object_mask._decode_rle_mask(payload["rle"][0], width=576, height=1024)
+    ys, xs = np.where(mask)
+    actual = (xs.min() / 576, ys.min() / 1024, (xs.max() + 1) / 576, (ys.max() + 1) / 1024)
+    cx, cy, width, height = payload["metadata"][0]["box"]
+    expected = (cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2)
+    ix0, iy0 = max(actual[0], expected[0]), max(actual[1], expected[1])
+    ix1, iy1 = min(actual[2], expected[2]), min(actual[3], expected[3])
+    intersection = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    union = (actual[2] - actual[0]) * (actual[3] - actual[1]) + (expected[2] - expected[0]) * (expected[3] - expected[1]) - intersection
+    assert mask.sum() > 0
+    assert intersection / union > 0.9
 
 
 def test_apply_object_rle_mask_keeps_unmasked_pixels() -> None:
@@ -555,7 +572,7 @@ def test_mask_objects_stats_breakdown(tmp_path: Path) -> None:
 # --- fal_sam3 真实 client 集成：产物落盘与指纹复用（mock HTTP，零真实调用）---
 
 _FAL_QUEUE_RESULT = {
-    "rle": ["0 1 1535"],
+    "rle": ["0 1536"],
     "boxes": [[0.5, 0.5, 0.4, 0.4]],
     "metadata": [{"index": 0, "score": None, "box": [0.5, 0.5, 0.4, 0.4]}],
 }
