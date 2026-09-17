@@ -163,6 +163,22 @@ def test_apply_object_block_uses_gaussian_blur_not_original_pixels() -> None:
     assert not np.array_equal(frame[2, 2], original_mix)
 
 
+def test_decode_rle_mask_uses_fortran_order_and_validates_dimensions() -> None:
+    mask = object_mask._decode_rle_mask("0 1 2 1", width=2, height=2)
+    assert np.array_equal(mask, np.array([[True, False], [False, True]]))
+    with pytest.raises(ObjectMaskError, match="dimensions do not match"):
+        object_mask._decode_rle_mask("0 1", width=2, height=2)
+
+
+def test_apply_object_rle_mask_keeps_unmasked_pixels() -> None:
+    frame = np.zeros((15, 15, 3), dtype=np.uint8)
+    mask = np.zeros((15, 15), dtype=bool)
+    mask[3:12, 3:12] = True
+    object_mask._apply_object_rle_mask(frame, mask, opacity=1.0)
+    assert tuple(frame[7, 7]) == OBJECT_BLOCK_FILL
+    assert tuple(frame[0, 0]) == (0, 0, 0)
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
 def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
     tmp_path: Path,
@@ -539,7 +555,7 @@ def test_mask_objects_stats_breakdown(tmp_path: Path) -> None:
 # --- fal_sam3 真实 client 集成：产物落盘与指纹复用（mock HTTP，零真实调用）---
 
 _FAL_QUEUE_RESULT = {
-    "rle": ["rle-frame-0"],
+    "rle": ["0 1 1535"],
     "boxes": [[0.5, 0.5, 0.4, 0.4]],
     "metadata": [{"index": 0, "score": None, "box": [0.5, 0.5, 0.4, 0.4]}],
 }

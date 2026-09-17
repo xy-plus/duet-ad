@@ -6,7 +6,7 @@
   直接返回 list；致命失败（4xx 等确定性错误、配置错误、未校准响应形态）抛
   ``app.providers.ProviderFailure``。``ProviderResult`` 仅底层 HTTP 证据记录用，
   不作为 detect 返回形态。
-- ``ObjectDetection``：``{label, timestamp_s, bbox_xyxy_normalized}``；bbox 为
+- ``ObjectDetection``：``{label, timestamp_s, bbox_xyxy_normalized, rle}``；bbox 为
   0–1 浮点、相对帧宽/高，构造时校验（坐标 ∈[0,1]、x0<x1、y0<y1、timestamp≥0）。
 - 多目标粒度：fal 端点的一次请求接受逗号分隔的 targets，``detect`` 将它们
   原顺序拼为一个 prompt，只发一次请求。已校准的响应仍是一套按帧对齐的
@@ -56,6 +56,7 @@ class ObjectDetection:
     label: str
     timestamp_s: float
     bbox_xyxy_normalized: tuple[float, float, float, float]
+    rle: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label:
@@ -67,6 +68,8 @@ class ObjectDetection:
         ):
             raise ValueError("ObjectDetection timestamp_s must be >= 0")
         object.__setattr__(self, "timestamp_s", float(self.timestamp_s))
+        if self.rle is not None and (not isinstance(self.rle, str) or not self.rle):
+            raise ValueError("ObjectDetection rle must be a non-empty string or None")
         bbox = self.bbox_xyxy_normalized
         if not isinstance(bbox, tuple) or len(bbox) != 4:
             raise ValueError("ObjectDetection bbox must be a 4-tuple")
@@ -547,6 +550,7 @@ class FalSam3GroundingClient:
                     label=prompt,
                     timestamp_s=frame_index / fps,
                     bbox_xyxy_normalized=bbox,
+                    rle=rle,
                 )
             )
         return detections, frames

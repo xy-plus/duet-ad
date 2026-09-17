@@ -57,6 +57,7 @@ def test_object_detection_accepts_valid_values() -> None:
     )
     assert detection.label == "bottle"
     assert detection.timestamp_s == 0.0
+    assert detection.rle is None
     assert detection.bbox_xyxy_normalized == (0.1, 0.2, 0.3, 0.4)
 
 
@@ -111,6 +112,7 @@ _FAL_SAM3_EXPECTED = [
             _clamp01(box[0] + box[2] / 2),
             _clamp01(box[1] + box[3] / 2),
         ),
+        _FAL_SAM3_RESULT["rle"][index],
     )
     for index, box in enumerate(_FAL_SAM3_RESULT["boxes"])
     if box is not None
@@ -137,6 +139,7 @@ _FAL_SAM3_MULTI_EXPECTED = [
             _clamp01(box[0] + box[2] / 2),
             _clamp01(box[1] + box[3] / 2),
         ),
+        rle,
     )
     for index, (rle, box) in enumerate(
         zip(_FAL_SAM3_MULTI_RESULT["rle"], _FAL_SAM3_MULTI_RESULT["boxes"])
@@ -240,6 +243,7 @@ def test_fal_sam3_detect_full_flow(tmp_path: Path, video: Path) -> None:
     }
     # 掩码 RLE 本期不消费，但逐帧解析记录（含 rle/score）保留供二期使用。
     assert [entry["rle"] for entry in client.last_frames] == _FAL_SAM3_RESULT["rle"]
+    assert [detection.rle for detection in result] == _FAL_SAM3_RESULT["rle"]
     assert client.last_frames[0]["frame_index"] == 0
     assert client.last_frames[0]["score"] is None
     assert client.last_frames[0]["box"] == _FAL_SAM3_RESULT["boxes"][0]
@@ -401,7 +405,7 @@ def test_fal_sam3_out_of_range_box_is_clamped(tmp_path: Path, video: Path) -> No
     handler = _fal_queue_handler(result_payload)
     client = _fal_client(_fal_settings(tmp_path), handler)
     assert client.detect(video, ["handbag"]) == [
-        ObjectDetection("handbag", 0.0, (0.0, 0.2, 1.0, 0.8))
+        ObjectDetection("handbag", 0.0, (0.0, 0.2, 1.0, 0.8), "rle-wide")
     ]
 
 

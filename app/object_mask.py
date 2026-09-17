@@ -2,8 +2,9 @@
 
 fal SAM-3 receives all requested objects and, when a person is replaced,
 ``face`` in one comma-separated prompt.  Its calibrated multi-target response
-is a single unlabelled per-frame union, so every returned box receives the
-same deep gray (64,64,64) block.  Sparse anchors first discard local area
+is a single unlabelled per-frame union, so every returned RLE mask receives the
+same deep gray (64,64,64) block; sparse/legacy anchors without a mask use their
+bbox rectangle. Sparse anchors first discard local area
 glitches, then are filled by local linear interpolation; a track that loses its box is held for
 ``OBJECT_MASK_HOLD_FRAMES`` frames.  The output uses the usual mp4v -> ffmpeg
 H.264/yuv420p pipeline.
@@ -39,6 +40,7 @@ OBJECT_MASK_HOLD_FRAMES = 12  # frames a lost object keeps its last known box
 OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
 OBJECT_MASK_GLITCH_WINDOW_FRAMES = 15
 OBJECT_MASK_GLITCH_AREA_RATIO = 0.6
+OBJECT_MASK_RLE_FEATHER_KERNEL = 7
 
 
 class ObjectMaskError(RuntimeError):
@@ -191,6 +193,39 @@ def _apply_object_block(
     ).astype(np.uint8)
 
 
+def _decode_rle_mask(rle: str, width: int, height: int) -> np.ndarray:
+    """Decode fal's uncompressed COCO RLE into a height-by-width bool mask."""
+    try:
+        counts = [int(value) for value in rle.split()]
+    except (AttributeError, ValueError) as exc:
+        raise ObjectMaskError("object mask RLE counts are invalid") from exc
+    if not counts or any(count < 0 for count in counts) or sum(counts) != width * height:
+        raise ObjectMaskError("object mask RLE dimensions do not match the frame")
+    flat = np.zeros(width * height, dtype=np.uint8)
+    offset = 0
+    for index, count in enumerate(counts):
+        if index % 2:
+            flat[offset : offset + count] = 1
+        offset += count
+    return flat.reshape((height, width), order="F").astype(bool)
+
+
+def _apply_object_rle_mask(frame: np.ndarray, mask: np.ndarray, *, opacity: float,
+                           blurred_frame: np.ndarray | None = None) -> None:
+    """Feather an RLE mask and apply the ordinary block blend in place."""
+    alpha = cv2.GaussianBlur(mask.astype(np.float32),
+                             (OBJECT_MASK_RLE_FEATHER_KERNEL,) * 2, 0)[..., None]
+    if opacity == 1.0:
+        replacement: np.ndarray | tuple[int, int, int] = OBJECT_BLOCK_FILL
+    else:
+        if blurred_frame is None:
+            raise ObjectMaskError("blurred frame is required for a translucent object block")
+        replacement = (np.asarray(OBJECT_BLOCK_FILL) * opacity
+                       + blurred_frame.astype(np.float64) * (1.0 - opacity))
+    frame[:] = np.rint(frame.astype(np.float64) * (1.0 - alpha)
+                       + np.asarray(replacement, dtype=np.float64) * alpha).astype(np.uint8)
+
+
 def _production_detector() -> Any:
     client = select_provider(get_settings())
     if client is None:
@@ -294,6 +329,7 @@ def mask_objects(
                             "bbox_xyxy_normalized": list(
                                 detection.bbox_xyxy_normalized
                             ),
+                            "rle": detection.rle,
                         }
                         for detection in detections
                     ],
@@ -305,6 +341,10 @@ def mask_objects(
         )
     hold_frame_set: set[int] = set()
     boxes_by_frame = _frame_boxes(detections, fps, hold_frames=hold_frame_set)
+    rles_by_frame: dict[int, list[str]] = {}
+    for detection in detections:
+        if detection.rle is not None:
+            rles_by_frame.setdefault(round(detection.timestamp_s * fps), []).append(detection.rle)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=".objects-masked-",
@@ -333,15 +373,22 @@ def mask_objects(
                 for bbox in boxes_by_frame.get(frame_index, [])
                 if (pixel_box := _pixel_box(bbox, width, height)) is not None
             ]
+            masks = [_decode_rle_mask(rle, width, height)
+                     for rle in rles_by_frame.get(frame_index, [])]
+            if masks:
+                boxes = []  # real anchors supersede bbox; bridge frames remain rectangles
             stats["frames"] += 1
-            stats["blocks_total"] += len(boxes)
-            if boxes:
+            stats["blocks_total"] += len(boxes) + len(masks)
+            if boxes or masks:
                 stats["frames_with_block"] += 1
             blurred_frame = (
                 cv2.GaussianBlur(frame, (block_blur, block_blur), 0)
-                if boxes and block_opacity < 1.0
+                if (boxes or masks) and block_opacity < 1.0
                 else None
             )
+            for mask in masks:
+                _apply_object_rle_mask(frame, mask, opacity=block_opacity,
+                                       blurred_frame=blurred_frame)
             for box in boxes:
                 _apply_object_block(
                     frame, box, opacity=block_opacity, blurred_frame=blurred_frame
