@@ -1599,7 +1599,8 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     )
 
     assert result_item["index"] == 1
-    assert result_prompt.startswith("FACE REPLACEMENT IS MANDATORY")
+    assert result_prompt.startswith("This is an editing task on Video 1")
+    assert "This is an editing task on Video 1" in result_prompt
     assert "FACE REPLACEMENT IS MANDATORY" in result_prompt
     assert "(64,64,64)" not in result_prompt
     assert "Preserve the source motion" in result_prompt
@@ -1619,11 +1620,12 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert calls[0]["schema"]["additionalProperties"] is False
     assert calls[0]["images"] == [sheet_image]
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
-    assert prompt.startswith("FACE REPLACEMENT IS MANDATORY")
+    assert prompt.startswith("This is an editing task on Video 1")
+    assert "This is an editing task on Video 1" in prompt
     assert "FACE REPLACEMENT IS MANDATORY" in prompt
-    assert prompt.index("FACE REPLACEMENT IS MANDATORY") < prompt.index(
-        "Preserve the source motion"
-    )
+    assert prompt.index("This is an editing task on Video 1") < prompt.index(
+        "FACE REPLACEMENT IS MANDATORY"
+    ) < prompt.index("Preserve the source motion")
     assert "Audio 1" in prompt
     assert "reference: Image 1, TILE_01" in prompt
     assert "[0.000-1.000s] 你好" in prompt
@@ -7672,12 +7674,13 @@ def test_h3_prompt_introduces_one_unified_mask_block_clause(
         ResearchLog(project),
     )
 
-    assert prompt.startswith(
+    assert prompt.startswith("This is an editing task on Video 1")
+    assert (
         "Dark gray (64,64,64) blocks mask faces of people to replace and "
         "replaceable objects; never draw or restore what they hide: rebuild "
         "people naturally from their descriptions, and rebuild objects only "
         "from the provided reference images."
-    )
+    ) in prompt
     assert "(128,128,128)" not in prompt
     assert prompt.index("(64,64,64)") < prompt.index("FACE REPLACEMENT")
     frozen = (
@@ -7705,7 +7708,8 @@ def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
         ResearchLog(project),
     )
 
-    assert prompt.startswith(
+    assert prompt.startswith("This is an editing task on Video 1")
+    assert (
         "Semi-transparent dark gray (64,64,64) blocks mask faces of people "
         "to replace and replaceable objects. The faint blurred source imagery "
         "showing through the blocks serves ONLY as position, motion, and "
@@ -7713,7 +7717,7 @@ def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
         "copy anything visible through the blocks; never draw or restore "
         "what they hide: rebuild people naturally from their descriptions, "
         "and rebuild objects only from the provided reference images."
-    )
+    ) in prompt
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
     ).read_text(encoding="utf-8")
@@ -7736,7 +7740,10 @@ def test_h3_prompt_object_block_clause_absent_without_object_masking(
         ResearchLog(project),
     )
 
-    assert prompt.startswith("FACE REPLACEMENT IS MANDATORY")
+    assert prompt.startswith("This is an editing task on Video 1")
+    assert prompt.index("This is an editing task on Video 1") < prompt.index(
+        "FACE REPLACEMENT IS MANDATORY"
+    )
     assert "(64,64,64)" not in prompt
 
 
@@ -7823,7 +7830,10 @@ def test_h3_prompt_object_block_clause_without_a_replaced_person(
 
     segment_dir = project / "work" / "segments" / "0001"
     assert muted == segment_dir / "source-objects-masked.mp4"
-    assert prompt.startswith("Dark gray (64,64,64) blocks mask faces of people")
+    assert prompt.startswith("This is an editing task on Video 1")
+    assert prompt.index("This is an editing task on Video 1") < prompt.index(
+        "Dark gray (64,64,64) blocks mask faces of people"
+    )
 
 
 def test_h3_task_hang_limit_resubmits_with_fresh_identity(

@@ -6219,6 +6219,18 @@ class Pipeline:
             # The frozen h3_prompt.txt is replayed verbatim on resume,
             # keeping the decision stable.
             processing = self._validated_effective_request(request)["processing"]
+            has_replaced_content = (
+                self._segment_has_replaced_person(element_index, index)
+                or self._segment_has_replaced_object(element_index, index)
+            )
+            editing_block = (
+                "This is an editing task on Video 1, not a generation task: keep "
+                "every shot, camera move, action, timing, transition and all "
+                "unreplaced content exactly as in Video 1; only the elements "
+                "described below are replaced.\n\n"
+                if has_replaced_content
+                else ""
+            )
             face_block = ""
             sheet_reference = replacement_sheet.get("h3_image_reference")
             masks_faces = (
@@ -6239,9 +6251,9 @@ class Pipeline:
                 )
             mask_block = ""
             if objects_masked:
-                # Keep the compact mask instruction first (primacy effect),
-                # and leave the following FACE REPLACEMENT block to carry
-                # identity-reference binding details.
+                # Keep the compact mask instruction first after the fixed
+                # editing framework, and leave the following FACE REPLACEMENT
+                # block to carry identity-reference binding details.
                 mask_block = (
                     "Dark gray (64,64,64) blocks mask faces of people to "
                     "replace and replaceable objects; never draw or restore "
@@ -6284,7 +6296,7 @@ class Pipeline:
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
                 for line in item["dialogue"]
             )
-            final_prompt = mask_block + face_block + prompt + overlay_block + (
+            final_prompt = editing_block + mask_block + face_block + prompt + overlay_block + (
                 "\n\nDialogue requirements: Audio 1 is this segment's "
                 "pre-recorded dialogue speech track in the target language. "
                 "Every speaking person must lip-sync precisely to Audio 1: "
