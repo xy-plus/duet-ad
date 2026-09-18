@@ -1459,6 +1459,11 @@ class Pipeline:
             raise ValueError("stored translated dialogue is invalid")
         if not translated_lines:
             return None
+        # Most lines pass through localize_dialogue, but resumed/frozen state
+        # can also originate from an older path.  ASR follows the audio stream,
+        # which may outlast the visual timeline by a few microseconds; keep
+        # that harmless drift from reaching TTS as an out-of-range window.
+        timeline_end = max(float(item["end_s"]) for item in prepared)
         dialogue_voices = enhanced_element_index.get("dialogue_voices")
         people = enhanced_element_index.get("people")
         # 不做形态校验：音色归属缺失/不齐时按无归属处理，落到默认音色。
@@ -1501,6 +1506,11 @@ class Pipeline:
                 or not 0 <= start_s < end_s
             ):
                 raise ValueError("stored translated dialogue is invalid")
+            start_s = min(start_s, timeline_end)
+            end_s = min(end_s, timeline_end)
+            if start_s >= end_s:
+                # A row wholly beyond the video has no audible placement.
+                continue
             voice_path: Path | None = None
             record = people.get(speaker) if isinstance(speaker, str) else None
             voice = record.get("voice") if isinstance(record, dict) else None
@@ -1558,6 +1568,8 @@ class Pipeline:
             line_audios.append(
                 {"audio": destination, "start_s": start_s, "end_s": end_s}
             )
+        if not line_audios:
+            return None
         full_track = directory / "full-track.wav"
         slices = [
             (
@@ -2836,8 +2848,31 @@ class Pipeline:
             if not lines:
                 log.event("subtitles_skipped", reason="no_dialogue")
                 return {"status": "skipped", "reason": "no_dialogue"}
-            tracks = [directory / f"line-{index:04d}.wav"
-                      for index in range(1, len(lines) + 1)]
+            duration_s = float(media.probe(final)["duration_s"])
+            cue_lines: list[dict[str, Any]] = []
+            tracks: list[Path] = []
+            for index, line in enumerate(lines, 1):
+                try:
+                    start_s = float(line["start_s"])
+                    end_s = float(line["end_s"])
+                except (KeyError, TypeError, ValueError):
+                    # Keep schema failures on the existing validation path.
+                    start_s = end_s = float("nan")
+                if (
+                    math.isfinite(start_s)
+                    and math.isfinite(end_s)
+                    and 0 <= start_s < end_s
+                    and start_s >= duration_s
+                ):
+                    # ASR can emit a final row just past the video timeline;
+                    # it has no visible or audible window, so omit it together
+                    # with the TTS file intentionally not produced upstream.
+                    continue
+                cue_lines.append(line)
+                tracks.append(directory / f"line-{index:04d}.wav")
+            if not cue_lines:
+                log.event("subtitles_skipped", reason="outside_video_timeline")
+                return {"status": "skipped", "reason": "outside_video_timeline"}
             for audio in [directory / "full-track.wav", *tracks]:
                 if not audio.is_file() or audio.stat().st_size == 0:
                     raise ValueError(
@@ -2845,7 +2880,7 @@ class Pipeline:
                         "请恢复原配音产物后续跑"
                     )
             cues = subtitles.build_subtitle_cues(
-                lines, tracks, media.probe(final)["duration_s"],
+                cue_lines, tracks, duration_s,
             )
             # Every resume re-stitches provider segments before entering here;
             # retain the clean, dubbed result and atomically publish only success.

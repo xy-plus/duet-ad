@@ -5969,6 +5969,85 @@ def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
         ).is_file()
 
 
+def test_dialogue_tts_clamps_microsecond_asr_tail_past_video_timeline(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    autodl = _FlowAutodlTTS()
+    (
+        store, project_id, project, pipeline,
+        _prepared, enhanced_index, voice_paths,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+    store.update(
+        project_id,
+        translated_voice_lines=[{
+            "text": "尾句",
+            "start_s": 22.0,
+            "end_s": 23.166688,
+        }],
+    )
+    prepared = [{
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 23.166666,
+        "duration_s": 23.166666,
+        "join_mode": "hard_cut",
+        "dialogue": [{"text": "尾句", "start_s": 22.0, "end_s": 23.166666}],
+    }]
+    observed: dict[str, Any] = {}
+
+    def assemble(
+        lines: list[dict[str, Any]],
+        total_duration_s: float,
+        destination: Path,
+    ) -> dict[str, Any]:
+        observed["lines"] = lines
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"audio")
+        return {"duration_s": total_duration_s}
+
+    monkeypatch.setattr(media, "assemble_dialogue_track", assemble)
+
+    pipeline._run_dialogue_audio(
+        project_id, project, prepared, enhanced_index, voice_paths,
+        ResearchLog(project),
+    )
+
+    assert [call["text"] for call in autodl.tts_calls] == ["尾句"]
+    assert observed["lines"][0]["end_s"] == 23.166666
+
+
+def test_dialogue_tts_drops_line_wholly_past_video_timeline(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    autodl = _FlowAutodlTTS()
+    (
+        store, project_id, project, pipeline,
+        _prepared, enhanced_index, voice_paths,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+    store.update(
+        project_id,
+        translated_voice_lines=[{
+            "text": "越界尾句",
+            "start_s": 23.166666,
+            "end_s": 23.166688,
+        }],
+    )
+    prepared = [{
+        "index": 1,
+        "start_s": 0.0,
+        "end_s": 23.166666,
+        "duration_s": 23.166666,
+        "join_mode": "hard_cut",
+        "dialogue": [],
+    }]
+
+    assert pipeline._run_dialogue_audio(
+        project_id, project, prepared, enhanced_index, voice_paths,
+        ResearchLog(project),
+    ) is None
+    assert autodl.tts_calls == []
+
+
 def test_dialogue_tts_moderation_rejection_retries_until_success(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
