@@ -19,12 +19,11 @@ OBJECT_REPLACE_OUTPUT_NAME = "duet.object-replace-output"
 OBJECT_REPLACE_OUTPUT_VERSION = 4
 MAX_REFERENCE_AUDIO = 3
 
-# entities replacement 的 detect_label：1–3 个全小写英文词组成的通用物品
-# 类别标签（如 "handbag"、"camera strap"），是物体检测节点在源视频里定位
-# 被替换实体的 prompt。词数、字符集和长度写进正则本身，让 agent 写不出
-# 长句；skills/object-replace/SKILL.md「检测标签」一节是同一约束的语义面，
-# 两侧样例由测试锁定一致。
-DETECT_LABEL_PATTERN = r"^(?=.{1,41}$)[a-z]+(?:[ -][a-z]+){0,2}$"
+# entities replacement 的 detect_label：最多 3 个同义英文通用类别短语；每个
+# 短语为 1–3 个全小写词，短语间只能用 ", " 分隔，总长最多 120。它是物体
+# 检测节点定位源对象的 prompt；skills/object-replace/SKILL.md「检测标签」一节
+# 是同一约束的语义面，两侧样例由测试锁定一致。
+DETECT_LABEL_PATTERN = r"^(?=.{1,120}$)[a-z]+(?:[ -][a-z]+){0,2}(?:, [a-z]+(?:[ -][a-z]+){0,2}){0,2}$"
 _DETECT_LABEL_RE = re.compile(DETECT_LABEL_PATTERN)
 
 _ELEMENT_CATEGORIES = ("people", "entities", "scenes")

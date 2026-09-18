@@ -7422,7 +7422,7 @@ def test_segment_replaced_object_targets_skip_transient_physical_effects() -> No
         "entities": {
             "entity-01": {
                 "occurrences": [{"segment_index": 1}],
-                "replacement": {"detect_label": "  MiSt  "},
+                "replacement": {"detect_label": "mist, spray, fog"},
             },
             "entity-02": {
                 "occurrences": [{"segment_index": 1}],

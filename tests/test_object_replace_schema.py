@@ -460,7 +460,7 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
 
 @pytest.mark.parametrize(
     "label",
-    ["handbag", "camera", "strap", "camera strap", "camera-strap", "a"],
+    ["handbag", "camera", "strap", "camera strap", "camera-strap", "a", "handheld fan, portable fan, hand-carry fan"],
 )
 def test_normalizer_accepts_a_short_generic_detect_label(label: str) -> None:
     element_index = _index()
@@ -488,10 +488,14 @@ def test_normalizer_accepts_a_short_generic_detect_label(label: str) -> None:
         " handbag",
         "handbag ",
         "hand  bag",
-        "x" * 42,
         "",
         1,
         None,
+        "handbag, bag, purse, clutch",
+        "Handbag, bag",
+        "handbag, , bag",
+        "handbag, bag,",
+        "a" * 121,
     ],
 )
 def test_normalizer_rejects_an_unusable_detect_label(label: Any) -> None:
@@ -637,25 +641,27 @@ def test_skill_defines_the_same_detect_label_contract_as_the_schema() -> None:
     for rule in (
         "`detect_label`",
         "源对象",
-        "1–3 个词",
+        "每个短语为 1–3 个",
+        "1–3 个同义的英文通用类别短语",
+        '用 ", " 分隔',
         "全小写",
         "单数",
-        "通用类别词",
+        "通用类别短语",
         "每个有非空 `replacement` 的 entities stable key 都必须输出 `detect_label`",
         "瞬态/环境物理效果",
         "不分配 `detect_label`",
         "缺失即为无效输出",
         "开放词汇检测器",
         "必须能被开放词汇检测器识别",
-        "handbag",
+        "handheld fan, portable fan, hand-carry fan",
         "不得含品牌、颜色、材质",
         "people 和 scenes 不得输出该字段",
     ):
         assert rule in skill
     # 代码侧正则与 SKILL 语义约束必须锁在同一批样例上。
-    for label in ("handbag", "camera", "strap", "camera strap"):
+    for label in ("handbag", "camera", "strap", "camera strap", "handheld fan, portable fan, hand-carry fan"):
         assert re.fullmatch(DETECT_LABEL_PATTERN, label)
-    for label in ("a red leather handbag", "Handbag", "黑色相机包"):
+    for label in ("a red leather handbag", "Handbag", "黑色相机包", "handbag, , bag", "handbag, bag,"):
         assert not re.fullmatch(DETECT_LABEL_PATTERN, label)
 
 

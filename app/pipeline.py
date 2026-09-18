@@ -81,8 +81,8 @@ MASTER_EMPTY_ASR_SIGNAL = 51 / 256
 _NO_REUSABLE_OUTPUT: Any = object()
 # These labels describe transient or ambient physical phenomena, rather than
 # objects with an identity that needs replacement.  Object Replace normally
-# omits them; _segment_replaced_object_targets keeps this narrow exact-label
-# filter as defense in depth for imperfect or frozen planning output.
+# omits them; _segment_replaced_object_targets checks every synonym phrase as
+# defense in depth for imperfect or frozen planning output.
 _TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS = frozenset(
     {
         "mist",
@@ -5764,9 +5764,9 @@ class Pipeline:
             detect_label = record["replacement"].get("detect_label")
             if isinstance(detect_label, str) and detect_label.strip():
                 normalized_label = detect_label.strip()
-                if (
-                    normalized_label.casefold()
-                    not in _TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS
+                if not any(
+                    phrase.casefold() in _TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS
+                    for phrase in normalized_label.split(", ")
                 ):
                     targets.append(normalized_label)
                 continue
