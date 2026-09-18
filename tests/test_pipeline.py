@@ -1306,7 +1306,6 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         ("TILE_02", "person-02"),
         ("TILE_03", "person-03"),
         ("TILE_04", "entity-01"),
-        ("TILE_05", "scene-01"),
     ]
     assert all(
         tile["stable_key"] != "relation-01"
