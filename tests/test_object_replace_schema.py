@@ -180,8 +180,8 @@ def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None
         encoding="utf-8"
     )
 
-    assert "只服从 `authoritative_constraints` 编译出的安全不变量" in skill
-    assert "不得用 raw `preserve` 恢复源身份或外观" in skill
+    assert "只服从权威块的安全不变量" in skill
+    assert "用 raw `preserve` 恢复任何 REPLACE 项的源身份或外观" in skill
     assert "同时遵守对象的 `preserve`" not in skill
     assert "对 `replacement.source=image_1` 的 stable key，权威块会列出它唯一可用的用户图编号" in skill
     assert "不得扩散给未绑定 stable key" in skill
