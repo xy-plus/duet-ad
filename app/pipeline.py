@@ -2775,13 +2775,32 @@ class Pipeline:
         final: Path,
         log: ResearchLog,
     ) -> None:
-        """Overwrite the stitched video with the assembled TTS speech track."""
+        """Overwrite generated audio with dialogue, or silence when absent."""
         if not any(item.get("dialogue") for item in prepared):
-            return
-        full_track = project / "work" / "dialogue-audio" / "full-track.wav"
+            full_track = (
+                project / "work" / "dialogue-audio" / "no-dialogue-silence.wav"
+            )
+            duration_s = float(media.probe(final)["duration_s"])
+            self._node(
+                log,
+                "create-silent-audio-track",
+                "project",
+                {"video": final, "duration_s": duration_s, "output": full_track},
+                [final],
+                lambda: media.silent_audio_track(duration_s, full_track),
+                lambda _value: [full_track],
+            )
+            log.event(
+                "audio_muted_no_dialogue",
+                output=final,
+                audio=full_track,
+                duration_s=duration_s,
+            )
+        else:
+            full_track = project / "work" / "dialogue-audio" / "full-track.wav"
         if not full_track.is_file():
             # Degrade: keep the stitched video with its generated audio
-            # instead of failing the whole project.
+            # when dialogue was expected but its assembled TTS track vanished.
             log.event(
                 "dialogue_track_missing_degraded",
                 output=final,

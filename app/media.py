@@ -1969,6 +1969,30 @@ def slice_dialogue_track(
     )
 
 
+def silent_audio_track(duration_s: float, destination: Path) -> dict[str, Any]:
+    """Create a stereo 48kHz silent WAV track for an exact video duration."""
+    if (
+        isinstance(duration_s, bool)
+        or not isinstance(duration_s, (int, float))
+        or not math.isfinite(float(duration_s))
+        or float(duration_s) <= 0
+    ):
+        raise ValueError("silent audio duration must be finite and positive")
+    duration = float(duration_s)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = run_command(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", f"{duration:.9f}",
+            "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+            str(destination),
+        ],
+        timeout=120,
+    )
+    return {**result, "duration_s": duration}
+
+
 def replace_audio_track(
     video: Path,
     audio: Path,

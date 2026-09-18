@@ -7913,6 +7913,53 @@ def test_missing_full_track_degrades_to_stitched_video(
     assert not (project / "logs" / "replace-audio-track").exists()
 
 
+def test_no_dialogue_replaces_final_audio_with_a_silent_track(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "request-no-dialogue-final-audio",
+    )
+    final = project / "output" / "generated.mp4"
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.write_bytes(b"provider-generated-audio")
+    pipeline = Pipeline(
+        _settings(tmp_path), store,
+        lambda _project_id, _path: "https://assets.invalid/value",
+        deepseek=object(), mediakit=object(), picsart=object(),
+    )
+    silence = project / "work" / "dialogue-audio" / "no-dialogue-silence.wav"
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr(media, "probe", lambda _path: {"duration_s": 9.2})
+
+    def make_silence(duration_s: float, destination: Path) -> dict[str, Any]:
+        calls["silence"] = (duration_s, destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"silence")
+        return {"duration_s": duration_s}
+
+    def replace(video: Path, audio: Path, destination: Path) -> dict[str, Any]:
+        calls["replace"] = (video, audio, destination)
+        destination.write_bytes(video.read_bytes() + b"|silent")
+        return {"duration_s": 9.2}
+
+    monkeypatch.setattr(media, "silent_audio_track", make_silence)
+    monkeypatch.setattr(media, "replace_audio_track", replace)
+
+    pipeline._replace_dialogue_audio_track(
+        project, [{"dialogue": []}], final, ResearchLog(project),
+    )
+
+    assert calls["silence"] == (9.2, silence)
+    assert calls["replace"] == (final, silence, final)
+    assert silence.is_file()
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "audio_muted_no_dialogue" in trace
+    assert "dialogue_track_missing_degraded" not in trace
+    assert (project / "logs" / "create-silent-audio-track").is_dir()
+    assert (project / "logs" / "replace-audio-track").is_dir()
+
+
 def test_pipeline_failure_persists_actionable_error_code(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:

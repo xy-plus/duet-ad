@@ -669,6 +669,17 @@ def test_assemble_dialogue_track_places_lines_on_a_silent_base(tmp_path: Path):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
+def test_silent_audio_track_has_requested_duration_and_no_signal(tmp_path: Path):
+    destination = tmp_path / "no-dialogue-silence.wav"
+
+    result = media.silent_audio_track(1.25, destination)
+
+    assert result["duration_s"] == 1.25
+    assert media._probe_audio_duration(destination) == pytest.approx(1.25, abs=0.05)
+    assert _max_volume(destination) < -60.0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
 def test_replace_audio_track_overwrites_audio_and_keeps_video(tmp_path: Path):
     video = tmp_path / "video.mp4"
     subprocess.run(
