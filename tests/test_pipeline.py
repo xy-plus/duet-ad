@@ -3115,7 +3115,14 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "the black bear-shaped jewelry case shown in Image 1" in entity_line
     assert "toothbrush form" not in entity_line
     assert "white color" not in entity_line
-    assert "source function, action interface, scale, contact" in entity_line
+    assert (
+        "source occurrence timing, position/orientation, action rhythm, camera language"
+        in entity_line
+    )
+    assert "bound reference is the sole authority for target shape, volume" in entity_line
+    assert "rebuild grip, occlusion, and contact placement naturally" in entity_line
+    assert "never deform the target to fit source geometry" in entity_line
+    assert "source function, action interface, scale, contact" not in entity_line
 
     assert "original cabinet fronts" not in scene_line
     assert "source scene type, color tone, composition" in scene_line
@@ -3127,9 +3134,10 @@ def test_fusion_authority_replace_uses_only_safe_category_invariants() -> None:
     assert "hand-painted logo; glazed finish" in keep_line
     assert "endpoints: person-01 -> entity-01" in relation_line
     assert (
-        "interaction type, contact, relative position, and motion continuity"
+        "interaction event, relative scene placement, and motion continuity"
         in relation_line
     )
+    assert "rebuild contact and occlusion for replacement geometry" in relation_line
     assert "holds the source toothbrush" not in relation_line
     assert "toothbrush handle" not in relation_line
     assert "brush-head angle" not in relation_line

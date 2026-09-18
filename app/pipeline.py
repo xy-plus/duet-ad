@@ -5848,8 +5848,12 @@ class Pipeline:
                         )
                     elif category == "entities":
                         preserve_text = (
-                            "source function, action interface, scale, contact, and "
-                            "relation semantics"
+                            "source occurrence timing, position/orientation, action rhythm, "
+                            "camera language, and interaction events only; target shape, "
+                            "volume, dimensions, proportions, and function come solely from "
+                            "the bound reference; rebuild grip, occlusion, and contact "
+                            "placement naturally for the target geometry; never deform the "
+                            "target to fit source geometry"
                         )
                     else:
                         preserve_text = (
@@ -5952,9 +5956,12 @@ class Pipeline:
                     )
                 elif category == "entities" and isinstance(replacement, dict):
                     line += (
-                        " | entity policy: preserve function, action interface, scale, "
-                        "contact, and relation semantics; visibly change material, "
-                        "color, breed, outline, structure, or form as specified by target"
+                        " | entity policy: preserve only source occurrence timing, "
+                        "position/orientation, action rhythm, camera language, and "
+                        "interaction events; the bound reference is the sole authority for "
+                        "target shape, volume, dimensions, proportions, and function; "
+                        "rebuild grip, occlusion, and contact placement naturally for the "
+                        "target geometry and never deform the target to fit source geometry"
                     )
                 lines.append(line)
 
@@ -5986,8 +5993,9 @@ class Pipeline:
             if subject in replaced_ids or object_key in replaced_ids:
                 lines.append(
                     f"- {stable_id} | RELATION | endpoints: {subject} -> "
-                    f"{object_key} | preserve: interaction type, contact, relative "
-                    "position, and motion continuity | replace together: "
+                    f"{object_key} | preserve: interaction event, relative scene "
+                    "placement, and motion continuity; rebuild contact and occlusion "
+                    "for replacement geometry | replace together: "
                     f"{replace_together_text}"
                 )
             else:
