@@ -89,7 +89,7 @@ def test_finalization_orders_subtitles_after_audio_and_preserves_public_path(con
             raise ValueError("local renderer failed")
         return burn(*args)
     monkeypatch.setattr(subtitles, "burn_subtitles", tracked_burn)
-    request = {"add_subtitles": True}
+    request = {"add_subtitles": True, "dialogue": {"target_language": "中文"}}
     if resume:
         monkeypatch.setattr(pipeline, "_load_r2v_resume", lambda _: (project, prepared, None, None, request, []))
         monkeypatch.setattr(pipeline, "_next_resume_identity", lambda *args: ("resume", "resume"))
@@ -104,7 +104,7 @@ def test_finalization_orders_subtitles_after_audio_and_preserves_public_path(con
             assert order.count("subtitles") == 1
         pipeline.resume_r2v("id")
     else:
-        pipeline._continue_after_replacement_sheet("id", project, prepared, {}, [], None, {}, None, request, ResearchLog(project))
+        pipeline._continue_after_replacement_sheet("id", project, prepared, {}, None, {}, None, request, ResearchLog(project))
     assert order[-3:] == ["stitch", "audio", "subtitles"]
     assert state["status"] == "succeeded"
     assert state["output_path"] == "output/generated.mp4"
