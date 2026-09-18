@@ -2777,6 +2777,7 @@ class Pipeline:
                 [final],
                 lambda: media.silent_audio_track(duration_s, full_track),
                 lambda _value: [full_track],
+                retry_if=lambda _exc: False,
             )
             log.event(
                 "audio_muted_no_dialogue",
@@ -2806,6 +2807,7 @@ class Pipeline:
             [final, full_track],
             lambda: media.replace_audio_track(final, full_track, final),
             lambda _value: [final],
+            retry_if=lambda _exc: False,
         )
 
     def _add_subtitles(

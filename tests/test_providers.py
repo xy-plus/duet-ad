@@ -547,7 +547,7 @@ def test_codex_structured_transport_wrappers(wrapper) -> None:
     }
 
 
-def _removed_mediakit_image_erase_multi_scene_test(
+def _legacy_mediakit_image_erase_multi_scene_test(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -677,7 +677,7 @@ def _removed_mediakit_image_erase_multi_scene_test(
         ),
     ],
 )
-def _removed_mediakit_image_erase_failure_test(
+def _legacy_mediakit_image_erase_failure_test(
     tmp_path: Path, response: httpx.Response, message: str
 ) -> None:
     source = tmp_path / "input.png"
@@ -1673,7 +1673,7 @@ def test_read_timeout_keeps_short_backoff_and_unknown_outcome(
     ] == ["ReadTimeout"] * 3
 
 
-def _removed_mediakit_image_erase_retry_test(tmp_path: Path) -> None:
+def _legacy_mediakit_image_erase_retry_test(tmp_path: Path) -> None:
     source = tmp_path / "input.png"
     source.write_bytes(b"input")
     calls = 0

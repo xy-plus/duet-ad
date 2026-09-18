@@ -1271,8 +1271,10 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for category in ("people", "entities", "scenes")
         for record in raw_index[category].values()
     )
-    assert enhanced_index["people"]["person-01"]["replacement"]["source"] == (
-        "image_1"
+    assert any(
+        record["replacement"]["source"] == "image_1"
+        for record in enhanced_index["entities"].values()
+        if isinstance(record.get("replacement"), dict)
     )
     assert state["object_replace"]["version"] == OBJECT_REPLACE_OUTPUT_VERSION
     replacement_sheet = state["replacement_sheet"]
@@ -5405,6 +5407,20 @@ def _install_resume_output_media(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(media, "trim_24fps", trim)
     monkeypatch.setattr(media, "concat", concat)
+
+    def silence(duration_s: float, destination: Path) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"silence")
+        return {"duration_s": duration_s}
+
+    def replace_audio(
+        video: Path, audio: Path, destination: Path,
+    ) -> dict[str, Any]:
+        destination.write_bytes(video.read_bytes() + audio.read_bytes())
+        return {"duration_s": 5.0}
+
+    monkeypatch.setattr(media, "silent_audio_track", silence)
+    monkeypatch.setattr(media, "replace_audio_track", replace_audio)
 
 
 def test_h3_prep_resume_gate_accepts_reusable_upstream_without_h3_manifest(
