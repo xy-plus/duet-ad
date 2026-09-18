@@ -1,7 +1,8 @@
 """Doubao Seed-TTS 2.0 client (Volcengine openspeech V3 HTTP unidirectional).
 
-接口：`POST https://openspeech.bytedance.com/api/v3/tts/unidirectional`
-（HTTP Chunked 单向流式，文档 6561/2528925）。新版控制台鉴权只有一把
+接口：`POST https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse`
+（SSE 单向流式，文档 6561/1257584；同 key 对非 SSE 的 chunked 变体
+会 403 not granted，SSE 变体才在授权范围内，2026-09-19 实测）。新版控制台鉴权只有一把
 API Key（X-Api-Key），没有 appid/cluster 概念；X-Api-Resource-Id 固定为
 seed-tts-2.0 常量，不是配置项。音频用 pcm 拉流（wav 在流式下会重复返回
 wav header，官方建议 pcm），本地拼好 PCM 后包成 24kHz 单声道 16bit WAV
@@ -31,7 +32,7 @@ from app.providers import (
 )
 
 
-DOUBAO_TTS_API_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+DOUBAO_TTS_API_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse"
 DOUBAO_TTS_RESOURCE_ID = "seed-tts-2.0"
 DOUBAO_TTS_SAMPLE_RATE = 24000
 # 接口文本上限 1024 字节（UTF-8），官方建议 300 字符以内。
@@ -251,7 +252,12 @@ class DoubaoTtsClient:
         chunk_count = 0
         finished = False
         for line in response.iter_lines():
-            if not line.strip():
+            line = line.strip()
+            if not line or line.startswith("event:"):
+                continue
+            if line.startswith("data:"):
+                line = line[len("data:"):].strip()
+            if not line:
                 continue
             try:
                 event = json.loads(line)

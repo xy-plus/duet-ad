@@ -1533,7 +1533,11 @@ def _doubao_client(
 
 
 def _doubao_stream(*events: dict[str, Any]) -> bytes:
-    return "".join(json.dumps(event) + "\n" for event in events).encode()
+    # openspeech 单向流 SSE 变体：每个事件一个 data: 行（另带 event: 序号行）。
+    return "".join(
+        f"event: {index}\ndata: {json.dumps(event)}\n\n"
+        for index, event in enumerate(events)
+    ).encode()
 
 
 def _doubao_audio_chunk(payload: bytes) -> dict[str, Any]:
@@ -1552,7 +1556,7 @@ def test_doubao_synthesize_posts_exact_request_and_writes_wav(
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
         assert request.url == httpx.URL(
-            "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+            "https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse"
         )
         assert request.headers["x-api-key"] == "volc-voice-secret"
         assert request.headers["x-api-resource-id"] == DOUBAO_TTS_RESOURCE_ID
