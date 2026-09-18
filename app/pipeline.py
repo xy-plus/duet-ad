@@ -411,23 +411,11 @@ class Pipeline:
         self.picsart = picsart or PicsartClient(settings)
         self.autodl = autodl or AutodlClient(settings)
         self.voice_library: VoiceLibrary = load_voice_library()
-        self._mediakit_gate = threading.BoundedSemaphore(
-            settings.mediakit_concurrency,
-        )
         # ProjectStore.update() is atomic, but a receipt ledger change is a
         # read-modify-write operation assembled here.  Serialize that whole
         # operation so parallel segment transitions cannot overwrite each
         # other before the paid POST boundary.
         self._picsart_receipt_lock = threading.Lock()
-
-    def _erase_with_limit(
-        self,
-        source: Path,
-        destination: Path,
-        stages: list[str],
-    ) -> ProviderResult[Path]:
-        with self._mediakit_gate:
-            return self.mediakit.erase(source, destination, stages)
 
     def _progress(
         self,
@@ -5320,72 +5308,7 @@ class Pipeline:
                 encoding="utf-8",
             )
 
-        request = self._validated_effective_request(request)
-        processing = request["processing"]
-        generation_config = self._generation_config(request)
-        stages: list[str] = []
-        if processing["remove_subtitle"]:
-            stages.append("full_screen_text_erase")
-        if processing["remove_logo"]:
-            stages.append("full_screen_icon_erase")
-        use_mediakit = (
-            self.settings.enable_mediakit
-            and processing["optimize_image"]
-            and bool(stages)
-        )
         authoritative_frames = list(frames)
-        if use_mediakit:
-            optimized = directory / "optimized-keyframes"
-            optimized.mkdir(exist_ok=True)
-            authoritative_frames = []
-            for order, frame in enumerate(frames, 1):
-                target = optimized / frame.name
-                if resume and media.is_decodable_image(target):
-                    authoritative_frames.append(target)
-                    log.event(
-                        "mediakit_artifact_reused",
-                        scope=f"{scope}-frame-{order:02d}",
-                        output=target,
-                    )
-                    continue
-                if resume and target.exists():
-                    log.event(
-                        "mediakit_artifact_damaged",
-                        scope=f"{scope}-frame-{order:02d}",
-                        output=target,
-                    )
-                erase_source = frame
-                remaining_stages = stages
-                node = "mediakit-erase"
-                if resume:
-                    node = "mediakit-erase-resume"
-                    for completed in range(1, len(stages)):
-                        checkpoint = target.with_name(
-                            f"{target.stem}.mediakit-stage-{completed:02d}{target.suffix}"
-                        )
-                        if media.is_decodable_image(checkpoint):
-                            erase_source = checkpoint
-                            remaining_stages = stages[completed:]
-                        elif checkpoint.exists():
-                            log.event(
-                                "mediakit_checkpoint_damaged",
-                                scope=f"{scope}-frame-{order:02d}",
-                                checkpoint=checkpoint,
-                            )
-                result = self._node(
-                    log,
-                    node,
-                    f"{scope}-frame-{order:02d}",
-                    {"source": erase_source, "scenes": remaining_stages},
-                    [erase_source],
-                    lambda erase_source=erase_source,
-                    target=target,
-                    remaining_stages=remaining_stages: self._erase_with_limit(
-                        erase_source, target, remaining_stages,
-                    ),
-                    lambda path: [path],
-                )
-                authoritative_frames.append(result)
 
         proxy_dir = directory / "analysis-keyframes"
         proxy_dir.mkdir(exist_ok=True)

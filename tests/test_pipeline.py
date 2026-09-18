@@ -1048,7 +1048,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     }
     assert len(picsart.submits) == 2
     assert len(seedream.calls) == 1
-    assert len(mediakit.calls) == 18
+    assert mediakit.calls == []
     # The source's burned-in subtitles are erased once at project level and
     # every downstream consumer switches to the erased file.
     assert mediakit.video_erase_calls == [
@@ -1062,10 +1062,6 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         ).read_text(encoding="utf-8")
     )
     assert cut_input["source"].endswith("work/source-nosubs.mp4")
-    assert all(
-        call == ["full_screen_text_erase", "full_screen_icon_erase"]
-        for call in mediakit.calls
-    )
     assert sorted(call["duration"] for call in picsart.submits) == [5, 5]
     assert picsart.poll_counts["task-1"] == 2
     assert picsart.poll_counts["task-2"] == 1
@@ -8718,7 +8714,7 @@ def _mediakit_resume_fixture(
     )
 
 
-def test_mediakit_resume_regenerates_a_zero_byte_stage_checkpoint(
+def test_resume_ignores_legacy_optimized_keyframes(
     tmp_path: Path,
 ) -> None:
     (
@@ -8739,19 +8735,11 @@ def test_mediakit_resume_regenerates_a_zero_byte_stage_checkpoint(
         resume=True,
     )
 
-    # The 0-byte stage checkpoint is not completion evidence: frame 5
-    # restarts from the raw keyframe with both erase stages.
-    target = project / "work" / "segments" / "0001" / "optimized-keyframes" / "05.png"
-    assert mediakit.calls == [
-        (raw_dir / "05.png", target, ["full_screen_text_erase", "full_screen_icon_erase"]),
-    ]
-    assert result["keyframe_paths"][4] == target
-    assert target.read_bytes() == _TEST_PNG
-    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
-    assert "mediakit_checkpoint_damaged" in trace
+    assert mediakit.calls == []
+    assert result["keyframe_paths"][4] == raw_dir / "05.png"
 
 
-def test_mediakit_resume_still_reuses_a_decodable_stage_checkpoint(
+def test_resume_does_not_read_legacy_optimized_keyframes(
     tmp_path: Path,
 ) -> None:
     (
@@ -8772,12 +8760,7 @@ def test_mediakit_resume_still_reuses_a_decodable_stage_checkpoint(
         resume=True,
     )
 
-    checkpoint = (
-        project / "work" / "segments" / "0001"
-        / "optimized-keyframes" / "05.mediakit-stage-01.png"
-    )
-    target = checkpoint.with_name("05.png")
-    assert mediakit.calls == [(checkpoint, target, ["full_screen_icon_erase"])]
+    assert mediakit.calls == []
 
 
 def test_reusable_node_output_treats_zero_byte_artifacts_as_missing(
