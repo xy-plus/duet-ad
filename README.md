@@ -45,7 +45,7 @@ Object Replace Skill 要求 `replacement_set` 中每个人物、实体和场景�
 
 新形象图版是 bundle v4、spec v2 下的项目级单张 2048×2048 PNG。后端只从 `appearance_description` 确定性编译隔离式图版提示词：每格恰好一个 stable key，人物、实体互不带入其他对象，场景必须为空置环境。Seedream 每项目只调用一次，输入固定为 `Image 1=后端空白布局`，存在唯一有效用户图绑定时再加入 `Image 2=规范化用户图`；不再生成或发送源帧证据。用户图只可影响 `source=image_1` 对应的一个 tile，不约束其他 tile。这里的 Seedream 编号不沿用到 H3：H3 侧新形象图版固定为 `Image 1`（身份锚点占主参考位），存在该绑定时用户图为 `Image 2`；没有绑定时不扩散原始用户图，图版单独作为 H3 `Image 1`。每个 segment 都使用同一张图版、同一顺序和同一 `stable key -> TILE_XX -> Image N` 映射；Fusion 只消费这套后端映射，不自行识别或重编号图版对象。
 
-音色目录位于 `/home/xy/duet-ad1-h3-max-r2v/assets/voice-library`。当前随仓库提供 30 条 2–5 秒单声道 PCM WAV；运行时只要求目录中存在可用条目，不把“恰好 30 条”设为门禁，也不复审年龄、性格等标签是否与声音主观相符。Object Replace 每条只接收一行 `voice_id - file - language - gender - 短特征`。Skill 仍负责为人物选择合适音色；后端只消费可用选择，并按稳定人物顺序保留最先出现的最多 3 个不同 `voice_id`，后续新增音色稳定降级为 `null`，再机械映射为 `Audio 1..N`。Picsart 的每个 segment 接收同一份、同一顺序的 0–3 条参考音频。
+音色目录位于 `assets/doubao-voices/catalog.json`（豆包语音合成 2.0 音色，由 `scripts/build_doubao_voice_catalog.py` 从火山文档快照 `source-page.md` 再生成，`--check` 校验一致）。Object Replace 只接收按目标语言过滤后的音色子集，每行 `voice_type - 音色名 - 语种码 - 性别 - 场景标签[- 备注]`；它为每行台词选择一个目录内 `voice_type`（`dialogue_voices`），无绑定时 TTS 回退该语种的通用默认音色。配音全程不再物化本地 wav 参考；H3 的 `reference_audio_urls` 只有各段 TTS 台词切片。
 
 ## 配置
 
