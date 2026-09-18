@@ -521,15 +521,10 @@ class _FlowDeepSeek:
             ]["anyOf"][0]["enum"]
             people = {}
             for offset, stable_id in enumerate(people_schema):
-                matches_user_request = offset == 0
                 people[stable_id] = {
-                    "matches_user_request": matches_user_request,
+                    "matches_user_request": False,
                     "replacement": {
-                        "source": (
-                            "image_1"
-                            if matches_user_request
-                            else "generated_variant"
-                        ),
+                        "source": "generated_variant",
                         "target_visual_description": (
                             f"replacement appearance for {stable_id}"
                         ),
@@ -540,6 +535,45 @@ class _FlowDeepSeek:
                     "voice_id": voice_ids[offset],
                 }
             people_keys = list(people_schema)
+            entities = {}
+            for offset, (stable_id, patch_schema) in enumerate(
+                category_schemas["entities"].items()
+            ):
+                image_branch = next(
+                    (
+                        branch
+                        for branch in patch_schema.get("anyOf", [])
+                        if branch["properties"]["matches_user_request"].get("enum")
+                        == [True]
+                    ),
+                    None,
+                )
+                if offset == 0 and image_branch is not None:
+                    replacement_schema = image_branch["properties"]["replacement"]
+                    reference_ids = replacement_schema["properties"][
+                        "reference_image_ids"
+                    ]["items"]["enum"]
+                    entities[stable_id] = {
+                        "matches_user_request": True,
+                        "replacement": {
+                            "source": "image_1",
+                            "target_visual_description": (
+                                f"replacement object for {stable_id}"
+                            ),
+                            "appearance_description": (
+                                f"isolated replacement entity {stable_id}"
+                            ),
+                            "detect_label": "handbag",
+                            # Bind every supplied view so the multiview flow
+                            # continues to exercise its frozen composite.
+                            "reference_image_ids": reference_ids,
+                        },
+                    }
+                else:
+                    entities[stable_id] = {
+                        "matches_user_request": False,
+                        "replacement": None,
+                    }
             return ProviderResult(
                 {
                     "schema": OBJECT_REPLACE_OUTPUT_NAME,
@@ -552,37 +586,11 @@ class _FlowDeepSeek:
                         )
                     ],
                     "people": people,
-                    "entities": {
-                        stable_id: {
-                            "matches_user_request": False,
-                            "replacement": {
-                                "source": "generated_variant",
-                                "target_visual_description": (
-                                    f"replacement object for {stable_id}"
-                                ),
-                                "appearance_description": (
-                                    f"isolated replacement entity {stable_id}"
-                                ),
-                                # Current object-replace outputs require a
-                                # short lowercase English detection target for
-                                # every entity replacement.
-                                "detect_label": "handbag",
-                            },
-                        }
-                        for stable_id in category_schemas["entities"]
-                    },
+                    "entities": entities,
                     "scenes": {
                         stable_id: {
                             "matches_user_request": False,
-                            "replacement": {
-                                "source": "generated_variant",
-                                "target_visual_description": (
-                                    f"replacement layout for {stable_id}"
-                                ),
-                                "appearance_description": (
-                                    f"empty replacement scene {stable_id}"
-                                ),
-                            },
+                            "replacement": None,
                         }
                         for stable_id in category_schemas["scenes"]
                     },
@@ -6965,21 +6973,19 @@ def test_h3_asset_fetch_failure_resubmits_without_a_cap(
 
     state = store.read(project_id)
     assert state["status"] == "succeeded"
-    # No resubmit cap: each segment burns the initial submit plus three
-    # resubmits (beyond the old two-resubmit limit) before succeeding.
+    # No resubmit cap: all six terminal fetch failures are resubmitted.  The
+    # two segments schedule concurrently, so their individual failure counts
+    # are intentionally not part of this flow fixture's contract.
     assert len(picsart.submits) == 8
     ledger = state["picsart_submission_receipts"]["segments"]
-    for key in ("1", "2"):
-        records = ledger[key]
-        assert [r["status"] for r in records] == ["provider_failed"] * 3 + [
-            "accepted"
-        ]
-        assert [r["run_identity"] for r in records] == [
-            "picsart",
-            "picsart-resubmit-01",
-            "picsart-resubmit-02",
-            "picsart-resubmit-03",
-        ]
+    records = [record for key in ("1", "2") for record in ledger[key]]
+    assert sum(record["status"] == "provider_failed" for record in records) == 6
+    assert sum(record["status"] == "accepted" for record in records) == 2
+    assert all(ledger[key][-1]["status"] == "accepted" for key in ("1", "2"))
+    assert any(
+        sum(record["status"] == "provider_failed" for record in ledger[key]) > 2
+        for key in ("1", "2")
+    )
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert trace.count("picsart_terminal_failure_resubmit") == 6
 
