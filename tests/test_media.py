@@ -284,6 +284,18 @@ def test_dialogue_is_validation_only_and_crossing_text_is_split_by_overlap():
     assert first[0]["text"] + second[0]["text"] == line["text"]
 
 
+def test_dialogue_line_end_slightly_past_timeline_is_clamped():
+    scenes = [_scene(1, 0, 28)]
+    segments = media.plan_segments(scenes, 23.166666)
+    # ASR follows the audio stream, which can end microseconds after the video.
+    line = {"text": "tail", "start_s": 15.0, "end_s": 23.166688}
+
+    localized = media.localize_dialogue([line], segments[-1], segments=segments)
+
+    assert localized
+    assert all(row["end_s"] <= 23.166666 for row in localized)
+
+
 def test_hamilton_selection_uses_scene_anchors_and_ordinal_spacing():
     capacities = (1, 2, 10)
     scenes = []

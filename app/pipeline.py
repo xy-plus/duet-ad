@@ -2500,6 +2500,7 @@ class Pipeline:
                 lambda item=item: media.localize_dialogue(
                     translated_lines, item, segments=prepared,
                 ),
+                retry_if=lambda _exc: False,
             )
 
         index_request, index_images = self._project_index_request(

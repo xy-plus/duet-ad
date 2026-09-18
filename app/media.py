@@ -1767,9 +1767,15 @@ def localize_dialogue(
             math.isfinite(line_start)
             and math.isfinite(line_end)
             and 0 <= line_start < line_end
-            and line_end <= normalized_segments[-1][2] + _EPS
         ):
             raise MediaError("long_video_invalid_dialogue")
+        # ASR timestamps follow the audio stream, which can run a few
+        # microseconds past the video timeline; clamp to the final segment end.
+        timeline_end = normalized_segments[-1][2]
+        line_start = min(line_start, timeline_end)
+        line_end = min(line_end, timeline_end)
+        if line_start >= line_end:
+            continue
         intersections = [
             (
                 item_index,
