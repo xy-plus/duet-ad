@@ -37,7 +37,7 @@ def fixture(instruction="把包换成参考图中的物品", has_image=True):
             "matches_user_request": False,
             "replacement": None,
         }
-    kwargs = dict(input_sha256=digest, element_index=index, voice_ids=["voice-a"],
+    kwargs = dict(input_sha256=digest, element_index=index, voice_types=["voice-a"],
                   has_user_image=has_image, user_instruction=instruction,
                   dialogue_line_count=0)
     return index, schema, output, kwargs
@@ -61,7 +61,7 @@ def test_multiple_existing_entities_share_image_without_merging_source_facts(ins
     original = copy.deepcopy(index)
     bind(output, "entity-01", "entity-02")
     normalized = normalize_object_replace(output, **kwargs)
-    merged = merge_object_replace_index(index, normalized, {})
+    merged = merge_object_replace_index(index, normalized, ["voice-a"])
     assert index == original
     assert merged["relations"] == original["relations"]
     for key in index["entities"]:

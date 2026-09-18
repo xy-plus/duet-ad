@@ -25,7 +25,6 @@ from app import product_views
 from app.config import Settings
 from app.fusion_schema import fusion_prompt_schema, normalize_fusion_prompt
 from app.object_replace_schema import (
-    MAX_REFERENCE_AUDIO,
     OBJECT_REPLACE_OUTPUT_VERSION,
     merge_object_replace_index,
     normalize_object_replace,
@@ -48,7 +47,8 @@ from app.providers import (
     ProviderFailure,
     ProviderResult,
 )
-from app.doubao_tts import DoubaoTtsClient, doubao_tts_voice_type
+from app.doubao_tts import DoubaoTtsClient
+from app.doubao_voices import DoubaoVoiceCatalog, load_doubao_voice_catalog
 from app.seedream import (
     SEEDREAM_OUTPUT_HEIGHT,
     SEEDREAM_OUTPUT_SIZE,
@@ -59,7 +59,6 @@ from app.seedream import (
 )
 from app.research_log import ResearchLog
 from app.store import ProjectStore, replacement_input_paths
-from app.voice_catalog import VoiceLibrary, load_voice_library
 from app.video_maker_schemas import (
     VISUAL_PROMPT_SCHEMA,
     normalize_project_index,
@@ -410,7 +409,7 @@ class Pipeline:
         self.seedream = seedream or SeedreamClient(settings)
         self.picsart = picsart or PicsartClient(settings)
         self.tts = tts or DoubaoTtsClient(settings)
-        self.voice_library: VoiceLibrary = load_voice_library()
+        self.voice_catalog: DoubaoVoiceCatalog = load_doubao_voice_catalog()
         # ProjectStore.update() is atomic, but a receipt ledger change is a
         # read-modify-write operation assembled here.  Serialize that whole
         # operation so parallel segment transitions cannot overwrite each
@@ -1118,91 +1117,16 @@ class Pipeline:
     def _stored_voice_references(
         project: Path, state: dict[str, Any],
     ) -> list[Path]:
-        """Load the frozen Audio 1..N list."""
+        """Validate the retired voice-reference slot.
+
+        豆包 TTS 直接按 voice_type 合成，不再物化本地 wav 参考；v5 起该字段
+        恒为空列表，仅保留字段名以维持 h3_prepared_artifacts 绑定结构
+        （voice_references_sha256）。旧项目的非空引用由 Object Replace 版本
+        门禁先行拒绝，走到这里仍非空即为损坏状态。"""
         references = state.get("voice_references")
-        if not isinstance(references, list) or len(references) > MAX_REFERENCE_AUDIO:
+        if not isinstance(references, list) or references:
             raise ValueError("stored voice references are invalid")
-        project_root = project.resolve(strict=True)
-        paths: list[Path] = []
-        for reference in references:
-            if (
-                not isinstance(reference, dict)
-                or not isinstance(reference.get("asset_path"), str)
-                or not reference["asset_path"]
-                or not isinstance(reference.get("voice_id"), str)
-                or not reference["voice_id"]
-                or not isinstance(reference.get("features"), str)
-                or not reference["features"]
-            ):
-                raise ValueError("stored voice reference is invalid")
-            candidate = project / reference["asset_path"]
-            if candidate.is_symlink() or not candidate.is_file():
-                raise ValueError("stored voice reference is outside the project")
-            resolved = candidate.resolve(strict=True)
-            if project_root not in resolved.parents:
-                raise ValueError("stored voice reference is outside the project")
-            if Pipeline._sha256(resolved) != reference.get("asset_sha256"):
-                raise ValueError("stored voice reference checksum does not match")
-            paths.append(resolved)
-        return paths
-
-    def _materialize_voice_references(
-        self,
-        project: Path,
-        patch: dict[str, dict[str, dict[str, Any]]],
-        fallback_voice_id: str | None = None,
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[Path], bool]:
-        selected_ids: list[str] = []
-        people = patch.get("people")
-        records = people.values() if isinstance(people, dict) else ()
-        for person in records:
-            voice_id = person.get("voice_id") if isinstance(person, dict) else None
-            if (
-                isinstance(voice_id, str)
-                and voice_id in self.voice_library.files
-                and voice_id not in selected_ids
-                and len(selected_ids) < MAX_REFERENCE_AUDIO
-            ):
-                selected_ids.append(voice_id)
-        fallback_used = False
-        if not selected_ids and fallback_voice_id is not None:
-            selected_ids.append(fallback_voice_id)
-            fallback_used = True
-
-        directory = project / "work" / "voice-references"
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        directory.chmod(0o700)
-        metadata_by_id: dict[str, dict[str, Any]] = {}
-        references: list[dict[str, Any]] = []
-        paths: list[Path] = []
-        for slot, voice_id in enumerate(selected_ids, 1):
-            voice = self.voice_library.voice(voice_id)
-            source = self.voice_library.files[voice_id]
-            relative = f"work/voice-references/audio-{slot:02d}.wav"
-            destination = project / relative
-            temporary = directory / f".audio-{slot:02d}.wav.tmp"
-            try:
-                shutil.copyfile(source, temporary)
-                temporary.chmod(0o600)
-                os.replace(temporary, destination)
-            finally:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
-            if self._sha256(destination) != voice["sha256"]:
-                raise ValueError("materialized voice reference checksum does not match")
-            metadata = {
-                "audio_reference": f"Audio {slot}",
-                "voice_id": voice_id,
-                "asset_path": relative,
-                "asset_sha256": voice["sha256"],
-                "features": self.voice_library.model_line(voice_id),
-            }
-            metadata_by_id[voice_id] = metadata
-            references.append(metadata)
-            paths.append(destination)
-        return metadata_by_id, references, paths, fallback_used
+        return []
 
     @staticmethod
     def _replacement_image_paths(project, state=None, replacement=None):
@@ -1293,7 +1217,7 @@ class Pipeline:
         user_reference: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
-    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[Path]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         request = self._validated_effective_request(request)
         guidance = request["replacement_guidance"]
         user_instruction = (
@@ -1312,7 +1236,13 @@ class Pipeline:
                     for order, path in enumerate(originals[1:], 2)
                 ]]
         reference_ids = [f"image_{order}" for order in range(1, len(reference_paths) + 1)]
-        voice_ids = [voice["voice_id"] for voice in self.voice_library.voices]
+        # 音色目录按目标语言过滤后再注入：只给该语种的豆包 2.0 音色子集，
+        # “与原视频相同”按台词文字系统解析，解析不出回退中文子集。
+        language_label = _dialogue_language_display(
+            target_language, translated_lines,
+        )
+        voice_subset = self.voice_catalog.voices_for_language(language_label)
+        voice_types = [voice["voice_type"] for voice in voice_subset]
         planning_context = object_replace_planning_context(element_index)
         payload = {
             **planning_context,
@@ -1323,9 +1253,7 @@ class Pipeline:
                 }
                 for item in sorted(prepared, key=lambda value: int(value["index"]))
             ],
-            "target_language": _dialogue_language_display(
-                target_language, translated_lines,
-            ),
+            "target_language": language_label,
             "translated_dialogue": translated_lines,
             "user_replacement_instruction": user_instruction,
             "has_user_image": user_reference is not None,
@@ -1334,8 +1262,8 @@ class Pipeline:
                 {"name": "Image 1", "sha256": self._sha256(user_reference)}
                 if user_reference is not None else None
             ),
-            "voice_catalog_sha256": self.voice_library.digest,
-            "voice_catalog_lines": self.voice_library.model_lines(),
+            "voice_catalog_sha256": self.voice_catalog.digest,
+            "voice_catalog_lines": self.voice_catalog.model_lines(voice_subset),
         }
         views = product_views.frozen_product_views(project)
         if views is not None and user_reference is not None:
@@ -1344,38 +1272,21 @@ class Pipeline:
                 views=views["layout"]["views"],
                 instruction=product_views.view_instruction(views["view_count"], "Image 1"),
             )
-        output_schema, input_sha256 = object_replace_schema(payload, voice_ids)
-        # Dialogue lines need a TTS voice even when the model deliberately
-        # leaves every person voiceless (e.g. only hands on camera); pick a
-        # deterministic catalog fallback instead of failing later.
-        fallback_voice_id = (
-            self.voice_library.default_voice(target_language)["voice_id"]
-            if translated_lines
-            else None
-        )
-        materialized: dict[str, Any] = {}
+        output_schema, input_sha256 = object_replace_schema(payload, voice_types)
 
         def normalize_and_merge(value: object) -> dict[str, Any]:
             patch = normalize_object_replace(
                 value,
                 input_sha256=input_sha256,
                 element_index=element_index,
-                voice_ids=voice_ids,
+                voice_types=voice_types,
                 has_user_image=user_reference is not None,
                 user_instruction=user_instruction,
                 dialogue_line_count=len(translated_lines),
                 reference_image_ids=reference_ids,
             )
-            (
-                metadata_by_id, references, paths, fallback_used,
-            ) = self._materialize_voice_references(
-                project, patch, fallback_voice_id=fallback_voice_id,
-            )
-            materialized["references"] = references
-            materialized["paths"] = paths
-            materialized["fallback_used"] = fallback_used
             return merge_object_replace_index(
-                element_index, patch, metadata_by_id,
+                element_index, patch, voice_types,
             )
 
         skill = OBJECT_REPLACE_SKILL.read_text(encoding="utf-8")
@@ -1402,7 +1313,7 @@ class Pipeline:
                     value,
                     input_sha256=input_sha256,
                     element_index=element_index,
-                    voice_ids=voice_ids,
+                    voice_types=voice_types,
                     has_user_image=user_reference is not None,
                     user_instruction=user_instruction,
                     dialogue_line_count=len(translated_lines),
@@ -1410,35 +1321,14 @@ class Pipeline:
                 ),
             ),
             transform=normalize_and_merge,
-            output_media=lambda _value: list(materialized.get("paths") or []),
+            output_media=lambda _value: [],
         )
-        references = list(materialized.get("references") or [])
-        paths = list(materialized.get("paths") or [])
-        fallback_used = bool(materialized.get("fallback_used"))
-        if fallback_used:
-            log.event(
-                "voice_reference_default_fallback",
-                voice_id=fallback_voice_id,
-                reason=(
-                    "dialogue requires TTS but no person was assigned a voice"
-                ),
-            )
         metadata = {
             "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": input_sha256,
-            "voice_catalog_sha256": self.voice_library.digest,
-            "voice_reference_fallback": (
-                {
-                    "voice_id": fallback_voice_id,
-                    "reason": (
-                        "dialogue requires TTS but no person was assigned a voice"
-                    ),
-                }
-                if fallback_used
-                else None
-            ),
+            "voice_catalog_sha256": self.voice_catalog.digest,
         }
-        return enhanced_index, metadata, references, paths
+        return enhanced_index, metadata
 
     def _run_dialogue_audio(
         self,
@@ -1465,26 +1355,24 @@ class Pipeline:
         # that harmless drift from reaching TTS as an out-of-range window.
         timeline_end = max(float(item["end_s"]) for item in prepared)
         dialogue_voices = enhanced_element_index.get("dialogue_voices")
-        people = enhanced_element_index.get("people")
-        # 不做形态校验：音色归属缺失/不齐时按无归属处理，落到默认音色。
+        # 不做形态校验：音色绑定缺失/不齐时按无绑定处理，落到默认音色。
         if not isinstance(dialogue_voices, list):
             dialogue_voices = []
         if len(dialogue_voices) < len(translated_lines):
             dialogue_voices = dialogue_voices + [None] * (
                 len(translated_lines) - len(dialogue_voices)
             )
-        if not isinstance(people, dict):
-            people = {}
         # 豆包 TTS 按语言选 voice_type；“与原视频相同”在这里解析成具体语言
         # 标签（台词文本的文字证据），解析不出时回落中文音色。
         language_label = _dialogue_language_display(
             target_language, translated_lines,
         )
+        default_voice_type = self.voice_catalog.default_voice_type(language_label)
         directory = project / "work" / "dialogue-audio"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
         line_audios: list[dict[str, Any]] = []
-        for offset, (line, speaker) in enumerate(
+        for offset, (line, assigned_voice_type) in enumerate(
             zip(translated_lines, dialogue_voices), 1
         ):
             text = line.get("text")
@@ -1508,22 +1396,13 @@ class Pipeline:
             if start_s >= end_s:
                 # A row wholly beyond the video has no audible placement.
                 continue
-            # 人物间不再区分音色；仅沿用 Object Replace 为人物分配音色时
-            # 留下的性别信息（音色库 voice_id 的 features.gender）选男/女声。
-            gender: str | None = None
-            record = people.get(speaker) if isinstance(speaker, str) else None
-            voice = record.get("voice") if isinstance(record, dict) else None
-            voice_id = voice.get("voice_id") if isinstance(voice, dict) else None
-            if isinstance(voice_id, str) and voice_id in self.voice_library.files:
-                features = self.voice_library.voice(voice_id).get("features")
-                value = (
-                    str(features.get("gender") or "").strip().lower()
-                    if isinstance(features, dict)
-                    else ""
-                )
-                if value in {"male", "female"}:
-                    gender = value
-            voice_type = doubao_tts_voice_type(language_label, gender)
+            # dialogue_voices 逐项是 Object Replace 分配的豆包 voice_type；
+            # 无绑定（null）或目录外的值回落到该语种的通用音色。
+            voice_type = (
+                assigned_voice_type
+                if self.voice_catalog.has(assigned_voice_type)
+                else default_voice_type
+            )
             destination = directory / f"line-{offset:04d}.wav"
 
             def operation(
@@ -1544,7 +1423,6 @@ class Pipeline:
                     "text": text,
                     "start_s": start_s,
                     "end_s": end_s,
-                    "speaker": speaker,
                     "language": language_label,
                     "voice_type": voice_type,
                     "output": destination,
@@ -2576,8 +2454,6 @@ class Pipeline:
         (
             enhanced_element_index,
             object_replace,
-            voice_references,
-            voice_reference_paths,
         ) = self._run_object_replace(
             project,
             prepared,
@@ -2609,7 +2485,7 @@ class Pipeline:
             project_id,
             enhanced_element_index=enhanced_element_index,
             object_replace=object_replace,
-            voice_references=voice_references,
+            voice_references=[],
         )
 
         self._progress(
@@ -2984,9 +2860,7 @@ class Pipeline:
                     project, frozen_sheet,
                 )
             )
-            voice_reference_paths = self._stored_voice_references(
-                project, state,
-            )
+            self._stored_voice_references(project, state)
             prepared_segments: list[dict[str, Any]] = []
             for raw in raw_segments:
                 visual_prompt = raw.get("visual_prompt")
@@ -3022,7 +2896,6 @@ class Pipeline:
                     "replacement_sheet_path": sheet_path,
                     "recovery_mode": recovery_mode,
                     "enhanced_element_index": enhanced_element_index,
-                    "voice_reference_paths": voice_reference_paths,
                 },
             )
         segments: list[dict[str, Any]] = []
@@ -3071,81 +2944,6 @@ class Pipeline:
             None,
         )
 
-    def _backfill_resume_voice_fallback(
-        self,
-        project_id: str,
-        project: Path,
-        request: dict[str, Any],
-        prepared_segments: list[dict[str, Any]],
-        replacement: Path | None,
-        checkpoint: dict[str, Any],
-        log: ResearchLog,
-    ) -> None:
-        """Backfill the catalog default voice for projects frozen before the
-        object-replace fallback existed: dialogue waits for TTS but the
-        frozen plan materialized zero voice references.  The frozen sheet
-        stays byte-identical; only its stored upstream bindings are
-        recomputed so the added reference is honestly reflected."""
-        if checkpoint["voice_reference_paths"]:
-            return
-        state = self.store.read(project_id)
-        translated_lines = state.get("translated_voice_lines")
-        if (
-            not isinstance(translated_lines, list)
-            or not translated_lines
-            or any(not isinstance(line, dict) for line in translated_lines)
-        ):
-            return
-        reason = (
-            "resume: dialogue requires TTS but the frozen plan assigned "
-            "no voice"
-        )
-        fallback_voice_id = self.voice_library.default_voice(
-            request["dialogue"]["target_language"],
-        )["voice_id"]
-        (
-            _metadata_by_id, references, paths, fallback_used,
-        ) = self._materialize_voice_references(
-            project, {"people": {}}, fallback_voice_id=fallback_voice_id,
-        )
-        if not fallback_used or len(references) != 1:
-            raise ValueError("voice reference fallback did not materialize")
-        log.event(
-            "voice_reference_default_fallback",
-            voice_id=fallback_voice_id,
-            reason=reason,
-        )
-        object_replace = state.get("object_replace")
-        if not isinstance(object_replace, dict):
-            raise ValueError("stored object-replace state is invalid")
-        updated_object_replace = {
-            **object_replace,
-            "voice_reference_fallback": {
-                "voice_id": fallback_voice_id,
-                "reason": reason,
-            },
-        }
-        updated_sheet = {
-            **checkpoint["replacement_sheet"],
-            "upstream_bindings": self._replacement_sheet_upstream_bindings(
-                project,
-                prepared_segments,
-                checkpoint["enhanced_element_index"],
-                updated_object_replace,
-                references,
-                request,
-                replacement,
-            ),
-        }
-        self.store.update(
-            project_id,
-            voice_references=references,
-            object_replace=updated_object_replace,
-            replacement_sheet=updated_sheet,
-        )
-        checkpoint["replacement_sheet"] = updated_sheet
-        checkpoint["voice_reference_paths"] = paths
-
     def validate_pre_picsart_resume(self, project_id: str) -> None:
         self._load_pre_picsart_resume(project_id)
 
@@ -3165,15 +2963,6 @@ class Pipeline:
         early_resume = checkpoint is not None and checkpoint.get("early_resume")
         try:
             if checkpoint is not None and not early_resume:
-                self._backfill_resume_voice_fallback(
-                    project_id,
-                    project,
-                    request,
-                    segments,
-                    replacement,
-                    checkpoint,
-                    log,
-                )
                 self._progress(
                     project_id,
                     55,
@@ -5910,18 +5699,6 @@ class Pipeline:
                         f"{preserve_text}"
                     )
                 if category == "people":
-                    voice = record.get("voice")
-                    if isinstance(voice, dict) and isinstance(
-                        voice.get("audio_reference"), str
-                    ) and voice["audio_reference"].strip():
-                        line += (
-                            f" | voice: {cls._one_line(voice['audio_reference'])}"
-                            f" | voice features: {cls._one_line(voice.get('features'))}"
-                            " | this person's lines are pre-recorded with this "
-                            "voice in Audio 1, the segment dialogue speech "
-                            "track; when this stable person speaks, lip-sync "
-                            "exactly to Audio 1 and never generate new speech"
-                        )
                     if isinstance(replacement, dict):
                         line += (
                             " | person policy: replace with a clearly different "

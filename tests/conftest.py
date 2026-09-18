@@ -113,7 +113,7 @@ def seedream_client(replay_settings: Settings) -> SeedreamClient:
 def pipeline_instance(
     replay_settings: Settings, tmp_path_factory: pytest.TempPathFactory,
 ) -> Pipeline:
-    """A real Pipeline (real voice library, real clients) on a scratch store."""
+    """A real Pipeline (real voice catalog, real clients) on a scratch store."""
     root = tmp_path_factory.mktemp("node-replay-store")
     store = ProjectStore(root, acquire_process_lock=False)
     return Pipeline(

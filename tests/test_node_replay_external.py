@@ -19,6 +19,8 @@ from app.fusion_schema import normalize_fusion_prompt
 from app.object_replace_schema import (
     merge_object_replace_index,
     normalize_object_replace,
+    object_replace_planning_context,
+    object_replace_schema,
 )
 from app.pipeline import (
     DIALOGUE_GENERATION_SCHEMA,
@@ -222,59 +224,65 @@ def test_object_replace(
 ) -> None:
     if not pipeline_instance.settings.deepseek_api_key:
         pytest.skip("DEEPSEEK_API_KEY is not set")
-    payload = fixture.input["payload"]
-    element_index = payload["global_element_index"]
-    translated = payload["translated_dialogue"]
-    voice_ids = [
-        voice["voice_id"] for voice in pipeline_instance.voice_library.voices
+    historical = fixture.input["payload"]
+    element_index = historical["global_element_index"]
+    translated = historical["translated_dialogue"]
+    # The voice contract changed (catalog voice_id -> Doubao voice_type), so
+    # the historical payload/schema are not replayed verbatim: the current
+    # payload and closed schema are rebuilt from the fixture's real element
+    # index and dialogue, with the language-filtered catalog subset injected
+    # exactly as the pipeline does.
+    catalog = pipeline_instance.voice_catalog
+    voice_subset = catalog.voices_for_language(historical["target_language"])
+    voice_types = [voice["voice_type"] for voice in voice_subset]
+    payload = {
+        **object_replace_planning_context(element_index),
+        "segment_visual_prompts": historical["segment_visual_prompts"],
+        "target_language": historical["target_language"],
+        "translated_dialogue": translated,
+        "user_replacement_instruction": historical["user_replacement_instruction"],
+        "has_user_image": historical["has_user_image"],
+        "user_reference_images": historical.get("user_reference_images", []),
+        "user_replacement_image": historical.get("user_replacement_image"),
+        "voice_catalog_sha256": catalog.digest,
+        "voice_catalog_lines": catalog.model_lines(voice_subset),
+    }
+    output_schema, input_sha256 = object_replace_schema(payload, voice_types)
+    reference_ids = [
+        f"image_{order}"
+        for order in range(1, len(payload["user_reference_images"]) + 1)
     ]
     user_reference = fixture.media[0] if payload["has_user_image"] else None
-    result = pipeline_instance.deepseek.complete_structured(
-        current_skill_replay(fixture, OBJECT_REPLACE_SKILL, tmp_path / "current-request"),
-        payload,
-        fixture.input["output_schema"],
-        [user_reference] if user_reference is not None else [],
-        validator=lambda value: normalize_object_replace(
+
+    def validate(value: object) -> dict[str, Any]:
+        return normalize_object_replace(
             value,
-            input_sha256=fixture.input["input_sha256"],
+            input_sha256=input_sha256,
             element_index=element_index,
-            voice_ids=voice_ids,
+            voice_types=voice_types,
             has_user_image=payload["has_user_image"],
             user_instruction=payload["user_replacement_instruction"],
             dialogue_line_count=len(translated),
-        ),
+            reference_image_ids=reference_ids,
+        )
+
+    result = pipeline_instance.deepseek.complete_structured(
+        current_skill_replay(fixture, OBJECT_REPLACE_SKILL, tmp_path / "current-request"),
+        payload,
+        output_schema,
+        [user_reference] if user_reference is not None else [],
+        validator=validate,
     )
-    patch = normalize_object_replace(
-        result.value,
-        input_sha256=fixture.input["input_sha256"],
-        element_index=element_index,
-        voice_ids=voice_ids,
-        has_user_image=payload["has_user_image"],
-        user_instruction=payload["user_replacement_instruction"],
-        dialogue_line_count=len(translated),
-    )
-    # The transform's voice materialization, including the default-voice
-    # fallback that keeps voiceless projects (e.g. dfe64795) alive.
-    fallback_voice_id = (
-        pipeline_instance.voice_library.default_voice(
-            payload["target_language"]
-        )["voice_id"]
-        if translated
-        else None
-    )
-    project = tmp_path / "project"
-    (
-        metadata_by_id, _references, paths, _fallback_used,
-    ) = pipeline_instance._materialize_voice_references(
-        project, patch, fallback_voice_id=fallback_voice_id,
-    )
-    enhanced = merge_object_replace_index(element_index, patch, metadata_by_id)
+    patch = validate(result.value)
+    enhanced = merge_object_replace_index(element_index, patch, voice_types)
     assert {"people", "entities", "scenes", "dialogue_voices"} <= set(enhanced)
-    if translated:
-        # The TTS stage must find at least one materialized voice reference.
-        assert paths, "dialogue requires TTS but no voice was materialized"
-        for path in paths:
-            assert path.is_file() and path.stat().st_size > 0
+    # The TTS stage consumes one catalog voice_type (or null -> default) per
+    # dialogue line; nothing is materialized locally anymore.
+    assert len(enhanced["dialogue_voices"]) == len(translated)
+    assert all(
+        voice is None or catalog.has(voice)
+        for voice in enhanced["dialogue_voices"]
+    )
 
 
 # --------------------------------------------------------- h3-max-r2v-prompt

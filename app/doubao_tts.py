@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.doubao_voices import known_voice_types
 from app.providers import (
     ProviderFailure,
     ProviderResult,
@@ -39,113 +40,6 @@ DOUBAO_TTS_SAMPLE_RATE = 24000
 _DOUBAO_TTS_MAX_TEXT_BYTES = 1024
 # code 0 = 音频/句子分片；20000000 = 合成正常结束；其余 code 均为失败。
 _DOUBAO_TTS_DONE_CODE = 20000000
-
-# 语言码 -> 性别 -> 豆包 2.0 voice_type（音色列表文档 6561/1257544，
-# 每语种选通用/中性音色；标注"仅限单向流"的音色与本接口匹配）。
-# th 只有女声、ms 只有男声、it 只有男声，缺性别时回退到该语种已有音色。
-DOUBAO_TTS_VOICES: dict[str, dict[str, str]] = {
-    "zh": {
-        "female": "zh_female_vv_uranus_bigtts",
-        "male": "zh_male_m191_uranus_bigtts",
-    },
-    "en": {
-        "female": "en_female_jane_uranus_bigtts",
-        "male": "en_male_alex_uranus_bigtts",
-    },
-    "th": {"female": "th_female_bv568_neutral_uranus_bigtts"},
-    "ja": {
-        "female": "ja_female_bv522_uranus_bigtts",
-        "male": "ja_male_bv524_uranus_bigtts",
-    },
-    "ko": {
-        "female": "ko_female_bv546_uranus_bigtts",
-        "male": "ko_male_bv545_uranus_bigtts",
-    },
-    "es": {
-        "female": "es_female_bv084_uranus_bigtts",
-        "male": "es_male_dani_uranus_bigtts",
-    },
-    "fr": {
-        "female": "fr_female_fr_bv078_uranus_bigtts",
-        "male": "fr_male_fr_m29_uranus_bigtts",
-    },
-    "de": {
-        "female": "de_female_bv081_uranus_bigtts",
-        "male": "de_male_sven_uranus_bigtts",
-    },
-    "ru": {
-        "female": "ru_female_af07_uranus_bigtts",
-        "male": "ru_male_pavel_uranus_bigtts",
-    },
-    "pt": {
-        "female": "pt_female_bv173_uranus_bigtts",
-        "male": "pt_male_bv172_uranus_bigtts",
-    },
-    "id": {
-        "female": "id_female_bv161_uranus_bigtts",
-        "male": "id_male_bv160_uranus_bigtts",
-    },
-    "ms": {"male": "ms_male_ham_uranus_bigtts"},
-    "vi": {
-        "female": "vi_female_ling_uranus_bigtts",
-        "male": "vi_male_wumg_uranus_bigtts",
-    },
-    "tl": {
-        "female": "tl_female_annika_uranus_bigtts",
-        "male": "tl_male_ed_uranus_bigtts",
-    },
-    "ar": {
-        "female": "ar_female_dina_uranus_bigtts",
-        "male": "ar_male_youssef_uranus_bigtts",
-    },
-    "it": {"male": "it_male_enzo_uranus_bigtts"},
-}
-
-_LANGUAGE_ALIASES: dict[str, tuple[str, ...]] = {
-    "zh": ("中文", "汉语", "普通话", "chinese", "mandarin", "zh"),
-    "en": ("英语", "英文", "english", "en"),
-    "th": ("泰语", "泰文", "thai", "th"),
-    "ja": ("日语", "日文", "japanese", "ja"),
-    "ko": ("韩语", "朝鲜语", "韩文", "korean", "ko"),
-    "es": ("西班牙语", "西语", "spanish", "es"),
-    "fr": ("法语", "french", "fr"),
-    "de": ("德语", "german", "de"),
-    "ru": ("俄语", "russian", "ru"),
-    "pt": ("葡萄牙语", "葡语", "portuguese", "pt"),
-    "id": ("印度尼西亚语", "印尼语", "indonesian", "id"),
-    "ms": ("马来语", "malay", "ms"),
-    "vi": ("越南语", "vietnamese", "vi"),
-    "tl": ("菲律宾语", "filipino", "tagalog", "tl"),
-    "ar": ("阿拉伯语", "arabic", "ar"),
-    "it": ("意大利语", "italian", "it"),
-}
-
-_KNOWN_VOICE_TYPES = frozenset(
-    voice_type
-    for voices in DOUBAO_TTS_VOICES.values()
-    for voice_type in voices.values()
-)
-
-
-def doubao_tts_language_key(language_label: str) -> str:
-    """归一化目标语言标签（如“泰语”/"Thai"/"th"）到映射表 key；未知回退 zh。"""
-    text = str(language_label or "").strip().lower()
-    if not text:
-        return "zh"
-    for key, aliases in _LANGUAGE_ALIASES.items():
-        for alias in aliases:
-            if text == alias or (len(alias) > 2 and alias in text):
-                return key
-    return "zh"
-
-
-def doubao_tts_voice_type(language_label: str, gender: str | None = None) -> str:
-    """按语言（+可选性别 male/female）选豆包 voice_type。"""
-    voices = DOUBAO_TTS_VOICES[doubao_tts_language_key(language_label)]
-    if gender in voices:
-        return voices[gender]
-    # 缺性别或该语种没有对应性别音色：优先女声，其次该语种唯一音色。
-    return voices.get("female") or next(iter(voices.values()))
 
 
 def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -199,7 +93,7 @@ class DoubaoTtsClient:
             or len(text.encode("utf-8")) > _DOUBAO_TTS_MAX_TEXT_BYTES
         ):
             raise ValueError("Doubao TTS text is invalid")
-        if voice_type not in _KNOWN_VOICE_TYPES:
+        if voice_type not in known_voice_types():
             raise ValueError("Doubao TTS voice_type is unknown")
         body = {
             "user": {"uid": "duet-dialogue-tts"},

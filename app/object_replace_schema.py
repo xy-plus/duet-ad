@@ -12,12 +12,11 @@ from app.fusion_schema import canonical_input
 
 
 OBJECT_REPLACE_OUTPUT_NAME = "duet.object-replace-output"
-# detect_label 不改变传输绑定形状：版本保持 4。当前 Object Replace 节点
-# 总会传入 reference_image_ids（即使为空），因此 normalize 对该新产出强制
-# 标签；detect_label 引入前的冻结 v4 输出不会传此参数，仍可恢复并由检测
-# target 派生环节回退源描述。
-OBJECT_REPLACE_OUTPUT_VERSION = 4
-MAX_REFERENCE_AUDIO = 3
+# v5：音色选择从本地音色库 voice_id 切换为豆包 voice_type。dialogue_voices
+# 每项从人物 stable key 变为目录内 voice_type（或 null），people patch 不再
+# 携带 voice_id，后端也不再物化本地 wav 参考。旧 v4 冻结产物在版本门禁处
+# 明确报错，不做静默兼容。
+OBJECT_REPLACE_OUTPUT_VERSION = 5
 
 # entities replacement 的 detect_label：最多 3 个同义英文通用类别短语；每个
 # 短语为 1–3 个全小写词，短语间只能用 ", " 分隔，总长最多 120。它是物体
@@ -39,8 +38,8 @@ _REPLACEMENT_FIELDS = (
     "target_visual_description",
     "appearance_description",
 )
-# ``generated_variant`` remains for automatic people identity replacement and
-# normalizing frozen v4 receipts; current entities/scenes cannot select it.
+# ``generated_variant`` is the automatic people identity replacement source;
+# current entities/scenes cannot select it.
 _REPLACEMENT_SOURCES = {"image_1", "generated_variant"}
 
 
@@ -97,15 +96,15 @@ def object_replace_planning_context(
     }
 
 
-def _catalog_ids(voice_ids: Collection[str]) -> tuple[str, ...]:
-    if isinstance(voice_ids, (str, bytes)):
+def _voice_types(voice_types: Collection[str]) -> tuple[str, ...]:
+    if isinstance(voice_types, (str, bytes)):
         raise ValueError("object-replace voice catalog is invalid")
-    values = tuple(voice_ids)
+    values = tuple(voice_types)
     if (
         not values
         or any(
-            not isinstance(voice_id, str) or not voice_id
-            for voice_id in values
+            not isinstance(voice_type, str) or not voice_type
+            for voice_type in values
         )
         or len(values) != len(set(values))
     ):
@@ -182,7 +181,6 @@ def _replacement_schema(
     *,
     allow_user_image_binding: bool,
     reference_image_ids: Sequence[str],
-    voice_ids: Sequence[str] | None = None,
     detect_label: bool = False,
     allow_null: bool = False,
     force_null: bool = False,
@@ -219,13 +217,6 @@ def _replacement_schema(
         ),
         "replacement": replacement_value,
     }
-    if voice_ids is not None:
-        patch_properties["voice_id"] = {
-            "anyOf": [
-                {"type": "string", "enum": list(voice_ids)},
-                {"type": "null"},
-            ],
-        }
     if not allow_user_image_binding:
         if allow_generated_variant:
             return _closed_object(patch_properties)
@@ -273,7 +264,7 @@ def _replacement_schema(
 
 
 def object_replace_schema(
-    payload: dict[str, Any], voice_ids: list[str],
+    payload: dict[str, Any], voice_types: list[str],
 ) -> tuple[dict[str, Any], str]:
     """Build a closed schema whose element keys are frozen to ``payload``."""
     if not isinstance(payload, dict):
@@ -282,7 +273,7 @@ def object_replace_schema(
     translated_dialogue = payload.get("translated_dialogue")
     if not isinstance(translated_dialogue, list):
         raise ValueError("object-replace translated dialogue is invalid")
-    catalog_ids = _catalog_ids(voice_ids)
+    catalog_voice_types = _voice_types(voice_types)
     input_sha256 = hashlib.sha256(canonical_input(payload)).hexdigest()
     user_instruction = payload.get("user_replacement_instruction")
     reference_image_ids = _payload_reference_image_ids(payload)
@@ -299,7 +290,6 @@ def object_replace_schema(
             patch_schema = _replacement_schema(
                 allow_user_image_binding=allow_user_image_binding,
                 reference_image_ids=reference_image_ids,
-                voice_ids=catalog_ids if category == "people" else None,
                 # 只有 entities 会被派生成物体检测 target，detect_label 因此
                 # 只约束 entities；people/scenes 的封闭 schema 直接拒绝该字段。
                 detect_label=category == "entities",
@@ -321,7 +311,7 @@ def object_replace_schema(
             "maxItems": len(translated_dialogue),
             "items": {
                 "type": ["string", "null"],
-                "enum": [*sorted(element_ids["people"]), None],
+                "enum": [*catalog_voice_types, None],
             },
         },
     }
@@ -394,7 +384,7 @@ def _normalize_dialogue_voices(
     value: object,
     *,
     dialogue_line_count: int,
-    people_ids: tuple[str, ...],
+    voice_types: tuple[str, ...],
 ) -> list[str | None]:
     if (
         isinstance(dialogue_line_count, bool)
@@ -404,7 +394,7 @@ def _normalize_dialogue_voices(
         or len(value) != dialogue_line_count
         or any(
             voice is not None
-            and (not isinstance(voice, str) or voice not in people_ids)
+            and (not isinstance(voice, str) or voice not in voice_types)
             for voice in value
         )
     ):
@@ -417,7 +407,7 @@ def normalize_object_replace(
     *,
     input_sha256: str,
     element_index: dict[str, Any],
-    voice_ids: Collection[str],
+    voice_types: Collection[str],
     has_user_image: bool,
     user_instruction: str,
     dialogue_line_count: int,
@@ -426,12 +416,10 @@ def normalize_object_replace(
     """Normalize the closed transport shape without judging model quality.
 
     ``reference_image_ids`` is supplied by every current Object Replace run,
-    including runs without a user image.  It is intentionally absent when
-    replaying a frozen v4 output from before ``detect_label`` existed, so it
-    also marks whether entity labels are mandatory.
+    including runs without a user image.
     """
     element_ids = _element_ids(element_index)
-    catalog_ids = set(_catalog_ids(voice_ids))
+    catalog_voice_types = _voice_types(voice_types)
     require_entity_detect_labels = reference_image_ids is not None
     allowed_reference_image_ids = (
         _reference_image_ids(reference_image_ids, allow_empty=True)
@@ -457,7 +445,6 @@ def normalize_object_replace(
         raise ValueError("object-replace output is not bound to its input")
     normalized: dict[str, Any] = {}
     image_1_locations: list[tuple[str, str]] = []
-    selected_voice_ids: set[str] = set()
     for category in _ELEMENT_CATEGORIES:
         category_value = value[category]
         if (
@@ -466,12 +453,9 @@ def normalize_object_replace(
         ):
             raise ValueError("object-replace output element keys are invalid")
         normalized[category] = {}
-        expected_patch_keys = (
-            _PATCH_KEYS | {"voice_id"} if category == "people" else _PATCH_KEYS
-        )
         for stable_id in sorted(element_ids[category]):
             patch = category_value[stable_id]
-            if not isinstance(patch, dict) or not expected_patch_keys <= set(patch):
+            if not isinstance(patch, dict) or not _PATCH_KEYS <= set(patch):
                 raise ValueError("object-replace patch is invalid")
             matches_user_request = patch["matches_user_request"]
             if not isinstance(matches_user_request, bool):
@@ -485,8 +469,8 @@ def normalize_object_replace(
                 allow_null=category != "people",
             )
             # Current requests always pass reference_image_ids, including an
-            # empty list.  Frozen v4 receipts predate the KEEP-only scene and
-            # unrequested-entity policy, so retain their recoverability.
+            # empty list; omitting it marks a pre-detect_label replay where
+            # entity labels and the KEEP-only policies are not enforceable.
             if reference_image_ids is not None and category == "scenes" and (
                 replacement is not None or matches_user_request
             ):
@@ -511,22 +495,6 @@ def normalize_object_replace(
                 "matches_user_request": matches_user_request,
                 "replacement": replacement,
             }
-            if category == "people":
-                voice_id = patch["voice_id"]
-                normalized_voice_id = (
-                    voice_id
-                    if isinstance(voice_id, str) and voice_id in catalog_ids
-                    else None
-                )
-                if (
-                    normalized_voice_id is not None
-                    and normalized_voice_id not in selected_voice_ids
-                    and len(selected_voice_ids) >= MAX_REFERENCE_AUDIO
-                ):
-                    normalized_voice_id = None
-                if normalized_voice_id is not None:
-                    selected_voice_ids.add(normalized_voice_id)
-                normalized_patch["voice_id"] = normalized_voice_id
             normalized[category][stable_id] = normalized_patch
     allows_image_1 = has_user_image and bool(user_instruction.strip())
     if not allows_image_1 and image_1_locations:
@@ -534,7 +502,7 @@ def normalize_object_replace(
     normalized["dialogue_voices"] = _normalize_dialogue_voices(
         value["dialogue_voices"],
         dialogue_line_count=dialogue_line_count,
-        people_ids=element_ids["people"],
+        voice_types=catalog_voice_types,
     )
     return normalized
 
@@ -542,15 +510,13 @@ def normalize_object_replace(
 def merge_object_replace_index(
     original: dict[str, Any],
     patch: dict[str, Any],
-    voice_metadata_by_id: Mapping[str, Any],
+    voice_types: Collection[str],
 ) -> dict[str, Any]:
     """Merge a normalized patch without exposing source facts to model edits."""
     element_ids = _element_ids(original)
-    if not isinstance(voice_metadata_by_id, Mapping):
-        raise ValueError("object-replace voice metadata is invalid")
+    catalog_voice_types = _voice_types(voice_types)
 
     merged = copy.deepcopy(original)
-    selected_voice_ids: set[str] = set()
     for category in _ELEMENT_CATEGORIES:
         category_patch = patch[category]
         for stable_id in element_ids[category]:
@@ -573,26 +539,10 @@ def merge_object_replace_index(
                     ),
                     **normalized_replacement,
                 }
-            if category == "people":
-                voice_id = item["voice_id"]
-                if (
-                    not isinstance(voice_id, str)
-                    or voice_id not in voice_metadata_by_id
-                    or (
-                        voice_id not in selected_voice_ids
-                        and len(selected_voice_ids) >= MAX_REFERENCE_AUDIO
-                    )
-                ):
-                    merged[category][stable_id]["voice"] = None
-                    continue
-                selected_voice_ids.add(voice_id)
-                merged[category][stable_id]["voice"] = copy.deepcopy(
-                    voice_metadata_by_id[voice_id],
-                )
     dialogue_voices = patch["dialogue_voices"]
     if not isinstance(dialogue_voices, list) or any(
         voice is not None
-        and (not isinstance(voice, str) or voice not in element_ids["people"])
+        and (not isinstance(voice, str) or voice not in catalog_voice_types)
         for voice in dialogue_voices
     ):
         raise ValueError("object-replace patch dialogue voices are invalid")

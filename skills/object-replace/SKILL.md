@@ -9,7 +9,7 @@ description: 基于 video-maker 的稳定全局索引、全部分段视频描述
 
 后端只检查输出能否按 Schema 结构、输入绑定和稳定 ID 机械传给下游，不会二次判断替换是否充分、对象是否匹配或音色是否最优；完成下列语义要求是本节点自身职责。本节点运行在任何灰块遮盖之前、看不到遮盖后的视频，输出 schema 不变：下游会按你的 replacement 绑定把要替换的源人脸和被替换物品统一遮成深灰 (64,64,64)，因此源侧描述必须准确指向将被遮盖的源对象。
 
-输入中的 `replacement_set` 是后端从 video-maker 索引确定性生成的必换集合，按 `people/entities/scenes` 列出全部 stable key。`global_element_index` 中完整且逐字一致的 stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点；名称、相似外观、空间邻近或关系都不能替代 stable key。`global_element_index` 是只供本节点规划的事实视图：后端已从人物、实体和场景记录中移除容易与替换目标冲突的 `preserve/replaceable` 提示，但会在下游继续保留完整原始索引。`segment_visual_prompts` 用于理解动作和跨段语境。`user_reference_images` 是有序目标证据清单，每项为 `{reference_id,image_reference,sha256}`；`reference_id`（例如 `image_1`）是唯一可输出的用户图编号，`image_reference` 只说明本次输入槽位，`sha256` 只用于绑定。`user_replacement_instruction` 说明这些目标证据怎样用于替换。它们都不属于源视频证据，绝不能据此新增、合并、拆分或补写源元素、occurrences 或 relations。`voice_catalog_lines` 每行格式为 `voice_id - file - language - gender - 短特征`；这些标签和文件对应关系不可改写或补猜。
+输入中的 `replacement_set` 是后端从 video-maker 索引确定性生成的必换集合，按 `people/entities/scenes` 列出全部 stable key。`global_element_index` 中完整且逐字一致的 stable key 是跨节点、跨图片、跨分段识别同一元素的唯一锚点；名称、相似外观、空间邻近或关系都不能替代 stable key。`global_element_index` 是只供本节点规划的事实视图：后端已从人物、实体和场景记录中移除容易与替换目标冲突的 `preserve/replaceable` 提示，但会在下游继续保留完整原始索引。`segment_visual_prompts` 用于理解动作和跨段语境。`user_reference_images` 是有序目标证据清单，每项为 `{reference_id,image_reference,sha256}`；`reference_id`（例如 `image_1`）是唯一可输出的用户图编号，`image_reference` 只说明本次输入槽位，`sha256` 只用于绑定。`user_replacement_instruction` 说明这些目标证据怎样用于替换。它们都不属于源视频证据，绝不能据此新增、合并、拆分或补写源元素、occurrences 或 relations。`voice_catalog_lines` 是本次目标语言可用的豆包音色子集，每行格式为 `voice_type - 音色名 - 语种码 - female|male - 场景标签[- 备注]`；只有列出的 voice_type 是合法输出，不得改写、补猜或引用目录外音色。
 
 全局索引记录上的 `target_reference_image_ids` 是前一视觉节点结合原指令与目标图给出的映射建议，不是源视频事实。逐 key 检查并据此规划 `replacement.reference_image_ids`；如需修正，以同一份用户指令、原图内容和该 key 的源角色为依据，不得因换了节点就丢弃映射或随意重排图号。
 
@@ -41,16 +41,11 @@ description: 基于 video-maker 的稳定全局索引、全部分段视频描述
 2. 只写类别词：不得含品牌、颜色、材质、尺寸、数量、所有者或空间关系等修饰，不得写中文、句子或标点。标签必须能独立命中该类物体，不得依赖画面语境。
 3. `detect_label` 只属于 entities 的 `replacement`；people 和 scenes 不得输出该字段。
 
-## 人物音色
+## 台词音色
 
-1. 为 `people` 中每个人物选择一个目录内存在的 `voice_id`；即使人物未匹配用户替换要求，也不得省略音色。
-2. 只依据索引明确给出的语言、性别、种族、年龄和表达风格匹配；缺失属性不得推断。多人可以复用 voice_id，全项目最多使用三个不同 voice_id。
-3. 人物超过三个时，按相近语言与表达风格复用最合适的已有 voice_id。不要输出文件路径、Audio 序号、目录标签副本或解释；这些由后端根据稳定人物顺序机械补入增强索引。
-
-## 台词归属
-
-1. `dialogue_voices` 与输入 `translated_dialogue` 逐行一一对应，长度必须相等；每项是该行台词的说话人 stable key（必须来自 `people`）或 `null`。
-2. 依据台词文本、时间窗和各段人物 occurrences 判断说话人；台词时间窗内出现且有语境支撑的人物才能作为归属。
-3. 旁白、画外音或无法确定说话人的行一律给 `null`，不得猜测归属。
+1. `dialogue_voices` 与输入 `translated_dialogue` 逐行一一对应，长度必须相等；每项是该行台词的豆包 `voice_type`（必须逐字来自 `voice_catalog_lines`），不得输出人物 stable key、音色名或解释。
+2. 先判断每行的说话人（依据台词文本、时间窗和各段人物 occurrences；旁白、画外音或无法确定说话人的行按旁白处理），再为该说话人选音色：只依据索引明确给出的人物视觉证据（年龄段、性别、气质）与场景标签匹配，缺失属性不得推断。
+3. 同一说话人的所有行必须复用同一个 voice_type；不同说话人尽量区分音色。旁白/画外音也要给音色：选子集中气质中性、适合叙述的通用音色，不得留 `null`（`null` 只在实在无法选择时使用，后端会回退默认音色）。
+4. 选音色不改变台词归属判断本身：音色分配只服务配音，不得反推或改写人物、实体、场景的替换规划。
 
 本次 `replacement_set` 已覆盖全部人物、实体和场景：people 的每个 stable key 的 `replacement` 必须非空；scenes 一律为 `null`；entities 仅用户点名商品及其联动组件为非空，其余一律为 `null`。该 `null` key 仍必须出现在输出中（显式 `null`），不得省略。后端不对描述做审美判断。关系不在本阶段重新生成。

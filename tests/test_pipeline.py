@@ -18,11 +18,14 @@ from app import media
 from app import object_detect
 from app import object_mask
 from app.config import SEEDREAM_API_BASE, SEEDREAM_PRO_MODEL, Settings
-from app.doubao_tts import doubao_tts_voice_type
+from app.doubao_voices import load_doubao_voice_catalog
 from app.fusion_schema import AUTHORITY_BEGIN, AUTHORITY_END, FUSION_OUTPUT_NAME
 from app.object_replace_schema import (
     OBJECT_REPLACE_OUTPUT_NAME,
     OBJECT_REPLACE_OUTPUT_VERSION,
+    normalize_object_replace,
+    object_replace_planning_context,
+    object_replace_schema,
 )
 from app.pipeline import (
     DIALOGUE_GENERATION_SCHEMA,
@@ -56,7 +59,6 @@ from app.seedream import (
     SeedreamError,
 )
 from app.store import ProjectStore
-from app.voice_catalog import load_voice_library
 from app.video_maker_schemas import (
     VISUAL_PROMPT_SCHEMA,
     normalize_project_index,
@@ -142,43 +144,31 @@ def test_effective_request_passes_through_regardless_of_shape() -> None:
         Pipeline._validated_effective_request(["not", "a", "dict"])
 
 
-def test_stored_voice_references_bind_by_hash_not_path_name(
+def test_stored_voice_references_must_stay_empty(
     tmp_path: Path,
 ) -> None:
+    """v5 起 voice_references 恒为空列表：豆包 TTS 不再物化本地 wav 参考，
+    非空即损坏状态（旧项目的非空引用先被 Object Replace 版本门禁拒绝）。"""
     store = ProjectStore(tmp_path / "projects")
     _project_id, project, _state = store.create(
         _effective_request(), "voice-path-version",
     )
-    library = load_voice_library()
-    voice = library.voices[0]
-    directory = project / "work" / "voice-references"
-    directory.mkdir(parents=True)
-    renamed = directory / "renamed.wav"
-    renamed.write_bytes(library.files[voice["voice_id"]].read_bytes())
-    state = {
-        "voice_references": [{
-            "audio_reference": "Audio 1",
-            "voice_id": voice["voice_id"],
-            "asset_path": "work/voice-references/renamed.wav",
-            "asset_sha256": voice["sha256"],
-            "features": library.model_line(voice["voice_id"]),
-        }],
-    }
 
-    assert Pipeline._stored_voice_references(project, state) == [
-        renamed.resolve()
-    ]
+    assert Pipeline._stored_voice_references(
+        project, {"voice_references": []},
+    ) == []
 
-    state["voice_references"][0]["asset_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="checksum does not match"):
-        Pipeline._stored_voice_references(project, state)
-
-    state["voice_references"][0]["asset_sha256"] = voice["sha256"]
-    state["voice_references"][0]["asset_path"] = (
-        "work/voice-references/missing.wav"
-    )
-    with pytest.raises(ValueError, match="voice reference"):
-        Pipeline._stored_voice_references(project, state)
+    with pytest.raises(ValueError, match="voice references"):
+        Pipeline._stored_voice_references(
+            project,
+            {
+                "voice_references": [{
+                    "audio_reference": "Audio 1",
+                    "voice_id": "legacy",
+                    "asset_path": "work/voice-references/audio-01.wav",
+                }],
+            },
+        )
 
 
 class _UnusedMediaKit:
@@ -517,11 +507,15 @@ class _FlowDeepSeek:
                 for category in ("people", "entities", "scenes")
             }
             people_schema = category_schemas["people"]
-            voice_ids = next(iter(people_schema.values()))["properties"][
-                "voice_id"
-            ]["anyOf"][0]["enum"]
+            voice_types = [
+                voice_type
+                for voice_type in schema["properties"]["dialogue_voices"][
+                    "items"
+                ]["enum"]
+                if voice_type is not None
+            ]
             people = {}
-            for offset, stable_id in enumerate(people_schema):
+            for stable_id in people_schema:
                 people[stable_id] = {
                     "matches_user_request": False,
                     "replacement": {
@@ -533,9 +527,7 @@ class _FlowDeepSeek:
                             f"isolated replacement person {stable_id}"
                         ),
                     },
-                    "voice_id": voice_ids[offset],
                 }
-            people_keys = list(people_schema)
             entities = {}
             for offset, (stable_id, patch_schema) in enumerate(
                 category_schemas["entities"].items()
@@ -581,7 +573,8 @@ class _FlowDeepSeek:
                     "version": OBJECT_REPLACE_OUTPUT_VERSION,
                     "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
                     "dialogue_voices": [
-                        people_keys[offset % len(people_keys)] if people_keys else None
+                        voice_types[offset % len(voice_types)]
+                        if voice_types else None
                         for offset, _line in enumerate(
                             payload["translated_dialogue"]
                         )
@@ -1128,10 +1121,17 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert sorted(call["payload"]["segment_index"] for call in fusion_calls) == [1, 2]
     object_replace_call = object_replace_calls[0]
     compact_catalog = object_replace_call["payload"]["voice_catalog_lines"]
-    assert len(compact_catalog.splitlines()) == 30
+    # 音色子集按目标语言（日语）过滤：只含 ja 音色，而不是整个目录。
+    ja_voice_count = len(
+        load_doubao_voice_catalog().voices_for_language("日语")
+    )
+    assert len(compact_catalog.splitlines()) == ja_voice_count
     assert len(compact_catalog) < 3500
     assert "{" not in compact_catalog
     assert all(" - " in line for line in compact_catalog.splitlines())
+    assert "ja_female_bv522_uranus_bigtts" in compact_catalog
+    # zh-only 音色不进日语子集（Vivi 2.0 等多语种音色除外，属正常命中）。
+    assert "zh_female_xiaohe_uranus_bigtts" not in compact_catalog
     assert object_replace_call["payload"]["user_replacement_instruction"] == (
         "把主角替换成用户参考形象"
     )
@@ -1331,19 +1331,16 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         (project / "work" / "global-reference-sheet" / "reference-sheet.png")
         .resolve()
     ) == 2
-    assert [reference["audio_reference"] for reference in state["voice_references"]] == [
-        "Audio 1", "Audio 2", "Audio 3",
-    ]
-    assert all(
-        (project / reference["asset_path"]).is_file()
-        for reference in state["voice_references"]
-    )
-    # The only translated line is attributed to person-01 and synthesized
-    # with the Japanese male Doubao voice（目标语言日语，Audio 1 的音色库
-    # 条目是男声）.
+    # 音色链路已切换到豆包 voice_type：不再物化本地 wav 参考。
+    assert state["voice_references"] == []
+    # The only translated line is bound to the first Japanese catalog voice
+    # by Object Replace（_FlowDeepSeek 从注入的音色子集枚举里取值）.
+    assigned_voice_type = load_doubao_voice_catalog().voices_for_language(
+        "日语"
+    )[0]["voice_type"]
     assert [call["text"] for call in tts.tts_calls] == ["translated line"]
     assert [call["voice_type"] for call in tts.tts_calls] == [
-        doubao_tts_voice_type("日语", "male"),
+        assigned_voice_type,
     ]
     full_track = project / "work" / "dialogue-audio" / "full-track.wav"
     assert full_track.is_file()
@@ -1355,13 +1352,15 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     assert not (
         project / "work" / "segments" / "0002" / "dialogue-track.wav"
     ).exists()
-    # H3 receives the per-segment dialogue speech slice as Audio 1, not the
-    # voice-library wavs; the segment without dialogue gets no audio input.
+    # H3 receives the per-segment dialogue speech slice as Audio 1;
+    # the segment without dialogue gets no audio input.
     assert sorted(call["audio_urls"] for call in picsart.submits) == [
         [],
         ["https://assets.invalid/0001/dialogue-track.wav"],
     ]
-    assert state["enhanced_element_index"]["dialogue_voices"] == ["person-01"]
+    assert state["enhanced_element_index"]["dialogue_voices"] == [
+        assigned_voice_type
+    ]
     assert (project / "output" / "generated.mp4").read_bytes().endswith(
         b"|tts-track"
     )
@@ -1385,7 +1384,6 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
             project / "work" / "segments" / f"{segment_index:04d}"
             / "h3_prompt.txt"
         ).read_text(encoding="utf-8")
-        segment_audio: list[str] = []
         requires_image_1 = False
         for category in ("people", "entities", "scenes"):
             for stable_id, record in enhanced_index[category].items():
@@ -1401,15 +1399,9 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
                         requires_image_1
                         or replacement_plan["source"] == "image_1"
                     )
-                if category == "people":
-                    audio_reference = record["voice"]["audio_reference"]
-                    if audio_reference not in segment_audio:
-                        segment_audio.append(audio_reference)
         assert requires_image_1 is True
         assert "Image 1" in prompt
         assert "Image 2" in prompt
-        assert segment_audio
-        assert all(reference in prompt for reference in segment_audio)
         assert prompt.count(AUTHORITY_BEGIN) == 1
         assert prompt.count(AUTHORITY_END) == 1
         for stable_id, person in enhanced_index["people"].items():
@@ -1422,10 +1414,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
                 line for line in prompt.splitlines()
                 if line.startswith(f"- {stable_id} | REPLACE |")
             )
-            assert (
-                f"| voice: {person['voice']['audio_reference']} |"
-                in authority_line
-            )
+            assert "| voice:" not in authority_line
             tile = next(
                 tile for tile in replacement_sheet["spec"]["tiles"]
                 if tile["stable_key"] == stable_id
@@ -1469,12 +1458,6 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     source = segment_dir / "source.mp4"
     source.write_bytes(b"source")
     calls: list[dict[str, Any]] = []
-    library = load_voice_library()
-    voice = library.voices[0]
-    voice_directory = project / "work" / "voice-references"
-    voice_directory.mkdir(parents=True)
-    voice_reference = voice_directory / "audio-01.wav"
-    voice_reference.write_bytes(library.files[voice["voice_id"]].read_bytes())
     enhanced_index = {
         "people": {
             "person-01": {
@@ -1487,13 +1470,6 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
                     "source": "generated_variant",
                     "target_visual_description": "a different visible person",
                     "appearance_description": "an isolated different visible person",
-                },
-                "voice": {
-                    "audio_reference": "Audio 1",
-                    "voice_id": voice["voice_id"],
-                    "asset_path": "work/voice-references/audio-01.wav",
-                    "asset_sha256": voice["sha256"],
-                    "features": library.model_line(voice["voice_id"]),
                 },
             },
         },
@@ -1985,25 +1961,8 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
             json.dumps(f"frozen prompt {segment['index']}"),
             encoding="utf-8",
         )
-    library = load_voice_library()
-    voice_directory = project / "work" / "voice-references"
-    voice_directory.mkdir(parents=True)
-    references: list[dict[str, Any]] = []
-    for slot, voice in enumerate(library.voices[:3], 1):
-        asset_path = f"work/voice-references/audio-{slot:02d}.wav"
-        destination = project / asset_path
-        destination.write_bytes(
-            library.files[voice["voice_id"]].read_bytes(),
-        )
-        references.append({
-            "audio_reference": f"Audio {slot}",
-            "voice_id": voice["voice_id"],
-            "asset_path": asset_path,
-            "asset_sha256": voice["sha256"],
-            "features": library.model_line(voice["voice_id"]),
-        })
     voice_state = {
-        "voice_references": references,
+        "voice_references": [],
         "object_replace": {
             "version": OBJECT_REPLACE_OUTPUT_VERSION,
             "input_sha256": "0" * 64,
@@ -2026,9 +1985,8 @@ def test_resume_r2v_reuses_prompt_and_muted_segments_without_upstream_calls(
                             f"isolated replacement person {slot}"
                         ),
                     },
-                    "voice": dict(reference),
                 }
-                for slot, reference in enumerate(references, 1)
+                for slot in range(1, 4)
             },
             "entities": {},
             "scenes": {},
@@ -2916,34 +2874,11 @@ def test_nullable_object_replace_plan_is_compiled_without_a_quality_gate(
         mediakit=object(),
         picsart=object(),
     )
-    patch = {
-        "people": {
-            "person-01": {
-                "matches_user_request": False,
-                "replacement": None,
-                "voice_id": None,
-            },
-        },
-        "entities": {},
-        "scenes": {
-            "scene-01": {
-                "matches_user_request": False,
-                "replacement": None,
-            },
-        },
-    }
-
-    metadata, references, paths, fallback_used = (
-        pipeline._materialize_voice_references(
-            store.path(project_id), patch,
-        )
-    )
-    authority = pipeline._fusion_authority_block({
+    merged = {
         "people": {
             "person-01": {
                 "occurrences": [{"segment_index": 1}],
                 "replacement": None,
-                "voice": None,
             },
         },
         "entities": {},
@@ -2954,12 +2889,9 @@ def test_nullable_object_replace_plan_is_compiled_without_a_quality_gate(
             },
         },
         "relations": {},
-    }, 1)
+    }
+    authority = pipeline._fusion_authority_block(merged, 1)
 
-    assert metadata == {}
-    assert references == []
-    assert paths == []
-    assert fallback_used is False
     assert "person-01 | KEEP" in authority
     assert "scene-01 | KEEP" in authority
     assert "Audio " not in authority
@@ -3970,15 +3902,15 @@ def test_pre_picsart_resume_reuses_succeeded_sheet_without_seedream_or_upstream(
     assert store.read(project_id)["replacement_sheet"] == frozen_sheet
 
 
-def test_pre_picsart_resume_backfills_default_voice_for_voiceless_frozen_plan(
+def test_pre_picsart_resume_with_dialogue_needs_no_voice_backfill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """豆包 voice_type 直选后，voiceless 冻结计划不再需要任何音色物化：
+    有待合成台词的项目照常续跑，voice_references 恒为空。"""
     store, project_id, project, frozen_sheet, _initial_seedream = (
         _failed_replacement_sheet_checkpoint(tmp_path, prepared=False)
     )
-    # The frozen plan predates the object-replace voice fallback: dialogue
-    # waits for TTS but no person was assigned a voice.
     assert store.read(project_id)["voice_references"] == []
     store.update(
         project_id,
@@ -4002,77 +3934,20 @@ def test_pre_picsart_resume_backfills_default_voice_for_voiceless_frozen_plan(
         lambda *args, **_kwargs: downstream.append(args),
     )
 
+    pipeline.validate_pre_picsart_resume(project_id)
     pipeline.resume_pre_picsart(project_id)
 
     assert len(downstream) == 1
-    fallback = pipeline.voice_library.voices[0]
-    materialized = project / "work" / "voice-references" / "audio-01.wav"
-    assert materialized.is_file()
     state = store.read(project_id)
-    assert [
-        reference["voice_id"] for reference in state["voice_references"]
-    ] == [fallback["voice_id"]]
-    assert state["object_replace"]["voice_reference_fallback"] == {
-        "voice_id": fallback["voice_id"],
-        "reason": (
-            "resume: dialogue requires TTS but the frozen plan assigned "
-            "no voice"
-        ),
+    assert state["voice_references"] == []
+    assert state["object_replace"] == {
+        "version": OBJECT_REPLACE_OUTPUT_VERSION,
+        "input_sha256": "a" * 64,
     }
-    # The frozen sheet keeps everything but its upstream bindings, which now
-    # honestly reflect the added Audio 1 reference.
-    updated_sheet = state["replacement_sheet"]
-    assert {
-        key: value
-        for key, value in updated_sheet.items()
-        if key != "upstream_bindings"
-    } == {
-        key: value
-        for key, value in frozen_sheet.items()
-        if key != "upstream_bindings"
-    }
-    updated_bindings = updated_sheet["upstream_bindings"]
-    old_bindings = frozen_sheet["upstream_bindings"]
-    assert updated_bindings["voice_references_sha256"] == (
-        Pipeline._json_sha256(state["voice_references"])
-    )
-    assert (
-        updated_bindings["voice_references_sha256"]
-        != old_bindings["voice_references_sha256"]
-    )
-    assert (
-        updated_bindings["segments_sha256"] == old_bindings["segments_sha256"]
-    )
-    fallback_events = [
-        event
-        for event in _trace_events(project)
-        if event["event"] == "voice_reference_default_fallback"
-    ]
-    assert len(fallback_events) == 1
-    assert fallback_events[0]["voice_id"] == fallback["voice_id"]
-    assert fallback_events[0]["reason"].startswith("resume:")
-
-    # The updated state is a consistent frozen set: the load gate passes and
-    # a later resume (after another failure) does not backfill again.
-    store.update(
-        project_id,
-        status="failed",
-        project_progress={
-            "status": "failed", "percent": 56, "stage": "pipeline_failed",
-        },
-        generation={
-            "status": "failed", "stage": "pipeline_failed", "error": "failed",
-        },
-    )
-    pipeline.validate_pre_picsart_resume(project_id)
-    pipeline.resume_pre_picsart(project_id)
-    assert len(downstream) == 2
-    assert materialized.is_file()
-    assert [
-        event
-        for event in _trace_events(project)
-        if event["event"] == "voice_reference_default_fallback"
-    ] == fallback_events
+    assert state["replacement_sheet"] == frozen_sheet
+    assert "voice_reference_default_fallback" not in (
+        project / "logs" / "trace.jsonl"
+    ).read_text(encoding="utf-8")
 
 
 def test_pre_picsart_resume_without_dialogue_keeps_the_empty_voice_list(
@@ -4843,26 +4718,18 @@ def test_h3_manifest_rejects_new_voice_mapping_with_old_prompt_binding(
         "visual_prompt": "visual",
         "status": "failed",
     }
-    library = load_voice_library()
-    voice_directory = project / "work" / "voice-references"
-    voice_directory.mkdir(parents=True)
+    library = load_doubao_voice_catalog()
 
-    def reference(voice: dict[str, Any]) -> dict[str, Any]:
+    def index_with_voices(dialogue_voices: list[Any]) -> dict[str, Any]:
         return {
-            "audio_reference": "Audio 1",
-            "voice_id": voice["voice_id"],
-            "asset_path": "work/voice-references/audio-01.wav",
-            "asset_sha256": voice["sha256"],
-            "features": library.model_line(voice["voice_id"]),
+            "people": {"person-01": {}},
+            "entities": {}, "scenes": {}, "relations": {},
+            "dialogue_voices": dialogue_voices,
         }
 
-    first = reference(library.voices[0])
-    audio = voice_directory / "audio-01.wav"
-    audio.write_bytes(library.files[first["voice_id"]].read_bytes())
-    first_index = {
-        "people": {"person-01": {"voice": dict(first)}},
-        "entities": {}, "scenes": {}, "relations": {},
-    }
+    first_index = index_with_voices(
+        [library.voices_for_language("中文")[0]["voice_type"]]
+    )
     store.update(
         project_id,
         status="failed",
@@ -4870,7 +4737,7 @@ def test_h3_manifest_rejects_new_voice_mapping_with_old_prompt_binding(
         segment_count=1,
         segments=[segment],
         enhanced_element_index=first_index,
-        voice_references=[first],
+        voice_references=[],
         object_replace={"input_sha256": "a" * 64},
         project_progress={
             "status": "failed", "percent": 57, "stage": "pipeline_failed",
@@ -4904,16 +4771,12 @@ def test_h3_manifest_rejects_new_voice_mapping_with_old_prompt_binding(
         replacement_sheet=replacement_sheet,
         request=request,
     )
-    second = reference(library.voices[1])
-    audio.write_bytes(library.files[second["voice_id"]].read_bytes())
-    second_index = {
-        "people": {"person-01": {"voice": dict(second)}},
-        "entities": {}, "scenes": {}, "relations": {},
-    }
+    second_index = index_with_voices(
+        [library.voices_for_language("中文")[1]["voice_type"]]
+    )
     store.update(
         project_id,
         enhanced_element_index=second_index,
-        voice_references=[second],
     )
     monkeypatch.setattr(
         media,
@@ -5843,24 +5706,14 @@ def _dialogue_audio_fixture(
             {"text": "第二句", "start_s": 5.0, "end_s": 7.0},
         ],
     )
-    library = load_voice_library()
-    people: dict[str, Any] = {}
-    for slot, voice in enumerate(library.voices[:2], 1):
-        people[f"person-{slot:02d}"] = {
-            "voice": {
-                "audio_reference": f"Audio {slot}",
-                "voice_id": voice["voice_id"],
-                "asset_path": f"work/voice-references/audio-{slot:02d}.wav",
-                "asset_sha256": voice["sha256"],
-                "features": library.model_line(voice["voice_id"]),
-            },
-        }
+    library = load_doubao_voice_catalog()
+    assigned_voice_type = library.voices_for_language("英语")[0]["voice_type"]
     enhanced_index = {
-        "people": people,
+        "people": {},
         "entities": {},
         "scenes": {},
         "relations": {},
-        "dialogue_voices": ["person-01", None],
+        "dialogue_voices": [assigned_voice_type, None],
     }
     prepared = [
         {
@@ -5938,11 +5791,13 @@ def test_dialogue_tts_synthesizes_each_line_with_a_doubao_voice(
         project / "work" / "dialogue-audio" / "full-track.wav"
     )
     assert full_track.is_file()
-    # person-01 的音色库条目是男声，其台词用英语男声；无归属台词落默认女声。
+    # 第一行带 Object Replace 分配的 voice_type，原样合成；第二行无绑定，
+    # 落到该语种（英语）的通用默认音色。
+    library = load_doubao_voice_catalog()
     assert [call["text"] for call in tts.tts_calls] == ["第一句", "第二句"]
     assert [call["voice_type"] for call in tts.tts_calls] == [
-        doubao_tts_voice_type("英语", "male"),
-        doubao_tts_voice_type("英语"),
+        library.voices_for_language("英语")[0]["voice_type"],
+        library.default_voice_type("英语"),
     ]
     for offset in (1, 2):
         assert (
@@ -6085,10 +5940,10 @@ def test_dialogue_tts_moderation_rejection_retries_until_success(
 
 
 class _ObjectReplaceOnlyDeepSeek:
-    """Object-replace node stub with a configurable voice assignment."""
+    """Object-replace node stub with a configurable dialogue voice binding."""
 
-    def __init__(self, voice_id: str | None = None) -> None:
-        self.voice_id = voice_id
+    def __init__(self, voice_type: str | None = None) -> None:
+        self.voice_type = voice_type
 
     def complete_structured(
         self,
@@ -6110,7 +5965,6 @@ class _ObjectReplaceOnlyDeepSeek:
                         f"isolated replacement person {stable_id}"
                     ),
                 },
-                "voice_id": self.voice_id,
             }
             for stable_id in schema["properties"]["people"]["properties"]
         }
@@ -6120,8 +5974,7 @@ class _ObjectReplaceOnlyDeepSeek:
                 "version": OBJECT_REPLACE_OUTPUT_VERSION,
                 "input_sha256": schema["properties"]["input_sha256"]["enum"][0],
                 "dialogue_voices": [
-                    "person-01" if self.voice_id is not None else None
-                    for _line in payload["translated_dialogue"]
+                    self.voice_type for _line in payload["translated_dialogue"]
                 ],
                 "people": people,
                 "entities": {},
@@ -6193,17 +6046,16 @@ def _trace_events(project: Path) -> list[dict[str, Any]]:
     ]
 
 
-def test_object_replace_voiceless_people_fall_back_to_default_voice(
+def test_object_replace_voiceless_lines_fall_back_to_default_voice(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    library = load_voice_library()
     (
         store, project_id, project, pipeline, request, log,
     ) = _object_replace_fixture(
         tmp_path, _ObjectReplaceOnlyDeepSeek(), target_language="中文",
     )
 
-    enhanced_index, metadata, references, paths = pipeline._run_object_replace(
+    enhanced_index, metadata = pipeline._run_object_replace(
         project,
         [dict(item) for item in _OBJECT_REPLACE_PREPARED],
         [dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES],
@@ -6216,40 +6068,28 @@ def test_object_replace_voiceless_people_fall_back_to_default_voice(
         log,
     )
 
-    # The catalog has no Chinese voice yet, so the first voice is picked.
-    fallback = library.default_voice("中文")
-    assert fallback == library.voices[0]
-    assert [reference["voice_id"] for reference in references] == [
-        fallback["voice_id"]
-    ]
-    assert [path.name for path in paths] == ["audio-01.wav"]
-    assert paths[0].is_file()
-    # The model's deliberate "no voice" decision is kept in the index; the
-    # fallback only materializes the Audio 1 reference.
-    assert enhanced_index["people"]["person-01"]["voice"] is None
-    assert metadata["voice_reference_fallback"] == {
-        "voice_id": fallback["voice_id"],
-        "reason": "dialogue requires TTS but no person was assigned a voice",
+    # 模型对无脸人物谨慎留白（dialogue_voices 全 null）：不物化任何本地
+    # 音色参考，也不写 fallback 元数据；配音链在合成时按语言兜底。
+    assert enhanced_index["dialogue_voices"] == [None]
+    assert "voice" not in enhanced_index["people"]["person-01"]
+    assert set(metadata) == {
+        "version", "input_sha256", "voice_catalog_sha256",
     }
-    fallback_events = [
-        event
-        for event in _trace_events(project)
-        if event["event"] == "voice_reference_default_fallback"
-    ]
-    assert len(fallback_events) == 1
-    assert fallback_events[0]["voice_id"] == fallback["voice_id"]
+    assert metadata["voice_catalog_sha256"] == pipeline.voice_catalog.digest
+    assert "voice_reference_default_fallback" not in (
+        project / "logs" / "trace.jsonl"
+    ).read_text(encoding="utf-8")
 
-    # Resume path: the fallback entry is a regular frozen Audio 1 reference.
     store.update(
         project_id,
-        voice_references=references,
+        voice_references=[],
         translated_voice_lines=[
             dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES
         ],
     )
     assert Pipeline._stored_voice_references(
         project, store.read(project_id),
-    ) == [paths[0].resolve()]
+    ) == []
 
     # The dialogue TTS chain no longer fails closed on voiceless people.
     def assemble(
@@ -6276,24 +6116,25 @@ def test_object_replace_voiceless_people_fall_back_to_default_voice(
         project / "work" / "dialogue-audio" / "full-track.wav"
     )
     assert full_track.is_file()
-    # 无人认领音色归属：台词落到该语言的默认豆包音色（person-01 无 voice）。
+    # 无音色绑定：台词落到该语言的默认豆包音色。
     assert [
         call["voice_type"] for call in pipeline.tts.tts_calls
-    ] == [doubao_tts_voice_type("中文")]
+    ] == [pipeline.voice_catalog.default_voice_type("中文")]
 
 
-def test_object_replace_with_assigned_voice_never_falls_back(
+def test_object_replace_with_assigned_voice_type_passes_it_through(
     tmp_path: Path,
 ) -> None:
-    library = load_voice_library()
-    assigned = library.voices[1]["voice_id"]
+    assigned = load_doubao_voice_catalog().voices_for_language(
+        "中文"
+    )[1]["voice_type"]
     (
         _store, _project_id, project, pipeline, request, log,
     ) = _object_replace_fixture(
         tmp_path, _ObjectReplaceOnlyDeepSeek(assigned),
     )
 
-    enhanced_index, metadata, references, paths = pipeline._run_object_replace(
+    enhanced_index, metadata = pipeline._run_object_replace(
         project,
         [dict(item) for item in _OBJECT_REPLACE_PREPARED],
         [dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES],
@@ -6306,22 +6147,73 @@ def test_object_replace_with_assigned_voice_never_falls_back(
         log,
     )
 
-    assert [reference["voice_id"] for reference in references] == [assigned]
-    assert enhanced_index["people"]["person-01"]["voice"]["voice_id"] == assigned
-    assert metadata["voice_reference_fallback"] is None
+    assert enhanced_index["dialogue_voices"] == [assigned]
+    assert set(metadata) == {
+        "version", "input_sha256", "voice_catalog_sha256",
+    }
     assert "voice_reference_default_fallback" not in (
         project / "logs" / "trace.jsonl"
     ).read_text(encoding="utf-8")
 
 
-def test_object_replace_without_dialogue_materializes_no_voice(
+def test_object_replace_rejects_a_voice_type_outside_the_catalog() -> None:
+    element_index = {
+        category: dict(records)
+        for category, records in _OBJECT_REPLACE_ELEMENT_INDEX.items()
+    }
+    payload = {
+        **object_replace_planning_context(element_index),
+        "translated_dialogue": [
+            dict(line) for line in _OBJECT_REPLACE_TRANSLATED_LINES
+        ],
+        "target_language": "中文",
+        "has_user_image": False,
+        "user_replacement_instruction": "",
+    }
+    voice_types = [
+        voice["voice_type"]
+        for voice in load_doubao_voice_catalog().voices_for_language("中文")
+    ]
+    _schema, digest = object_replace_schema(payload, voice_types)
+    value = {
+        "schema": OBJECT_REPLACE_OUTPUT_NAME,
+        "version": OBJECT_REPLACE_OUTPUT_VERSION,
+        "input_sha256": digest,
+        "dialogue_voices": ["zh_female_nonexistent_uranus_bigtts"],
+        "people": {
+            "person-01": {
+                "matches_user_request": False,
+                "replacement": {
+                    "source": "generated_variant",
+                    "target_visual_description": "a different person",
+                    "appearance_description": "an isolated different person",
+                },
+            },
+        },
+        "entities": {},
+        "scenes": {},
+    }
+
+    with pytest.raises(ValueError, match="dialogue voices"):
+        normalize_object_replace(
+            value,
+            input_sha256=digest,
+            element_index=element_index,
+            voice_types=voice_types,
+            has_user_image=False,
+            user_instruction="",
+            dialogue_line_count=1,
+        )
+
+
+def test_object_replace_without_dialogue_injects_no_voice_lines(
     tmp_path: Path,
 ) -> None:
     (
         _store, _project_id, project, pipeline, request, log,
     ) = _object_replace_fixture(tmp_path, _ObjectReplaceOnlyDeepSeek())
 
-    _enhanced_index, metadata, references, paths = pipeline._run_object_replace(
+    enhanced_index, metadata = pipeline._run_object_replace(
         project,
         [dict(item) for item in _OBJECT_REPLACE_PREPARED],
         [],
@@ -6334,9 +6226,10 @@ def test_object_replace_without_dialogue_materializes_no_voice(
         log,
     )
 
-    assert references == []
-    assert paths == []
-    assert metadata["voice_reference_fallback"] is None
+    assert enhanced_index["dialogue_voices"] == []
+    assert set(metadata) == {
+        "version", "input_sha256", "voice_catalog_sha256",
+    }
     assert "voice_reference_default_fallback" not in (
         project / "logs" / "trace.jsonl"
     ).read_text(encoding="utf-8")

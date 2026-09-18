@@ -16,8 +16,6 @@ from app.doubao_tts import (
     DOUBAO_TTS_RESOURCE_ID,
     DOUBAO_TTS_SAMPLE_RATE,
     DoubaoTtsClient,
-    doubao_tts_language_key,
-    doubao_tts_voice_type,
 )
 from app.fusion_schema import FUSION_OUTPUT_NAME, fusion_prompt_schema
 from app.providers import (
@@ -1734,48 +1732,3 @@ def test_doubao_synthesize_bad_stream_fails_closed(
         )
 
 
-@pytest.mark.parametrize(
-    ("label", "key"),
-    [
-        ("中文", "zh"),
-        ("英语", "en"),
-        ("泰语", "th"),
-        ("Thai", "th"),
-        ("th", "th"),
-        ("日语", "ja"),
-        ("韩语", "ko"),
-        ("西班牙语", "es"),
-        ("法语", "fr"),
-        ("德语", "de"),
-        ("俄语", "ru"),
-        ("葡萄牙语", "pt"),
-        ("印尼语", "id"),
-        ("马来语", "ms"),
-        ("越南语", "vi"),
-        ("菲律宾语", "tl"),
-        ("阿拉伯语", "ar"),
-        ("意大利语", "it"),
-        ("克林贡语", "zh"),
-        ("", "zh"),
-    ],
-)
-def test_doubao_language_key_normalizes_labels(label: str, key: str) -> None:
-    assert doubao_tts_language_key(label) == key
-
-
-@pytest.mark.parametrize(
-    ("label", "gender", "voice_type"),
-    [
-        ("泰语", None, "th_female_bv568_neutral_uranus_bigtts"),
-        ("泰语", "male", "th_female_bv568_neutral_uranus_bigtts"),
-        ("英语", "female", "en_female_jane_uranus_bigtts"),
-        ("英语", "male", "en_male_alex_uranus_bigtts"),
-        ("英语", None, "en_female_jane_uranus_bigtts"),
-        ("马来语", "female", "ms_male_ham_uranus_bigtts"),
-        ("未知语言", "female", "zh_female_vv_uranus_bigtts"),
-    ],
-)
-def test_doubao_voice_type_by_language_and_gender(
-    label: str, gender: str | None, voice_type: str
-) -> None:
-    assert doubao_tts_voice_type(label, gender) == voice_type

@@ -11,7 +11,6 @@ import pytest
 from app.fusion_schema import canonical_input
 from app.object_replace_schema import (
     DETECT_LABEL_PATTERN,
-    MAX_REFERENCE_AUDIO,
     OBJECT_REPLACE_OUTPUT_NAME,
     OBJECT_REPLACE_OUTPUT_VERSION,
     merge_object_replace_index,
@@ -21,7 +20,7 @@ from app.object_replace_schema import (
 )
 
 
-VOICE_IDS = ["voice-a", "voice-b", "voice-c", "voice-d"]
+VOICE_TYPES = ["voice-a", "voice-b", "voice-c", "voice-d"]
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -202,9 +201,8 @@ def _output(
                     ),
                     f"new appearance for {stable_id}",
                 ),
-                "voice_id": VOICE_IDS[index % len(VOICE_IDS)],
             }
-            for index, stable_id in enumerate(element_index["people"])
+            for stable_id in element_index["people"]
         },
         "entities": {
             stable_id: {
@@ -245,7 +243,7 @@ def _normalize(
     *,
     digest: str,
     element_index: dict[str, Any],
-    voice_ids: list[str] = VOICE_IDS,
+    voice_types: list[str] = VOICE_TYPES,
     has_user_image: bool = True,
     instruction: str = "replace the held product",
     dialogue_line_count: int = 0,
@@ -255,7 +253,7 @@ def _normalize(
         value,
         input_sha256=digest,
         element_index=element_index,
-        voice_ids=voice_ids,
+        voice_types=voice_types,
         has_user_image=has_user_image,
         user_instruction=instruction,
         dialogue_line_count=dialogue_line_count,
@@ -273,7 +271,7 @@ def _keep_entities_and_scenes(value: dict[str, Any]) -> None:
 def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
     element_index = _index()
     payload = _payload(element_index)
-    schema, digest = object_replace_schema(payload, VOICE_IDS)
+    schema, digest = object_replace_schema(payload, VOICE_TYPES)
 
     assert digest == hashlib.sha256(canonical_input(payload)).hexdigest()
     assert schema["additionalProperties"] is False
@@ -286,7 +284,7 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
         "scenes",
         "dialogue_voices",
     ]
-    assert OBJECT_REPLACE_OUTPUT_VERSION == 4
+    assert OBJECT_REPLACE_OUTPUT_VERSION == 5
     assert schema["properties"]["input_sha256"]["enum"] == [digest]
     assert set(schema["properties"]) == {
         "schema",
@@ -303,7 +301,7 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
     assert dialogue_voices_schema["maxItems"] == 0
     assert dialogue_voices_schema["items"] == {
         "type": ["string", "null"],
-        "enum": ["person-01", "person-02", None],
+        "enum": [*VOICE_TYPES, None],
     }
 
     for category in ("people", "entities", "scenes"):
@@ -318,9 +316,9 @@ def test_schema_is_closed_bound_and_requires_every_replacement() -> None:
         assert image_branch["properties"]["replacement"]["properties"]["source"]["enum"] == ["image_1"]
         assert generated_branch["properties"]["matches_user_request"]["enum"] == [False]
         assert generated_branch["properties"]["replacement"]["properties"]["source"]["enum"] == ["generated_variant"]
-        assert patch_schema["properties"]["voice_id"]["anyOf"] == [
-            {"type": "string", "enum": VOICE_IDS}, {"type": "null"},
-        ]
+        assert set(patch_schema["properties"]) == {
+            "matches_user_request", "replacement",
+        }
 
     for patch_schema in schema["properties"]["entities"]["properties"].values():
         image_branch, keep_branch = patch_schema["anyOf"]
@@ -353,7 +351,7 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
         for reference_id in ("image_1", "image_2", "image_3", "image_4")
     ]
 
-    schema, _digest = object_replace_schema(payload, VOICE_IDS)
+    schema, _digest = object_replace_schema(payload, VOICE_TYPES)
 
     expected_reference_ids = {
         "type": "array",
@@ -384,7 +382,7 @@ def test_schema_binds_optional_reference_ids_to_payload_images() -> None:
 )
 def test_normalizer_accepts_a_short_generic_detect_label(label: str) -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-01"]["replacement"]["detect_label"] = label
 
@@ -392,7 +390,7 @@ def test_normalizer_accepts_a_short_generic_detect_label(label: str) -> None:
 
     replacement = normalized["entities"]["entity-01"]["replacement"]
     assert replacement["detect_label"] == label
-    merged = merge_object_replace_index(element_index, normalized, {})
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
     assert (
         merged["entities"]["entity-01"]["replacement"]["detect_label"] == label
     )
@@ -420,7 +418,7 @@ def test_normalizer_accepts_a_short_generic_detect_label(label: str) -> None:
 )
 def test_normalizer_rejects_an_unusable_detect_label(label: Any) -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-01"]["replacement"]["detect_label"] = label
 
@@ -432,7 +430,7 @@ def test_normalizer_tolerates_a_missing_detect_label_for_legacy_outputs() -> Non
     # 旧冻结产物（detect_label 引入前）没有该字段：normalize 必须继续放行，
     # 由检测 target 派生环节回退 source_visual_description。
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     for patch in value["entities"].values():
         patch["replacement"].pop("detect_label")
@@ -441,14 +439,14 @@ def test_normalizer_tolerates_a_missing_detect_label_for_legacy_outputs() -> Non
 
     for patch in normalized["entities"].values():
         assert "detect_label" not in patch["replacement"]
-    merged = merge_object_replace_index(element_index, normalized, {})
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
     for record in merged["entities"].values():
         assert "detect_label" not in record["replacement"]
 
 
 def test_normalizer_and_merge_keep_an_explicit_null_entity_replacement() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-02"] = {
         "matches_user_request": False,
@@ -456,7 +454,7 @@ def test_normalizer_and_merge_keep_an_explicit_null_entity_replacement() -> None
     }
 
     normalized = _normalize(value, digest=digest, element_index=element_index)
-    merged = merge_object_replace_index(element_index, normalized, {})
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
 
     assert set(normalized["entities"]["entity-02"]) == {
         "matches_user_request", "replacement",
@@ -467,7 +465,7 @@ def test_normalizer_and_merge_keep_an_explicit_null_entity_replacement() -> None
 
 def test_normalizer_rejects_a_null_replacement_for_people() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"]["replacement"] = None
 
@@ -477,7 +475,7 @@ def test_normalizer_rejects_a_null_replacement_for_people() -> None:
 
 def test_normalizer_requires_the_explicit_null_entity_key_and_rejects_a_match() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"].pop("entity-02")
 
@@ -516,7 +514,7 @@ def test_normalizer_rejects_missing_or_invalid_detect_label_for_current_outputs(
 ) -> None:
     """Validator ValueError is fed back to the current agent retry loop."""
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
     value["entities"]["entity-01"] = {
@@ -541,7 +539,7 @@ def test_normalizer_rejects_missing_or_invalid_detect_label_for_current_outputs(
 
 def test_normalizer_current_output_does_not_require_detect_label_for_people() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
 
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
@@ -601,7 +599,7 @@ def test_model_reference_redundancy_is_normalized_before_sheet(source, reference
     from app.replacement_sheet import build_replacement_sheet_spec, validate_replacement_sheet_spec
 
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
     for key in ("person-01",):
@@ -612,7 +610,7 @@ def test_model_reference_redundancy_is_normalized_before_sheet(source, reference
     assert replacement.get("reference_image_ids") == expected
     assert ("reference_image_ids" in replacement) == (expected is not None)
     assert value["people"]["person-01"]["replacement"]["reference_image_ids"] == references
-    enhanced = merge_object_replace_index(element_index, normalized, {})
+    enhanced = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
     spec = build_replacement_sheet_spec(enhanced)
     validate_replacement_sheet_spec(spec)
     tile = next(tile for tile in spec["tiles"] if tile["stable_key"] == "person-01")
@@ -626,7 +624,7 @@ def test_normalizer_preserves_multiple_user_reference_ids_per_stable_key() -> No
         {"reference_id": reference_id}
         for reference_id in ("image_1", "image_2", "image_3", "image_4")
     ]
-    _schema, digest = object_replace_schema(payload, VOICE_IDS)
+    _schema, digest = object_replace_schema(payload, VOICE_TYPES)
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
     value["people"]["person-01"]["replacement"]["reference_image_ids"] = [
@@ -647,7 +645,7 @@ def test_normalizer_preserves_multiple_user_reference_ids_per_stable_key() -> No
         element_index=element_index,
         reference_image_ids=["image_1", "image_2", "image_3", "image_4"],
     )
-    merged = merge_object_replace_index(element_index, normalized, {})
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
 
     assert normalized["people"]["person-01"]["replacement"][
         "reference_image_ids"
@@ -665,7 +663,7 @@ def test_normalizer_preserves_multiple_user_reference_ids_per_stable_key() -> No
 
 def test_normalizer_keeps_legacy_image_binding_without_reference_ids() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
 
     normalized = _normalize(
         _output(element_index, digest),
@@ -702,7 +700,7 @@ def test_normalizer_rejects_unusable_reference_image_ids(
     replacement: dict[str, Any],
 ) -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-01"]["replacement"] = replacement
 
@@ -730,7 +728,7 @@ def test_schema_forbids_image_1_without_an_explicit_image_request(
     if not has_user_image:
         payload["user_replacement_image"] = None
 
-    schema, _digest = object_replace_schema(payload, VOICE_IDS)
+    schema, _digest = object_replace_schema(payload, VOICE_TYPES)
 
     for patch_schema in schema["properties"]["people"]["properties"].values():
         assert "anyOf" not in patch_schema
@@ -753,7 +751,7 @@ def test_schema_accepts_an_empty_reference_list_without_a_user_image() -> None:
     payload["user_replacement_instruction"] = ""
     payload["user_reference_images"] = []
 
-    schema, _digest = object_replace_schema(payload, VOICE_IDS)
+    schema, _digest = object_replace_schema(payload, VOICE_TYPES)
 
     for patch_schema in schema["properties"]["people"]["properties"].values():
         assert "reference_image_ids" not in patch_schema["properties"]["replacement"]["properties"]
@@ -781,7 +779,7 @@ def test_schema_ignores_a_replacement_set_not_derived_from_the_index(
     payload = _payload(element_index)
     payload["replacement_set"] = replacement_set
 
-    schema, digest = object_replace_schema(payload, VOICE_IDS)
+    schema, digest = object_replace_schema(payload, VOICE_TYPES)
 
     assert digest == hashlib.sha256(canonical_input(payload)).hexdigest()
     assert set(schema["properties"]["people"]["properties"]) == {
@@ -804,7 +802,7 @@ def test_schema_does_not_revalidate_upstream_content_or_user_pairing() -> None:
     payload["segment_visual_prompts"] = []
     payload["extra_context"] = "forward this too"
 
-    schema, digest = object_replace_schema(payload, VOICE_IDS)
+    schema, digest = object_replace_schema(payload, VOICE_TYPES)
 
     assert digest == hashlib.sha256(canonical_input(payload)).hexdigest()
     assert schema["properties"]["scenes"]["properties"] == {}
@@ -812,18 +810,16 @@ def test_schema_does_not_revalidate_upstream_content_or_user_pairing() -> None:
 
 def test_normalizer_allows_semantically_imperfect_but_consumable_output() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
 
     value["people"]["person-01"] = {
         "matches_user_request": False,
         "replacement": _replacement("generated_variant", ""),
-        "voice_id": None,
     }
     value["people"]["person-02"] = {
         "matches_user_request": False,
         "replacement": _replacement("generated_variant", "person-02"),
-        "voice_id": None,
     }
     value["entities"]["entity-01"] = {
         "matches_user_request": False,
@@ -861,7 +857,7 @@ def test_normalizer_allows_semantically_imperfect_but_consumable_output() -> Non
 
 def test_normalizer_trims_a_renderable_appearance_without_a_quality_gate() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-01"]["replacement"] = _replacement(
         "generated_variant",
@@ -881,7 +877,7 @@ def test_normalizer_rejects_an_empty_trimmed_appearance(
     appearance: str,
 ) -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-01"]["replacement"] = _replacement(
         "generated_variant",
@@ -895,7 +891,7 @@ def test_normalizer_rejects_an_empty_trimmed_appearance(
 
 def test_normalizer_does_not_limit_description_length_or_compare_source() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"]["replacement"] = _replacement(
         "image_1", "person-01",
@@ -915,7 +911,7 @@ def test_normalizer_does_not_limit_description_length_or_compare_source() -> Non
 
 def test_normalizer_rejects_image_1_without_a_user_image() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
 
     with pytest.raises(ValueError, match="binding count is invalid"):
@@ -929,7 +925,7 @@ def test_normalizer_rejects_image_1_without_a_user_image() -> None:
 
 def test_normalizer_accepts_zero_image_1_bindings_for_a_nonblank_request() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"]["replacement"] = _replacement(
         "generated_variant",
@@ -953,13 +949,12 @@ def test_normalizer_accepts_all_generated_variants_for_multiple_images() -> None
         {"reference_id": reference_id}
         for reference_id in ("image_1", "image_2", "image_3", "image_4")
     ]
-    _schema, digest = object_replace_schema(payload, VOICE_IDS)
+    _schema, digest = object_replace_schema(payload, VOICE_TYPES)
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
     value["people"]["person-01"] = {
         "matches_user_request": False,
         "replacement": _replacement("generated_variant", "person-01"),
-        "voice_id": None,
     }
 
     normalized = _normalize(
@@ -983,7 +978,7 @@ def test_normalizer_accepts_all_generated_variants_for_multiple_images() -> None
 
 def test_normalizer_accepts_multiple_image_1_bindings() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-01"] = {
         "matches_user_request": True,
@@ -995,7 +990,7 @@ def test_normalizer_accepts_multiple_image_1_bindings() -> None:
     assert normalized["people"]["person-01"]["replacement"]["source"] == "image_1"
     assert normalized["entities"]["entity-01"]["replacement"]["source"] == "image_1"
     original = copy.deepcopy(element_index)
-    merged = merge_object_replace_index(element_index, normalized, {})
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
     assert element_index == original
     assert merged["relations"] == original["relations"]
     for category in ("people", "entities", "scenes"):
@@ -1007,7 +1002,7 @@ def test_normalizer_accepts_multiple_image_1_bindings() -> None:
 
 def test_normalizer_accepts_image_1_even_when_the_match_flag_is_false() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"]["matches_user_request"] = False
 
@@ -1021,7 +1016,7 @@ def test_normalizer_accepts_image_1_even_when_the_match_flag_is_false() -> None:
 
 def test_normalizer_accepts_true_match_without_image_1() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"]["replacement"] = _replacement(
         "generated_variant",
@@ -1038,12 +1033,11 @@ def test_normalizer_accepts_true_match_without_image_1() -> None:
 
 def test_normalizer_accepts_true_match_without_a_user_image() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"] = {
         "matches_user_request": True,
         "replacement": _replacement("generated_variant", "person-01"),
-        "voice_id": None,
     }
 
     normalized = _normalize(
@@ -1061,12 +1055,11 @@ def test_normalizer_accepts_true_match_without_a_user_image() -> None:
 
 def test_normalizer_accepts_zero_bindings_without_a_user_image() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"] = {
         "matches_user_request": False,
         "replacement": _replacement("generated_variant", "person-01"),
-        "voice_id": None,
     }
 
     normalized = _normalize(
@@ -1083,12 +1076,11 @@ def test_normalizer_accepts_zero_bindings_for_a_blank_instruction() -> None:
     element_index = _index()
     payload = _payload(element_index)
     payload["user_replacement_instruction"] = "  \n\t  "
-    _schema, digest = object_replace_schema(payload, VOICE_IDS)
+    _schema, digest = object_replace_schema(payload, VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"] = {
         "matches_user_request": False,
         "replacement": _replacement("generated_variant", "person-01"),
-        "voice_id": None,
     }
 
     normalized = _normalize(
@@ -1103,7 +1095,7 @@ def test_normalizer_accepts_zero_bindings_for_a_blank_instruction() -> None:
 
 def test_normalizer_accepts_exactly_one_matching_image_1_binding() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     normalized = _normalize(value, digest=digest, element_index=element_index)
 
@@ -1125,7 +1117,7 @@ def test_normalizer_accepts_exactly_one_matching_image_1_binding() -> None:
 
 def test_normalizer_rejects_a_nonnull_scene_for_current_outputs() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
     value["scenes"]["scene-01"]["replacement"] = _replacement(
@@ -1141,7 +1133,7 @@ def test_normalizer_rejects_a_nonnull_scene_for_current_outputs() -> None:
 
 def test_current_normalizer_keeps_unmatched_entities_and_requires_user_images() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     _keep_entities_and_scenes(value)
 
@@ -1209,7 +1201,7 @@ def test_current_normalizer_keeps_unmatched_entities_and_requires_user_images() 
 )
 def test_normalizer_rejects_only_unusable_transport_shapes(mutation: Any) -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     mutation(value)
 
@@ -1219,7 +1211,7 @@ def test_normalizer_rejects_only_unusable_transport_shapes(mutation: Any) -> Non
 
 def test_normalizer_tolerates_extra_top_level_keys() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["is_project_index"] = False
     value["notes"] = "stray model field"
@@ -1235,7 +1227,7 @@ def test_normalizer_tolerates_extra_top_level_keys() -> None:
 
 def test_normalizer_tolerates_extra_element_and_patch_keys() -> None:
     element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["entities"]["entity-99"] = {}
     value["scenes"]["scene-01"]["extra"] = True
@@ -1252,52 +1244,23 @@ def test_normalizer_requires_dict_stable_id_maps() -> None:
     malformed = _index()
     malformed["people"] = []
     with pytest.raises(ValueError, match="global element index"):
-        object_replace_schema(_payload(malformed), VOICE_IDS)
+        object_replace_schema(_payload(malformed), VOICE_TYPES)
 
     # A stable id repeated across categories is ambiguous for humans but
     # unambiguous for the per-category contract; it passes through.
     duplicated = _index(entities=("person-01",))
-    schema, _digest = object_replace_schema(_payload(duplicated), VOICE_IDS)
+    schema, _digest = object_replace_schema(_payload(duplicated), VOICE_TYPES)
     assert set(schema["properties"]["entities"]["properties"]) == {"person-01"}
-
-
-def test_normalizer_degrades_null_or_unmapped_voice_to_no_voice() -> None:
-    element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
-    value = _output(element_index, digest)
-    value["people"]["person-01"]["voice_id"] = None
-    _normalize(value, digest=digest, element_index=element_index)
-
-    value["people"]["person-01"]["voice_id"] = "unknown"
-    normalized = _normalize(value, digest=digest, element_index=element_index)
-    assert normalized["people"]["person-01"]["voice_id"] is None
-
-
-def test_normalizer_degrades_fourth_unique_voice_in_stable_person_order() -> None:
-    four_people = _index(
-        people=("person-01", "person-02", "person-03", "person-04"),
-        entities=(),
-    )
-    _schema, digest = object_replace_schema(_payload(four_people), VOICE_IDS)
-    value = _output(four_people, digest)
-    assert MAX_REFERENCE_AUDIO == 3
-    normalized = _normalize(value, digest=digest, element_index=four_people)
-
-    assert [
-        normalized["people"][stable_id]["voice_id"]
-        for stable_id in four_people["people"]
-    ] == ["voice-a", "voice-b", "voice-c", None]
 
 
 def test_merge_safely_copies_without_semantic_review() -> None:
     element_index = _index()
     element_index["relations"]["relation-01"]["object_key"] = "unresolved"
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
+    _schema, digest = object_replace_schema(_payload(element_index), VOICE_TYPES)
     value = _output(element_index, digest)
     value["people"]["person-01"] = {
         "matches_user_request": False,
         "replacement": _replacement("generated_variant", "person-01"),
-        "voice_id": None,
     }
     value["entities"]["entity-01"] = {
         "matches_user_request": True,
@@ -1307,15 +1270,10 @@ def test_merge_safely_copies_without_semantic_review() -> None:
 
     original_snapshot = copy.deepcopy(element_index)
     patch_snapshot = copy.deepcopy(normalized)
-    voice_metadata = {
-        "voice-b": {"file": "voices/b.wav", "features": {"gender": "male"}},
-    }
-    metadata_snapshot = copy.deepcopy(voice_metadata)
-    merged = merge_object_replace_index(element_index, normalized, voice_metadata)
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
 
     assert element_index == original_snapshot
     assert normalized == patch_snapshot
-    assert voice_metadata == metadata_snapshot
     assert merged is not element_index
     assert merged["relations"] == element_index["relations"]
     assert merged["dialogue_voices"] == []
@@ -1325,9 +1283,9 @@ def test_merge_safely_copies_without_semantic_review() -> None:
         "target_visual_description": "person-01",
         "appearance_description": "isolated new appearance",
     }
-    assert merged["people"]["person-01"]["voice"] is None
-    assert merged["people"]["person-02"]["voice"] == voice_metadata["voice-b"]
-    assert merged["people"]["person-02"]["voice"] is not voice_metadata["voice-b"]
+    assert all(
+        "voice" not in record for record in merged["people"].values()
+    )
     assert merged["entities"]["entity-01"]["replacement"] == {
         "reason": "user_requested",
         "source": "image_1",
@@ -1338,26 +1296,7 @@ def test_merge_safely_copies_without_semantic_review() -> None:
         for stable_id, merged_record in merged[category].items():
             facts = copy.deepcopy(merged_record)
             facts.pop("replacement")
-            if category == "people":
-                facts.pop("voice")
             assert facts == element_index[category][stable_id]
-
-
-def test_merge_degrades_missing_backend_voice_metadata_to_no_voice() -> None:
-    element_index = _index()
-    _schema, digest = object_replace_schema(_payload(element_index), VOICE_IDS)
-    normalized = _normalize(
-        _output(element_index, digest),
-        digest=digest,
-        element_index=element_index,
-    )
-    merged = merge_object_replace_index(element_index, normalized, {})
-    assert all(person["voice"] is None for person in merged["people"].values())
-
-    for person in normalized["people"].values():
-        person["voice_id"] = None
-    merged = merge_object_replace_index(element_index, normalized, {})
-    assert all(person["voice"] is None for person in merged["people"].values())
 
 
 def _dialogue_payload(element_index: dict[str, Any]) -> dict[str, Any]:
@@ -1389,23 +1328,21 @@ def _dialogue_output(
 def test_schema_locks_dialogue_voices_to_the_translated_lines() -> None:
     element_index = _index()
     schema, _digest = object_replace_schema(
-        _dialogue_payload(element_index), VOICE_IDS,
+        _dialogue_payload(element_index), VOICE_TYPES,
     )
 
     dialogue_voices_schema = schema["properties"]["dialogue_voices"]
     assert dialogue_voices_schema["minItems"] == 2
     assert dialogue_voices_schema["maxItems"] == 2
-    assert dialogue_voices_schema["items"]["enum"] == [
-        "person-01", "person-02", None,
-    ]
+    assert dialogue_voices_schema["items"]["enum"] == [*VOICE_TYPES, None]
 
 
-def test_dialogue_voices_attribute_each_line_to_a_person_or_narration() -> None:
+def test_dialogue_voices_bind_each_line_to_a_catalog_voice_type() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(
-        _dialogue_payload(element_index), VOICE_IDS,
+        _dialogue_payload(element_index), VOICE_TYPES,
     )
-    value = _dialogue_output(element_index, digest, ["person-02", None])
+    value = _dialogue_output(element_index, digest, [VOICE_TYPES[1], None])
 
     normalized = _normalize(
         value,
@@ -1415,21 +1352,21 @@ def test_dialogue_voices_attribute_each_line_to_a_person_or_narration() -> None:
         instruction="",
         dialogue_line_count=2,
     )
-    merged = merge_object_replace_index(element_index, normalized, {})
+    merged = merge_object_replace_index(element_index, normalized, VOICE_TYPES)
 
-    assert normalized["dialogue_voices"] == ["person-02", None]
-    assert merged["dialogue_voices"] == ["person-02", None]
+    assert normalized["dialogue_voices"] == [VOICE_TYPES[1], None]
+    assert merged["dialogue_voices"] == [VOICE_TYPES[1], None]
 
 
 @pytest.mark.parametrize(
     "dialogue_voices",
     [
-        ["person-02"],
-        ["person-02", None, None],
-        "person-02",
-        ["person-02", "entity-01"],
-        ["person-02", "unknown-person"],
-        ["person-02", 1],
+        [VOICE_TYPES[1]],
+        [VOICE_TYPES[1], None, None],
+        VOICE_TYPES[1],
+        [VOICE_TYPES[1], "zh_female_vv_uranus_bigtts"],
+        [VOICE_TYPES[1], "unknown-voice"],
+        [VOICE_TYPES[1], 1],
     ],
 )
 def test_normalizer_rejects_invalid_dialogue_voices(
@@ -1437,7 +1374,7 @@ def test_normalizer_rejects_invalid_dialogue_voices(
 ) -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(
-        _dialogue_payload(element_index), VOICE_IDS,
+        _dialogue_payload(element_index), VOICE_TYPES,
     )
     value = _dialogue_output(element_index, digest, dialogue_voices)
 
@@ -1452,20 +1389,20 @@ def test_normalizer_rejects_invalid_dialogue_voices(
         )
 
 
-def test_merge_rejects_dialogue_voices_outside_the_people_index() -> None:
+def test_merge_rejects_dialogue_voices_outside_the_catalog() -> None:
     element_index = _index()
     _schema, digest = object_replace_schema(
-        _dialogue_payload(element_index), VOICE_IDS,
+        _dialogue_payload(element_index), VOICE_TYPES,
     )
     normalized = _normalize(
-        _dialogue_output(element_index, digest, ["person-01", None]),
+        _dialogue_output(element_index, digest, [VOICE_TYPES[0], None]),
         digest=digest,
         element_index=element_index,
         has_user_image=False,
         instruction="",
         dialogue_line_count=2,
     )
-    normalized["dialogue_voices"] = ["person-01", "entity-01"]
+    normalized["dialogue_voices"] = [VOICE_TYPES[0], "entity-01"]
 
     with pytest.raises(ValueError, match="dialogue voices"):
-        merge_object_replace_index(element_index, normalized, {})
+        merge_object_replace_index(element_index, normalized, VOICE_TYPES)
