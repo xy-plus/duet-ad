@@ -228,7 +228,7 @@ def _pipeline(tmp_path: Path, retention: str) -> tuple[Pipeline, ProjectStore]:
         mediakit=object(),
         picsart=object(),
         seedream=object(),
-        autodl=object(),
+        tts=object(),
     )
     return pipeline, store
 

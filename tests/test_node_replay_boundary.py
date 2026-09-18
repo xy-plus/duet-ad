@@ -2,11 +2,11 @@
 
 The dfe64795 project failed with ``dialogue TTS requires a voice reference``:
 its Object Replace output deliberately left every person voiceless while four
-translated dialogue lines waited for TTS.  The current pipeline materializes a
-deterministic catalog fallback voice instead — both on fresh runs and when a
-pre-fallback project resumes from its frozen sheet checkpoint.  These tests
-replay that exact upstream state (harvested from the project's state
-snapshot, no mocks).
+translated dialogue lines waited for TTS.  The voice-file requirement is gone
+entirely now — Doubao TTS picks a voice_type by dialogue language (plus the
+catalog voice's gender when a person has one), and the catalog fallback voice
+is still materialized for the frozen H3-side state.  These tests replay that
+exact upstream state (harvested from the project's state snapshot, no mocks).
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from app.doubao_tts import _KNOWN_VOICE_TYPES, doubao_tts_voice_type
 from app.object_replace_schema import OBJECT_REPLACE_OUTPUT_VERSION
 from app.pipeline import Pipeline
 from app.research_log import ResearchLog
@@ -80,10 +81,8 @@ def test_voiceless_object_replace_falls_back_to_default_voice(
     assert references[0]["asset_path"] == "work/voice-references/audio-01.wav"
 
     # Replay _run_dialogue_audio's voice resolution over the real lines:
-    # every line must resolve to a voice instead of raising
-    # "dialogue TTS requires a voice reference".
-    valid_voices = {path.resolve() for path in paths}
-    default_voice = paths[0].resolve()
+    # every line resolves to a Doubao voice_type from the dialogue language
+    # (voiceless people carry no gender, so the language default applies).
     people = enhanced["people"]
     dialogue_voices = enhanced["dialogue_voices"]
     assert len(dialogue_voices) == len(translated)
@@ -91,15 +90,14 @@ def test_voiceless_object_replace_falls_back_to_default_voice(
         assert line["text"].strip()
         record = people.get(speaker) if isinstance(speaker, str) else None
         voice = record.get("voice") if isinstance(record, dict) else None
-        asset_path = voice.get("asset_path") if isinstance(voice, dict) else None
-        resolved = None
-        if isinstance(asset_path, str):
-            candidate = (project / asset_path).resolve()
-            if candidate in valid_voices:
-                resolved = candidate
-        if resolved is None:
-            resolved = default_voice
-        assert resolved is not None and resolved.is_file()
+        voice_id = voice.get("voice_id") if isinstance(voice, dict) else None
+        gender = None
+        if isinstance(voice_id, str):
+            features = pipeline_instance.voice_library.voice(voice_id)["features"]
+            value = str(features.get("gender") or "").strip().lower()
+            gender = value if value in {"male", "female"} else None
+        voice_type = doubao_tts_voice_type(target_language, gender)
+        assert voice_type in _KNOWN_VOICE_TYPES
 
 
 def test_pre_picsart_resume_backfills_voice_for_the_boundary_snapshot(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +12,15 @@ import pytest
 
 from app import providers
 from app.config import Settings
+from app.doubao_tts import (
+    DOUBAO_TTS_RESOURCE_ID,
+    DOUBAO_TTS_SAMPLE_RATE,
+    DoubaoTtsClient,
+    doubao_tts_language_key,
+    doubao_tts_voice_type,
+)
 from app.fusion_schema import FUSION_OUTPUT_NAME, fusion_prompt_schema
 from app.providers import (
-    AutodlClient,
     CodexClient,
     DeepSeekClient,
     MediaKitClient,
@@ -1089,220 +1097,6 @@ def test_picsart_poll_preserves_workflow_failed_422_exchange(
     assert caught.value.record["polls"][-1]["response"]["body"] == body
 
 
-def _autodl_client(
-    tmp_path: Path, handler: Any, **overrides: object
-) -> AutodlClient:
-    return AutodlClient(
-        _settings(
-            tmp_path,
-            autodl_api_key="autodl-secret",
-            autodl_api_base="https://autodl.test",
-            **overrides,
-        ),
-        httpx.MockTransport(handler),
-    )
-
-
-def test_autodl_poll_waits_for_success_and_returns_artifact_url(
-    tmp_path: Path,
-) -> None:
-    statuses = iter(["QUEUED", "RUNNING", "SUCCESS"])
-    poll_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal poll_count
-        poll_count += 1
-        assert request.method == "GET"
-        assert request.url == httpx.URL(
-            "https://autodl.test/api/v1/comfyui/comfyui_workflow/result/task-1"
-        )
-        assert request.headers["authorization"] == "autodl-secret"
-        status = next(statuses)
-        results: list[dict[str, str]] = []
-        if status == "SUCCESS":
-            results = [{"url": "https://cdn.test/output/task-1.mp4"}]
-        return httpx.Response(
-            200,
-            json={"code": "Success", "data": {"status": status, "results": results}},
-        )
-
-    result = _autodl_client(tmp_path, handler).poll("task-1")
-
-    assert result.value == "https://cdn.test/output/task-1.mp4"
-    assert poll_count == 3
-    assert len(result.record["polls"]) == 3
-
-
-def test_autodl_poll_accepts_dict_results_and_prefers_mp4(
-    tmp_path: Path,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "code": "Success",
-                "data": {
-                    "status": "SUCCESS",
-                    "results": {
-                        "preview": {"url": "https://cdn.test/preview.png"},
-                        "video": {"url": "https://cdn.test/output.mp4"},
-                    },
-                },
-            },
-        )
-
-    assert _autodl_client(tmp_path, handler).poll("task-1").value == (
-        "https://cdn.test/output.mp4"
-    )
-
-
-@pytest.mark.parametrize(
-    ("payload", "message"),
-    [
-        (
-            {"code": "Success", "data": {"status": "FAILED", "msg": "boom"}},
-            "AutoDL task failed",
-        ),
-        (
-            {"code": "Success", "data": {"status": "SUCCESS", "results": []}},
-            "no artifact URL",
-        ),
-        (
-            {"code": "Failed", "msg": "unknown task"},
-            "data must be an object",
-        ),
-    ],
-)
-def test_autodl_poll_failures_fail_closed(
-    tmp_path: Path, payload: dict[str, Any], message: str
-) -> None:
-    client = _autodl_client(
-        tmp_path, lambda request: httpx.Response(200, json=payload)
-    )
-
-    with pytest.raises(ProviderFailure, match=message):
-        client.poll("task-1")
-
-
-def test_autodl_poll_times_out(tmp_path: Path) -> None:
-    client = _autodl_client(
-        tmp_path,
-        lambda request: httpx.Response(
-            200, json={"code": "Success", "data": {"status": "RUNNING"}}
-        ),
-        provider_poll_timeout_s=0.0,
-    )
-
-    with pytest.raises(ProviderFailure, match="timed out"):
-        client.poll("task-1")
-
-
-def test_autodl_download_writes_artifact(tmp_path: Path) -> None:
-    destination = tmp_path / "nested" / "line-0001.wav"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url == httpx.URL("https://cdn.test/output.mp4")
-        return httpx.Response(200, content=b"tts-audio")
-
-    result = _autodl_client(tmp_path, handler).download(
-        "https://cdn.test/output.mp4", destination,
-    )
-
-    assert result.value == destination
-    assert destination.read_bytes() == b"tts-audio"
-    assert result.evidence_media == [destination]
-
-
-def _autodl_voice(tmp_path: Path) -> Path:
-    voice = tmp_path / "audio-01.wav"
-    voice.write_bytes(b"RIFF" + b"voice-bytes")
-    return voice
-
-
-def test_autodl_submit_tts_uses_tts_workflow_and_exact_body(
-    tmp_path: Path,
-) -> None:
-    voice = _autodl_voice(tmp_path)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
-        assert request.url == httpx.URL(
-            "https://autodl.test/api/v1/comfyui/comfyui_workflow/indextts2-v1"
-        )
-        assert request.headers["authorization"] == "autodl-secret"
-        body = json.loads(request.content)
-        assert set(body) == {"prompt_text", "prompt_simple", "emo_control_method"}
-        assert body["prompt_text"] == "第一句台词"
-        assert body["prompt_simple"].startswith("data:audio/wav;base64,")
-        assert body["emo_control_method"] == "与音色参考音频相同"
-        return httpx.Response(
-            200, json={"code": "Success", "data": {"task_id": "tts-task-1"}}
-        )
-
-    result = _autodl_client(tmp_path, handler).submit_tts(
-        text="第一句台词", voice_path=voice,
-    )
-
-    assert result.value == "tts-task-1"
-    assert result.record["outcome"] == "accepted"
-    assert result.record["task_id"] == "tts-task-1"
-
-
-@pytest.mark.parametrize(
-    ("text", "voice_name", "message"),
-    [
-        ("", "audio-01.wav", "TTS text is invalid"),
-        ("   ", "audio-01.wav", "TTS text is invalid"),
-        ("x" * 2049, "audio-01.wav", "TTS text is invalid"),
-        ("台词", "audio-01.mp3", "voice input file is invalid"),
-        ("台词", "missing.wav", "voice input file is invalid"),
-    ],
-)
-def test_autodl_submit_tts_validates_inputs(
-    tmp_path: Path, text: str, voice_name: str, message: str
-) -> None:
-    voice = _autodl_voice(tmp_path).with_name(voice_name)
-    if voice.name != "missing.wav":
-        voice.write_bytes(b"voice-bytes")
-    client = _autodl_client(
-        tmp_path, lambda request: pytest.fail("no request allowed")
-    )
-
-    with pytest.raises(ValueError, match=message):
-        client.submit_tts(text=text, voice_path=voice)
-
-
-def test_autodl_submit_tts_rejection_fails_closed(tmp_path: Path) -> None:
-    voice = _autodl_voice(tmp_path)
-    client = _autodl_client(
-        tmp_path,
-        lambda request: httpx.Response(
-            200, json={"code": "Failed", "msg": "bad params"}
-        ),
-    )
-
-    with pytest.raises(ProviderFailure):
-        client.submit_tts(text="台词", voice_path=voice)
-
-
-def test_autodl_poll_returns_wav_artifact_url(tmp_path: Path) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "code": "Success",
-                "data": {
-                    "status": "SUCCESS",
-                    "results": [{"url": "https://cdn.test/output/line-0001.wav"}],
-                },
-            },
-        )
-
-    assert _autodl_client(tmp_path, handler).poll("tts-task-1").value == (
-        "https://cdn.test/output/line-0001.wav"
-    )
-
-
 def test_mediakit_video_subtitle_erase_pro_uses_v5_and_exact_body(
     tmp_path: Path,
 ) -> None:
@@ -1566,8 +1360,6 @@ def test_connect_failure_uses_long_backoff_then_raises(
 
 def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
     calls = 0
-    voice = tmp_path / "audio-01.wav"
-    voice.write_bytes(b"voice-bytes")
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
@@ -1575,14 +1367,23 @@ def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
         if calls <= 2:
             return httpx.Response(503, json={"error": "upstream unavailable"})
         return httpx.Response(
-            200, json={"code": "Success", "data": {"task_id": "task-1"}}
+            200,
+            json={
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": '{"ok": true}'}],
+                }],
+            },
         )
 
-    client = _autodl_client(tmp_path, handler)
-    result = client.submit_tts(text="台词", voice_path=voice)
+    result = DeepSeekClient(
+        _settings(tmp_path), httpx.MockTransport(handler)
+    ).complete_structured("instruction", {"input": 1}, {"type": "object"})
 
-    assert result.value == "task-1"
-    assert result.record["outcome"] == "accepted"
+    assert result.value == {"ok": True}
     assert calls == 3
     attempts = result.record["attempts"]
     assert [entry["attempt"] for entry in attempts] == [1, 2, 3]
@@ -1717,165 +1518,260 @@ def _legacy_mediakit_image_erase_retry_test(tmp_path: Path) -> None:
     assert initialize["attempts"][0]["error"]["type"] == "ConnectError"
 
 
-def test_picsart_submit_retries_connect_error_then_succeeds(tmp_path: Path) -> None:
-    calls = 0
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise httpx.ConnectError("ssl eof", request=request)
-        return httpx.Response(200, json={"response": {"id": "task-after-retry"}})
 
-    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
-    result = client.submit(
-        prompt="prompt",
-        video_url="https://assets.test/source.mp4",
-        image_urls=None,
-        duration=5,
-        resolution="768p",
-        aspect_ratio="16:9",
+# ------------------------------------------------------------- doubao TTS 2.0
+
+
+def _doubao_client(
+    tmp_path: Path, handler: Any, **overrides: object
+) -> DoubaoTtsClient:
+    return DoubaoTtsClient(
+        _settings(tmp_path, volc_voice_api_key="volc-voice-secret", **overrides),
+        httpx.MockTransport(handler),
     )
 
-    assert result.value == "task-after-retry"
-    assert result.record["outcome"] == "accepted"
-    assert calls == 2
-    attempts = result.record["attempts"]
-    assert [entry["attempt"] for entry in attempts] == [1, 2]
-    assert attempts[0]["error"]["type"] == "ConnectError"
-    assert attempts[0]["response"] is None
-    assert attempts[1]["response"]["status_code"] == 200
+
+def _doubao_stream(*events: dict[str, Any]) -> bytes:
+    return "".join(json.dumps(event) + "\n" for event in events).encode()
 
 
-def test_deepseek_retries_remote_protocol_error_then_succeeds(tmp_path: Path) -> None:
-    calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise httpx.RemoteProtocolError("eof mid-stream", request=request)
-        return httpx.Response(
-            200,
-            json={
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": '{"ok": true}'}],
-                }],
-            },
-        )
-
-    result = DeepSeekClient(
-        _settings(tmp_path), httpx.MockTransport(handler)
-    ).complete_structured("instruction", {"input": 1}, {"type": "object"})
-
-    assert result.value == {"ok": True}
-    assert calls == 2
-    attempts = result.record["attempts"]
-    assert [entry["attempt"] for entry in attempts] == [1, 2]
-    assert attempts[0]["error"]["type"] == "RemoteProtocolError"
+def _doubao_audio_chunk(payload: bytes) -> dict[str, Any]:
+    return {
+        "code": 0,
+        "message": "",
+        "data": base64.b64encode(payload).decode("ascii"),
+    }
 
 
-def test_connect_failure_uses_long_backoff_then_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = 0
-    sleeps: list[float] = []
-    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        raise httpx.ConnectError("unreachable", request=request)
-
-    client = DeepSeekClient(_settings(tmp_path), httpx.MockTransport(handler))
-    with pytest.raises(ProviderFailure, match="unreachable") as caught:
-        client.complete_structured("instruction", {"input": 1}, {"type": "object"})
-
-    assert calls == 6
-    assert sleeps == list(providers.CONNECTION_RETRY_BACKOFF_S)
-    assert caught.value.record["response"] is None
-    attempts = caught.value.record["attempts"]
-    assert [entry["attempt"] for entry in attempts] == [1, 2, 3, 4, 5, 6]
-    assert [entry["error"]["type"] for entry in attempts] == ["ConnectError"] * 6
-
-
-def test_gateway_statuses_are_retried_then_succeed(tmp_path: Path) -> None:
-    calls = 0
-    voice = tmp_path / "audio-01.wav"
-    voice.write_bytes(b"voice-bytes")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls <= 2:
-            return httpx.Response(503, json={"error": "upstream unavailable"})
-        return httpx.Response(
-            200, json={"code": "Success", "data": {"task_id": "task-1"}}
-        )
-
-    client = _autodl_client(tmp_path, handler)
-    result = client.submit_tts(text="台词", voice_path=voice)
-
-    assert result.value == "task-1"
-    assert result.record["outcome"] == "accepted"
-    assert calls == 3
-    attempts = result.record["attempts"]
-    assert [entry["attempt"] for entry in attempts] == [1, 2, 3]
-    assert [entry["response"]["status_code"] for entry in attempts] == [503, 503, 200]
-
-
-def test_gateway_status_exhaustion_keeps_picsart_outcome_unknown(
+def test_doubao_synthesize_posts_exact_request_and_writes_wav(
     tmp_path: Path,
 ) -> None:
-    calls = 0
+    pcm = b"\x01\x00\x02\x00" + b"\x03\x00\x04\x00"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(502, json={"error": "bad gateway"})
-
-    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
-    with pytest.raises(ProviderFailure) as caught:
-        client.submit(
-            prompt="prompt",
-            video_url="https://assets.test/source.mp4",
-            image_urls=None,
-            duration=5,
-            resolution="768p",
-            aspect_ratio="16:9",
+        assert request.method == "POST"
+        assert request.url == httpx.URL(
+            "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+        )
+        assert request.headers["x-api-key"] == "volc-voice-secret"
+        assert request.headers["x-api-resource-id"] == DOUBAO_TTS_RESOURCE_ID
+        assert request.headers["x-api-request-id"]
+        body = json.loads(request.content)
+        assert body == {
+            "user": {"uid": "duet-dialogue-tts"},
+            "req_params": {
+                "text": "สวัสดี",
+                "speaker": "th_female_bv568_neutral_uranus_bigtts",
+                "audio_params": {
+                    "format": "pcm",
+                    "sample_rate": DOUBAO_TTS_SAMPLE_RATE,
+                },
+            },
+        }
+        return httpx.Response(
+            200,
+            content=_doubao_stream(
+                _doubao_audio_chunk(pcm[:4]),
+                {"code": 0, "message": "", "data": None, "sentence": {}},
+                _doubao_audio_chunk(pcm[4:]),
+                {
+                    "code": 20000000,
+                    "message": "ok",
+                    "data": None,
+                    "usage": {"text_words": 3},
+                },
+            ),
         )
 
-    assert calls == 3
-    assert caught.value.record["outcome"] == "unknown"
-    assert [
-        entry["response"]["status_code"]
-        for entry in caught.value.record["attempts"]
-    ] == [502, 502, 502]
+    destination = tmp_path / "nested" / "line-0001.wav"
+    result = _doubao_client(tmp_path, handler).synthesize(
+        text="สวัสดี",
+        voice_type="th_female_bv568_neutral_uranus_bigtts",
+        destination=destination,
+    )
+
+    assert result.value == destination
+    assert result.evidence_media == [destination]
+    with wave.open(str(destination), "rb") as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getsampwidth() == 2
+        assert handle.getframerate() == DOUBAO_TTS_SAMPLE_RATE
+        assert handle.readframes(handle.getnframes()) == pcm
+    assert result.record["outcome"] == "synthesized"
+    assert result.record["response"]["audio_chunks"] == 2
+    assert result.record["response"]["pcm_bytes"] == len(pcm)
+    assert result.record["usage"] == {"text_words": 3}
 
 
-def test_client_errors_are_not_retried(tmp_path: Path) -> None:
-    calls = 0
+def test_doubao_synthesize_requires_api_key(tmp_path: Path) -> None:
+    client = DoubaoTtsClient(
+        _settings(tmp_path),
+        httpx.MockTransport(lambda request: pytest.fail("no request allowed")),
+    )
 
+    with pytest.raises(ValueError, match="VOLC_VOICE_API_KEY"):
+        client.synthesize(
+            text="台词",
+            voice_type="zh_female_vv_uranus_bigtts",
+            destination=tmp_path / "line.wav",
+        )
+
+
+@pytest.mark.parametrize(
+    ("text", "voice_type", "message"),
+    [
+        ("", "zh_female_vv_uranus_bigtts", "TTS text is invalid"),
+        ("   ", "zh_female_vv_uranus_bigtts", "TTS text is invalid"),
+        ("x" * 1025, "zh_female_vv_uranus_bigtts", "TTS text is invalid"),
+        ("台词", "BV001_streaming", "voice_type is unknown"),
+    ],
+)
+def test_doubao_synthesize_validates_inputs(
+    tmp_path: Path, text: str, voice_type: str, message: str
+) -> None:
+    client = _doubao_client(
+        tmp_path, lambda request: pytest.fail("no request allowed")
+    )
+
+    with pytest.raises(ValueError, match=message):
+        client.synthesize(
+            text=text, voice_type=voice_type, destination=tmp_path / "line.wav"
+        )
+
+
+def test_doubao_synthesize_stream_error_code_fails_closed(
+    tmp_path: Path,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(422, json={"error": "invalid prompt"})
-
-    client = PicsartClient(_settings(tmp_path), httpx.MockTransport(handler))
-    with pytest.raises(ProviderFailure) as caught:
-        client.submit(
-            prompt="prompt",
-            video_url="https://assets.test/source.mp4",
-            image_urls=None,
-            duration=5,
-            resolution="768p",
-            aspect_ratio="16:9",
+        return httpx.Response(
+            200,
+            content=_doubao_stream(
+                _doubao_audio_chunk(b"\x01\x00"),
+                {
+                    "code": 45000000,
+                    "message": "speaker permission denied",
+                    "data": None,
+                },
+            ),
         )
 
-    assert calls == 1
-    assert caught.value.record["outcome"] == "rejected"
-    assert "attempts" not in caught.value.record
+    client = _doubao_client(tmp_path, handler)
+    with pytest.raises(ProviderFailure, match="45000000") as caught:
+        client.synthesize(
+            text="台词",
+            voice_type="zh_female_vv_uranus_bigtts",
+            destination=tmp_path / "line.wav",
+        )
+
+    assert caught.value.record["response"]["status_code"] == 200
+    assert not (tmp_path / "line.wav").exists()
+
+
+def test_doubao_synthesize_http_error_fails_closed(tmp_path: Path) -> None:
+    client = _doubao_client(
+        tmp_path,
+        lambda request: httpx.Response(500, json={"error": "server"}),
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        client.synthesize(
+            text="台词",
+            voice_type="zh_female_vv_uranus_bigtts",
+            destination=tmp_path / "line.wav",
+        )
+
+    assert caught.value.record["response"]["status_code"] == 500
+
+
+def test_doubao_synthesize_timeout_fails_closed(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    client = _doubao_client(tmp_path, handler)
+    with pytest.raises(ProviderFailure, match="slow"):
+        client.synthesize(
+            text="台词",
+            voice_type="zh_female_vv_uranus_bigtts",
+            destination=tmp_path / "line.wav",
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (_doubao_stream(_doubao_audio_chunk(b"\x01\x00")), "finish event"),
+        (
+            _doubao_stream({"code": 20000000, "message": "ok", "data": None}),
+            "no valid PCM audio",
+        ),
+        (b"not-json\n", "not valid JSON"),
+        (
+            _doubao_stream(
+                {"code": 0, "message": "", "data": "!!not-base64!!"},
+                {"code": 20000000, "message": "ok", "data": None},
+            ),
+            "audio chunk is invalid",
+        ),
+    ],
+)
+def test_doubao_synthesize_bad_stream_fails_closed(
+    tmp_path: Path, payload: bytes, message: str
+) -> None:
+    client = _doubao_client(
+        tmp_path, lambda request: httpx.Response(200, content=payload)
+    )
+
+    with pytest.raises(ProviderFailure, match=message):
+        client.synthesize(
+            text="台词",
+            voice_type="zh_female_vv_uranus_bigtts",
+            destination=tmp_path / "line.wav",
+        )
+
+
+@pytest.mark.parametrize(
+    ("label", "key"),
+    [
+        ("中文", "zh"),
+        ("英语", "en"),
+        ("泰语", "th"),
+        ("Thai", "th"),
+        ("th", "th"),
+        ("日语", "ja"),
+        ("韩语", "ko"),
+        ("西班牙语", "es"),
+        ("法语", "fr"),
+        ("德语", "de"),
+        ("俄语", "ru"),
+        ("葡萄牙语", "pt"),
+        ("印尼语", "id"),
+        ("马来语", "ms"),
+        ("越南语", "vi"),
+        ("菲律宾语", "tl"),
+        ("阿拉伯语", "ar"),
+        ("意大利语", "it"),
+        ("克林贡语", "zh"),
+        ("", "zh"),
+    ],
+)
+def test_doubao_language_key_normalizes_labels(label: str, key: str) -> None:
+    assert doubao_tts_language_key(label) == key
+
+
+@pytest.mark.parametrize(
+    ("label", "gender", "voice_type"),
+    [
+        ("泰语", None, "th_female_bv568_neutral_uranus_bigtts"),
+        ("泰语", "male", "th_female_bv568_neutral_uranus_bigtts"),
+        ("英语", "female", "en_female_jane_uranus_bigtts"),
+        ("英语", "male", "en_male_alex_uranus_bigtts"),
+        ("英语", None, "en_female_jane_uranus_bigtts"),
+        ("马来语", "female", "ms_male_ham_uranus_bigtts"),
+        ("未知语言", "female", "zh_female_vv_uranus_bigtts"),
+    ],
+)
+def test_doubao_voice_type_by_language_and_gender(
+    label: str, gender: str | None, voice_type: str
+) -> None:
+    assert doubao_tts_voice_type(label, gender) == voice_type

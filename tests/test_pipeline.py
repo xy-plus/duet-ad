@@ -18,6 +18,7 @@ from app import media
 from app import object_detect
 from app import object_mask
 from app.config import SEEDREAM_API_BASE, SEEDREAM_PRO_MODEL, Settings
+from app.doubao_tts import doubao_tts_voice_type
 from app.fusion_schema import AUTHORITY_BEGIN, AUTHORITY_END, FUSION_OUTPUT_NAME
 from app.object_replace_schema import (
     OBJECT_REPLACE_OUTPUT_NAME,
@@ -708,28 +709,21 @@ class _FlowDeepSeek:
         )
 
 
-class _FlowAutodlTTS:
+class _FlowDoubaoTTS:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.tts_calls: list[dict[str, Any]] = []
 
-    def submit_tts(self, *, text: str, voice_path: Path) -> ProviderResult[str]:
+    def synthesize(
+        self, *, text: str, voice_type: str, destination: Path
+    ) -> ProviderResult[Path]:
         with self.lock:
-            task_id = f"tts-task-{len(self.tts_calls) + 1}"
-            self.tts_calls.append({"text": text, "voice_path": voice_path})
-        return ProviderResult(
-            task_id, {"outcome": "accepted", "task_id": task_id},
-        )
-
-    def poll(self, task_id: str) -> ProviderResult[str]:
-        return ProviderResult(
-            f"https://result.invalid/{task_id}.wav", {"task_id": task_id},
-        )
-
-    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+            self.tts_calls.append({"text": text, "voice_type": voice_type})
         destination.write_bytes(b"tts-audio")
         return ProviderResult(
-            destination, {"request": {"url": url}}, [destination],
+            destination,
+            {"outcome": "synthesized", "voice_type": voice_type},
+            [destination],
         )
 
 
@@ -1016,7 +1010,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
     picsart = _FlowPicsart()
     mediakit = _FlowMediaKit()
     seedream = _FlowSeedream(deepseek.events)
-    autodl = _FlowAutodlTTS()
+    tts = _FlowDoubaoTTS()
     registered: list[Path] = []
 
     def register(_project_id: str, path: Path) -> str:
@@ -1031,7 +1025,7 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         mediakit=mediakit,
         picsart=picsart,
         seedream=seedream,
-        autodl=autodl,
+        tts=tts,
     )
 
     pipeline.run(project_id)
@@ -1345,10 +1339,11 @@ def test_full_pipeline_uses_clean_structured_index_barrier_and_split_poll_retry(
         for reference in state["voice_references"]
     )
     # The only translated line is attributed to person-01 and synthesized
-    # with that person's Audio 1 voice.
-    assert [call["text"] for call in autodl.tts_calls] == ["translated line"]
-    assert [call["voice_path"].name for call in autodl.tts_calls] == [
-        "audio-01.wav",
+    # with the Japanese male Doubao voice（目标语言日语，Audio 1 的音色库
+    # 条目是男声）.
+    assert [call["text"] for call in tts.tts_calls] == ["translated line"]
+    assert [call["voice_type"] for call in tts.tts_calls] == [
+        doubao_tts_voice_type("日语", "male"),
     ]
     full_track = project / "work" / "dialogue-audio" / "full-track.wav"
     assert full_track.is_file()
@@ -4010,10 +4005,9 @@ def test_pre_picsart_resume_backfills_default_voice_for_voiceless_frozen_plan(
     pipeline.resume_pre_picsart(project_id)
 
     assert len(downstream) == 1
-    voice_paths = downstream[0][4]
     fallback = pipeline.voice_library.voices[0]
-    assert [path.name for path in voice_paths] == ["audio-01.wav"]
-    assert voice_paths[0].is_file()
+    materialized = project / "work" / "voice-references" / "audio-01.wav"
+    assert materialized.is_file()
     state = store.read(project_id)
     assert [
         reference["voice_id"] for reference in state["voice_references"]
@@ -4073,9 +4067,7 @@ def test_pre_picsart_resume_backfills_default_voice_for_voiceless_frozen_plan(
     pipeline.validate_pre_picsart_resume(project_id)
     pipeline.resume_pre_picsart(project_id)
     assert len(downstream) == 2
-    assert [path.resolve() for path in downstream[1][4]] == [
-        path.resolve() for path in voice_paths
-    ]
+    assert materialized.is_file()
     assert [
         event
         for event in _trace_events(project)
@@ -4109,7 +4101,6 @@ def test_pre_picsart_resume_without_dialogue_keeps_the_empty_voice_list(
     pipeline.resume_pre_picsart(project_id)
 
     assert len(downstream) == 1
-    assert downstream[0][4] == []
     state = store.read(project_id)
     assert state["voice_references"] == []
     assert "voice_reference_fallback" not in state["object_replace"]
@@ -5839,8 +5830,8 @@ def _prepare_h3_person_fixture(
 def _dialogue_audio_fixture(
     tmp_path: Path,
     monkeypatch: Any,
-    autodl: Any,
-) -> tuple[ProjectStore, str, Path, Pipeline, list[dict[str, Any]], dict[str, Any], list[Path]]:
+    tts: Any,
+) -> tuple[ProjectStore, str, Path, Pipeline, list[dict[str, Any]], dict[str, Any]]:
     store = ProjectStore(tmp_path / "projects")
     project_id, project, _state = store.create(
         _effective_request(), "dialogue-audio",
@@ -5853,14 +5844,8 @@ def _dialogue_audio_fixture(
         ],
     )
     library = load_voice_library()
-    voice_directory = project / "work" / "voice-references"
-    voice_directory.mkdir(parents=True)
-    voice_paths: list[Path] = []
     people: dict[str, Any] = {}
     for slot, voice in enumerate(library.voices[:2], 1):
-        destination = voice_directory / f"audio-{slot:02d}.wav"
-        destination.write_bytes(library.files[voice["voice_id"]].read_bytes())
-        voice_paths.append(destination)
         people[f"person-{slot:02d}"] = {
             "voice": {
                 "audio_reference": f"Audio {slot}",
@@ -5875,7 +5860,7 @@ def _dialogue_audio_fixture(
         "entities": {},
         "scenes": {},
         "relations": {},
-        "dialogue_voices": ["person-02", None],
+        "dialogue_voices": ["person-01", None],
     }
     prepared = [
         {
@@ -5926,26 +5911,26 @@ def _dialogue_audio_fixture(
         deepseek=object(),
         mediakit=object(),
         picsart=object(),
-        autodl=autodl,
+        tts=tts,
     )
-    return store, project_id, project, pipeline, prepared, enhanced_index, voice_paths
+    return store, project_id, project, pipeline, prepared, enhanced_index
 
 
-def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
+def test_dialogue_tts_synthesizes_each_line_with_a_doubao_voice(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    autodl = _FlowAutodlTTS()
+    tts = _FlowDoubaoTTS()
     (
         _store, project_id, project, pipeline,
-        prepared, enhanced_index, voice_paths,
-    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+        prepared, enhanced_index,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, tts)
 
     full_track = pipeline._run_dialogue_audio(
         project_id,
         project,
         prepared,
         enhanced_index,
-        voice_paths,
+        "英语",
         ResearchLog(project),
     )
 
@@ -5953,12 +5938,11 @@ def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
         project / "work" / "dialogue-audio" / "full-track.wav"
     )
     assert full_track.is_file()
-    # person-02's line uses Audio 2; the unattributed line falls back to
-    # Audio 1.
-    assert [call["text"] for call in autodl.tts_calls] == ["第一句", "第二句"]
-    assert [call["voice_path"] for call in autodl.tts_calls] == [
-        voice_paths[1].resolve(),
-        voice_paths[0].resolve(),
+    # person-01 的音色库条目是男声，其台词用英语男声；无归属台词落默认女声。
+    assert [call["text"] for call in tts.tts_calls] == ["第一句", "第二句"]
+    assert [call["voice_type"] for call in tts.tts_calls] == [
+        doubao_tts_voice_type("英语", "male"),
+        doubao_tts_voice_type("英语"),
     ]
     for offset in (1, 2):
         assert (
@@ -5970,7 +5954,7 @@ def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
             / "attempt-1" / "output.json"
         ).read_text(encoding="utf-8")
     )
-    assert output["provider_record"]["submit"]["outcome"] == "accepted"
+    assert output["provider_record"]["outcome"] == "synthesized"
     for index in (1, 2):
         assert (
             project / "work" / "segments" / f"{index:04d}" / "dialogue-track.wav"
@@ -5980,11 +5964,11 @@ def test_dialogue_tts_synthesizes_each_line_with_the_attributed_voice(
 def test_dialogue_tts_clamps_microsecond_asr_tail_past_video_timeline(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    autodl = _FlowAutodlTTS()
+    tts = _FlowDoubaoTTS()
     (
         store, project_id, project, pipeline,
-        _prepared, enhanced_index, voice_paths,
-    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+        _prepared, enhanced_index,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, tts)
     store.update(
         project_id,
         translated_voice_lines=[{
@@ -6016,22 +6000,22 @@ def test_dialogue_tts_clamps_microsecond_asr_tail_past_video_timeline(
     monkeypatch.setattr(media, "assemble_dialogue_track", assemble)
 
     pipeline._run_dialogue_audio(
-        project_id, project, prepared, enhanced_index, voice_paths,
+        project_id, project, prepared, enhanced_index, "中文",
         ResearchLog(project),
     )
 
-    assert [call["text"] for call in autodl.tts_calls] == ["尾句"]
+    assert [call["text"] for call in tts.tts_calls] == ["尾句"]
     assert observed["lines"][0]["end_s"] == 23.166666
 
 
 def test_dialogue_tts_drops_line_wholly_past_video_timeline(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    autodl = _FlowAutodlTTS()
+    tts = _FlowDoubaoTTS()
     (
         store, project_id, project, pipeline,
-        _prepared, enhanced_index, voice_paths,
-    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+        _prepared, enhanced_index,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, tts)
     store.update(
         project_id,
         translated_voice_lines=[{
@@ -6050,35 +6034,35 @@ def test_dialogue_tts_drops_line_wholly_past_video_timeline(
     }]
 
     assert pipeline._run_dialogue_audio(
-        project_id, project, prepared, enhanced_index, voice_paths,
+        project_id, project, prepared, enhanced_index, "中文",
         ResearchLog(project),
     ) is None
-    assert autodl.tts_calls == []
+    assert tts.tts_calls == []
 
 
 def test_dialogue_tts_moderation_rejection_retries_until_success(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    class FlakyAutodl(_FlowAutodlTTS):
+    class FlakyDoubaoTTS(_FlowDoubaoTTS):
         def __init__(self) -> None:
             super().__init__()
             self.calls = 0
 
-        def submit_tts(self, **kwargs: Any) -> ProviderResult[str]:
+        def synthesize(self, **kwargs: Any) -> ProviderResult[Path]:
             self.calls += 1
             if self.calls <= 4:
                 raise ProviderFailure(
                     {"error": "content policy violation"},
                     [],
-                    RuntimeError("autodl tts content policy rejection"),
+                    RuntimeError("doubao tts content policy rejection"),
                 )
-            return super().submit_tts(**kwargs)
+            return super().synthesize(**kwargs)
 
-    autodl = FlakyAutodl()
+    tts = FlakyDoubaoTTS()
     (
         _store, project_id, project, pipeline,
-        prepared, enhanced_index, voice_paths,
-    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, autodl)
+        prepared, enhanced_index,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, tts)
     delays: list[float] = []
     monkeypatch.setattr(pipeline, "_retry_sleep", delays.append)
 
@@ -6087,36 +6071,17 @@ def test_dialogue_tts_moderation_rejection_retries_until_success(
         project,
         prepared,
         enhanced_index,
-        voice_paths,
+        "中文",
         ResearchLog(project),
     )
 
     # Moderation rejections retry with backoff instead of failing closed.
     # Two dialogue lines: the first burns four failures plus its success,
     # the second succeeds on its first attempt.
-    assert autodl.calls == 6
+    assert tts.calls == 6
     # Retries 2-3 rerun immediately; attempts 3 and 4 back off 60s and 120s.
     assert delays == [60.0, 120.0]
     assert (project / "work" / "dialogue-audio" / "full-track.wav").is_file()
-
-
-def test_dialogue_tts_without_any_voice_reference_fails_closed(
-    tmp_path: Path, monkeypatch: Any,
-) -> None:
-    (
-        _store, project_id, project, pipeline,
-        prepared, enhanced_index, _voice_paths,
-    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, _FlowAutodlTTS())
-
-    with pytest.raises(ValueError, match="voice reference"):
-        pipeline._run_dialogue_audio(
-            project_id,
-            project,
-            prepared,
-            enhanced_index,
-            [],
-            ResearchLog(project),
-        )
 
 
 class _ObjectReplaceOnlyDeepSeek:
@@ -6186,7 +6151,7 @@ def _object_replace_fixture(
         deepseek=deepseek,
         mediakit=object(),
         picsart=object(),
-        autodl=_FlowAutodlTTS(),
+        tts=_FlowDoubaoTTS(),
     )
     return store, project_id, project, pipeline, request, ResearchLog(project)
 
@@ -6304,16 +6269,17 @@ def test_object_replace_voiceless_people_fall_back_to_default_voice(
         project,
         [dict(item) for item in _OBJECT_REPLACE_PREPARED],
         enhanced_index,
-        paths,
+        request["dialogue"]["target_language"],
         log,
     )
     assert full_track == (
         project / "work" / "dialogue-audio" / "full-track.wav"
     )
     assert full_track.is_file()
+    # 无人认领音色归属：台词落到该语言的默认豆包音色（person-01 无 voice）。
     assert [
-        call["voice_path"] for call in pipeline.autodl.tts_calls
-    ] == [paths[0].resolve()]
+        call["voice_type"] for call in pipeline.tts.tts_calls
+    ] == [doubao_tts_voice_type("中文")]
 
 
 def test_object_replace_with_assigned_voice_never_falls_back(
@@ -6381,8 +6347,8 @@ def test_no_dialogue_skips_the_whole_tts_chain(
 ) -> None:
     (
         store, project_id, project, pipeline,
-        prepared, enhanced_index, voice_paths,
-    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, _FlowAutodlTTS())
+        prepared, enhanced_index,
+    ) = _dialogue_audio_fixture(tmp_path, monkeypatch, _FlowDoubaoTTS())
     store.update(project_id, translated_voice_lines=[])
     monkeypatch.setattr(
         media,
@@ -6397,7 +6363,7 @@ def test_no_dialogue_skips_the_whole_tts_chain(
         project,
         [{**item, "dialogue": []} for item in prepared],
         enhanced_index,
-        voice_paths,
+        "中文",
         ResearchLog(project),
     ) is None
 
@@ -7022,7 +6988,7 @@ def _run_h3_with_picsart(
         mediakit=_FlowMediaKit(),
         picsart=picsart,
         seedream=_FlowSeedream(deepseek.events),
-        autodl=_FlowAutodlTTS(),
+        tts=_FlowDoubaoTTS(),
     )
     pipeline.run(project_id)
     return store, project_id, project
@@ -8917,7 +8883,7 @@ def test_multiview_product_uses_one_frozen_composite_through_all_providers(
     pipeline = Pipeline(_settings(tmp_path),store,
                         lambda _pid,path: f"https://assets.invalid/{path.name}",
                         deepseek=deepseek,picsart=picsart,seedream=seedream,
-                        mediakit=_FlowMediaKit(),autodl=_FlowAutodlTTS())
+                        mediakit=_FlowMediaKit(),tts=_FlowDoubaoTTS())
     monkeypatch.setattr(pipeline, "_retry_sleep", lambda _delay: (_ for _ in ()).throw(AssertionError("unexpected repeated node failure")))
     pipeline.run(project_id)
     state = store.read(project_id)

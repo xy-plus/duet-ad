@@ -76,7 +76,6 @@ NODES = [
     "object-replace",
     "h3-max-r2v-prompt",
     "seedream-reference-submit",
-    "dialogue-tts-line",
 ]
 
 # Model weights resolve from canonical host paths at replay time.

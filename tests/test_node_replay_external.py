@@ -2,9 +2,9 @@
 
 DeepSeek nodes call the live API with the harvested payload (vision nodes
 attach the harvested frame images) and assert the answer passes the same
-validator/normalizer the pipeline applies.  ``seedream-reference-submit`` and
-``dialogue-tts-line`` are paid calls and marked ``live_provider`` (disable
-with ``NODE_REPLAY_LIVE=0``); see docs/node-replay-tests.md for costs.
+validator/normalizer the pipeline applies.  ``seedream-reference-submit`` is
+a paid call and marked ``live_provider`` (disable with
+``NODE_REPLAY_LIVE=0``); see docs/node-replay-tests.md for costs.
 """
 
 from __future__ import annotations
@@ -358,35 +358,3 @@ def test_seedream_reference_submit(
         np.frombuffer(output.read_bytes(), np.uint8), cv2.IMREAD_COLOR
     )
     assert decoded is not None and decoded.size > 0
-
-
-# ------------------------------------------------------------ dialogue-tts-line
-
-
-@pytest.mark.live_provider
-@pytest.mark.parametrize(
-    "fixture",
-    _params("dialogue-tts-line"),
-    ids=_ids(_params("dialogue-tts-line")),
-)
-def test_dialogue_tts_line(
-    fixture: Fixture, autodl_client, tmp_path: Path,
-) -> None:
-    from app import media
-
-    payload = fixture.input
-    voice = fixture.media[0]
-    assert voice.suffix == ".wav"
-    submitted = autodl_client.submit_tts(text=payload["text"], voice_path=voice)
-    polled = autodl_client.poll(submitted.value)
-    destination = tmp_path / "line.wav"
-    autodl_client.download(polled.value, destination)
-    assert destination.is_file() and destination.stat().st_size > 0
-    probe = media.run_command(
-        [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "json", str(destination),
-        ],
-        timeout=60,
-    )
-    assert float(json.loads(probe["stdout"])["format"]["duration"]) > 0.2

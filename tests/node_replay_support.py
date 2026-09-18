@@ -45,7 +45,6 @@ REQUIRED_NODES = [
     "object-replace",
     "h3-max-r2v-prompt",
     "seedream-reference-submit",
-    "dialogue-tts-line",
 ]
 
 BOUNDARY_PROJECT = "dfe6479538184759ba6cc953a0bda138"  # TTS 缺音色失败单

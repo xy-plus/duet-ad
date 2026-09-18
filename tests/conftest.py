@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from app.config import Settings  # noqa: E402
 from app.pipeline import Pipeline  # noqa: E402
-from app.providers import AutodlClient, DeepSeekClient  # noqa: E402
+from app.providers import DeepSeekClient  # noqa: E402
 from app.seedream import SeedreamClient  # noqa: E402
 from app.store import ProjectStore  # noqa: E402
 
@@ -63,7 +63,7 @@ def _live_enabled() -> bool:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "live_provider: real paid provider call (Seedream image, AutoDL TTS);"
+        "live_provider: real paid provider call (Seedream image);"
         " disable with NODE_REPLAY_LIVE=0",
     )
 
@@ -90,8 +90,6 @@ def replay_settings() -> Settings:
         enable_mediakit=False,
         provider_poll_interval_s=2.0,
         deepseek_api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-        autodl_api_key=os.environ.get("AUTODL_ART_TOKEN")
-        or os.environ.get("AUTODL_TOKEN", ""),
         seedream_api_key=os.environ.get("ARK_API_KEY", ""),
         store_lock_enabled=False,
     )
@@ -109,13 +107,6 @@ def seedream_client(replay_settings: Settings) -> SeedreamClient:
     if not replay_settings.seedream_api_key:
         pytest.skip("ARK_API_KEY is not set (seedream credential missing)")
     return SeedreamClient(replay_settings)
-
-
-@pytest.fixture(scope="session")
-def autodl_client(replay_settings: Settings) -> AutodlClient:
-    if not replay_settings.autodl_api_key:
-        pytest.skip("AUTODL_ART_TOKEN is not set (AutoDL credential missing)")
-    return AutodlClient(replay_settings)
 
 
 @pytest.fixture(scope="session")

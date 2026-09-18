@@ -16,7 +16,7 @@ from app.pipeline import (
 )
 from app.store import ProjectStore
 from test_pipeline import (
-    _FlowAutodlTTS,
+    _FlowDoubaoTTS,
     _FlowDeepSeek,
     _FlowMediaKit,
     _FlowPicsart,
@@ -266,7 +266,7 @@ def test_pipeline_multi_reference_inputs_are_frozen_and_r2v_resume_reuses_them(
         mediakit=_FlowMediaKit(),
         picsart=picsart,
         seedream=seedream,
-        autodl=_FlowAutodlTTS(),
+        tts=_FlowDoubaoTTS(),
     )
 
     pipeline.run(project_id)
@@ -390,7 +390,7 @@ def test_all_uploaded_references_reach_h3_when_no_key_binds_them(
         mediakit=_FlowMediaKit(),
         picsart=picsart,
         seedream=seedream,
-        autodl=_FlowAutodlTTS(),
+        tts=_FlowDoubaoTTS(),
     )
 
     pipeline.run(project_id)

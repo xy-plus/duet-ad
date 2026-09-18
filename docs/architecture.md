@@ -21,7 +21,7 @@
 8. 后端从 raw stable index 确定性生成 `replacement_set`：`people/entities/scenes` 分别包含本类全部 stable key 并排序；同时生成仅移除这三类记录顶层 `preserve/replaceable` 的模型规划视图，relations 和其他事实不变。
 9. 一次项目级 DeepSeek Object Replace v4：读取规划视图、`replacement_set`、全部逐段视觉提示、目标语言与项目级翻译台词、可选用户图及说明，以及当前音色目录；输出绑定 stable key 的 replacement/voice patch，每个非空 replacement 分离 `appearance_description` 与 `target_visual_description`，并逐行输出 `dialogue_voices` 台词说话人归属（人物 stable key 或 null=旁白）。
 10. 后端深拷贝完整 raw index 并机械合并 patch；对可用的 `voice_id` 按稳定顺序映射 `Audio N`，生成项目级增强索引（含独立 `dialogue_voices` 块）和同序的 0–3 条冻结音频。有台词但没有任何人物分配到音色时（模型对无脸人物谨慎留白），后端从音色库兜底一条默认音色（优先匹配目标语言，其次目录第一条）作为 `Audio 1`，记 `voice_reference_default_fallback` 日志事件并落 `state.object_replace.voice_reference_fallback`，不再因此失败。
-11. 逐行台词 TTS：AutoDL `indextts2-v1` 按归属人物的音色克隆合成每行台词（null 归属回退 Audio 1），拼成整条静音底轨音轨（超窗 atempo 压进、欠窗留停顿），并切出每段 `dialogue-track.wav`；任一环节失败项目 fail-closed。无台词项目跳过整条音频链。
+11. 逐行台词 TTS：豆包语音合成 2.0（`app/doubao_tts.py`，火山 openspeech V3 HTTP 单向接口）按目标语言选 voice_type 合成每行台词（归属人物的音色库条目提供性别，据此选男/女声；无归属用该语言默认音色），拼成整条静音底轨音轨（超窗 atempo 压进、欠窗留停顿），并切出每段 `dialogue-track.wav`；任一环节失败项目 fail-closed。无台词项目跳过整条音频链。
 12. 后端以冻结 enhanced index 为唯一身份锚点，把所有实际非空 replacement 确定性映射为 `stable key -> TILE_XX -> row/column`，生成 sheet bundle v4/spec v2 并从 `appearance_description` 编译隔离式提示词；Seedream 每项目调用一次，以空白布局为 Image 1、可选规范化用户图为 Image 2，生成一张 2048×2048 新形象图版，不生成或发送源帧证据。
 
 只有上述公共输入完成并能传给下游，才启动逐段 R2V 准备。所有片段先并行完成 Fusion、最终提示词和静音 Video 1；随后完成有序参考图、素材 URL 注册和 Picsart 硬参数预检，才允许发出 Picsart POST。这些屏障只防止缺文件、供应商参数不合法和半批次付费，不判断模型内容质量。

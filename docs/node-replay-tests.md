@@ -6,7 +6,7 @@ download/trim）之外的所有节点。**全部通过才发起 E2E。**
 所有输入都是老项目对应节点真实出现过的输入（`data/projects/<id>/logs/
 <node>/<scope>/attempt-N/input.json` + `input-media/`），没有 mock 数据；
 测试调用管线里该节点对应的真实函数（`app.media` /
-`app.replacement_sheet` / DeepSeek / Seedream / AutoDL 客户端），不是重发
+`app.replacement_sheet` / DeepSeek / Seedream 客户端），不是重发
 整个 pipeline。
 
 ## 1. 采集 fixtures
@@ -44,7 +44,7 @@ cd /home/xy/duet-ad1-h3-max-r2v-release
 - 凭证：`tests/conftest.py` 自动加载 `~/.config/duet-ad1/service.env`、
   `~/.config/claude/deepseek.env` 和主树 `.env`（与 deploy 脚本同源），
   不打印任何值。缺 DeepSeek 凭证时对应测试 skip。
-- **付费节点**：`seedream-reference-submit` 和 `dialogue-tts-line` 标记为
+- **付费节点**：`seedream-reference-submit` 标记为
   `live_provider`，默认开启（这是真实验证的要求）。关闭：
   `NODE_REPLAY_LIVE=0 python -m pytest ...`。
 
@@ -54,7 +54,9 @@ cd /home/xy/duet-ad1-h3-max-r2v-release
 | --- | --- | --- |
 | DeepSeek（video-maker/索引/object-replace/fusion/翻译/台词生成） | ~50 次（含约 20 次带 9 图的视觉调用） | 数元（flash 视觉模型） |
 | Seedream 参考图版 | 5 张 2048×2048 | 约 1–2 元 |
-| AutoDL IndexTTS | 4 行 | 角级 |
+
+配音 TTS 已切换到豆包语音合成 2.0（app/doubao_tts.py），AutoDL 节点与
+fixtures 已随切换移除；如需回放 dialogue-tts-line，按新 client 重新采集。
 
 ## 3. 判定标准
 

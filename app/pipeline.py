@@ -40,7 +40,6 @@ from app.replacement_sheet import (
     validate_replacement_sheet_spec,
 )
 from app.providers import (
-    AutodlClient,
     CodexClient,
     CodexProcessError,
     DeepSeekClient,
@@ -49,6 +48,7 @@ from app.providers import (
     ProviderFailure,
     ProviderResult,
 )
+from app.doubao_tts import DoubaoTtsClient, doubao_tts_voice_type
 from app.seedream import (
     SEEDREAM_OUTPUT_HEIGHT,
     SEEDREAM_OUTPUT_SIZE,
@@ -399,7 +399,7 @@ class Pipeline:
         mediakit: MediaKitClient | None = None,
         seedream: SeedreamClient | None = None,
         picsart: PicsartClient | None = None,
-        autodl: AutodlClient | None = None,
+        tts: DoubaoTtsClient | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -409,7 +409,7 @@ class Pipeline:
         self.mediakit = mediakit or MediaKitClient(settings)
         self.seedream = seedream or SeedreamClient(settings)
         self.picsart = picsart or PicsartClient(settings)
-        self.autodl = autodl or AutodlClient(settings)
+        self.tts = tts or DoubaoTtsClient(settings)
         self.voice_library: VoiceLibrary = load_voice_library()
         # ProjectStore.update() is atomic, but a receipt ledger change is a
         # read-modify-write operation assembled here.  Serialize that whole
@@ -1446,7 +1446,7 @@ class Pipeline:
         project: Path,
         prepared: list[dict[str, Any]],
         enhanced_element_index: dict[str, Any],
-        voice_reference_paths: list[Path],
+        target_language: str,
         log: ResearchLog,
     ) -> Path | None:
         """Synthesize every dialogue line and assemble the full speech track."""
@@ -1475,13 +1475,10 @@ class Pipeline:
             )
         if not isinstance(people, dict):
             people = {}
-        valid_voices = {
-            path.resolve(strict=True) for path in voice_reference_paths
-        }
-        default_voice = (
-            voice_reference_paths[0].resolve(strict=True)
-            if voice_reference_paths
-            else None
+        # 豆包 TTS 按语言选 voice_type；“与原视频相同”在这里解析成具体语言
+        # 标签（台词文本的文字证据），解析不出时回落中文音色。
+        language_label = _dialogue_language_display(
+            target_language, translated_lines,
         )
         directory = project / "work" / "dialogue-audio"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1511,41 +1508,31 @@ class Pipeline:
             if start_s >= end_s:
                 # A row wholly beyond the video has no audible placement.
                 continue
-            voice_path: Path | None = None
+            # 人物间不再区分音色；仅沿用 Object Replace 为人物分配音色时
+            # 留下的性别信息（音色库 voice_id 的 features.gender）选男/女声。
+            gender: str | None = None
             record = people.get(speaker) if isinstance(speaker, str) else None
             voice = record.get("voice") if isinstance(record, dict) else None
-            asset_path = (
-                voice.get("asset_path") if isinstance(voice, dict) else None
-            )
-            if isinstance(asset_path, str):
-                candidate = (project / asset_path).resolve()
-                if candidate in valid_voices:
-                    voice_path = candidate
-            if voice_path is None:
-                # Unattributed lines (narration) and voiceless people fall
-                # back to the Audio 1 voice.
-                voice_path = default_voice
-            if voice_path is None:
-                # Defensive: fresh runs always materialize at least the
-                # catalog fallback voice in _run_object_replace.
-                raise ValueError("dialogue TTS requires a voice reference")
+            voice_id = voice.get("voice_id") if isinstance(voice, dict) else None
+            if isinstance(voice_id, str) and voice_id in self.voice_library.files:
+                features = self.voice_library.voice(voice_id).get("features")
+                value = (
+                    str(features.get("gender") or "").strip().lower()
+                    if isinstance(features, dict)
+                    else ""
+                )
+                if value in {"male", "female"}:
+                    gender = value
+            voice_type = doubao_tts_voice_type(language_label, gender)
             destination = directory / f"line-{offset:04d}.wav"
 
             def operation(
                 text: str = text,
-                voice_path: Path = voice_path,
+                voice_type: str = voice_type,
                 destination: Path = destination,
             ) -> ProviderResult[Path]:
-                submitted = self.autodl.submit_tts(
-                    text=text, voice_path=voice_path,
-                )
-                record: dict[str, Any] = {"submit": submitted.record}
-                polled = self.autodl.poll(submitted.value)
-                record["poll"] = polled.record
-                downloaded = self.autodl.download(polled.value, destination)
-                record["download"] = downloaded.record
-                return ProviderResult(
-                    destination, record, list(downloaded.evidence_media),
+                return self.tts.synthesize(
+                    text=text, voice_type=voice_type, destination=destination,
                 )
 
             self._node(
@@ -1558,10 +1545,11 @@ class Pipeline:
                     "start_s": start_s,
                     "end_s": end_s,
                     "speaker": speaker,
-                    "voice": voice_path,
+                    "language": language_label,
+                    "voice_type": voice_type,
                     "output": destination,
                 },
-                [voice_path],
+                [],
                 operation,
                 lambda value: [value],
             )
@@ -2643,7 +2631,6 @@ class Pipeline:
             project,
             prepared,
             enhanced_element_index,
-            voice_reference_paths,
             replacement,
             replacement_sheet,
             replacement_sheet_path,
@@ -2657,7 +2644,6 @@ class Pipeline:
         project: Path,
         prepared: list[dict[str, Any]],
         enhanced_element_index: dict[str, Any],
-        voice_reference_paths: list[Path],
         replacement: Path | None,
         replacement_sheet: dict[str, Any],
         replacement_sheet_path: Path | None,
@@ -2677,7 +2663,7 @@ class Pipeline:
             project,
             prepared,
             enhanced_element_index,
-            voice_reference_paths,
+            request["dialogue"]["target_language"],
             log,
         )
         self._progress(
@@ -3208,7 +3194,6 @@ class Pipeline:
                     project,
                     segments,
                     checkpoint["enhanced_element_index"],
-                    checkpoint["voice_reference_paths"],
                     replacement,
                     replacement_sheet,
                     replacement_sheet_path,

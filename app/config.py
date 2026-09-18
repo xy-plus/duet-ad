@@ -53,8 +53,10 @@ class Settings:
     picsart_api_base: str = "https://api.picsart.com"
     # 直连 Picsart 受 DNS 污染影响时可设代理；None = 直连。
     picsart_proxy: str | None = None
-    autodl_api_key: str = field(default="", repr=False)
-    autodl_api_base: str = "https://autodl.art"
+    # 豆包语音合成 2.0（火山引擎 openspeech V3，实现见 app/doubao_tts.py）：
+    # 新版控制台一把 API Key 走 X-Api-Key 鉴权，无 appid/cluster 配置；
+    # 未配置时首个 TTS 调用直接报错，不回落其他火山产品凭证。
+    volc_voice_api_key: str = field(default="", repr=False)
     seedream_api_key: str = field(default="", repr=False)
     seedream_api_base: str = SEEDREAM_API_BASE
     seedream_model: str = SEEDREAM_PRO_MODEL
@@ -117,6 +119,17 @@ class Settings:
         ):
             raise ValueError("ARK_API_KEY must be header-safe ASCII")
         object.__setattr__(self, "seedream_api_key", seedream_key)
+        voice_key = (
+            self.volc_voice_api_key.strip()
+            if isinstance(self.volc_voice_api_key, str)
+            else ""
+        )
+        if voice_key and (
+            not voice_key.isascii()
+            or any(not 0x21 <= ord(character) <= 0x7E for character in voice_key)
+        ):
+            raise ValueError("VOLC_VOICE_API_KEY must be header-safe ASCII")
+        object.__setattr__(self, "volc_voice_api_key", voice_key)
         seedream_base = (
             self.seedream_api_base.strip().rstrip("/")
             if isinstance(self.seedream_api_base, str)
@@ -371,11 +384,7 @@ def get_settings() -> Settings:
         picsart_api_key=os.environ.get("PICSART_API_KEY", ""),
         picsart_api_base=os.environ.get("PICSART_API_BASE", "https://api.picsart.com").rstrip("/"),
         picsart_proxy=os.environ.get("PICSART_PROXY", "").strip() or None,
-        autodl_api_key=(
-            os.environ.get("AUTODL_ART_TOKEN")
-            or os.environ.get("AUTODL_TOKEN", "")
-        ).strip(),
-        autodl_api_base=os.environ.get("AUTODL_API_BASE", "https://autodl.art").rstrip("/"),
+        volc_voice_api_key=os.environ.get("VOLC_VOICE_API_KEY", "").strip(),
         seedream_api_key=os.environ.get("ARK_API_KEY", "").strip(),
         seedream_api_base=os.environ.get(
             "SEEDREAM_API_BASE", SEEDREAM_API_BASE
