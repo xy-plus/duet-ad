@@ -35,9 +35,7 @@ def fixture(instruction="把包换成参考图中的物品", has_image=True):
     for stable_id in index["entities"]:
         output["entities"][stable_id] = {
             "matches_user_request": False,
-            "replacement": {"source": "generated_variant",
-                            "target_visual_description": "new object",
-                            "appearance_description": "isolated new object"},
+            "replacement": None,
         }
     kwargs = dict(input_sha256=digest, element_index=index, voice_ids=["voice-a"],
                   has_user_image=has_image, user_instruction=instruction,
@@ -47,8 +45,14 @@ def fixture(instruction="把包换成参考图中的物品", has_image=True):
 
 def bind(output, *keys):
     for key in keys:
-        output["entities"][key]["matches_user_request"] = True
-        output["entities"][key]["replacement"]["source"] = "image_1"
+        output["entities"][key] = {
+            "matches_user_request": True,
+            "replacement": {
+                "source": "image_1",
+                "target_visual_description": "new object",
+                "appearance_description": "isolated new object",
+            },
+        }
 
 
 @pytest.mark.parametrize("instruction", ["把所有包替换成参考图", "把包换成参考图中的物品"])
@@ -63,12 +67,12 @@ def test_multiple_existing_entities_share_image_without_merging_source_facts(ins
     for key in index["entities"]:
         record = merged["entities"][key]
         assert {k: v for k, v in record.items() if k != "replacement"} == index["entities"][key]
-    assert merged["entities"]["entity-03"]["replacement"]["source"] == "generated_variant"
+    assert merged["entities"]["entity-03"]["replacement"] is None
     assert Pipeline._enhanced_index_uses_user_image(merged)
     spec = build_replacement_sheet_spec(merged)
     assert {tile["stable_key"] for tile in spec["tiles"] if tile["source"] == "image_1"} == {
         "entity-01", "entity-02"}
-    assert len({tile["tile_id"] for tile in spec["tiles"]}) == 3
+    assert len({tile["tile_id"] for tile in spec["tiles"]}) == 2
 
 
 @pytest.mark.parametrize("has_image,instruction", [(False, "替换所有包"), (True, " \n ")])
@@ -105,7 +109,7 @@ def test_transport_schema_stays_closed_and_match_source_branches_stay_consistent
             )
             for branch in replacement_branches
         }
-        assert pairs == {(True, "image_1"), (False, "generated_variant")}
+        assert pairs == {(True, "image_1")}
         assert any(
             branch["properties"]["matches_user_request"]["enum"] == [False]
             and branch["properties"]["replacement"] == {"type": "null"}

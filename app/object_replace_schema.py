@@ -39,6 +39,8 @@ _REPLACEMENT_FIELDS = (
     "target_visual_description",
     "appearance_description",
 )
+# ``generated_variant`` remains for automatic people identity replacement and
+# normalizing frozen v4 receipts; current entities/scenes cannot select it.
 _REPLACEMENT_SOURCES = {"image_1", "generated_variant"}
 
 
@@ -183,12 +185,17 @@ def _replacement_schema(
     voice_ids: Sequence[str] | None = None,
     detect_label: bool = False,
     allow_null: bool = False,
+    force_null: bool = False,
+    allow_generated_variant: bool = False,
 ) -> dict[str, Any]:
-    replacement_sources = (
-        _REPLACEMENT_SOURCES
-        if allow_user_image_binding
-        else {"generated_variant"}
-    )
+    if force_null:
+        return _closed_object({
+            "matches_user_request": {"type": "boolean", "enum": [False]},
+            "replacement": {"type": "null"},
+        })
+    replacement_sources = {"image_1"} if allow_user_image_binding else set()
+    if allow_generated_variant:
+        replacement_sources.add("generated_variant")
     replacement = _replacement_object(
         sources=replacement_sources,
         reference_image_ids=(
@@ -219,6 +226,14 @@ def _replacement_schema(
                 {"type": "null"},
             ],
         }
+    if not allow_user_image_binding:
+        if allow_generated_variant:
+            return _closed_object(patch_properties)
+        return _closed_object({
+            **patch_properties,
+            "matches_user_request": {"type": "boolean", "enum": [False]},
+            "replacement": {"type": "null"},
+        })
     patch_schema = _closed_object(patch_properties)
     if allow_user_image_binding:
         image_patch_properties = copy.deepcopy(patch_properties)
@@ -232,20 +247,19 @@ def _replacement_schema(
             detect_label=detect_label,
         )
 
-        generated_patch_properties = copy.deepcopy(patch_properties)
-        generated_patch_properties["matches_user_request"] = {
-            "type": "boolean",
-            "enum": [False],
-        }
-        generated_patch_properties["replacement"] = _replacement_object(
-            sources={"generated_variant"},
-            reference_image_ids=reference_image_ids,
-            detect_label=detect_label,
-        )
-        patch_branches = [
-            _closed_object(image_patch_properties),
-            _closed_object(generated_patch_properties),
-        ]
+        patch_branches = [_closed_object(image_patch_properties)]
+        if allow_generated_variant:
+            generated_patch_properties = copy.deepcopy(patch_properties)
+            generated_patch_properties["matches_user_request"] = {
+                "type": "boolean",
+                "enum": [False],
+            }
+            generated_patch_properties["replacement"] = _replacement_object(
+                sources={"generated_variant"},
+                reference_image_ids=reference_image_ids,
+                detect_label=detect_label,
+            )
+            patch_branches.append(_closed_object(generated_patch_properties))
         if allow_null:
             keep_patch_properties = copy.deepcopy(patch_properties)
             keep_patch_properties["matches_user_request"] = {
@@ -289,7 +303,9 @@ def object_replace_schema(
                 # 只有 entities 会被派生成物体检测 target，detect_label 因此
                 # 只约束 entities；people/scenes 的封闭 schema 直接拒绝该字段。
                 detect_label=category == "entities",
-                allow_null=category == "entities",
+                allow_null=category != "people",
+                force_null=category == "scenes",
+                allow_generated_variant=category == "people",
             )
             properties[stable_id] = patch_schema
         category_schemas[category] = _closed_object(properties)
@@ -466,8 +482,24 @@ def normalize_object_replace(
                 require_detect_label=(
                     category == "entities" and require_entity_detect_labels
                 ),
-                allow_null=category == "entities",
+                allow_null=category != "people",
             )
+            # Current requests always pass reference_image_ids, including an
+            # empty list.  Frozen v4 receipts predate the KEEP-only scene and
+            # unrequested-entity policy, so retain their recoverability.
+            if reference_image_ids is not None and category == "scenes" and (
+                replacement is not None or matches_user_request
+            ):
+                raise ValueError("object-replace scenes must be kept")
+            if category == "entities" and reference_image_ids is not None:
+                if not matches_user_request and replacement is not None:
+                    raise ValueError("object-replace unmatched entity must be kept")
+                if matches_user_request and (
+                    replacement is None or replacement["source"] != "image_1"
+                ):
+                    raise ValueError(
+                        "object-replace matched entity must use user image"
+                    )
             if replacement is None:
                 if matches_user_request:
                     raise ValueError(
@@ -526,7 +558,7 @@ def merge_object_replace_index(
             matches_user_request = item["matches_user_request"]
             normalized_replacement = _normalize_replacement(
                 item["replacement"],
-                allow_null=category == "entities",
+                allow_null=category != "people",
             )
             if normalized_replacement is None:
                 if matches_user_request:
