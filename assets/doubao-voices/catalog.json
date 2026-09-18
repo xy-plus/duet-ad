@@ -1,0 +1,3955 @@
+{
+  "schema": "duet.doubao-voices",
+  "version": 1,
+  "source": {
+    "url": "https://www.volcengine.com/docs/6561/1257544",
+    "snapshot": "assets/doubao-voices/source-page.md",
+    "voice_type_suffix": "_uranus_bigtts"
+  },
+  "voices": [
+    {
+      "voice_type": "zh_female_vv_uranus_bigtts",
+      "name": "Vivi 2.0",
+      "languages": [
+        "zh",
+        "ja",
+        "id",
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": "方言：粤语、上海、河南、北京、天津、四川、陕西、东北"
+    },
+    {
+      "voice_type": "zh_female_xiaohe_uranus_bigtts",
+      "name": "小何 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": "方言：粤语、上海、河南、北京、天津、四川、陕西、东北"
+    },
+    {
+      "voice_type": "zh_male_m191_uranus_bigtts",
+      "name": "云舟 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": "方言：粤语、上海、河南、北京、天津、四川、陕西、东北"
+    },
+    {
+      "voice_type": "zh_male_taocheng_uranus_bigtts",
+      "name": "小天 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": "方言：粤语、上海、河南、北京、天津、四川、陕西、东北"
+    },
+    {
+      "voice_type": "zh_male_liufei_uranus_bigtts",
+      "name": "刘飞 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_sophie_uranus_bigtts",
+      "name": "魅力苏菲 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_qingxinnvsheng_uranus_bigtts",
+      "name": "清新女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_cancan_uranus_bigtts",
+      "name": "知性灿灿 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_sajiaoxuemei_uranus_bigtts",
+      "name": "撒娇学妹 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_tianmeixiaoyuan_uranus_bigtts",
+      "name": "甜美小源 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_tianmeitaozi_uranus_bigtts",
+      "name": "甜美桃子 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_shuangkuaisisi_uranus_bigtts",
+      "name": "爽快思思 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_peiqi_uranus_bigtts",
+      "name": "佩奇猪 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_linjianvhai_uranus_bigtts",
+      "name": "邻家女孩 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_shaonianzixin_uranus_bigtts",
+      "name": "少年梓辛 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_sunwukong_uranus_bigtts",
+      "name": "猴哥 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_yingyujiaoxue_uranus_bigtts",
+      "name": "Tina老师 2.0",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教育场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_kefunvsheng_uranus_bigtts",
+      "name": "暖阳女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "客服场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_xiaoxue_uranus_bigtts",
+      "name": "儿童绘本 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_dayi_uranus_bigtts",
+      "name": "大壹 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_mizai_uranus_bigtts",
+      "name": "黑猫侦探社咪仔 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_jitangnv_uranus_bigtts",
+      "name": "鸡汤女 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_meilinvyou_uranus_bigtts",
+      "name": "魅力女友 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_liuchangnv_uranus_bigtts",
+      "name": "流畅女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_ruyayichen_uranus_bigtts",
+      "name": "儒雅逸辰 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_tim_uranus_bigtts",
+      "name": "Tim",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "外语音色"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_dacey_uranus_bigtts",
+      "name": "Dacey",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "外语音色"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_stokie_uranus_bigtts",
+      "name": "Stokie",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "外语音色"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_wenroumama_uranus_bigtts",
+      "name": "温柔妈妈 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_jieshuoxiaoming_uranus_bigtts",
+      "name": "解说小明 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_tvbnv_uranus_bigtts",
+      "name": "TVB女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_yizhipiannan_uranus_bigtts",
+      "name": "译制片男 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_qiaopinv_uranus_bigtts",
+      "name": "俏皮女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_zhishuaiyingzi_uranus_bigtts",
+      "name": "直率英子 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_linjiananhai_uranus_bigtts",
+      "name": "邻家男孩 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_silang_uranus_bigtts",
+      "name": "四郎 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_ruyaqingnian_uranus_bigtts",
+      "name": "儒雅青年 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_qingcang_uranus_bigtts",
+      "name": "擎苍 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_xionger_uranus_bigtts",
+      "name": "熊二 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_yingtaowanzi_uranus_bigtts",
+      "name": "樱桃丸子 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_wennuanahu_uranus_bigtts",
+      "name": "温暖阿虎 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_naiqimengwa_uranus_bigtts",
+      "name": "奶气萌娃 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_popo_uranus_bigtts",
+      "name": "婆婆 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_gaolengyujie_uranus_bigtts",
+      "name": "高冷御姐 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_aojiaobazong_uranus_bigtts",
+      "name": "傲娇霸总 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_lanyinmianbao_uranus_bigtts",
+      "name": "懒音绵宝 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_fanjuanqingnian_uranus_bigtts",
+      "name": "反卷青年 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_wenroushunv_uranus_bigtts",
+      "name": "温柔淑女 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_gufengshaoyu_uranus_bigtts",
+      "name": "古风少御 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_huolixiaoge_uranus_bigtts",
+      "name": "活力小哥 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_baqiqingshu_uranus_bigtts",
+      "name": "霸气青叔 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_xuanyijieshuo_uranus_bigtts",
+      "name": "悬疑解说 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_mengyatou_uranus_bigtts",
+      "name": "萌丫头 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_tiexinnvsheng_uranus_bigtts",
+      "name": "贴心女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_jitangmei_uranus_bigtts",
+      "name": "鸡汤妹妹 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_cixingjieshuonan_uranus_bigtts",
+      "name": "磁性解说男声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_liangsangmengzai_uranus_bigtts",
+      "name": "亮嗓萌仔 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_kailangjiejie_uranus_bigtts",
+      "name": "开朗姐姐 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_gaolengchenwen_uranus_bigtts",
+      "name": "高冷沉稳 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_shenyeboke_uranus_bigtts",
+      "name": "深夜播客 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_lubanqihao_uranus_bigtts",
+      "name": "鲁班七号 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_jiaochuannv_uranus_bigtts",
+      "name": "娇喘女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_linxiao_uranus_bigtts",
+      "name": "林潇 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_lingling_uranus_bigtts",
+      "name": "玲玲姐姐 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_chunribu_uranus_bigtts",
+      "name": "春日部姐姐 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_tangseng_uranus_bigtts",
+      "name": "唐僧 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_zhuangzhou_uranus_bigtts",
+      "name": "庄周 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_kailangdidi_uranus_bigtts",
+      "name": "开朗弟弟 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_zhubajie_uranus_bigtts",
+      "name": "猪八戒 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_ganmaodianyin_uranus_bigtts",
+      "name": "感冒电音姐姐 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_chanmeinv_uranus_bigtts",
+      "name": "谄媚女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_nvleishen_uranus_bigtts",
+      "name": "女雷神 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_qinqienv_uranus_bigtts",
+      "name": "亲切女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_kuailexiaodong_uranus_bigtts",
+      "name": "快乐小东 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_kailangxuezhang_uranus_bigtts",
+      "name": "开朗学长 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_youyoujunzi_uranus_bigtts",
+      "name": "悠悠君子 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_wenjingmaomao_uranus_bigtts",
+      "name": "文静毛毛 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_zhixingnv_uranus_bigtts",
+      "name": "知性女声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_qingshuangnanda_uranus_bigtts",
+      "name": "清爽男大 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_yuanboxiaoshu_uranus_bigtts",
+      "name": "渊博小叔 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_yangguangqingnian_uranus_bigtts",
+      "name": "阳光青年 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_qingchezizi_uranus_bigtts",
+      "name": "清澈梓梓 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_tianmeiyueyue_uranus_bigtts",
+      "name": "甜美悦悦 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_xinlingjitang_uranus_bigtts",
+      "name": "心灵鸡汤 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_wenrouxiaoge_uranus_bigtts",
+      "name": "温柔小哥 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_roumeinvyou_uranus_bigtts",
+      "name": "柔美女友 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_dongfanghaoran_uranus_bigtts",
+      "name": "东方浩然 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_wenrouxiaoya_uranus_bigtts",
+      "name": "温柔小雅 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_tiancaitongsheng_uranus_bigtts",
+      "name": "天才童声 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_wuzetian_uranus_bigtts",
+      "name": "武则天 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_gujie_uranus_bigtts",
+      "name": "顾姐 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_male_guanggaojieshuo_uranus_bigtts",
+      "name": "广告解说 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "zh_female_shaoergushi_uranus_bigtts",
+      "name": "少儿故事 2.0",
+      "languages": [
+        "zh"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读"
+      ],
+      "capabilities": [
+        "指令遵循"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ar_female_dina_uranus_bigtts",
+      "name": "Dina",
+      "languages": [
+        "ar"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ar_female_fatma_uranus_bigtts",
+      "name": "Fatma",
+      "languages": [
+        "ar"
+      ],
+      "gender": "female",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ar_male_youssef_uranus_bigtts",
+      "name": "Youssef",
+      "languages": [
+        "ar"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "de_female_bv081_uranus_bigtts",
+      "name": "Stella",
+      "languages": [
+        "de"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "de_male_sven_uranus_bigtts",
+      "name": "Sven",
+      "languages": [
+        "de"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_male_adam-imitation_uranus_bigtts",
+      "name": "Rowan",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_alberto_uranus_bigtts",
+      "name": "Alberto",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_alex_uranus_bigtts",
+      "name": "Alex",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_allison_uranus_bigtts",
+      "name": "Allison",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_authoritative-british_uranus_bigtts",
+      "name": "Charlotte",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_authoritative-informative_uranus_bigtts",
+      "name": "Margaret",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_bill-jones_uranus_bigtts",
+      "name": "Jones",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_bill_jones_corey_uranus_bigtts",
+      "name": "Bill",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_male_brad_pitt_p1_uranus_bigtts",
+      "name": "Brad_Pitt",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_brittney_uranus_bigtts",
+      "name": "Brittney",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_brittney_pimintel_uranus_bigtts",
+      "name": "Zoe",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_male_bruce_uranus_bigtts",
+      "name": "Adrian",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_chandler_p1_uranus_bigtts",
+      "name": "Leo",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_cowboy-bob_uranus_bigtts",
+      "name": "Bob",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_cowboy_john_b_uranus_bigtts",
+      "name": "John",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_male_david_uranus_bigtts",
+      "name": "David",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_deep-voice_uranus_bigtts",
+      "name": "Orion",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_diyuwenrounan_uranus_bigtts",
+      "name": "Julian",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_evil-guy-oxley_uranus_bigtts",
+      "name": "Harrison",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_excited-male-voice_uranus_bigtts",
+      "name": "Jasper",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_father-christmas_uranus_bigtts",
+      "name": "Alfred",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_female_tutor_ms-jenny_uranus_bigtts",
+      "name": "Holly",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_fernando-martinez_uranus_bigtts",
+      "name": "Felix",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_godfather_uranus_bigtts",
+      "name": "Godfather",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_gollum_uranus_bigtts",
+      "name": "Gollum",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_hades_uranus_bigtts",
+      "name": "Beau",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_hayley_uranus_bigtts",
+      "name": "Hayley",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_jamie_uranus_bigtts",
+      "name": "Jamie",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_jane_uranus_bigtts",
+      "name": "Jane",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_jenny_uranus_bigtts",
+      "name": "Jenny",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_jidongchuanjiaoshi_uranus_bigtts",
+      "name": "Blaze",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_jimmy_uranus_bigtts",
+      "name": "Jimmy",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_joanne_uranus_bigtts",
+      "name": "Joanne",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_joker_uranus_bigtts",
+      "name": "Joker",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_josh_uranus_bigtts",
+      "name": "Josh",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_josh_coery_uranus_bigtts",
+      "name": "Josiah",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_male_kevin_uranus_bigtts",
+      "name": "Kevin",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_knightley_uranus_bigtts",
+      "name": "Knightley",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_lana_del_rey_kelley_d_p1_uranus_bigtts",
+      "name": "Lynn",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_lana_del_rey_parky_s_p1_uranus_bigtts",
+      "name": "Ivy",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_marcus_uranus_bigtts",
+      "name": "Marcus",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_mel_uranus_bigtts",
+      "name": "Mel",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_michael_uranus_bigtts",
+      "name": "Hank",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_michael-mouse_uranus_bigtts",
+      "name": "Chip",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_michael_kevin_uranus_bigtts",
+      "name": "Michael_Kevin",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_male_motivational-coach_uranus_bigtts",
+      "name": "Rory",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_myra_uranus_bigtts",
+      "name": "Myra",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_myra_cmb_uranus_bigtts",
+      "name": "Sunny",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_female_nadia_uranus_bigtts",
+      "name": "Blair",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_natasha_uranus_bigtts",
+      "name": "Natasha",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_female_pleasant-female_uranus_bigtts",
+      "name": "Elaine",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_rachel_p1_uranus_bigtts",
+      "name": "Rachel",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_ronald_uranus_bigtts",
+      "name": "Ronald",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_russell_uranus_bigtts",
+      "name": "Russell",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_scarlet_p1_uranus_bigtts",
+      "name": "Scarlet",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_sharron_uranus_bigtts",
+      "name": "Sharron",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_simba_p1_uranus_bigtts",
+      "name": "Simba",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_skye_uranus_bigtts",
+      "name": "Skye",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_tom_hiddleston_p1_uranus_bigtts",
+      "name": "Tom",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_valentino_uranus_bigtts",
+      "name": "Valentino",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_valentino_corey_uranus_bigtts",
+      "name": "Clark",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "en_female_wenrouzhishijieshuonv_uranus_bigtts",
+      "name": "Megan",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_xinwenjieshuonv_uranus_bigtts",
+      "name": "Kayla",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_male_yangguangjieshuonan_uranus_bigtts",
+      "name": "Dylan",
+      "languages": [
+        "en"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "en_female_zendaya_p1_uranus_bigtts",
+      "name": "Zendaya",
+      "languages": [
+        "en"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "es_female_bv084_uranus_bigtts",
+      "name": "Gracie",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "es_male_dani_uranus_bigtts",
+      "name": "Dani",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "es_male_guillem_uranus_bigtts",
+      "name": "Guillem",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "es_female_ht_mx_f6_uranus_bigtts",
+      "name": "Marisol",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "fr_female_fr_bv078_uranus_bigtts",
+      "name": "Simone",
+      "languages": [
+        "fr"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "fr_female_fr_f47_uranus_bigtts",
+      "name": "Camille",
+      "languages": [
+        "fr"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "fr_male_fr_m29_uranus_bigtts",
+      "name": "Maurice",
+      "languages": [
+        "fr"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "fr_male_usseau_uranus_bigtts",
+      "name": "Usseau",
+      "languages": [
+        "fr"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "id_male_bv160_uranus_bigtts",
+      "name": "Rocco",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_male_bv160dialogue_uranus_bigtts",
+      "name": "Jude",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_male_bv160narration_uranus_bigtts",
+      "name": "Hugo",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_female_bv161_uranus_bigtts",
+      "name": "Clara",
+      "languages": [
+        "id"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_female_bv161dialogue_uranus_bigtts",
+      "name": "Sylvia",
+      "languages": [
+        "id"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_female_bv161narration_uranus_bigtts",
+      "name": "Celeste",
+      "languages": [
+        "id"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_female_bv164_uranus_bigtts",
+      "name": "Crew",
+      "languages": [
+        "id"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_male_bv164dialogue_uranus_bigtts",
+      "name": "Elian",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_male_bv164narration_uranus_bigtts",
+      "name": "Ronan",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_female_f20_uranus_bigtts",
+      "name": "Chloe",
+      "languages": [
+        "id"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_male_han_uranus_bigtts",
+      "name": "Han",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_male_m08_uranus_bigtts",
+      "name": "Kyle",
+      "languages": [
+        "id"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "id_female_phulia_uranus_bigtts",
+      "name": "Phulia",
+      "languages": [
+        "id"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_female_bv024_uranus_bigtts",
+      "name": "Bonnie",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_female_bv520_uranus_bigtts",
+      "name": "Poppy",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_female_bv521_uranus_bigtts",
+      "name": "Aoi",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "趣味口音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_female_bv522_uranus_bigtts",
+      "name": "Hana",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_female_bv523_uranus_bigtts",
+      "name": "Lily",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "趣味口音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_male_bv524_uranus_bigtts",
+      "name": "Ken",
+      "languages": [
+        "ja"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ja_female_minimi_uranus_bigtts",
+      "name": "Minimi",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "ja_female_shirou_uranus_bigtts",
+      "name": "Shirou",
+      "languages": [
+        "ja"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ko_male_bv545_uranus_bigtts",
+      "name": "Jay",
+      "languages": [
+        "ko"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ko_female_bv546_uranus_bigtts",
+      "name": "Momo",
+      "languages": [
+        "ko"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ko_male_m03_uranus_bigtts",
+      "name": "Minho",
+      "languages": [
+        "ko"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ko_male_shane_uranus_bigtts",
+      "name": "Shane",
+      "languages": [
+        "ko"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "ms_male_ham_uranus_bigtts",
+      "name": "Ham",
+      "languages": [
+        "ms"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ms_male_naim_uranus_bigtts",
+      "name": "Naim",
+      "languages": [
+        "ms"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_female_bv065_uranus_bigtts",
+      "name": "Irene",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_male_bv165dialogue_uranus_bigtts",
+      "name": "Diego",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_male_bv165narrator_uranus_bigtts",
+      "name": "Marcos",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_female_bv166dialogue_uranus_bigtts",
+      "name": "Lucy",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_female_bv166emotion_uranus_bigtts",
+      "name": "Rosa",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_female_bv166narrator_uranus_bigtts",
+      "name": "Freya",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_male_felipe_uranus_bigtts",
+      "name": "Felipe",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "mx_male_ht_mx_m012_uranus_bigtts",
+      "name": "Derek",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_female_leslie_uranus_bigtts",
+      "name": "Leslie",
+      "languages": [
+        "es"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "mx_male_marcelo_uranus_bigtts",
+      "name": "Marcelo",
+      "languages": [
+        "es"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_male_bv172_uranus_bigtts",
+      "name": "Sam",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_male_bv172dialogue_uranus_bigtts",
+      "name": "Walter",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_male_bv172emotion_uranus_bigtts",
+      "name": "Vincent",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_male_bv172narrator_uranus_bigtts",
+      "name": "Miles",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "有声阅读",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_female_bv173_uranus_bigtts",
+      "name": "Diana",
+      "languages": [
+        "pt"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_female_bv173dialogue_uranus_bigtts",
+      "name": "Elena",
+      "languages": [
+        "pt"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_female_bv173emotion_uranus_bigtts",
+      "name": "Lola",
+      "languages": [
+        "pt"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_female_bv173narrator_uranus_bigtts",
+      "name": "Emma",
+      "languages": [
+        "pt"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_female_bv530_uranus_bigtts",
+      "name": "Sofia",
+      "languages": [
+        "pt"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_male_bv531_uranus_bigtts",
+      "name": "Arthur",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_female_mari_uranus_bigtts",
+      "name": "Mari",
+      "languages": [
+        "pt"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "pt_male_martins_uranus_bigtts",
+      "name": "Toby",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    },
+    {
+      "voice_type": "pt_male_rael_uranus_bigtts",
+      "name": "Rael",
+      "languages": [
+        "pt"
+      ],
+      "gender": "male",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ru_female_af07_uranus_bigtts",
+      "name": "Amelia",
+      "languages": [
+        "ru"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ru_female_irinae_uranus_bigtts",
+      "name": "Irinae",
+      "languages": [
+        "ru"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ru_male_pavel_uranus_bigtts",
+      "name": "Pavel",
+      "languages": [
+        "ru"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ru_female_sophie_uranus_bigtts",
+      "name": "Ksenia",
+      "languages": [
+        "ru"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "ru_male_vlad_uranus_bigtts",
+      "name": "Silas",
+      "languages": [
+        "ru"
+      ],
+      "gender": "male",
+      "scenes": [
+        "趣味口音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_angry_uranus_bigtts",
+      "name": "Valeria",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "教学场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_fear_uranus_bigtts",
+      "name": "Iris",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_happy_uranus_bigtts",
+      "name": "Zara",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_hate_uranus_bigtts",
+      "name": "Valentina",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_neutral_uranus_bigtts",
+      "name": "Mildred",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_sad_uranus_bigtts",
+      "name": "Lydia",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "th_female_bv568_suprise_uranus_bigtts",
+      "name": "Phoebe",
+      "languages": [
+        "th"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "tl_female_annika_uranus_bigtts",
+      "name": "Annika",
+      "languages": [
+        "tl"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "tl_male_ed_uranus_bigtts",
+      "name": "Ed",
+      "languages": [
+        "tl"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "tl_female_hervie_uranus_bigtts",
+      "name": "Hervie",
+      "languages": [
+        "tl"
+      ],
+      "gender": "female",
+      "scenes": [
+        "有声阅读",
+        "视频配音",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_female_hong_uranus_bigtts",
+      "name": "Hong",
+      "languages": [
+        "vi"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_female_ling_uranus_bigtts",
+      "name": "Ling",
+      "languages": [
+        "vi"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_female_linh_uranus_bigtts",
+      "name": "Linh",
+      "languages": [
+        "vi"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_female_partner_uranus_bigtts",
+      "name": "Partner",
+      "languages": [
+        "vi"
+      ],
+      "gender": "female",
+      "scenes": [
+        "视频配音",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_female_ruan_uranus_bigtts",
+      "name": "Ruan",
+      "languages": [
+        "vi"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "有声阅读",
+        "角色扮演",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_female_wu_uranus_bigtts",
+      "name": "Wu",
+      "languages": [
+        "vi"
+      ],
+      "gender": "female",
+      "scenes": [
+        "通用场景",
+        "视频配音",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "vi_male_wumg_uranus_bigtts",
+      "name": "Wumg",
+      "languages": [
+        "vi"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "客服场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "QA"
+      ],
+      "notes": ""
+    },
+    {
+      "voice_type": "it_male_enzo_uranus_bigtts",
+      "name": "Enzo",
+      "languages": [
+        "it"
+      ],
+      "gender": "male",
+      "scenes": [
+        "通用场景",
+        "教学场景",
+        "外语音色"
+      ],
+      "capabilities": [
+        "Context"
+      ],
+      "notes": "仅限单向流"
+    }
+  ]
+}
