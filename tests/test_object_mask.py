@@ -228,6 +228,8 @@ def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
         "hold_frames": 4,
         "interpolated_frames": 2,
         "targets": {"mug": {"detections": 2, "detected_frames": 2}},
+        "hit_prompt": "mug",
+        "prompt_attempts": ["mug"],
     }
     assert detector.calls == [(source, ["mug"])]
     capture = cv2.VideoCapture(str(destination))
@@ -312,6 +314,8 @@ def test_mask_objects_holds_the_last_position_then_disappears(
         "hold_frames": OBJECT_MASK_HOLD_FRAMES,
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 1, "detected_frames": 1}},
+        "hit_prompt": "mug",
+        "prompt_attempts": ["mug"],
     }
     frames = _read_frames(destination)
     assert len(frames) == 20
@@ -354,6 +358,8 @@ def test_mask_objects_matches_simultaneous_boxes_to_tracks_by_iou(
         "hold_frames": 0,
         "interpolated_frames": 1,
         "targets": {"mug": {"detections": 4, "detected_frames": 2}},
+        "hit_prompt": "mug",
+        "prompt_attempts": ["mug"],
     }
     frames = _read_frames(destination)
     for frame in frames:
@@ -387,6 +393,8 @@ def test_mask_objects_without_detections_leaves_frames_untouched(
         "hold_frames": 0,
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 0, "detected_frames": 0}},
+        "hit_prompt": None,
+        "prompt_attempts": ["mug"],
     }
     frames = _read_frames(destination)
     assert len(frames) == 3
@@ -451,6 +459,8 @@ def test_mask_objects_blocks_total_counts_anchor_frames_once(
         "hold_frames": 0,
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 3, "detected_frames": 3}},
+        "hit_prompt": "mug",
+        "prompt_attempts": ["mug"],
     }
 
 
@@ -511,7 +521,7 @@ def test_mask_objects_detects_multiple_targets_in_one_request(
         source, tmp_path / "out.mp4", ["mug", "scarf"],
         detector=detector, detect_artifacts_dir=artifacts,
     )
-    assert detector.calls == [(source, ["mug", "scarf"])]
+    assert detector.calls == [(source, ["mug, scarf"])]
     assert detector.cache_paths == [
         artifacts / "object-detect-response.json",
     ]
@@ -519,18 +529,25 @@ def test_mask_objects_detects_multiple_targets_in_one_request(
     assert detections_file.is_file()
     payload = json.loads(detections_file.read_text(encoding="utf-8"))
     assert payload["targets"] == ["mug", "scarf"]
+    # 首选候选（原词整串）即命中：未重试，命中变体记录在产物里。
+    assert payload["hit_prompt"] == "mug, scarf"
+    assert payload["prompt_attempts"] == ["mug, scarf"]
     assert [entry["label"] for entry in payload["detections"]] == [
         "mug, scarf", "mug, scarf"
     ]
     assert stats["targets"] == {
         "mug, scarf": {"detections": 2, "detected_frames": 2},
     }
+    assert stats["hit_prompt"] == "mug, scarf"
+    assert stats["prompt_attempts"] == ["mug, scarf"]
 
 
 def test_mask_objects_multi_target_empty_detection_is_one_group_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """无 per-target 标注，整体零检出只能作为一个 target group 记日志。"""
+    """全部候选零检出：按 原词→上游变体 顺序重试到底（无空格短语故无连
+    字符候选），仍走原零检出语义——无 per-target 标注，整体作为一个
+    target group 记日志。"""
     source = tmp_path / "source-muted.mp4"
     _solid_video(source, frames=3)
     detector = _GroupDetector([])
@@ -539,11 +556,17 @@ def test_mask_objects_multi_target_empty_detection_is_one_group_warning(
         source, tmp_path / "out.mp4", ["mug", "ghost"],
         detector=detector, detect_artifacts_dir=tmp_path / "segment",
     )
-    assert detector.calls == [(source, ["mug", "ghost"])]
+    assert detector.calls == [
+        (source, ["mug, ghost"]),
+        (source, ["mug"]),
+        (source, ["ghost"]),
+    ]
     assert stats["blocks_total"] == 0
     assert stats["targets"] == {
         "mug, ghost": {"detections": 0, "detected_frames": 0}
     }
+    assert stats["hit_prompt"] is None
+    assert stats["prompt_attempts"] == ["mug, ghost", "mug", "ghost"]
     assert any(
         "target group 'mug, ghost' got no detections" in message
         for message in caplog.messages
@@ -678,3 +701,75 @@ def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> Non
         detector=reused, detect_artifacts_dir=tmp_path / "other-project-segment",
     )
     assert stats2["blocks_total"] == stats["blocks_total"]
+
+
+# ==== 措辞重试（mask 层集成，规则见 object_detect 段头注释） ====
+
+
+class _PromptKeyedDetector:
+    """按完整 prompt 决定是否检出的 seam，带 with_cache 钩子。"""
+
+    def __init__(self, hits: dict[str, list[ObjectDetection]]) -> None:
+        self.hits = hits
+        self.calls: list[str] = []
+        self.cache_paths: list[Path] = []
+
+    def with_cache(self, cache_path: Path) -> "_PromptKeyedDetector":
+        self.cache_paths.append(cache_path)
+        return self
+
+    def detect(self, video_path: Path, targets: list[str]) -> list[ObjectDetection]:
+        prompt = ", ".join(targets)
+        self.calls.append(prompt)
+        return list(self.hits.get(prompt, []))
+
+
+def test_mask_objects_retries_prompt_variants_until_hit(tmp_path: Path) -> None:
+    """措辞重试集成：原词零检出 → 连字符兜底命中；命中变体与尝试序列写进
+    stats 和 object-detections.json，检出帧正常渲染灰块。"""
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=3)
+    detector = _PromptKeyedDetector({
+        "handheld-fan": [
+            _detection(0.0, (0.1, 0.1, 0.4, 0.4), label="handheld-fan"),
+            _detection(1.0, (0.5, 0.5, 0.9, 0.9), label="handheld-fan"),
+        ],
+    })
+    artifacts = tmp_path / "segment"
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["handheld fan"],
+        detector=detector, detect_artifacts_dir=artifacts,
+    )
+    assert detector.calls == ["handheld fan", "handheld-fan"]
+    assert detector.cache_paths == [artifacts / "object-detect-response.json"]
+    assert stats["blocks_total"] > 0
+    assert stats["hit_prompt"] == "handheld-fan"
+    assert stats["prompt_attempts"] == ["handheld fan", "handheld-fan"]
+    payload = json.loads(
+        (artifacts / "object-detections.json").read_text(encoding="utf-8")
+    )
+    assert payload["hit_prompt"] == "handheld-fan"
+    assert payload["prompt_attempts"] == ["handheld fan", "handheld-fan"]
+    assert [entry["label"] for entry in payload["detections"]] == [
+        "handheld-fan", "handheld-fan"
+    ]
+
+
+def test_mask_objects_first_variant_hit_never_retries(tmp_path: Path) -> None:
+    """首变体（原词整串）有检出：只调用 1 次，不为其余候选付费。"""
+    source = tmp_path / "source-muted.mp4"
+    _solid_video(source, frames=3)
+    detector = _PromptKeyedDetector({
+        "handheld fan, face": [
+            _detection(0.0, (0.1, 0.1, 0.4, 0.4), label="handheld fan, face"),
+        ],
+        "handheld fan": [_detection(0.0, (0.2, 0.2, 0.5, 0.5))],
+        "face": [_detection(0.0, (0.6, 0.1, 0.9, 0.4))],
+    })
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["handheld fan", "face"],
+        detector=detector, detect_artifacts_dir=tmp_path / "segment",
+    )
+    assert detector.calls == ["handheld fan, face"]
+    assert stats["hit_prompt"] == "handheld fan, face"
+    assert stats["prompt_attempts"] == ["handheld fan, face"]

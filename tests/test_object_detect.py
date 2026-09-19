@@ -2043,3 +2043,149 @@ def test_get_settings_wavespeed_env_unset(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("WAVESPEED_API_KEY", raising=False)
     settings = get_settings()
     assert settings.wavespeed_sam3_api_key is None
+
+
+# ==== 措辞重试（prompt_variants / detect_with_prompt_variants） ====
+# 规则见 app/object_detect.py 段头注释：候选 = 原词 → 上游变体 → 连字符
+# 兜底，去重；有检出即停，只有零检出才重试。
+
+
+def _variant_detection(prompt: str) -> ObjectDetection:
+    return ObjectDetection(
+        label=prompt,
+        timestamp_s=0.0,
+        bbox_xyxy_normalized=(0.1, 0.1, 0.4, 0.4),
+        rle="0 4",
+    )
+
+
+def test_prompt_variants_orders_base_atoms_hyphenated() -> None:
+    assert object_detect.prompt_variants(
+        ["handheld fan, portable fan, mini fan", "face"]
+    ) == [
+        "handheld fan, portable fan, mini fan, face",  # 原词整串优先
+        "handheld fan",  # 上游变体（逗号拆分，原顺序）
+        "portable fan",
+        "mini fan",
+        "face",
+        "handheld-fan",  # 连字符兜底
+        "portable-fan",
+        "mini-fan",
+    ]
+
+
+def test_prompt_variants_dedupes_identical_candidates() -> None:
+    # 原词是 targets 逐字拼接（与现状首次调用一致）；原子短语与连字符形式
+    # 去重。生产上 pipeline 已对 targets 去重，重复只会来自同义变体列表。
+    assert object_detect.prompt_variants(["mug", "mug"]) == ["mug, mug", "mug"]
+    assert object_detect.prompt_variants(["fan, fan"]) == ["fan, fan", "fan"]
+    assert object_detect.prompt_variants(["handheld fan"]) == [
+        "handheld fan",
+        "handheld-fan",
+    ]
+
+
+def test_prompt_variants_hyphenates_only_spaced_phrases() -> None:
+    assert object_detect.prompt_variants(["fan"]) == ["fan"]
+    assert object_detect.prompt_variants(["cat food bag"]) == [
+        "cat food bag",
+        "cat-food-bag",
+    ]
+    # 已含连字符的短语不再二次处理（无空格）。
+    assert object_detect.prompt_variants(["handheld-fan"]) == ["handheld-fan"]
+
+
+class _VariantDetector:
+    """按完整 prompt 决定是否检出的假 detector，记录每次调用的 prompt。"""
+
+    def __init__(self, hits: dict[str, list[ObjectDetection]]) -> None:
+        self.hits = hits
+        self.calls: list[str] = []
+
+    def detect(
+        self, video_path: Path, targets: list[str]
+    ) -> list[ObjectDetection]:
+        prompt = ", ".join(targets)
+        self.calls.append(prompt)
+        return list(self.hits.get(prompt, []))
+
+
+def test_detect_with_prompt_variants_first_choice_hit_stops(
+    tmp_path: Path, video: Path
+) -> None:
+    """首变体（原词整串）有检出：只调用 1 次，不重试（省钱断言）。"""
+    detector = _VariantDetector({
+        "mug, scarf": [_variant_detection("mug, scarf")],
+        "mug": [_variant_detection("mug")],
+    })
+    detections, hit_prompt, attempted = object_detect.detect_with_prompt_variants(
+        detector, video, ["mug", "scarf"]
+    )
+    assert detector.calls == ["mug, scarf"]
+    assert hit_prompt == "mug, scarf"
+    assert attempted == ["mug, scarf"]
+    assert detections == [_variant_detection("mug, scarf")]
+
+
+def test_detect_with_prompt_variants_retries_in_order_until_hit(
+    tmp_path: Path, video: Path
+) -> None:
+    """零检出才重试：按 原词→上游变体 顺序逐个提交，命中即停（连字符候选
+    不再尝试）。"""
+    detector = _VariantDetector({
+        "mini fan": [_variant_detection("mini fan")],
+    })
+    detections, hit_prompt, attempted = object_detect.detect_with_prompt_variants(
+        detector, video, ["handheld fan, portable fan, mini fan"]
+    )
+    assert detector.calls == [
+        "handheld fan, portable fan, mini fan",
+        "handheld fan",
+        "portable fan",
+        "mini fan",
+    ]
+    assert hit_prompt == "mini fan"
+    assert attempted == detector.calls
+    assert detections == [_variant_detection("mini fan")]
+
+
+def test_detect_with_prompt_variants_hyphenated_fallback_hit(
+    tmp_path: Path, video: Path
+) -> None:
+    """实测场景复现：handheld fan 零检出、handheld-fan 命中。"""
+    detector = _VariantDetector({
+        "handheld-fan": [_variant_detection("handheld-fan")],
+    })
+    detections, hit_prompt, attempted = object_detect.detect_with_prompt_variants(
+        detector, video, ["handheld fan"]
+    )
+    assert detector.calls == ["handheld fan", "handheld-fan"]
+    assert hit_prompt == "handheld-fan"
+    assert detections == [_variant_detection("handheld-fan")]
+
+
+def test_detect_with_prompt_variants_all_empty_returns_no_hit(
+    tmp_path: Path, video: Path
+) -> None:
+    """全部候选零检出：空结果 + hit_prompt None + 完整尝试序列（原零检出
+    语义，最多尝试次数 = 去重后候选数）。"""
+    detector = _VariantDetector({})
+    detections, hit_prompt, attempted = object_detect.detect_with_prompt_variants(
+        detector, video, ["cat food bag"]
+    )
+    assert detections == []
+    assert hit_prompt is None
+    assert attempted == ["cat food bag", "cat-food-bag"]
+    assert detector.calls == attempted
+
+
+def test_detect_with_prompt_variants_empty_targets(
+    tmp_path: Path, video: Path
+) -> None:
+    detector = _VariantDetector({})
+    assert object_detect.detect_with_prompt_variants(detector, video, []) == (
+        [],
+        None,
+        [],
+    )
+    assert detector.calls == []
