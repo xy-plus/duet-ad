@@ -958,37 +958,39 @@ class SandbaseSam3GroundingClient:
 # ==== wavespeed_sam3（WaveSpeed SAM3 video-rle）：直传 ticket + 轮询 ====
 # 2026-09-19 接入，排在 provider 链路第一位（fal 账号被官方 Admin lock、
 # sandbase worker 连续 generation_timeout，两家当前均不可用）。接口事实
-# 来源（2026-09-19 查证，均为官方页面/官方客户端源码，未经真实调用验证）：
-# - 提交/轮询/输出形态：官方模型页
-#   https://wavespeed.ai/models/wavespeed-ai/sam3-video-rle 的 README 与
-#   playground 真实输出样例。提交 POST {base}/api/v3/{model}，body
-#   {"video": <URL>, "prompt": <文本>, "apply_mask": false}（prompt 支持
-#   逗号分隔多目标）；响应 {"data": {"id": ...}} 或直接 {"id": ...}（官方
-#   示例代码按 body.get("data", body) 两种兼容，本实现同样处理）。轮询
-#   GET {base}/api/v3/predictions/{id}/result，data.status: completed /
-#   failed / cancelled / timeout / deleted / 其他（处理中）；completed 时
-#   outputs = {"rle_url": "..._rle.json", "video_url": "....mp4"}（字典，
-#   不是 sandbase 那样的列表）。
-# - 上传：视频输入只接受 URL，官方有文件上传端点（文档
+# 已经 2026-09-19 一次真实付费调用校准（原始响应落盘
+# data-verify/wavespeed-calib-20260919/，结构逐项核对见该目录 README）：
+# - 上传：视频输入只接受 URL，官方直传流程（文档
 #   https://wavespeed.ai/docs/upload-files-api 与官方 ComfyUI 节点源码
-#   WaveSpeedAI/wavespeed-comfyui py/wavespeed_upload.py，两处一致）：
-#   推荐的直传流程是 POST {base}/api/v3/media/uploads（JSON
-#   {"filename", "size", "content_type"}，Bearer 鉴权）拿一次性 ticket，
-#   响应 {"code": 200, "data": {"download_url": ..., "upload": {"url",
-#   "method", "headers"}}}，再按 ticket 的 method/headers 把文件字节 PUT
-#   到 upload.url（不带 API key），download_url 即可作为模型输入。本实现
-#   只用直传流程；文档另载 legacy 端点 /api/v3/media/upload/binary
-#   （multipart 字段 file），标注为兼容保留，不采用。
-# - RLE 内容格式：官方 README 的解码示例是 pycocotools 标准格式
-#   {"counts": "146301 3 147834 11...", "size": [height, width]}，counts
-#   为空白分隔数字字符串（背景起始交替游程、列主序），与 fal 的行主序
-#   (start,length) 对格式不同，由下方 _decode_pycocotools_counts /
-#   _encode_fal_rle_pairs 适配转换。
-# - **rle_url 指向 JSON 的完整外层结构（逐帧如何组织、多目标如何归组）
-#   官方页面没有写，未经真实响应验证**：本实现按最合理的结构写适配层
-#   （见 _parse_wavespeed_rle_result 头注释），形态不符时抛
-#   UncalibratedResponseError 确定性致命，绝不静默降级或错解析。首次真实
-#   调用后须用落盘的原始响应复核本段假设。
+#   WaveSpeedAI/wavespeed-comfyui py/wavespeed_upload.py，真实调用证实）：
+#   POST {base}/api/v3/media/uploads（JSON {"filename", "size",
+#   "content_type"}，Bearer 鉴权）拿一次性 ticket，响应 {"code": 200,
+#   "data": {"download_url", "upload": {"url", "method", "headers"}}}，再按
+#   ticket 的 method/headers 把文件字节 PUT 到 upload.url（不带 API key，
+#   ticket URL 本身是临时凭证，按官方要求视为不透明值逐字使用），
+#   download_url 即可作为模型输入。文档另载 legacy 端点
+#   /api/v3/media/upload/binary（multipart），标注兼容保留，不采用。
+# - 提交/轮询：提交 POST {base}/api/v3/{model}，body {"video": <URL>,
+#   "prompt": <文本>, "apply_mask": false}（prompt 支持逗号分隔多目标）；
+#   响应 {"data": {"id", "status", ...}}（官方示例兼容裸 {"id": ...}，本
+#   实现按 body.get("data", body) 处理）。轮询
+#   GET {base}/api/v3/predictions/{id}/result，data.status 实测
+#   created → processing → completed；终态失败 failed / cancelled /
+#   timeout / deleted。
+# - completed 的 outputs：真实响应是 **list**，每项 {"rle_url",
+#   "video_url"}（ playground 样例曾显示单个 dict，两种都接受并归一化为
+#   list）。单 prompt 真实调用只产 1 项；多项目（多目标）的组织方式未经
+#   真实验证，按"每项一组逐帧 mask"理解、逐帧并集合并（与 fal 已校准的
+#   "整条 prompt 合并检测组"语义一致），多项目帧数不一致 = 未校准形态
+#   致命。
+# - rle_url 产物：真实响应是顶层 **list[str]**，下标 = 帧号（5 秒 30fps
+#   视频 → 150 项），每帧一个 COCO **压缩** counts 字符串（pycocotools
+#   ASCII 编码，不是官方 README 示例的空白分隔数字串；README 非压缩形态
+#   也保留解析路径，未经真实验证），无 size 字段（尺寸取源视频帧尺寸），
+#   未检出帧 = 编码全背景的空 mask 字符串（实测 150 帧全为 "PPPb0" =
+#   [h*w] 单游程，即零检出；不是 null）。counts 与 fal 的行主序
+#   (start,length) 对格式不同，由下方 _decode_wavespeed_counts /
+#   _encode_fal_rle_pairs 适配转换，下游零改动。
 # - 计价（官方 README）：$0.05/5 秒，按视频时长 5 秒向上取整，封顶 600 秒。
 # 与 fal/sandbase 相同：确定性模型空结果即确定答案、畸形结果直接致命，
 # 都不重提。
@@ -1000,45 +1002,10 @@ WAVESPEED_FAILED_STATUSES = frozenset(
 )
 
 
-def _decode_pycocotools_counts(
-    counts: Any, size: Any, frame_index: int, provider_name: str
+def _runs_to_mask(
+    values: list[int], height: int, width: int, frame_index: int, provider_name: str
 ) -> np.ndarray | None:
-    """pycocotools 非压缩 counts → bool mask；全零（该帧未检出）返回 None。
-
-    counts 语义按官方 README 的 pycocotools 解码示例：空白分隔的非负整数，
-    背景游程起始、0/1 交替，列主序（Fortran order）展平，总和恰为 h*w。
-    任何一点不符（含 sum != h*w）都是未校准形态，抛
-    UncalibratedResponseError——pycocotools 语义是文档假设，真实响应若不同
-    必须致命而不是静默解错。counts 为空字符串视为该帧未检出（与 fal 的 ""
-    语义对齐），返回 None。
-    """
-    if (
-        not isinstance(size, (list, tuple))
-        or len(size) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in size
-        )
-    ):
-        raise UncalibratedResponseError(
-            f"{provider_name} rle frame {frame_index} has an invalid size; "
-            "uncalibrated response shape"
-        )
-    height, width = int(size[0]), int(size[1])
-    if not isinstance(counts, str):
-        raise UncalibratedResponseError(
-            f"{provider_name} rle frame {frame_index} counts must be a string; "
-            "uncalibrated response shape"
-        )
-    if not counts.strip():
-        return None
-    try:
-        values = [int(value) for value in counts.split()]
-    except ValueError as exc:
-        raise UncalibratedResponseError(
-            f"{provider_name} rle frame {frame_index} counts are not integers; "
-            "uncalibrated response shape"
-        ) from exc
+    """背景起始交替游程 → 列主序 bool mask；全零（该帧未检出）返回 None。"""
     if not values or any(value < 0 for value in values):
         raise UncalibratedResponseError(
             f"{provider_name} rle frame {frame_index} counts are invalid; "
@@ -1058,6 +1025,83 @@ def _decode_pycocotools_counts(
         offset += run_length
     mask = flat.reshape((height, width), order="F")
     return mask if mask.any() else None
+
+
+def _decode_coco_compressed_counts(
+    counts: str, height: int, width: int, frame_index: int, provider_name: str
+) -> np.ndarray | None:
+    """COCO 压缩 counts（pycocotools ASCII 编码）→ 游程 → bool mask。
+
+    真实校准形态（2026-09-19 真实调用，见段头注释）：编码与 pycocotools
+    maskApi.c 严格一致——每个 count 以 5bit 块编码，char = 块值 + 48，
+    0x20 为续位、末块 0x10 为负号位；第 4 个（下标 ≥3）起的 count 存与
+    cnts[i-2] 的差分。本实现已用 pycocotools 对拍验证（500 个随机 mask
+    编解码全等，见 data-verify/wavespeed-calib-20260919/）。
+    """
+    values: list[int] = []
+    position = 0
+    length = len(counts)
+    while position < length:
+        value = 0
+        shift = 0
+        while True:
+            code = ord(counts[position]) - 48
+            position += 1
+            if code < 0 or code > 63:
+                raise UncalibratedResponseError(
+                    f"{provider_name} rle frame {frame_index} compressed "
+                    "counts contain an invalid char; uncalibrated response shape"
+                )
+            value |= (code & 0x1F) << shift
+            shift += 5
+            if not code & 0x20:
+                if code & 0x10:
+                    value |= -1 << shift
+                break
+        if len(values) > 2:
+            value += values[-2]
+        values.append(value)
+    return _runs_to_mask(values, height, width, frame_index, provider_name)
+
+
+def _decode_pycocotools_counts(
+    counts: str, height: int, width: int, frame_index: int, provider_name: str
+) -> np.ndarray | None:
+    """pycocotools 非压缩 counts（空白分隔数字）→ 游程 → bool mask。
+
+    官方 README 解码示例的形态（{"counts": "146301 3 147834 11..."}），
+    **未经真实响应验证**（2026-09-19 真实调用实测为压缩 ASCII 编码）；
+    保留本路径是防同一模型返回 README 形态，校验同样严格（sum == h*w）。
+    """
+    try:
+        values = [int(value) for value in counts.split()]
+    except ValueError as exc:
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} counts are not integers; "
+            "uncalibrated response shape"
+        ) from exc
+    return _runs_to_mask(values, height, width, frame_index, provider_name)
+
+
+def _decode_wavespeed_counts(
+    counts: Any, height: int, width: int, frame_index: int, provider_name: str
+) -> np.ndarray | None:
+    """按内容判别 counts 编码：纯数字+空白 → README 非压缩形态；否则 →
+    COCO 压缩 ASCII（2026-09-19 真实校准形态）。空字符串 = 该帧未检出。"""
+    if not isinstance(counts, str):
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} counts must be a string; "
+            "uncalibrated response shape"
+        )
+    if not counts.strip():
+        return None
+    if all(character.isdigit() or character.isspace() for character in counts):
+        return _decode_pycocotools_counts(
+            counts, height, width, frame_index, provider_name
+        )
+    return _decode_coco_compressed_counts(
+        counts, height, width, frame_index, provider_name
+    )
 
 
 def _encode_fal_rle_pairs(mask: np.ndarray) -> str:
@@ -1099,70 +1143,52 @@ def _parse_wavespeed_rle_result(
 ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
     """WaveSpeed rle_url 产物 → 归一化 detections（bbox 从 mask 派生）。
 
-    **外层结构假设（未经真实响应验证，2026-09-19 官方页面未载）**：产物是
-    逐帧对齐的序列，接受两种显式包络——顶层 list，或带 "frames" 键的
-    dict；序列下标 = 帧号；每帧条目为 null（未检出）、单个 pycocotools
-    RLE 对象 {"counts", "size"}，或该帧多个 RLE 对象的 list（多目标/多实例
-    合并为并集，与 fal 已校准的"整条 prompt 合并检测组"语义一致）。除此
-    之外的一切形态都抛 UncalibratedResponseError 确定性致命，不做任何
-    猜测性解析。各帧 size 必须与源视频帧尺寸一致（强校准锚点：不符说明
-    对结构或尺寸的理解有误）。bbox 官方输出不提供，由并集 mask 的最小外接
-    框确定性派生；rle 重编码为 fal 行主序对格式（下游零改动）。多 target
-    无归属字段，label 为实际发送的完整逗号分隔 prompt（与 fal/sandbase
-    同语义）。
+    真实校准形态（2026-09-19 真实调用，原始响应见
+    data-verify/wavespeed-calib-20260919/）：每个 rle 产物是顶层
+    list[str]，下标 = 帧号，每帧一个 counts 字符串（压缩 ASCII 为实测
+    形态，README 非压缩数字串保留解析路径），无 size 字段（尺寸取源视频
+    帧尺寸，sum(counts) 必须恰为 h*w，强校准锚点）；未检出帧 = 全背景空
+    mask 字符串。outputs 多项目（多目标）的组织方式未经真实验证（单
+    prompt 真实调用只产 1 项）：按"每项一组逐帧 mask"理解、逐帧并集合并
+    （与 fal 合并检测组语义一致）；多项目帧数不一致 = 未校准形态致命。
+    bbox 官方输出不提供，由并集 mask 的最小外接框确定性派生；rle 重编码
+    为 fal 行主序对格式（下游零改动）。多 target 无归属字段，label 为
+    实际发送的完整逗号分隔 prompt（与 fal/sandbase 同语义）。除此之外的
+    一切形态都抛 UncalibratedResponseError 确定性致命，不做猜测性解析。
     """
-    if not isinstance(payload, dict) or "rle_artifact" not in payload:
-        raise UncalibratedResponseError(
-            f"{provider_name} cached payload lacks rle_artifact; "
-            "uncalibrated response shape"
+    artifacts = payload.get("rle_artifacts") if isinstance(payload, dict) else None
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or any(
+            not isinstance(artifact, list)
+            or any(not isinstance(item, str) for item in artifact)
+            for artifact in artifacts
         )
-    artifact = payload["rle_artifact"]
-    if isinstance(artifact, list):
-        frame_entries: list[Any] = artifact
-    elif isinstance(artifact, dict) and isinstance(artifact.get("frames"), list):
-        frame_entries = artifact["frames"]
-    else:
+    ):
         raise UncalibratedResponseError(
-            f"{provider_name} rle artifact must be a frame list or an object "
-            "with a frames list; uncalibrated response shape"
+            f"{provider_name} rle artifacts must be a non-empty list of "
+            "per-frame counts string lists; uncalibrated response shape"
+        )
+    frame_counts = {len(artifact) for artifact in artifacts}
+    if len(frame_counts) != 1:
+        raise UncalibratedResponseError(
+            f"{provider_name} rle artifacts have mismatched frame counts; "
+            "uncalibrated response shape"
         )
     video_height, video_width = frame_size
     prompt = ", ".join(target.strip() for target in targets)
     detections: list[ObjectDetection] = []
     frames: list[dict[str, Any]] = []
-    for frame_index, entry in enumerate(frame_entries):
-        if entry is None:
-            frames.append({
-                "frame_index": frame_index,
-                "label": prompt,
-                "score": None,
-                "box": None,
-                "rle": None,
-            })
-            continue
-        masks = entry if isinstance(entry, list) else [entry]
+    for frame_index in range(len(artifacts[0])):
         union: np.ndarray | None = None
-        for item in masks:
-            if not isinstance(item, dict):
-                raise UncalibratedResponseError(
-                    f"{provider_name} rle frame {frame_index} entry must be an "
-                    "rle object; uncalibrated response shape"
-                )
-            size = item.get("size")
-            if (
-                isinstance(size, (list, tuple))
-                and len(size) == 2
-                and all(isinstance(value, int) and not isinstance(value, bool)
-                        for value in size)
-                and (int(size[0]), int(size[1])) != (video_height, video_width)
-            ):
-                raise UncalibratedResponseError(
-                    f"{provider_name} rle frame {frame_index} size "
-                    f"{list(size)} != video frame size "
-                    f"{[video_height, video_width]}; uncalibrated response shape"
-                )
-            mask = _decode_pycocotools_counts(
-                item.get("counts"), size, frame_index, provider_name
+        for artifact in artifacts:
+            mask = _decode_wavespeed_counts(
+                artifact[frame_index],
+                video_height,
+                video_width,
+                frame_index,
+                provider_name,
             )
             if mask is not None:
                 union = mask if union is None else union | mask
@@ -1203,8 +1229,8 @@ class WavespeedSam3GroundingClient:
     "落盘纪律"）。指纹键为 video_sha256/prompt/model（该模型无置信度阈值
     参数），靠 model 字符串与其他 provider 天然隔离；payload_key 用
     "provider_response"。缓存 payload = {"completed_outputs": 轮询
-    completed 的原始 outputs 字典（rle_url/video_url 原样保留）,
-    "rle_artifact": rle_url 下载的原始 JSON}——原始响应字段一个不丢。
+    completed 的原始 outputs 列表（每项 rle_url/video_url 原样保留）,
+    "rle_artifacts": 各 rle_url 下载的原始 JSON}——原始响应字段一个不丢。
     """
 
     provider_name = "wavespeed_sam3"
@@ -1290,10 +1316,10 @@ class WavespeedSam3GroundingClient:
                 file_url = self._upload(client, api_key, video_path, content, record)
                 prediction_id = self._submit(client, api_key, file_url, prompt, record)
                 outputs = self._poll_result(client, api_key, prediction_id, record)
-                artifact = self._download_rle(client, outputs, record)
+                artifacts = self._download_rles(client, outputs, record)
                 return {
                     "completed_outputs": outputs,
-                    "rle_artifact": artifact,
+                    "rle_artifacts": artifacts,
                 }, record
         except ProviderFailure:
             raise
@@ -1427,15 +1453,25 @@ class WavespeedSam3GroundingClient:
                 raise ValueError("wavespeed poll response data must be an object")
             status = str(data.get("status") or "").upper()
             if status == "COMPLETED":
+                # 真实校准形态（2026-09-19）：outputs 是 list，每项
+                # {"rle_url", "video_url"}；playground 样例曾显示单个
+                # dict，两种都接受并归一化为 list。
                 outputs = data.get("outputs")
+                if isinstance(outputs, dict):
+                    outputs = [outputs]
                 if (
-                    not isinstance(outputs, dict)
-                    or not isinstance(outputs.get("rle_url"), str)
-                    or not outputs["rle_url"]
+                    not isinstance(outputs, list)
+                    or not outputs
+                    or any(
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("rle_url"), str)
+                        or not item["rle_url"]
+                        for item in outputs
+                    )
                 ):
                     raise UncalibratedResponseError(
-                        "wavespeed completed prediction has no outputs.rle_url; "
-                        "uncalibrated response shape"
+                        "wavespeed completed prediction has no outputs list "
+                        "with rle_url; uncalibrated response shape"
                     )
                 return outputs
             if status in WAVESPEED_FAILED_STATUSES:
@@ -1455,28 +1491,31 @@ class WavespeedSam3GroundingClient:
                 )
             time.sleep(self.settings.provider_poll_interval_s)
 
-    def _download_rle(
+    def _download_rles(
         self,
         client: httpx.Client,
-        outputs: dict[str, Any],
+        outputs: list[dict[str, Any]],
         record: dict[str, Any],
-    ) -> Any:
-        """下载 completed prediction 的 RLE JSON 产物（outputs.rle_url，官方
-        样例为 cloudfront 公开 URL，无需鉴权）。outputs.video_url（预览
-        mp4）不下载，随 outputs 原始字段一起进缓存落盘。"""
-        response, record["rle_download"] = providers._send(
-            client, "GET", outputs["rle_url"]
-        )
-        providers._ensure_success(response, record["rle_download"])
-        payload = providers._json_body(response)
-        if not isinstance(payload, (dict, list)):
-            raise UncalibratedResponseError(
-                "wavespeed rle artifact must be an object or a list; "
-                "uncalibrated response shape"
-            )
-        return payload
+    ) -> list[Any]:
+        """下载 completed prediction 各项目的 RLE JSON 产物（rle_url 为
+        cloudfront 公开 URL，无需鉴权）。各项 video_url（预览 mp4）不下载，
+        随 outputs 原始字段一起进缓存落盘。"""
+        record["rle_downloads"] = []
+        artifacts: list[Any] = []
+        for item in outputs:
+            response, exchange = providers._send(client, "GET", item["rle_url"])
+            record["rle_downloads"].append(exchange)
+            providers._ensure_success(response, exchange)
+            payload = providers._json_body(response)
+            if not isinstance(payload, list):
+                raise UncalibratedResponseError(
+                    "wavespeed rle artifact must be a per-frame list; "
+                    "uncalibrated response shape"
+                )
+            artifacts.append(payload)
+        return artifacts
 
-    # --- 响应解析（外层结构假设未经真实响应验证，见解析函数头注释） ---
+    # --- 响应解析（真实校准形态见解析函数头注释） ---
 
     def _parse_result(
         self,

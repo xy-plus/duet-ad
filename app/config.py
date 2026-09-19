@@ -139,8 +139,8 @@ class Settings:
     # 提示词按未遮盖处理），trace 记 object_mask_disabled 以区分配置关闭
     # 与失败降级。缺省 true 维持现状；检测后端不可用期间（2026-09-19 fal
     # 账号被锁、sandbase worker 连续 generation_timeout，wavespeed 已接入
-    # 但输出形态未经真实校准）在 .env 显式写 false。本开关不进前端、不进
-    # 公开 API。
+    # 并当日完成输出标定、尚未在真实项目启用）在 .env 显式写 false。本开关
+    # 不进前端、不进公开 API。
     object_mask_enabled: bool = True
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0

@@ -1381,9 +1381,11 @@ def test_sandbase_cache_fingerprint_mismatch_refetches(
 # 流程：POST /api/v3/media/uploads（ticket）→ PUT 字节到 ticket 的一次性
 # URL（不带 API key）→ POST /api/v3/{model} 提交 →
 # GET /api/v3/predictions/{id}/result 轮询（completed/failed/cancelled/
-# timeout/deleted 终态）→ GET outputs.rle_url 下载 RLE JSON。
-# 接口事实来源与"外层结构未经真实响应验证"声明见 app/object_detect.py
-# wavespeed 段头注释；本段全部用合成 fixture，严禁真实 API 调用。
+# timeout/deleted 终态）→ GET 各 outputs 项 rle_url 下载 RLE JSON。
+# 接口形态已经 2026-09-19 一次真实付费调用校准（原始响应与结构核对见
+# app/object_detect.py wavespeed 段头注释和
+# data-verify/wavespeed-calib-20260919/）；本段全部用合成 fixture，严禁
+# 真实 API 调用。
 
 
 def _wavespeed_settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -1401,6 +1403,7 @@ def _wavespeed_handler(
     completed: object | None,
     *,
     artifact: object | None = None,
+    artifact2: object | None = None,
     observed: dict[str, object] | None = None,
     statuses: tuple[str, ...] = ("processing", "completed"),
     submit_status: int = 200,
@@ -1481,6 +1484,8 @@ def _wavespeed_handler(
             )
         if request.method == "GET" and path == "/files/rle.json":
             return httpx.Response(200, json=artifact)
+        if request.method == "GET" and path == "/files/rle2.json":
+            return httpx.Response(200, json=artifact2)
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     handler.state = state  # type: ignore[attr-defined]
@@ -1495,16 +1500,27 @@ def _wavespeed_client(
     )
 
 
-def _wavespeed_completed(**overrides: object) -> dict[str, object]:
+def _wavespeed_completed(
+    second_output: bool = False, **overrides: object
+) -> dict[str, object]:
+    """completed 响应：outputs 为 list（2026-09-19 真实校准形态）。"""
+    outputs: list[dict[str, object]] = [
+        {
+            "rle_url": "https://cdn.wavespeed.test/files/rle.json",
+            "video_url": "https://cdn.wavespeed.test/files/out.mp4",
+        }
+    ]
+    if second_output:
+        outputs.append({
+            "rle_url": "https://cdn.wavespeed.test/files/rle2.json",
+            "video_url": "https://cdn.wavespeed.test/files/out2.mp4",
+        })
     data: dict[str, object] = {
         "id": "pred-1",
         "model": "wavespeed-ai/sam3-video-rle",
         "status": "completed",
-        "outputs": {
-            "rle_url": "https://cdn.wavespeed.test/files/rle.json",
-            "video_url": "https://cdn.wavespeed.test/files/out.mp4",
-        },
-        "error": None,
+        "outputs": outputs,
+        "error": "",
     }
     data.update(overrides)
     return {"code": 200, "message": "success", "data": data}
@@ -1649,16 +1665,23 @@ def test_wavespeed_completed_without_rle_url_is_fatal(
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
 
 
-# --- wavespeed 成功链路（合成 fixture，外层结构未经真实响应验证） ---
-# fixture 的合成方式与假设结构声明见文件内 _comment；视频为 320x240@2fps，
-# size=[240,320]。期望 bbox 手工计算（矩形行列 ÷ 帧宽高），rle 用下游真实的
-# object_mask._decode_rle_mask 做往返验证（证明归一化输出下游零改动可消费）。
+# --- wavespeed 成功链路（合成 fixture，形态已经 2026-09-19 真实调用校准） ---
+# fixture 的合成方式与真实校准结论见文件内 _comment 与
+# data-verify/wavespeed-calib-20260919/；视频为 320x240@2fps。期望 bbox 手工
+# 计算（矩形行列 ÷ 帧宽高），rle 用下游真实的 object_mask._decode_rle_mask
+# 做往返验证（证明归一化输出下游零改动可消费）。
 _WAVESPEED_SAM3_FIXTURE = (
     Path(__file__).parent / "fixtures" / "wavespeed_sam3_video_rle_response.json"
 )
 _WAVESPEED_SAM3_ARTIFACT = json.loads(
     _WAVESPEED_SAM3_FIXTURE.read_text(encoding="utf-8")
-)
+)["artifact"]
+_WAVESPEED_SAM3_ARTIFACT2 = json.loads(
+    _WAVESPEED_SAM3_FIXTURE.read_text(encoding="utf-8")
+)["second_artifact"]
+_WAVESPEED_SAM3_UNCOMPRESSED = json.loads(
+    _WAVESPEED_SAM3_FIXTURE.read_text(encoding="utf-8")
+)["uncompressed_artifact"]
 
 
 def _rect_mask(rows: slice, cols: slice) -> np.ndarray:
@@ -1667,15 +1690,10 @@ def _rect_mask(rows: slice, cols: slice) -> np.ndarray:
     return mask
 
 
-# (timestamp_s, bbox, 期望 mask)；frame 2 为 null（未检出），不在期望里。
+# (timestamp_s, bbox, 期望 mask)；frame 2 为全背景空串（未检出），不在期望里。
 _WAVESPEED_SAM3_EXPECTED = [
     (0.0, (0.25, 0.25, 0.5, 0.5), _rect_mask(slice(60, 120), slice(80, 160))),
-    (
-        0.5,
-        (0.0, 0.0, 1.0, 1.0),
-        _rect_mask(slice(0, 10), slice(0, 10))
-        | _rect_mask(slice(230, 240), slice(310, 320)),
-    ),
+    (0.5, (0.0, 0.0, 0.03125, 10 / 240), _rect_mask(slice(0, 10), slice(0, 10))),
     (
         1.5,
         (0.625, 100 / 240, 0.6875, 110 / 240),
@@ -1703,7 +1721,7 @@ def _assert_wavespeed_detections(
 
 def test_wavespeed_detect_full_flow(tmp_path: Path, video: Path) -> None:
     """ticket → PUT → 提交 → 轮询 → 下载 RLE → 解析全链路；多 target 合成一个
-    prompt；frame 1 的两个 RLE 对象合并为并集。"""
+    prompt；全背景空串帧 = 未检出。"""
     observed: dict[str, object] = {}
     handler = _wavespeed_handler(
         _wavespeed_completed(),
@@ -1728,7 +1746,7 @@ def test_wavespeed_detect_full_flow(tmp_path: Path, video: Path) -> None:
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
     assert len(client.last_frames) == 4
     assert client.last_frames[0]["frame_index"] == 0
-    assert client.last_frames[2]["box"] is None  # frame 2 null = 未检出
+    assert client.last_frames[2]["box"] is None  # frame 2 全背景空串 = 未检出
     assert client.last_frames[2]["rle"] is None
     assert {frame["label"] for frame in client.last_frames} == (
         {"handheld fan, face"}
@@ -1747,32 +1765,77 @@ def test_wavespeed_bare_submit_id_envelope(tmp_path: Path, video: Path) -> None:
     _assert_wavespeed_detections(result, "handheld fan, face")
 
 
-def test_wavespeed_artifact_bare_frame_list_envelope(
-    tmp_path: Path, video: Path
-) -> None:
-    """rle 产物为顶层逐帧 list（无 frames 键包络）解析结果一致。"""
+def test_wavespeed_dict_outputs_envelope(tmp_path: Path, video: Path) -> None:
+    """completed outputs 为单个 dict（playground 样例形态）也接受，归一化为
+    list 后解析结果一致。"""
     handler = _wavespeed_handler(
-        _wavespeed_completed(), artifact=_WAVESPEED_SAM3_ARTIFACT["frames"]
+        _wavespeed_completed(
+            outputs={
+                "rle_url": "https://cdn.wavespeed.test/files/rle.json",
+                "video_url": "https://cdn.wavespeed.test/files/out.mp4",
+            }
+        ),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
     )
     client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
     result = client.detect(video, ["handheld fan", "face"])
     _assert_wavespeed_detections(result, "handheld fan, face")
 
 
-def test_wavespeed_empty_result_is_not_retried(tmp_path: Path, video: Path) -> None:
-    """空结果是确定答案：返回空列表，不重提（省钱纪律）。"""
+def test_wavespeed_multi_output_items_union(tmp_path: Path, video: Path) -> None:
+    """outputs 多项目（多目标组织方式未验证，按每项一组逐帧 mask 理解）：
+    逐帧并集合并，frame 1 两个对角矩形并成整幅 bbox。"""
     handler = _wavespeed_handler(
-        _wavespeed_completed(), artifact={"frames": []}
+        _wavespeed_completed(second_output=True),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
+        artifact2=_WAVESPEED_SAM3_ARTIFACT2,
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    assert len(result) == 3
+    union_detection = result[1]
+    assert union_detection.timestamp_s == 0.5
+    assert union_detection.bbox_xyxy_normalized == (0.0, 0.0, 1.0, 1.0)
+    assert union_detection.rle is not None
+    assert np.array_equal(
+        _decode_rle_mask(union_detection.rle, 320, 240),
+        _rect_mask(slice(0, 10), slice(0, 10))
+        | _rect_mask(slice(230, 240), slice(310, 320)),
+    )
+
+
+def test_wavespeed_uncompressed_readme_counts_form(
+    tmp_path: Path, video: Path
+) -> None:
+    """README 示例的非压缩数字串 counts（未经真实验证的形态）也能严格解析。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact=_WAVESPEED_SAM3_UNCOMPRESSED
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    assert len(result) == 1
+    assert result[0].bbox_xyxy_normalized == (0.25, 0.25, 0.5, 0.5)
+    assert result[0].rle is not None
+    assert np.array_equal(
+        _decode_rle_mask(result[0].rle, 320, 240),
+        _rect_mask(slice(60, 120), slice(80, 160)),
+    )
+
+
+def test_wavespeed_empty_result_is_not_retried(tmp_path: Path, video: Path) -> None:
+    """零检出（真实形态：每帧全背景空串）是确定答案：返回空列表，不重提。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact=["PP[2", "PP[2", "PP[2", "PP[2"]
     )
     client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
     assert client.detect(video, ["handheld fan"]) == []
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
 
 
-def test_wavespeed_artifact_not_frame_structure_is_fatal(
+def test_wavespeed_artifact_not_list_is_fatal(
     tmp_path: Path, video: Path
 ) -> None:
-    """产物既不是逐帧 list 也不是带 frames 键的 dict = 未校准形态：致命。"""
+    """产物不是逐帧 list（真实校准形态）= 未校准形态：确定性致命。"""
     handler = _wavespeed_handler(
         _wavespeed_completed(), artifact={"unexpected": 1}
     )
@@ -1793,10 +1856,11 @@ def test_wavespeed_artifact_scalar_is_fatal(tmp_path: Path, video: Path) -> None
 def test_wavespeed_artifact_counts_sum_mismatch_is_fatal(
     tmp_path: Path, video: Path
 ) -> None:
-    """counts 总和 != h*w（不符合 pycocotools 语义）= 未校准形态：致命。"""
+    """counts 总和 != h*w（不符合 pycocotools 语义）= 未校准形态：致命。
+    "PPPb0" 是真实响应里 576x1024 视频的全背景串（sum=589824），对
+    320x240 测试视频必然不匹配——尺寸锚点生效。"""
     handler = _wavespeed_handler(
-        _wavespeed_completed(),
-        artifact={"frames": [{"counts": "0 10 0", "size": [240, 320]}]},
+        _wavespeed_completed(), artifact=["PPPb0"]
     )
     client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
     with pytest.raises(ProviderFailure) as excinfo:
@@ -1805,14 +1869,14 @@ def test_wavespeed_artifact_counts_sum_mismatch_is_fatal(
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
 
 
-def test_wavespeed_artifact_size_mismatch_video_is_fatal(
+def test_wavespeed_artifacts_frame_count_mismatch_is_fatal(
     tmp_path: Path, video: Path
 ) -> None:
-    """size 与源视频帧尺寸不符 = 未校准形态：确定性致命（强校准锚点）。"""
+    """outputs 多项目帧数不一致 = 未校准形态：确定性致命。"""
     handler = _wavespeed_handler(
-        _wavespeed_completed(),
-        # 120*160=19200 全背景游程：counts 自身合法，仅尺寸与视频不符。
-        artifact={"frames": [{"counts": "19200", "size": [120, 160]}]},
+        _wavespeed_completed(second_output=True),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
+        artifact2=_WAVESPEED_SAM3_ARTIFACT2[:2],
     )
     client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
     with pytest.raises(ProviderFailure) as excinfo:
@@ -1824,8 +1888,7 @@ def test_wavespeed_artifact_malformed_counts_is_fatal(
     tmp_path: Path, video: Path
 ) -> None:
     handler = _wavespeed_handler(
-        _wavespeed_completed(),
-        artifact={"frames": [{"counts": "not-a-number", "size": [240, 320]}]},
+        _wavespeed_completed(), artifact=["not-a-valid-counts~"]
     )
     client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
     with pytest.raises(ProviderFailure) as excinfo:
@@ -1841,8 +1904,8 @@ def test_wavespeed_shared_cache_cross_project_reuse(
 ) -> None:
     """实例级共享：同指纹（同视频同 prompt）跨项目零 HTTP 复用；payload_key
     为 provider_response，指纹含 model 与其他 provider 缓存天然隔离。
-    缓存 payload 保留 completed outputs 原始字段（rle_url/video_url 一个不
-    丢）与 rle_url 下载的原始 JSON。"""
+    缓存 payload 保留 completed outputs 原始列表（每项 rle_url/video_url
+    一个不丢）与各 rle_url 下载的原始 JSON。"""
     settings = _wavespeed_settings(tmp_path)
     handler = _wavespeed_handler(
         _wavespeed_completed(), artifact=_WAVESPEED_SAM3_ARTIFACT
@@ -1861,11 +1924,13 @@ def test_wavespeed_shared_cache_cross_project_reuse(
     assert len(shared) == 1
     cached = json.loads(shared[0].read_text(encoding="utf-8"))
     payload = cached["provider_response"]
-    assert payload["completed_outputs"] == {
-        "rle_url": "https://cdn.wavespeed.test/files/rle.json",
-        "video_url": "https://cdn.wavespeed.test/files/out.mp4",
-    }
-    assert payload["rle_artifact"] == _WAVESPEED_SAM3_ARTIFACT
+    assert payload["completed_outputs"] == [
+        {
+            "rle_url": "https://cdn.wavespeed.test/files/rle.json",
+            "video_url": "https://cdn.wavespeed.test/files/out.mp4",
+        }
+    ]
+    assert payload["rle_artifacts"] == [_WAVESPEED_SAM3_ARTIFACT]
     assert cached["fingerprint"]["prompt"] == "handheld fan, face"
     assert cached["fingerprint"]["model"] == "wavespeed-ai/sam3-video-rle"
 
