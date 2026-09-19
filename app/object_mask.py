@@ -30,11 +30,7 @@ import numpy as np
 
 from app import media
 from app.config import get_settings
-from app.object_detect import (
-    ObjectDetection,
-    detect_with_prompt_variants,
-    select_provider,
-)
+from app.object_detect import ObjectDetection, select_provider
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -255,38 +251,25 @@ def _detect_all(
     targets: list[str],
     detector: Any,
     artifacts_dir: Path | None,
-) -> tuple[list[ObjectDetection], str | None, list[str]]:
-    """措辞重试编排（object_detect.detect_with_prompt_variants，规则详见其
-    段头注释）：首选候选是 targets 原样拼的完整逗号 prompt——一次请求覆盖
-    全部目标与上游变体，最省钱；零检出才按 上游变体→连字符 顺序逐个重试
-    （只有零检出才再付费），有检出即停；全部零检出走原有零检出语义。
+) -> list[ObjectDetection]:
+    """One SAM request covers all targets, avoiding a second paid invocation.
 
-    每个候选的原始响应缓存仍按各自的完整 prompt 指纹命中（实例级共享
-    目录），项目级回退读路径保持一条。SAM 不按 target 标注框归属，检出
-    组的 label 即实际命中的 prompt。返回 (detections, hit_prompt,
-    attempted_prompts)；全部零检出时 hit_prompt 为 None。
+    The raw detection response cache is keyed by the complete comma-separated
+    prompt.  The project-local fallback is therefore one prompt-level path
+    rather than a per-target path.  SAM does not label boxes by target in a
+    multi-target response, so an empty result is meaningful only for the whole
+    target group.
     """
     client = detector
     if artifacts_dir is not None and hasattr(detector, "with_cache"):
         client = detector.with_cache(artifacts_dir / "object-detect-response.json")
-    detections, hit_prompt, attempted = detect_with_prompt_variants(
-        client, source, targets
-    )
+    detections = client.detect(source, targets)
     if not detections:
         _LOGGER.warning(
-            "object mask: target group %r got no detections in %d prompt attempt(s)",
+            "object mask: target group %r got no detections",
             ", ".join(target.strip() for target in targets),
-            len(attempted),
         )
-    elif len(attempted) > 1:
-        _LOGGER.info(
-            "object mask: prompt variant %r hit after %d attempt(s); "
-            "first choice %r missed",
-            hit_prompt,
-            len(attempted),
-            attempted[0],
-        )
-    return detections, hit_prompt, attempted
+    return detections
 
 
 def mask_objects(
@@ -305,14 +288,12 @@ def mask_objects(
     omitted, the production SAM-3 client is used (wavespeed → sandbase →
     fal 链路顺序，见 object_detect.select_provider，需对应平台 key)。
     ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
-    解析后的契约 detections 写 object-detections.json（含措辞重试的
-    prompt_attempts 与 hit_prompt，见 _detect_all 与
-    object_detect.detect_with_prompt_variants 的段头注释）；
+    解析后的契约 detections 写 object-detections.json（见 _detect_all）；
     检测原始响应的指纹缓存写实例级共享目录
     <DATA_DIR>/shared/object-detect-cache/（跨项目命中即零 HTTP，见
     object_detect 的落盘纪律注释），with_cache 传入的本目录
     object-detect-response.json 仅作项目级缓存的回退读。多目标的 SAM 结果
-    无目标归属；其 detection label 是实际命中的 prompt，所有框仍统一遮盖。
+    无目标归属；其 detection label 是完整 prompt，所有框仍统一遮盖。
     ``block_opacity`` controls the fill contribution and defaults to the
     original fully opaque behavior.  For translucent blocks, ``block_blur``
     controls the Gaussian kernel applied once per source frame before its
@@ -342,10 +323,10 @@ def mask_objects(
         raise ObjectMaskError("object mask source metadata is incomplete")
     if detector is None and targets:
         detector = _production_detector()
-    detections, hit_prompt, prompt_attempts = (
+    detections = (
         _detect_all(source, targets, detector, detect_artifacts_dir)
         if targets
-        else ([], None, [])
+        else []
     )
     if detect_artifacts_dir is not None and targets:
         detect_artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -353,8 +334,6 @@ def mask_objects(
             json.dumps(
                 {
                     "targets": list(targets),
-                    "hit_prompt": hit_prompt,
-                    "prompt_attempts": prompt_attempts,
                     "detections": [
                         {
                             "label": detection.label,
@@ -454,8 +433,6 @@ def mask_objects(
     stats["interpolated_frames"] = (
         stats["frames_with_block"] - stats["anchor_frames"] - stats["hold_frames"]
     )
-    stats["hit_prompt"] = hit_prompt
-    stats["prompt_attempts"] = prompt_attempts
     labels = list(dict.fromkeys(detection.label for detection in detections))
     if not labels:
         labels = [", ".join(target.strip() for target in targets)] if targets else []
