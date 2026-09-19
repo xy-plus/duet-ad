@@ -63,6 +63,25 @@ from app.providers import ProviderFailure
 _LOGGER = logging.getLogger(__name__)
 
 
+def _send_detect(
+    settings: Settings,
+    client: httpx.Client,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> tuple[httpx.Response, dict[str, Any]]:
+    """providers._send + 429 限流长退避预算（检测三 provider 统一启用；
+    退避序列/钳制/预算语义见 providers.RATE_LIMIT_BACKOFF_S 段头注释，
+    预算值来自 settings.provider_rate_limit_budget_s）。"""
+    return providers._send(
+        client,
+        method,
+        url,
+        rate_limit_budget_s=settings.provider_rate_limit_budget_s,
+        **kwargs,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ObjectDetection:
     label: str
@@ -555,7 +574,7 @@ class FalSam3GroundingClient:
         content: bytes,
         record: dict[str, Any],
     ) -> str:
-        response, record["upload_initiate"] = providers._send(
+        response, record["upload_initiate"] = _send_detect(self.settings, 
             client,
             "POST",
             FAL_STORAGE_UPLOAD_URL,
@@ -576,7 +595,7 @@ class FalSam3GroundingClient:
             or not file_url
         ):
             raise ValueError("fal storage initiate response lacks upload_url/file_url")
-        put_response, record["upload_put"] = providers._send(
+        put_response, record["upload_put"] = _send_detect(self.settings, 
             client,
             "PUT",
             upload_url,
@@ -603,7 +622,7 @@ class FalSam3GroundingClient:
             "prompt": prompt,
             "detection_threshold": self.settings.fal_sam3_threshold,
         }
-        response, record["submit"] = providers._send(
+        response, record["submit"] = _send_detect(self.settings, 
             client,
             "POST",
             submit_url,
@@ -635,7 +654,7 @@ class FalSam3GroundingClient:
         record["polls"] = []
         deadline = time.monotonic() + self.settings.provider_poll_timeout_s
         while True:
-            response, exchange = providers._send(
+            response, exchange = _send_detect(self.settings, 
                 client, "GET", status_url, headers=self._headers(api_key)
             )
             record["polls"].append(exchange)
@@ -656,7 +675,7 @@ class FalSam3GroundingClient:
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"fal task {request_id} timed out")
             time.sleep(self.settings.provider_poll_interval_s)
-        response, record["result"] = providers._send(
+        response, record["result"] = _send_detect(self.settings, 
             client, "GET", response_url, headers=self._headers(api_key)
         )
         providers._ensure_success(response, record["result"])
@@ -811,7 +830,7 @@ class SandbaseSam3GroundingClient:
         content: bytes,
         record: dict[str, Any],
     ) -> str:
-        response, record["upload"] = providers._send(
+        response, record["upload"] = _send_detect(self.settings, 
             client,
             "POST",
             f"{self.settings.sandbase_sam3_api_base}/v1/upload",
@@ -849,7 +868,7 @@ class SandbaseSam3GroundingClient:
             "max_num_objects": 16,
             "detection_threshold": self.settings.sandbase_sam3_threshold,
         }
-        response, record["submit"] = providers._send(
+        response, record["submit"] = _send_detect(self.settings, 
             client,
             "POST",
             f"{self.settings.sandbase_sam3_api_base}/v1/run",
@@ -874,7 +893,7 @@ class SandbaseSam3GroundingClient:
         poll_url = f"{self.settings.sandbase_sam3_api_base}/v1/run/{run_id}"
         deadline = time.monotonic() + self.settings.provider_poll_timeout_s
         while True:
-            response, exchange = providers._send(
+            response, exchange = _send_detect(self.settings, 
                 client, "GET", poll_url, headers=self._headers(api_key)
             )
             record["polls"].append(exchange)
@@ -935,7 +954,7 @@ class SandbaseSam3GroundingClient:
                 "sandbase completed run has no JSON output; "
                 "uncalibrated response shape"
             )
-        response, record["output_download"] = providers._send(
+        response, record["output_download"] = _send_detect(self.settings, 
             client, "GET", output["url"]
         )
         providers._ensure_success(response, record["output_download"])
@@ -1345,7 +1364,7 @@ class WavespeedSam3GroundingClient:
         官方要求视为不透明值逐字使用。PUT 不带 API key（ticket URL 本身是
         临时凭证）。
         """
-        response, record["upload_ticket"] = providers._send(
+        response, record["upload_ticket"] = _send_detect(self.settings, 
             client,
             "POST",
             f"{self.settings.wavespeed_sam3_api_base}/api/v3/media/uploads",
@@ -1379,7 +1398,7 @@ class WavespeedSam3GroundingClient:
         upload_headers = upload.get("headers")
         if not isinstance(upload_headers, dict):
             upload_headers = {}
-        put_response, record["upload_put"] = providers._send(
+        put_response, record["upload_put"] = _send_detect(self.settings, 
             client,
             method,
             upload["url"],
@@ -1405,7 +1424,7 @@ class WavespeedSam3GroundingClient:
             "prompt": prompt,
             "apply_mask": False,
         }
-        response, record["submit"] = providers._send(
+        response, record["submit"] = _send_detect(self.settings, 
             client,
             "POST",
             f"{self.settings.wavespeed_sam3_api_base}/api/v3/"
@@ -1440,7 +1459,7 @@ class WavespeedSam3GroundingClient:
         )
         deadline = time.monotonic() + self.settings.provider_poll_timeout_s
         while True:
-            response, exchange = providers._send(
+            response, exchange = _send_detect(self.settings, 
                 client, "GET", poll_url, headers=self._headers(api_key)
             )
             record["polls"].append(exchange)
@@ -1503,7 +1522,7 @@ class WavespeedSam3GroundingClient:
         record["rle_downloads"] = []
         artifacts: list[Any] = []
         for item in outputs:
-            response, exchange = providers._send(client, "GET", item["rle_url"])
+            response, exchange = _send_detect(self.settings, client, "GET", item["rle_url"])
             record["rle_downloads"].append(exchange)
             providers._ensure_success(response, exchange)
             payload = providers._json_body(response)

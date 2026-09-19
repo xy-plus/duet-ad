@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from app import providers
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.doubao_tts import (
     DOUBAO_TTS_RESOURCE_ID,
     DOUBAO_TTS_SAMPLE_RATE,
@@ -1732,3 +1732,219 @@ def test_doubao_synthesize_bad_stream_fails_closed(
         )
 
 
+
+
+# ==== 429 限流长退避（providers._send 的 rate_limit_budget_s） ====
+# 语义见 app/providers.py RATE_LIMIT_BACKOFF_S 段头注释：Retry-After 优先、
+# 无头分钟级指数退避、累计等待超预算即落下响应由调用方维持 4xx 致命。
+# 全部经 retry_sleep 记录，零真实等待、零真实 API 调用。
+
+
+def _send_get(handler: object, **kwargs: object) -> object:
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        return providers._send(client, "GET", "https://provider.test/x", **kwargs)
+
+
+def test_rate_limit_retries_respect_retry_after_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-After 秒数被尊重：两次 429 后成功，等待恰为头部值。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return httpx.Response(
+                429, json={"error": "slow down"}, headers={"Retry-After": "45"}
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    response, record = _send_get(handler, rate_limit_budget_s=900.0)
+    assert response.status_code == 200
+    assert calls == 3
+    assert sleeps == [45.0, 45.0]
+    assert [
+        entry["response"]["status_code"] for entry in record["attempts"]
+    ] == [429, 429, 200]
+
+
+def test_rate_limit_retry_after_http_date_is_respected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-After HTTP-date 形态换算为相对秒数。"""
+    import time as _time
+    from email.utils import formatdate
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                429,
+                json={"error": "slow down"},
+                headers={"Retry-After": formatdate(_time.time() + 45, usegmt=True)},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    response, _record = _send_get(handler, rate_limit_budget_s=900.0)
+    assert response.status_code == 200
+    assert len(sleeps) == 1
+    assert 40.0 < sleeps[0] <= 45.0
+
+
+def test_rate_limit_retry_after_is_clamped_to_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-After 超过钳制上限：按上限等待，不无限信任对端。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                429, json={"error": "slow down"}, headers={"Retry-After": "5000"}
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    response, _record = _send_get(handler, rate_limit_budget_s=2000.0)
+    assert response.status_code == 200
+    assert sleeps == [providers.RATE_LIMIT_RETRY_AFTER_MAX_S]
+
+
+def test_rate_limit_without_header_uses_backoff_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无 Retry-After（含非法值）：按分钟级指数序列退避后成功。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            headers = {"Retry-After": "garbage"} if calls == 3 else {}
+            return httpx.Response(429, json={"error": "slow down"}, headers=headers)
+        return httpx.Response(200, json={"ok": True})
+
+    response, _record = _send_get(handler, rate_limit_budget_s=900.0)
+    assert response.status_code == 200
+    assert calls == 4
+    assert sleeps == list(providers.RATE_LIMIT_BACKOFF_S[:3]) == [30.0, 60.0, 120.0]
+
+
+def test_rate_limit_budget_exhaustion_falls_back_to_caller_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """累计等待超预算：停止重试、响应原样落下，_ensure_success 维持 4xx
+    确定性致命（原降级语义），不新增门禁。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, json={"error": "slow down"})
+
+    response, record = _send_get(handler, rate_limit_budget_s=100.0)
+    # 等待 30（累计 30 ≤ 100）、60（累计 90 ≤ 100），下一次 120 超预算 → 停。
+    assert calls == 3
+    assert sleeps == [30.0, 60.0]
+    assert response.status_code == 429
+    with pytest.raises(ProviderFailure):
+        providers._ensure_success(response, record)
+
+
+def test_rate_limit_disabled_by_default_keeps_old_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不传预算（默认 None）：429 维持原 4xx 语义立即返回——Picsart 等其余
+    provider 的 429 分类（submission-unknown）不受影响。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, json={"error": "slow down"})
+
+    response, _record = _send_get(handler)
+    assert response.status_code == 429
+    assert calls == 1
+    assert sleeps == []
+
+
+def test_non_rate_limit_client_error_still_immediate_with_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 429 的 4xx：启用预算也不重试，确定性致命语义不变。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"error": "bad request"})
+
+    response, record = _send_get(handler, rate_limit_budget_s=900.0)
+    assert response.status_code == 400
+    assert calls == 1
+    assert sleeps == []
+    assert "attempts" not in record
+    with pytest.raises(ProviderFailure):
+        providers._ensure_success(response, record)
+
+
+def test_gateway_status_backoff_unchanged_with_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5xx 网关状态：启用预算后仍走原秒级短重试序列，行为不变。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(providers, "retry_sleep", sleeps.append)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, json={"error": "upstream unavailable"})
+
+    response, _record = _send_get(handler, rate_limit_budget_s=900.0)
+    assert response.status_code == 503
+    assert calls == 3
+    assert sleeps == list(providers.RETRY_BACKOFF_S) == [2.0, 5.0]
+
+
+# --- provider_rate_limit_budget_s 配置 ---
+
+
+def test_settings_rejects_invalid_rate_limit_budget(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="PROVIDER_RATE_LIMIT_BUDGET_S"):
+        _settings(tmp_path, provider_rate_limit_budget_s=0.0)
+    with pytest.raises(ValueError, match="PROVIDER_RATE_LIMIT_BUDGET_S"):
+        _settings(tmp_path, provider_rate_limit_budget_s=True)
+
+
+def test_get_settings_reads_rate_limit_budget_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.setenv("PROVIDER_RATE_LIMIT_BUDGET_S", "120")
+    settings = get_settings()
+    assert settings.provider_rate_limit_budget_s == 120.0
+    monkeypatch.delenv("PROVIDER_RATE_LIMIT_BUDGET_S")
+    settings = get_settings()
+    assert settings.provider_rate_limit_budget_s == 900.0

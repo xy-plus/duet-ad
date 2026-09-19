@@ -96,6 +96,11 @@ class Settings:
     request_timeout_s: float = 180.0
     provider_poll_interval_s: float = 3.0
     provider_poll_timeout_s: float = 1800.0
+    # 429 限流长退避的累计等待上限（实现见 app/providers.py
+    # RATE_LIMIT_BACKOFF_S 段头注释；仅检测类 provider 启用，其余 provider
+    # 429 语义不变）。缺省 900s；合法值为正有限数，加载期校验。不进前端、
+    # 不进公开 API。
+    provider_rate_limit_budget_s: float = 900.0
     picsart_task_hang_limit_s: float = 21600.0
     max_upload_mb: int = 500
     store_lock_enabled: bool = True
@@ -274,6 +279,15 @@ class Settings:
             or self.picsart_task_hang_limit_s <= 0
         ):
             raise ValueError("PICSART_TASK_HANG_LIMIT_S must be a positive finite number")
+        if (
+            isinstance(self.provider_rate_limit_budget_s, bool)
+            or not isinstance(self.provider_rate_limit_budget_s, (int, float))
+            or not math.isfinite(float(self.provider_rate_limit_budget_s))
+            or self.provider_rate_limit_budget_s <= 0
+        ):
+            raise ValueError(
+                "PROVIDER_RATE_LIMIT_BUDGET_S must be a positive finite number"
+            )
         clients_file = self.public_api_clients_file
         if clients_file is None:
             clients_file = self.data_dir / ".public-api" / "public-api-clients.json"
@@ -545,6 +559,9 @@ def get_settings() -> Settings:
         request_timeout_s=float(os.environ.get("REQUEST_TIMEOUT_S", "180")),
         provider_poll_interval_s=float(os.environ.get("PROVIDER_POLL_INTERVAL_S", "3")),
         provider_poll_timeout_s=float(os.environ.get("PROVIDER_POLL_TIMEOUT_S", "1800")),
+        provider_rate_limit_budget_s=float(
+            os.environ.get("PROVIDER_RATE_LIMIT_BUDGET_S", "900")
+        ),
         picsart_task_hang_limit_s=float(os.environ.get("PICSART_TASK_HANG_LIMIT_S", "21600")),
         max_upload_mb=int(os.environ.get("MAX_UPLOAD_MB", "500")),
         public_api_enabled=_bool("PUBLIC_API_ENABLED", False),

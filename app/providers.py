@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Generic, Mapping, TypeVar
 from urllib.parse import urlsplit
@@ -38,6 +40,15 @@ RETRY_BACKOFF_S = (2.0, 5.0)
 # been established: those may have transmitted the request.
 CONNECTION_RETRY_BACKOFF_S = (10.0, 30.0, 60.0, 120.0, 300.0)
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
+# 429 限流单独处理（默认关闭，仅调用方按预算启用——检测类 provider 经
+# rate_limit_budget_s 启用，其余 provider 的 429 语义不变）：限流是"等
+# 窗口过去就能成"的暂时性失败，与 RETRYABLE_STATUSES 的秒级短重试不同，
+# 用分钟级退避。优先尊重响应 Retry-After 头（秒数或 HTTP-date，钳到
+# RATE_LIMIT_RETRY_AFTER_MAX_S；缺失/非法/非正值时退化为本指数序列）；
+# 累计等待超过调用方预算即停止重试、响应原样返回，由调用方
+# _ensure_success 维持 4xx 确定性致命（原降级语义），不新增门禁。
+RATE_LIMIT_BACKOFF_S = (30.0, 60.0, 120.0, 240.0, 480.0)
+RATE_LIMIT_RETRY_AFTER_MAX_S = 900.0
 _CONNECTION_TRANSPORT_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -181,6 +192,29 @@ def retry_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Retry-After 头（秒数或 HTTP-date）→ 等待秒数，钳到
+    RATE_LIMIT_RETRY_AFTER_MAX_S；缺失/非法/非正值返回 None（调用方退化为
+    RATE_LIMIT_BACKOFF_S 序列）。"""
+    header = response.headers.get("retry-after")
+    if header is None:
+        return None
+    header = header.strip()
+    if header.isdigit():
+        seconds = float(int(header))
+    else:
+        try:
+            parsed = parsedate_to_datetime(header)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+    if seconds <= 0:
+        return None
+    return min(seconds, RATE_LIMIT_RETRY_AFTER_MAX_S)
+
+
 def _send(
     client: httpx.Client,
     method: str,
@@ -191,6 +225,7 @@ def _send(
     content: bytes | None = None,
     files: Mapping[str, Any] | None = None,
     request_body: Any = _MISSING,
+    rate_limit_budget_s: float | None = None,
 ) -> tuple[httpx.Response, dict[str, Any]]:
     kwargs: dict[str, Any] = {"headers": headers}
     if json_body is not _MISSING:
@@ -209,6 +244,8 @@ def _send(
     connection_phase = True
     connection_retries = 0
     ambiguous_retries = 0
+    rate_limit_retries = 0
+    rate_limit_waited_s = 0.0
     while True:
         attempt_number += 1
         try:
@@ -258,6 +295,29 @@ def _send(
         exchange = response_record(response, request_body=request_body)
         exchange["attempt"] = attempt_number
         attempts.append(exchange)
+        if response.status_code == 429 and rate_limit_budget_s is not None:
+            # 429 限流：长退避等窗口（序列/钳制见 RATE_LIMIT_BACKOFF_S 段头
+            # 注释）。累计等待超预算即落下响应，由调用方维持 4xx 致命语义。
+            wait_s = _retry_after_seconds(response)
+            if wait_s is None:
+                wait_s = RATE_LIMIT_BACKOFF_S[
+                    min(rate_limit_retries, len(RATE_LIMIT_BACKOFF_S) - 1)
+                ]
+            if rate_limit_waited_s + wait_s <= rate_limit_budget_s:
+                rate_limit_retries += 1
+                rate_limit_waited_s += wait_s
+                _LOGGER.warning(
+                    "provider %s %s attempt %d returned HTTP 429; "
+                    "retrying in %gs (rate-limit wait %gs/%gs)",
+                    method,
+                    url,
+                    attempt_number,
+                    wait_s,
+                    rate_limit_waited_s,
+                    rate_limit_budget_s,
+                )
+                retry_sleep(wait_s)
+                continue
         if response.status_code in RETRYABLE_STATUSES:
             # A gateway response is an ambiguous, post-transport outcome;
             # retain its historical two short retries even if preceding

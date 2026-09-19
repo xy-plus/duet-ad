@@ -1410,6 +1410,7 @@ def _wavespeed_handler(
     ticket_status: int = 200,
     put_status: int = 200,
     bare_submit_id: bool = False,
+    submit_429_count: int = 0,
 ) -> object:
     """wavespeed 上传 ticket + PUT + 提交/轮询/RLE 下载全链路 mock。"""
     state = {"tickets": 0, "puts": 0, "submits": 0, "polls": 0}
@@ -1453,6 +1454,11 @@ def _wavespeed_handler(
             assert request.headers["authorization"] == "Bearer wavespeed-secret"
             if observed is not None:
                 observed["submit_body"] = json.loads(request.content)
+            if state["submits"] <= submit_429_count:
+                # 限流（无 Retry-After 头）：触发长退避序列。
+                return httpx.Response(
+                    429, json={"code": 429, "message": "Too Many Requests"}
+                )
             if submit_status != 200:
                 return httpx.Response(
                     submit_status, json={"code": 401, "message": "invalid API key"}
@@ -2043,3 +2049,47 @@ def test_get_settings_wavespeed_env_unset(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("WAVESPEED_API_KEY", raising=False)
     settings = get_settings()
     assert settings.wavespeed_sam3_api_key is None
+
+
+# --- wavespeed 429 限流长退避（providers._send 预算经 _send_detect 透传） ---
+
+
+def test_wavespeed_submit_429_retries_with_long_backoff_then_succeeds(
+    tmp_path: Path, video: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """提交连续 429（实测场景：限流窗口没过就放弃 → object_mask_degraded）：
+    按分钟级序列长退避后成功；settings 的预算经共享 HTTP 层生效。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(object_detect.providers, "retry_sleep", sleeps.append)
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
+        submit_429_count=2,
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    _assert_wavespeed_detections(result, "handheld fan, face")
+    assert handler.state["submits"] == 3  # type: ignore[attr-defined]
+    assert sleeps == [30.0, 60.0]
+
+
+def test_wavespeed_submit_429_budget_exhausted_keeps_degraded_semantics(
+    tmp_path: Path, video: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """预算小于首次退避：一次 429 即停，ProviderFailure → 原
+    object_mask_degraded 降级语义，不重试不等待。"""
+    sleeps: list[float] = []
+    monkeypatch.setattr(object_detect.providers, "retry_sleep", sleeps.append)
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
+        submit_429_count=99,
+    )
+    client = _wavespeed_client(
+        _wavespeed_settings(tmp_path, provider_rate_limit_budget_s=10.0),
+        handler,
+    )
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["handheld fan"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    assert sleeps == []
