@@ -15,6 +15,7 @@ from app.config import Settings, get_settings
 from app.object_detect import (
     FalSam3GroundingClient,
     ObjectDetection,
+    SandbaseSam3GroundingClient,
     available_providers,
     select_provider,
 )
@@ -841,3 +842,534 @@ def test_get_settings_ignores_removed_object_detect_providers_env(
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
     monkeypatch.setenv("OBJECT_DETECT_PROVIDERS", "doubao,qwen")
     assert not hasattr(get_settings(), "object_detect_providers")
+
+
+# ==== sandbase_sam3（sandbase.ai SAM 3.1 video-rle）：2026-09-19 起主 provider ====
+# 流程：POST /v1/upload（multipart 字段 file）→ POST /v1/run（202 拿 id）→
+# GET /v1/run/{id} 轮询（pending/running 继续，completed/failed/timeout 终态）。
+# 接口事实见 app/object_detect.py sandbase 段头注释与
+# data-verify/sandbase-sam31-calib-20260919/README.md。
+
+
+def _sandbase_settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "sandbase_sam3_api_key": "sandbase-secret",
+        "sandbase_sam3_api_base": "https://sandbase.test",
+        "sandbase_sam3_model": "meta/sam-3-1/video-rle",
+        "provider_poll_interval_s": 0.01,
+    }
+    values.update(overrides)
+    return _settings(tmp_path, **values)
+
+
+def _sandbase_handler(
+    completed: object | None,
+    *,
+    artifact: object | None = None,
+    observed: dict[str, object] | None = None,
+    statuses: tuple[str, ...] = ("running", "completed"),
+    submit_status: int = 202,
+    upload_status: int = 200,
+) -> object:
+    """sandbase 上传 + 提交/轮询/输出下载全链路 mock。"""
+    state = {"polls": 0, "submits": 0, "uploads": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/v1/upload":
+            state["uploads"] += 1
+            assert request.headers["authorization"] == "Bearer sandbase-secret"
+            assert request.headers["content-type"].startswith(
+                "multipart/form-data"
+            )
+            assert b'name="file"' in request.content
+            assert b"video/mp4" in request.content
+            if upload_status != 200:
+                return httpx.Response(
+                    upload_status, json={"error": "file type not allowed"}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "content_type": "video/mp4",
+                    "filename": "clip.mp4",
+                    "size": len(request.content),
+                    "type": "video/mp4",
+                    "url": "https://sandbase.test/files/clip.mp4",
+                },
+            )
+        if request.method == "POST" and path == "/v1/run":
+            state["submits"] += 1
+            assert request.headers["authorization"] == "Bearer sandbase-secret"
+            if observed is not None:
+                observed["submit_body"] = json.loads(request.content)
+            if submit_status != 202:
+                return httpx.Response(
+                    submit_status, json={"error": "invalid API key"}
+                )
+            return httpx.Response(
+                202,
+                json={
+                    "id": "run-1",
+                    "status": "pending",
+                    "model": "meta/sam-3-1/video-rle",
+                },
+            )
+        if request.method == "GET" and path == "/v1/run/run-1":
+            status = statuses[min(state["polls"], len(statuses) - 1)]
+            state["polls"] += 1
+            if status == "completed":
+                return httpx.Response(200, json=completed)
+            if status == "failed":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "run-1",
+                        "status": "failed",
+                        "model": "meta/sam-3-1/video-rle",
+                        "error": {"type": "runner_error", "message": "exploded"},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "run-1",
+                    "status": status,
+                    "model": "meta/sam-3-1/video-rle",
+                },
+            )
+        if request.method == "GET" and path == "/files/output.json":
+            return httpx.Response(200, json=artifact)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    handler.state = state  # type: ignore[attr-defined]
+    return handler
+
+
+def _sandbase_client(settings: Settings, handler) -> SandbaseSam3GroundingClient:
+    return SandbaseSam3GroundingClient(
+        settings, transport=httpx.MockTransport(handler)
+    )
+
+
+def test_sandbase_requires_api_key(tmp_path: Path, video: Path) -> None:
+    client = _sandbase_client(
+        _sandbase_settings(tmp_path, sandbase_sam3_api_key=None),
+        lambda request: httpx.Response(200),
+    )
+    with pytest.raises(ValueError, match="sandbase_sam3 API key"):
+        client.detect(video, ["bottle"])
+
+
+def test_sandbase_empty_targets_return_empty(tmp_path: Path, video: Path) -> None:
+    client = _sandbase_client(
+        _sandbase_settings(tmp_path), lambda request: httpx.Response(200)
+    )
+    assert client.detect(video, []) == []
+
+
+def test_sandbase_upload_client_error_is_fatal_without_retry(
+    tmp_path: Path, video: Path
+) -> None:
+    """上传 4xx（实测形态扁平 {"error": "..."}）是确定性错误：致命不重传。"""
+    handler = _sandbase_handler(None, upload_status=400)
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+    assert handler.state["uploads"] == 1  # type: ignore[attr-defined]
+    assert handler.state["submits"] == 0  # type: ignore[attr-defined]
+
+
+def test_sandbase_upload_without_url_is_fatal(tmp_path: Path, video: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/upload":
+            return httpx.Response(200, json={"size": 1})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+
+
+def test_sandbase_submit_unauthorized_is_fatal_without_retry(
+    tmp_path: Path, video: Path
+) -> None:
+    """401 invalid API key（实测形态）：确定性 4xx，致命不重提。"""
+    handler = _sandbase_handler(None, submit_status=401)
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_sandbase_submit_without_id_is_fatal(tmp_path: Path, video: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/v1/upload":
+            return httpx.Response(
+                200, json={"url": "https://sandbase.test/files/clip.mp4"}
+            )
+        if request.method == "POST" and path == "/v1/run":
+            return httpx.Response(202, json={"status": "pending"})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+
+
+def test_sandbase_run_failed_is_fatal(tmp_path: Path, video: Path) -> None:
+    """任务级失败：status=failed 带 error {type,message}，致命不重提。"""
+    handler = _sandbase_handler(None, statuses=("failed",))
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, ValueError)
+    assert "exploded" in str(excinfo.value.cause)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_sandbase_run_timeout_status_is_fatal(tmp_path: Path, video: Path) -> None:
+    handler = _sandbase_handler(None, statuses=("timeout",))
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, ValueError)
+
+
+def test_sandbase_unknown_status_is_fatal(tmp_path: Path, video: Path) -> None:
+    handler = _sandbase_handler(None, statuses=("exploding",))
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, ValueError)
+
+
+def test_sandbase_poll_timeout_raises_provider_failure(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _sandbase_handler(None, statuses=("running",))
+    settings = _sandbase_settings(
+        tmp_path, provider_poll_interval_s=0.0, provider_poll_timeout_s=0.0
+    )
+    client = _sandbase_client(settings, handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, TimeoutError)
+
+
+# --- 可用性门禁与 client 构造（sandbase 主、fal 后备） ---
+
+
+def test_available_providers_prefers_sandbase(tmp_path: Path) -> None:
+    settings = _sandbase_settings(tmp_path, fal_sam3_api_key="fal-secret")
+    assert available_providers(settings) == ["sandbase_sam3"]
+
+
+def test_available_providers_falls_back_to_fal(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, fal_sam3_api_key="fal-secret")
+    assert available_providers(settings) == ["fal_sam3"]
+
+
+def test_available_providers_empty_without_any_key(tmp_path: Path) -> None:
+    assert available_providers(_settings(tmp_path)) == []
+
+
+def test_select_provider_returns_sandbase_client(tmp_path: Path) -> None:
+    client = select_provider(_sandbase_settings(tmp_path))
+    assert isinstance(client, SandbaseSam3GroundingClient)
+
+
+def test_select_provider_falls_back_to_fal(tmp_path: Path) -> None:
+    client = select_provider(_settings(tmp_path, fal_sam3_api_key="fal-secret"))
+    assert isinstance(client, FalSam3GroundingClient)
+
+
+def test_select_provider_none_without_any_key(tmp_path: Path) -> None:
+    assert select_provider(_settings(tmp_path)) is None
+
+
+# --- sandbase_sam3 配置校验 ---
+
+
+def test_settings_sandbase_sam3_defaults(tmp_path: Path) -> None:
+    settings = _sandbase_settings(tmp_path)
+    assert settings.sandbase_sam3_threshold == 0.3
+    assert settings.sandbase_sam3_api_key == "sandbase-secret"
+    assert settings.sandbase_sam3_api_base == "https://sandbase.test"
+    assert settings.sandbase_sam3_model == "meta/sam-3-1/video-rle"
+
+
+def test_settings_sandbase_sam3_api_key_defaults_to_none(tmp_path: Path) -> None:
+    assert _settings(tmp_path).sandbase_sam3_api_key is None
+
+
+def test_settings_rejects_non_ascii_sandbase_key(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="SANDBASE_API_KEY"):
+        _settings(tmp_path, sandbase_sam3_api_key="k€y")
+
+
+def test_settings_rejects_invalid_sandbase_sam3_model(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="SANDBASE_SAM3_MODEL"):
+        _settings(tmp_path, sandbase_sam3_model="bad model!")
+
+
+def test_settings_rejects_non_https_sandbase_sam3_api_base(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="SANDBASE_SAM3_API_BASE"):
+        _settings(tmp_path, sandbase_sam3_api_base="http://sandbase.test")
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.1, 1.5, True, "0.3"])
+def test_settings_rejects_invalid_sandbase_sam3_threshold(
+    tmp_path: Path, threshold: object
+) -> None:
+    with pytest.raises(ValueError, match="SANDBASE_SAM3_THRESHOLD"):
+        _sandbase_settings(tmp_path, sandbase_sam3_threshold=threshold)
+
+
+def test_get_settings_reads_sandbase_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.setenv("SANDBASE_API_KEY", "  sandbase-key ")
+    monkeypatch.setenv("SANDBASE_SAM3_THRESHOLD", "0.2")
+    settings = get_settings()
+    assert settings.sandbase_sam3_api_key == "sandbase-key"
+    assert settings.sandbase_sam3_threshold == 0.2
+    assert settings.sandbase_sam3_api_base == "https://api.sandbase.ai"
+    assert settings.sandbase_sam3_model == "meta/sam-3-1/video-rle"
+
+
+def test_get_settings_sandbase_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.delenv("SANDBASE_API_KEY", raising=False)
+    monkeypatch.delenv("SANDBASE_SAM3_THRESHOLD", raising=False)
+    settings = get_settings()
+    assert settings.sandbase_sam3_api_key is None
+    assert settings.sandbase_sam3_threshold == 0.3
+
+
+# --- sandbase 成功链路（合成 fixture，形态未经真实 completed 响应验证） ---
+# fixture 是 fal 真实校准响应数值的逐字复制（同一模型假定），来源与"未验证"
+# 声明见 tests/fixtures/sandbase_sam3_video_rle_response.json 内 _comment。
+_SANDBASE_SAM3_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "sandbase_sam3_video_rle_response.json"
+)
+_SANDBASE_SAM3_RESULT = json.loads(
+    _SANDBASE_SAM3_FIXTURE.read_text(encoding="utf-8")
+)
+_SANDBASE_SAM3_EXPECTED = [
+    ObjectDetection(
+        "handheld fan, face",
+        index / 2.0,
+        (
+            _clamp01(box[0] - box[2] / 2),
+            _clamp01(box[1] - box[3] / 2),
+            _clamp01(box[0] + box[2] / 2),
+            _clamp01(box[1] + box[3] / 2),
+        ),
+        _SANDBASE_SAM3_RESULT["rle"][index],
+    )
+    for index, box in enumerate(_SANDBASE_SAM3_RESULT["boxes"])
+    if box is not None
+]
+
+
+def _sandbase_completed(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "id": "run-1",
+        "status": "completed",
+        "model": "meta/sam-3-1/video-rle",
+        "outputs": [
+            {
+                "url": "https://sandbase.test/files/output.json",
+                "content_type": "application/json",
+            }
+        ],
+        "error": None,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_sandbase_detect_full_flow(tmp_path: Path, video: Path) -> None:
+    """上传 → 提交 → 轮询 → 下载输出 → 解析全链路；多 target 合成一个 prompt。"""
+    observed: dict[str, object] = {}
+    handler = _sandbase_handler(
+        _sandbase_completed(), artifact=_SANDBASE_SAM3_RESULT, observed=observed
+    )
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    assert result == _SANDBASE_SAM3_EXPECTED
+    assert len(result) == 8
+    assert observed["submit_body"] == {
+        "model": "meta/sam-3-1/video-rle",
+        "video": "https://sandbase.test/files/clip.mp4",
+        "prompt": "handheld fan, face",
+        "apply_mask": False,
+        "box_prompts": [],
+        "frame_index": 0,
+        "point_prompts": [],
+        "boundingbox_zip": False,
+        "max_num_objects": 16,
+        "detection_threshold": 0.3,
+    }
+    assert handler.state["uploads"] == 1  # type: ignore[attr-defined]
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    assert [entry["rle"] for entry in client.last_frames] == (
+        _SANDBASE_SAM3_RESULT["rle"]
+    )
+    assert [detection.rle for detection in result] == (
+        _SANDBASE_SAM3_RESULT["rle"]
+    )
+    assert client.last_frames[0]["frame_index"] == 0
+    assert client.last_frames[0]["score"] is None
+    assert client.last_frames[0]["box"] == _SANDBASE_SAM3_RESULT["boxes"][0]
+    assert {frame["label"] for frame in client.last_frames} == (
+        {"handheld fan, face"}
+    )
+
+
+def test_sandbase_empty_result_is_not_retried(tmp_path: Path, video: Path) -> None:
+    """空结果是确定答案：返回空列表，不重提（省钱纪律）。"""
+    handler = _sandbase_handler(
+        _sandbase_completed(),
+        artifact={"rle": [], "boxes": [], "metadata": []},
+    )
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    assert client.detect(video, ["handheld fan"]) == []
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_sandbase_completed_without_outputs_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """completed 但没有 outputs 列表 = 未校准形态：确定性致命，标记类型。"""
+    handler = _sandbase_handler(
+        {"id": "run-1", "status": "completed", "model": "x"}
+    )
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_sandbase_completed_without_json_output_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """outputs 里没有 JSON 产物（如只有 zip）= 未校准形态：确定性致命。"""
+    handler = _sandbase_handler(
+        _sandbase_completed(
+            outputs=[
+                {
+                    "url": "https://sandbase.test/files/output.zip",
+                    "content_type": "application/zip",
+                }
+            ]
+        )
+    )
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+
+
+def test_sandbase_artifact_not_object_is_fatal(tmp_path: Path, video: Path) -> None:
+    handler = _sandbase_handler(_sandbase_completed(), artifact=[1, 2, 3])
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+
+
+def test_sandbase_uncalibrated_artifact_is_fatal_without_resubmit(
+    tmp_path: Path, video: Path
+) -> None:
+    """产物 rle/boxes 不等长 = 未校准形态：确定性致命不重提。"""
+    handler = _sandbase_handler(
+        _sandbase_completed(), artifact={"rle": ["rle-a"], "boxes": []}
+    )
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_sandbase_malformed_box_is_fatal_without_resubmit(
+    tmp_path: Path, video: Path
+) -> None:
+    bad = {
+        "rle": ["rle-bad"],
+        "boxes": [[0.1, 0.2, 0.3]],
+        "metadata": [{"index": 0, "score": None, "box": [0.1, 0.2, 0.3]}],
+    }
+    handler = _sandbase_handler(_sandbase_completed(), artifact=bad)
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, ValueError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+# --- sandbase 产物落盘与复用（与 fal 同一实例级共享缓存布局） ---
+
+
+def test_sandbase_shared_cache_cross_project_reuse(
+    tmp_path: Path, video: Path
+) -> None:
+    """实例级共享：同指纹（同视频同 prompt）跨项目零 HTTP 复用；payload_key
+    为 provider_response，指纹含 model 与 fal 缓存天然隔离。"""
+    settings = _sandbase_settings(tmp_path)
+    handler = _sandbase_handler(
+        _sandbase_completed(), artifact=_SANDBASE_SAM3_RESULT
+    )
+    client = SandbaseSam3GroundingClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+        cache_path=(
+            tmp_path / "projects" / "a" / "work" / "segments" / "0001"
+            / "object-detect-response.json"
+        ),
+    )
+    first = client.detect(video, ["handheld fan", "face"])
+    assert first == _SANDBASE_SAM3_EXPECTED
+    shared = _shared_cache_files(settings)
+    assert len(shared) == 1
+    cached = json.loads(shared[0].read_text(encoding="utf-8"))
+    assert cached["provider_response"] == _SANDBASE_SAM3_RESULT
+    assert cached["fingerprint"]["prompt"] == "handheld fan, face"
+    assert cached["fingerprint"]["model"] == "meta/sam-3-1/video-rle"
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    reused = SandbaseSam3GroundingClient(
+        settings,
+        transport=httpx.MockTransport(fail_handler),
+        cache_path=(
+            tmp_path / "projects" / "b" / "work" / "segments" / "0001"
+            / "object-detect-response.json"
+        ),
+    )
+    assert reused.detect(video, ["handheld fan", "face"]) == first
+    assert [entry["rle"] for entry in reused.last_frames] == (
+        _SANDBASE_SAM3_RESULT["rle"]
+    )
+
+
+def test_sandbase_cache_fingerprint_mismatch_refetches(
+    tmp_path: Path, video: Path
+) -> None:
+    """target 变化 = 新任务：指纹不匹配则重新调用。"""
+    handler = _sandbase_handler(
+        _sandbase_completed(), artifact=_SANDBASE_SAM3_RESULT
+    )
+    client = _sandbase_client(_sandbase_settings(tmp_path), handler)
+    client.detect(video, ["handheld fan"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    client.detect(video, ["bottle"])
+    assert handler.state["submits"] == 2  # type: ignore[attr-defined]

@@ -17,13 +17,24 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MULTIREF_MODES = frozenset({"composed", "direct"})
 ARTIFACT_RETENTION_MODES = frozenset({"full", "lean"})
 
-# 物品检测只走 fal.ai SAM 3.1 video-rle（实现见 app/object_detect.py）：
-# 队列 base 含端点路径，model 为端点末段，提交 URL = <base>/<model>。
+# 物品检测只走 SAM 3.1 video-rle（实现见 app/object_detect.py）：sandbase.ai
+# 为主 provider（2026-09-19 起），fal.ai 保留作后备。
+# fal 队列 base 含端点路径，model 为端点末段，提交 URL = <base>/<model>。
 # 凭证环境变量名沿用 fal 平台统一约定 FAL_KEY（不是 FAL_SAM3_API_KEY）。
 # 端点从 sam-3 升级到 sam-3-1（schema 一致，仅多一个可选 max_num_objects，
 # 默认 16）；仍可用 FAL_SAM3_API_BASE 配回旧端点。
 FAL_SAM3_API_BASE = "https://queue.fal.run/fal-ai/sam-3-1"
 FAL_SAM3_MODEL = "video-rle"
+# sandbase.ai SAM 3.1 video-rle（2026-09-19 起替代 fal 成为物品/人脸灰块检测
+# 主 provider：fal 账号被官方 Admin lock，storage upload 403；fal 配置保留作
+# 后备）。端点均为 <base>/v1/...（上传 /v1/upload、提交 /v1/run、轮询
+# /v1/run/{id}），model 是含路径段的完整模型 ID。凭证环境变量名沿用
+# sandbase 官方 CLI 约定 SANDBASE_API_KEY。
+SANDBASE_SAM3_API_BASE = "https://api.sandbase.ai"
+SANDBASE_SAM3_MODEL = "meta/sam-3-1/video-rle"
+# sandbase 模型 ID 含 "/" 路径段（meta/sam-3-1/video-rle），校验比
+# _MODEL_ID_RE 多允许一个字符。
+_MODEL_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 # fal 代理只允许 http/https（socks5/socks5h 需要 socksio，未引入依赖），
 # Scheme 白名单见 __post_init__。
 _PROXY_SCHEMES = frozenset({"http", "https"})
@@ -82,7 +93,18 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
-    # fal SAM-3 物品检测；fal_sam3_api_key 缺省 None = 未配置（FAL_KEY 未设，
+    # sandbase SAM-3 物品检测主 provider；sandbase_sam3_api_key 缺省 None =
+    # 未配置（SANDBASE_API_KEY 未设），此时回退 fal（fal key 也未配置则物品
+    # 灰块节点不触发）。默认值来自上方 SANDBASE_SAM3_API_BASE /
+    # SANDBASE_SAM3_MODEL。国内直连 api.sandbase.ai 通畅（2026-09-19 实测），
+    # 故没有 proxy 配置项。
+    sandbase_sam3_api_key: str | None = field(default=None, repr=False)
+    sandbase_sam3_api_base: str = SANDBASE_SAM3_API_BASE
+    sandbase_sam3_model: str = SANDBASE_SAM3_MODEL
+    # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高）；
+    # 与 FAL_SAM3_THRESHOLD 语义相同但独立配置，合法区间 (0, 1]，加载期校验。
+    sandbase_sam3_threshold: float = 0.3
+    # fal SAM-3 物品检测（后备 provider）；fal_sam3_api_key 缺省 None = 未配置（FAL_KEY 未设，
     # 物品灰块节点不触发）。默认值来自上方 FAL_SAM3_API_BASE / FAL_SAM3_MODEL。
     fal_sam3_api_key: str | None = field(default=None, repr=False)
     fal_sam3_api_base: str = FAL_SAM3_API_BASE
@@ -94,11 +116,12 @@ class Settings:
     # 合法区间 (0, 1]，加载期校验。
     fal_sam3_threshold: float = 0.3
     # 物品灰块节点总开关：false 时 mask-replaceable-objects 完全不触发，
-    # 不发起任何 fal 调用（无上传、无重试、无等待），行为与
+    # 不发起任何检测调用（无上传、无重试、无等待），行为与
     # object_mask_degraded 降级路径完全一致（参考视频保持 source-muted、
     # 提示词按未遮盖处理），trace 记 object_mask_disabled 以区分配置关闭
-    # 与失败降级。缺省 true 维持现状；fal 账号不可用期间在 .env 显式写
-    # false。本开关不进前端、不进公开 API。
+    # 与失败降级。缺省 true 维持现状；检测后端不可用期间（2026-09-19 fal
+    # 账号被锁、替代 provider sandbase 的 worker 又连续 generation_timeout）
+    # 在 .env 显式写 false。本开关不进前端、不进公开 API。
     object_mask_enabled: bool = True
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0
@@ -238,6 +261,48 @@ class Settings:
         if not isinstance(clients_file, Path):
             raise ValueError("PUBLIC_API_CLIENTS_FILE must be a filesystem path")
         object.__setattr__(self, "public_api_clients_file", clients_file)
+        sandbase_key = self.sandbase_sam3_api_key
+        if sandbase_key is not None:
+            if not isinstance(sandbase_key, str) or not sandbase_key.strip():
+                raise ValueError("SANDBASE_API_KEY must be a non-empty value or unset")
+            sandbase_key = sandbase_key.strip()
+            if (
+                not sandbase_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in sandbase_key)
+            ):
+                raise ValueError("SANDBASE_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "sandbase_sam3_api_key", sandbase_key)
+        sandbase_base = (
+            self.sandbase_sam3_api_base.strip().rstrip("/")
+            if isinstance(self.sandbase_sam3_api_base, str)
+            else ""
+        )
+        try:
+            sandbase_base_url = urlsplit(sandbase_base)
+        except ValueError as exc:
+            raise ValueError(
+                "SANDBASE_SAM3_API_BASE must be an HTTPS base URL"
+            ) from exc
+        if sandbase_base_url.scheme != "https" or not sandbase_base_url.netloc:
+            raise ValueError("SANDBASE_SAM3_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "sandbase_sam3_api_base", sandbase_base)
+        sandbase_model = (
+            self.sandbase_sam3_model.strip()
+            if isinstance(self.sandbase_sam3_model, str)
+            else ""
+        )
+        if not _MODEL_PATH_RE.fullmatch(sandbase_model):
+            raise ValueError("SANDBASE_SAM3_MODEL must be a valid model identifier")
+        object.__setattr__(self, "sandbase_sam3_model", sandbase_model)
+        sandbase_threshold = self.sandbase_sam3_threshold
+        if (
+            isinstance(sandbase_threshold, bool)
+            or not isinstance(sandbase_threshold, (int, float))
+            or not math.isfinite(float(sandbase_threshold))
+            or not 0.0 < float(sandbase_threshold) <= 1.0
+        ):
+            raise ValueError("SANDBASE_SAM3_THRESHOLD must be a number in (0, 1]")
+        object.__setattr__(self, "sandbase_sam3_threshold", float(sandbase_threshold))
         fal_key = self.fal_sam3_api_key
         if fal_key is not None:
             if not isinstance(fal_key, str) or not fal_key.strip():
@@ -365,6 +430,12 @@ def get_settings() -> Settings:
         os.environ.get("ARTIFACT_RETENTION", "").strip().lower() or "full"
     )
     try:
+        sandbase_sam3_threshold = float(
+            os.environ.get("SANDBASE_SAM3_THRESHOLD", "0.3").strip()
+        )
+    except ValueError as exc:
+        raise ValueError("SANDBASE_SAM3_THRESHOLD must be a number in (0, 1]") from exc
+    try:
         fal_sam3_threshold = float(
             os.environ.get("FAL_SAM3_THRESHOLD", "0.3").strip()
         )
@@ -432,6 +503,14 @@ def get_settings() -> Settings:
         # therefore cannot disable the single-worker store lock; tests may do
         # so only by constructing Settings explicitly.
         store_lock_enabled=True,
+        sandbase_sam3_api_key=os.environ.get("SANDBASE_API_KEY", "").strip() or None,
+        sandbase_sam3_api_base=os.environ.get(
+            "SANDBASE_SAM3_API_BASE", SANDBASE_SAM3_API_BASE
+        ).strip(),
+        sandbase_sam3_model=os.environ.get(
+            "SANDBASE_SAM3_MODEL", SANDBASE_SAM3_MODEL
+        ).strip(),
+        sandbase_sam3_threshold=sandbase_sam3_threshold,
         fal_sam3_api_key=os.environ.get("FAL_KEY", "").strip() or None,
         fal_sam3_api_base=os.environ.get(
             "FAL_SAM3_API_BASE", FAL_SAM3_API_BASE

@@ -1,4 +1,4 @@
-"""物品检测：fal.ai SAM 3.1 video-rle，唯一的检测路径，不再有 provider 选择。
+"""物品检测：SAM 3.1 video-rle，sandbase.ai 主 provider + fal.ai 后备。
 
 接口契约（object_mask 只面向本契约，不感知 HTTP 细节）：
 
@@ -8,21 +8,26 @@
   不作为 detect 返回形态。
 - ``ObjectDetection``：``{label, timestamp_s, bbox_xyxy_normalized, rle}``；bbox 为
   0–1 浮点、相对帧宽/高，构造时校验（坐标 ∈[0,1]、x0<x1、y0<y1、timestamp≥0）。
-- 多目标粒度：fal 端点的一次请求接受逗号分隔的 targets，``detect`` 将它们
+- 多目标粒度：SAM 3.1 端点的一次请求接受逗号分隔的 targets，``detect`` 将它们
   原顺序拼为一个 prompt，只发一次请求。已校准的响应仍是一套按帧对齐的
   rle/boxes/metadata，**没有每框所属 target 的字段**；因此多目标结果的
   ``ObjectDetection.label`` 是实际发送的完整 prompt（例如 ``"face, necklace"``），
   表示不可归因的合并检测组，而不是猜测性地归给任一 target。
 
-为什么只剩 fal SAM-3 一家（2026-09-15 用户拍板）：此前平行接入的 7 家 VLM
-（doubao/qwen/glm/hunyuan/kimi/step/gemini）输出文本 bbox，无法确定性转成
-逐帧掩码，不符合需求，已全部删除；检测路径固定走 fal SAM-3，不再存在
-"选择 provider"的概念。
+Provider 布局（2026-09-19）：sandbase.ai 为主（``SandbaseSam3GroundingClient``，
+SANDBASE_API_KEY 配置即用），fal.ai 保留作后备（``FalSam3GroundingClient``，
+FAL_KEY）。背景：2026-09-19 fal 账号被官方 Admin lock（storage upload 403），
+检测后端切换到同一模型（meta SAM 3.1 video-rle）的 sandbase 部署。两家
+provider 的归一化输出形状完全一致，下游 object_mask/pipeline 零改动。
 
-缺 key 语义（与人脸节点"model is missing 才致命"对齐）：FAL_KEY 未配置 →
-物品灰块节点不触发（等同该段无 OR 目标）；配置非法（非空但非法的
-key/base/model）→ Settings 启动校验报错，即致命。provider 名称一律不出现在
-公开 API 的参数与响应里。
+为什么只有 SAM 3.1 这一路（2026-09-15 用户拍板）：此前平行接入的 7 家 VLM
+（doubao/qwen/glm/hunyuan/kimi/step/gemini）输出文本 bbox，无法确定性转成
+逐帧掩码，不符合需求，已全部删除；检测路径固定走 SAM-3 video-rle。
+
+缺 key 语义（与人脸节点"model is missing 才致命"对齐）：SANDBASE_API_KEY 与
+FAL_KEY 都未配置 → 物品灰块节点不触发（等同该段无 OR 目标）；配置非法
+（非空但非法的 key/base/model）→ Settings 启动校验报错，即致命。
+provider 名称一律不出现在公开 API 的参数与响应里。
 
 确定性模型不做"重试 = 重新推理"：空结果即确定答案、畸形结果直接致命
 （重提只会得到同样结果，白花钱）。
@@ -145,6 +150,114 @@ def _clamp01(value: float) -> float:
     return min(1.0, max(0.0, value))
 
 
+# ==== 检测响应的实例级共享缓存（两个 provider 共用布局） ====
+# 布局：<DATA_DIR>/shared/object-detect-cache/object-detect-response-<指纹
+# sha256>.json，文件内容 {"fingerprint": ..., <payload_key>: 原始响应}。
+# fal 的 payload_key 是 "fal_response"（2026-09-15 起的既有磁盘格式，不能改，
+# 改名会让存量缓存全部失效、白花钱重调）；sandbase 用 "provider_response"。
+# 指纹含 model 字段，两家 model 字符串不同（"video-rle" vs
+# "meta/sam-3-1/video-rle"），同视频同 prompt 也不会互相命中。
+
+
+def _shared_cache_path(settings: Settings, fingerprint: dict[str, Any]) -> Path:
+    """实例级共享缓存路径：文件名 = 指纹规范 JSON 的 sha256。"""
+    canonical = json.dumps(
+        fingerprint, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return (
+        settings.data_dir
+        / "shared"
+        / "object-detect-cache"
+        / f"object-detect-response-{digest}.json"
+    )
+
+
+def _load_cache_file(
+    path: Path,
+    fingerprint: dict[str, Any],
+    payload_key: str,
+    provider_name: str,
+) -> dict[str, Any] | None:
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, dict) or cached.get("fingerprint") != fingerprint:
+        return None
+    payload = cached.get(payload_key)
+    if not isinstance(payload, dict):
+        return None
+    _LOGGER.info(
+        "object detect provider %s: reusing cached response %s",
+        provider_name,
+        path,
+    )
+    return payload
+
+
+def _load_cached_response(
+    settings: Settings,
+    cache_path: Path | None,
+    fingerprint: dict[str, Any],
+    payload_key: str,
+    provider_name: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """先查实例级共享缓存，再回退查旧版项目级 ``cache_path``（只读）。"""
+    shared = _shared_cache_path(settings, fingerprint)
+    payload = _load_cache_file(shared, fingerprint, payload_key, provider_name)
+    if payload is not None:
+        return payload, {"reused_cache": str(shared)}
+    if cache_path is not None and cache_path != shared:
+        payload = _load_cache_file(
+            cache_path, fingerprint, payload_key, provider_name
+        )
+        if payload is not None:
+            return payload, {"reused_cache": str(cache_path)}
+    return None, {}
+
+
+def _store_cached_response(
+    settings: Settings,
+    fingerprint: dict[str, Any],
+    payload_key: str,
+    payload: Any,
+    provider_name: str,
+) -> None:
+    """只写实例级共享缓存，原子写：同目录唯一临时文件 + os.replace，
+    并发项目同指纹也不会写出半截文件（内容相同，最后一个 rename 胜出）。"""
+    path = _shared_cache_path(settings, fingerprint)
+    temp: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".object-detect-response-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp = Path(handle.name)
+            json.dump(
+                {"fingerprint": fingerprint, payload_key: payload},
+                handle,
+                ensure_ascii=False,
+            )
+        os.replace(temp, path)
+    except OSError:
+        # 产物写盘失败不能让检测本身失败（结果已经在内存里）。
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+        _LOGGER.warning(
+            "object detect provider %s: cache write failed: %s",
+            provider_name,
+            path,
+            exc_info=True,
+        )
+
+
 class UncalibratedResponseError(ValueError):
     """fal 响应形态与已校准形态不符：确定性错误，重提只会得到同样结果。
 
@@ -152,6 +265,127 @@ class UncalibratedResponseError(ValueError):
     mask-replaceable-objects 节点的 ``retry_if``）把本类型当作确定性
     4xx 同级处理：致命、不进 never-fail 退避重试。
     """
+
+
+def _cxcywh_to_xyxy(
+    box: Any, position: int, provider_name: str
+) -> tuple[float, float, float, float] | None:
+    """归一化 cxcywh → xyxy，越界钳到 [0,1]；畸形抛 ValueError，退化返回 None。"""
+    if (
+        not isinstance(box, (list, tuple))
+        or len(box) != 4
+        or any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in box
+        )
+    ):
+        raise ValueError(
+            f"{provider_name} result object {position - 1} has an invalid box"
+        )
+    cx, cy, width, height = (float(value) for value in box)
+    x0 = _clamp01(cx - width / 2)
+    y0 = _clamp01(cy - height / 2)
+    x1 = _clamp01(cx + width / 2)
+    y1 = _clamp01(cy + height / 2)
+    if not x0 < x1 or not y0 < y1:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _parse_frame_aligned_result(
+    payload: dict[str, Any], targets: list[str], fps: float, provider_name: str
+) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
+    """SAM 3.1 video-rle 的逐帧对齐形态解析（fal/sandbase 两个部署共用）。
+
+    真实形态（fal 2026-09-14/15/16 三次真实校准，见 fal 段落头注释的形态
+    对照表）：rle / boxes / metadata 按下标=帧号对齐。该帧未检出（box 为
+    null，或 rle 为 null/""）→ 跳过，不是错误；整段零检出 → 空 detections，
+    正常返回。boxes 缺失/null 时从 metadata[i].box 派生（同一来源）。列表
+    缺失/类型不对/不等长/metadata 错位/box 两处皆无 = 未校准形态，抛
+    UncalibratedResponseError（确定性致命，不退避重试）。多 target 的真实
+    响应没有归属字段，故每个检测的 label 是实际发送的完整逗号分隔 prompt，
+    代表一个不可拆分的合并检测组；这避免将 face 或物品框猜测归给错误的
+    target。sandbase 侧按同一模型 + 官方文档结构复用本解析，尚未经真实
+    completed 响应验证（2026-09-19 三次真实任务均 generation_timeout）。
+    """
+    rles = payload.get("rle")
+    if not isinstance(rles, list):
+        raise UncalibratedResponseError(
+            f"{provider_name} result must contain an rle list; "
+            "uncalibrated response shape"
+        )
+    metadata_raw = payload.get("metadata")
+    if metadata_raw is not None and (
+        not isinstance(metadata_raw, list) or len(metadata_raw) != len(rles)
+    ):
+        raise UncalibratedResponseError(
+            f"{provider_name} result metadata length mismatch; "
+            "uncalibrated response shape"
+        )
+    boxes_raw = payload.get("boxes")
+    if boxes_raw is None:
+        # 零检出真实形态：顶层 boxes 整个为 null/缺失，逐帧 box 只在
+        # metadata[i].box（与 boxes[i] 同一来源，有检出校验证实相等）。
+        if not isinstance(metadata_raw, list):
+            raise UncalibratedResponseError(
+                f"{provider_name} result has no box source (boxes and metadata "
+                "both absent); uncalibrated response shape"
+            )
+        boxes: list[Any] = [
+            meta.get("box") if isinstance(meta, dict) else None
+            for meta in metadata_raw
+        ]
+    elif isinstance(boxes_raw, list):
+        if len(boxes_raw) != len(rles):
+            raise UncalibratedResponseError(
+                f"{provider_name} result rle/boxes length mismatch; "
+                "uncalibrated response shape"
+            )
+        boxes = boxes_raw
+    else:
+        raise UncalibratedResponseError(
+            f"{provider_name} result boxes must be a list or null; "
+            "uncalibrated response shape"
+        )
+    metadata: list[Any] = metadata_raw or [None] * len(rles)
+    prompt = ", ".join(target.strip() for target in targets)
+    detections: list[ObjectDetection] = []
+    frames: list[dict[str, Any]] = []
+    for frame_index, rle in enumerate(rles):
+        if rle is not None and not isinstance(rle, str):
+            raise UncalibratedResponseError(
+                f"{provider_name} result frame {frame_index} rle must be a "
+                "string or null; uncalibrated response shape"
+            )
+        box = boxes[frame_index]
+        meta = metadata[frame_index]
+        if isinstance(meta, dict) and meta.get("index") != frame_index:
+            raise UncalibratedResponseError(
+                f"{provider_name} result metadata index mismatch at frame "
+                f"{frame_index}; uncalibrated response shape"
+            )
+        score = meta.get("score") if isinstance(meta, dict) else None
+        frames.append({
+            "frame_index": frame_index,
+            "label": prompt,
+            "score": score,
+            "box": box,
+            "rle": rle,
+        })
+        if box is None or not rle:
+            continue  # 该帧未检出（box 为 null，或 rle 为 null/""——同义）
+        bbox = _cxcywh_to_xyxy(box, frame_index, provider_name)
+        if bbox is None:
+            continue  # 钳位后退化（零面积），无框可画
+        detections.append(
+            ObjectDetection(
+                label=prompt,
+                timestamp_s=frame_index / fps,
+                bbox_xyxy_normalized=bbox,
+                rle=rle,
+            )
+        )
+    return detections, frames
 
 
 class FalSam3GroundingClient:
@@ -235,84 +469,30 @@ class FalSam3GroundingClient:
         return detections
 
     # --- 产物落盘与复用（实例级共享缓存 + 旧版项目级回退读） ---
+    # 实现抽为模块级函数（与 sandbase provider 共用布局）；payload_key 固定
+    # "fal_response" 保持 2026-09-15 以来存量缓存文件的磁盘格式。
 
-    def _shared_cache_path(self, fingerprint: dict[str, Any]) -> Path:
-        """实例级共享缓存路径：文件名 = 指纹规范 JSON 的 sha256。"""
-        canonical = json.dumps(
-            fingerprint, sort_keys=True, separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        return (
-            self.settings.data_dir
-            / "shared"
-            / "object-detect-cache"
-            / f"object-detect-response-{digest}.json"
-        )
-
-    def _load_cache_file(
-        self, path: Path, fingerprint: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        try:
-            cached = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(cached, dict) or cached.get("fingerprint") != fingerprint:
-            return None
-        payload = cached.get("fal_response")
-        if not isinstance(payload, dict):
-            return None
-        _LOGGER.info(
-            "object detect provider fal_sam3: reusing cached fal response %s",
-            path,
-        )
-        return payload
+    _PAYLOAD_KEY = "fal_response"
 
     def _load_cache(
         self, fingerprint: dict[str, Any]
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        """先查实例级共享缓存，再回退查旧版项目级 ``cache_path``（只读）。"""
-        shared = self._shared_cache_path(fingerprint)
-        payload = self._load_cache_file(shared, fingerprint)
-        if payload is not None:
-            return payload, {"reused_cache": str(shared)}
-        if self.cache_path is not None and self.cache_path != shared:
-            payload = self._load_cache_file(self.cache_path, fingerprint)
-            if payload is not None:
-                return payload, {"reused_cache": str(self.cache_path)}
-        return None, {}
+        return _load_cached_response(
+            self.settings,
+            self.cache_path,
+            fingerprint,
+            self._PAYLOAD_KEY,
+            self.provider_name,
+        )
 
     def _store_cache(self, fingerprint: dict[str, Any], payload: Any) -> None:
-        """只写实例级共享缓存，原子写：同目录唯一临时文件 + os.replace，
-        并发项目同指纹也不会写出半截文件（内容相同，最后一个 rename 胜出）。"""
-        path = self._shared_cache_path(fingerprint)
-        temp: Path | None = None
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=path.parent,
-                prefix=".object-detect-response-",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temp = Path(handle.name)
-                json.dump(
-                    {"fingerprint": fingerprint, "fal_response": payload},
-                    handle,
-                    ensure_ascii=False,
-                )
-            os.replace(temp, path)
-        except OSError:
-            # 产物写盘失败不能让检测本身失败（结果已经在内存里）。
-            if temp is not None:
-                temp.unlink(missing_ok=True)
-            _LOGGER.warning(
-                "object detect provider fal_sam3: cache write failed: %s",
-                path,
-                exc_info=True,
-            )
+        _store_cached_response(
+            self.settings,
+            fingerprint,
+            self._PAYLOAD_KEY,
+            payload,
+            self.provider_name,
+        )
 
     # --- fal 队列流程（每步 HTTP 走 providers._send 语义） ---
 
@@ -468,132 +648,315 @@ class FalSam3GroundingClient:
     def _parse_result(
         self, payload: dict[str, Any], targets: list[str], fps: float
     ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
-        """真实形态：rle / boxes / metadata 按下标=帧号对齐（形态对照见段落头注释）。
+        return _parse_frame_aligned_result(payload, targets, fps, "fal")
 
-        该帧未检出（box 为 null，或 rle 为 null/""）→ 跳过，不是错误；整段
-        零检出 → 空 detections，正常返回。boxes 缺失/null 时从
-        metadata[i].box 派生（同一来源）。列表缺失/类型不对/不等长/
-        metadata 错位/box 两处皆无 = 未校准形态，抛 UncalibratedResponseError
-        （确定性致命，不退避重试）。多 target 的真实响应没有归属字段，故每个
-        检测的 label 是实际发送的完整逗号分隔 prompt，代表一个不可拆分的
-        合并检测组；这避免将 face 或物品框猜测归给错误的 target。
-        """
-        rles = payload.get("rle")
-        if not isinstance(rles, list):
-            raise UncalibratedResponseError(
-                "fal result must contain an rle list; uncalibrated response shape"
+
+# ==== sandbase_sam3（sandbase.ai SAM 3.1 video-rle）：multipart 上传 + 轮询 ====
+# 2026-09-19 起替代 fal 成为主 provider（fal 账号被官方 Admin lock，storage
+# upload 403；fal 代码保留作后备）。接口事实来自官方文档
+# https://www.sandbase.ai/model/meta/sam-3-1/video-rle/docs 与 2026-09-19 真实
+# 校准调用（落盘 data-verify/sandbase-sam31-calib-20260919/）：
+# - 本地视频先 POST {base}/v1/upload（multipart 字段名 file，视频固定
+#   video/mp4——pipeline 喂的永远是 source-muted.mp4），响应
+#   {"url", "content_type", "filename", "size", "type"}，取 url 提交。
+# - 提交 POST {base}/v1/run 返回 202 {"id", "status", "model"}；
+#   轮询 GET {base}/v1/run/{id}，status ∈ pending/running 继续，
+#   completed 取 outputs，failed/timeout 带 error {type, message}。
+# - 提交/上传路径的错误体是扁平 {"error": "..."}（实测：401 invalid API
+#   key、404 model not found / prediction not found、400 file type not
+#   allowed / failed to parse multipart form）；HTTP 层语义与 fal 相同，
+#   交给 providers._send/_ensure_success 分类（4xx 确定性、5xx 网关可重试）。
+# - 任务级失败实测（2026-09-19 三次真实提交全中）：
+#   status=failed、error={"type":"generation_timeout","message":"poll timeout
+#   after 600 attempts"}——sandbase 的该模型 worker 等 600 次无果（约
+#   45-65 分钟/次），连官方示例视频也一样，是 provider 侧故障。**因此
+#   completed 的输出产物格式未经真实响应验证**：下载与解析按官方文档结构
+#   （outputs[] {url, content_type}）+ 同一模型的 fal 部署已校准形态实现，
+#   形态不符会以 UncalibratedResponseError 确定性致命而非静默错解析；
+#   worker 恢复后须用一次真实 completed 响应复核（步骤见校准 README）。
+# 与 fal 相同：确定性模型空结果即确定答案、畸形结果直接致命，都不重提。
+SANDBASE_QUEUED_STATUSES = frozenset({"PENDING", "RUNNING"})
+
+
+class SandbaseSam3GroundingClient:
+    """sandbase.ai SAM 3.1 video-rle：归一化输出与 fal provider 完全一致。
+
+    产物复用语义与 fal client 相同（实例级共享缓存，同指纹零 HTTP；缓存
+    实现见模块级 _shared_cache_path 等函数，落盘纪律搜索锚点 "落盘纪律"）。
+    指纹键与 fal 相同（video_sha256/prompt/detection_threshold/model），
+    靠 model 字符串不同天然隔离；payload_key 用 "provider_response"。
+    """
+
+    provider_name = "sandbase_sam3"
+    _PAYLOAD_KEY = "provider_response"
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.BaseTransport | None = None,
+        cache_path: Path | None = None,
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self.cache_path = cache_path
+        self.last_frames: list[dict[str, Any]] = []
+
+    def with_cache(self, cache_path: Path) -> "SandbaseSam3GroundingClient":
+        """返回挂同一 settings/transport、带旧版项目级回退读路径的新实例。"""
+        return SandbaseSam3GroundingClient(
+            self.settings, transport=self.transport, cache_path=cache_path
+        )
+
+    def detect(
+        self, video_path: Path, targets: list[str]
+    ) -> list[ObjectDetection]:
+        if any(not isinstance(target, str) or not target.strip() for target in targets):
+            raise ValueError("object detect targets must be non-empty strings")
+        if not targets:
+            return []
+        api_key = self.settings.sandbase_sam3_api_key
+        if not api_key:
+            raise ValueError(
+                "sandbase_sam3 API key is not configured; "
+                "the object mask node must not run"
             )
-        metadata_raw = payload.get("metadata")
-        if metadata_raw is not None and (
-            not isinstance(metadata_raw, list) or len(metadata_raw) != len(rles)
-        ):
-            raise UncalibratedResponseError(
-                "fal result metadata length mismatch; uncalibrated response shape"
-            )
-        boxes_raw = payload.get("boxes")
-        if boxes_raw is None:
-            # 零检出真实形态：顶层 boxes 整个为 null/缺失，逐帧 box 只在
-            # metadata[i].box（与 boxes[i] 同一来源，有检出校验证实相等）。
-            if not isinstance(metadata_raw, list):
-                raise UncalibratedResponseError(
-                    "fal result has no box source (boxes and metadata both "
-                    "absent); uncalibrated response shape"
-                )
-            boxes: list[Any] = [
-                meta.get("box") if isinstance(meta, dict) else None
-                for meta in metadata_raw
-            ]
-        elif isinstance(boxes_raw, list):
-            if len(boxes_raw) != len(rles):
-                raise UncalibratedResponseError(
-                    "fal result rle/boxes length mismatch; "
-                    "uncalibrated response shape"
-                )
-            boxes = boxes_raw
-        else:
-            raise UncalibratedResponseError(
-                "fal result boxes must be a list or null; "
-                "uncalibrated response shape"
-            )
-        metadata: list[Any] = metadata_raw or [None] * len(rles)
+        content = Path(video_path).read_bytes()
+        if not content:
+            raise ValueError(f"object detect video input is empty: {video_path}")
+        fps = _probe_fps(video_path)
         prompt = ", ".join(target.strip() for target in targets)
-        detections: list[ObjectDetection] = []
-        frames: list[dict[str, Any]] = []
-        for frame_index, rle in enumerate(rles):
-            if rle is not None and not isinstance(rle, str):
-                raise UncalibratedResponseError(
-                    f"fal result frame {frame_index} rle must be a string or "
-                    "null; uncalibrated response shape"
-                )
-            box = boxes[frame_index]
-            meta = metadata[frame_index]
-            if isinstance(meta, dict) and meta.get("index") != frame_index:
-                raise UncalibratedResponseError(
-                    f"fal result metadata index mismatch at frame {frame_index}; "
-                    "uncalibrated response shape"
-                )
-            score = meta.get("score") if isinstance(meta, dict) else None
-            frames.append({
-                "frame_index": frame_index,
-                "label": prompt,
-                "score": score,
-                "box": box,
-                "rle": rle,
-            })
-            if box is None or not rle:
-                continue  # 该帧未检出（box 为 null，或 rle 为 null/""——同义）
-            bbox = self._cxcywh_to_xyxy(box, frame_index)
-            if bbox is None:
-                continue  # 钳位后退化（零面积），无框可画
-            detections.append(
-                ObjectDetection(
-                    label=prompt,
-                    timestamp_s=frame_index / fps,
-                    bbox_xyxy_normalized=bbox,
-                    rle=rle,
-                )
+        fingerprint = {
+            "video_sha256": hashlib.sha256(content).hexdigest(),
+            "prompt": prompt,
+            "detection_threshold": self.settings.sandbase_sam3_threshold,
+            "model": self.settings.sandbase_sam3_model,
+        }
+        payload, record = _load_cached_response(
+            self.settings,
+            self.cache_path,
+            fingerprint,
+            self._PAYLOAD_KEY,
+            self.provider_name,
+        )
+        if payload is None:
+            payload, record = self._run_flow(api_key, video_path, content, prompt)
+            _store_cached_response(
+                self.settings,
+                fingerprint,
+                self._PAYLOAD_KEY,
+                payload,
+                self.provider_name,
             )
-        return detections, frames
+        try:
+            detections, self.last_frames = self._parse_result(payload, targets, fps)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ProviderFailure(record, [], exc) from exc
+        return detections
+
+    # --- sandbase 流程（每步 HTTP 走 providers._send 语义） ---
+
+    def _run_flow(
+        self, api_key: str, video_path: Path, content: bytes, prompt: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        record: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.settings.request_timeout_s,
+            "transport": self.transport,
+        }
+        try:
+            with httpx.Client(**client_kwargs) as client:
+                file_url = self._upload(client, api_key, video_path, content, record)
+                run_id = self._submit(client, api_key, file_url, prompt, record)
+                completed = self._poll_result(client, api_key, run_id, record)
+                payload = self._download_output(client, completed, record)
+                return payload, record
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
 
     @staticmethod
-    def _cxcywh_to_xyxy(
-        box: Any, position: int
-    ) -> tuple[float, float, float, float] | None:
-        """归一化 cxcywh → xyxy，越界钳到 [0,1]；畸形抛 ValueError，退化返回 None。"""
-        if (
-            not isinstance(box, (list, tuple))
-            or len(box) != 4
-            or any(
-                isinstance(value, bool) or not isinstance(value, (int, float))
-                for value in box
+    def _headers(api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
+
+    def _upload(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        video_path: Path,
+        content: bytes,
+        record: dict[str, Any],
+    ) -> str:
+        response, record["upload"] = providers._send(
+            client,
+            "POST",
+            f"{self.settings.sandbase_sam3_api_base}/v1/upload",
+            headers=self._headers(api_key),
+            files={
+                "file": (Path(video_path).name, content, "video/mp4"),
+            },
+        )
+        providers._ensure_success(response, record["upload"])
+        body = providers._json_body(response)
+        file_url = body.get("url") if isinstance(body, dict) else None
+        if not isinstance(file_url, str) or not file_url.startswith("https://"):
+            raise ValueError("sandbase upload response lacks a usable url")
+        return file_url
+
+    def _submit(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        file_url: str,
+        prompt: str,
+        record: dict[str, Any],
+    ) -> str:
+        # 请求体按官方文档示例全字段显式提交（不用服务端缺省，避免误用）；
+        # max_num_objects 16 与 fal 文档默认一致。
+        body = {
+            "model": self.settings.sandbase_sam3_model,
+            "video": file_url,
+            "prompt": prompt,
+            "apply_mask": False,
+            "box_prompts": [],
+            "frame_index": 0,
+            "point_prompts": [],
+            "boundingbox_zip": False,
+            "max_num_objects": 16,
+            "detection_threshold": self.settings.sandbase_sam3_threshold,
+        }
+        response, record["submit"] = providers._send(
+            client,
+            "POST",
+            f"{self.settings.sandbase_sam3_api_base}/v1/run",
+            headers={**self._headers(api_key), "Content-Type": "application/json"},
+            json_body=body,
+        )
+        providers._ensure_success(response, record["submit"])
+        payload = providers._json_body(response)
+        run_id = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("sandbase submit response has no id")
+        return run_id
+
+    def _poll_result(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        run_id: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        record["polls"] = []
+        poll_url = f"{self.settings.sandbase_sam3_api_base}/v1/run/{run_id}"
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        while True:
+            response, exchange = providers._send(
+                client, "GET", poll_url, headers=self._headers(api_key)
             )
-        ):
-            raise ValueError(f"fal result object {position - 1} has an invalid box")
-        cx, cy, width, height = (float(value) for value in box)
-        x0 = _clamp01(cx - width / 2)
-        y0 = _clamp01(cy - height / 2)
-        x1 = _clamp01(cx + width / 2)
-        y1 = _clamp01(cy + height / 2)
-        if not x0 < x1 or not y0 < y1:
-            return None
-        return (x0, y0, x1, y1)
+            record["polls"].append(exchange)
+            providers._ensure_success(response, exchange)
+            body = providers._json_body(response)
+            if not isinstance(body, dict):
+                raise ValueError("sandbase poll response must be an object")
+            status = str(body.get("status") or "").upper()
+            if status == "COMPLETED":
+                if not isinstance(body.get("outputs"), list):
+                    raise UncalibratedResponseError(
+                        "sandbase completed run has no outputs list; "
+                        "uncalibrated response shape"
+                    )
+                return body
+            if status in {"FAILED", "TIMEOUT"}:
+                error = body.get("error")
+                raise ValueError(
+                    f"sandbase run {run_id} {status.lower()}: "
+                    + json.dumps(error, ensure_ascii=False)
+                )
+            if status not in SANDBASE_QUEUED_STATUSES:
+                raise ValueError(
+                    f"sandbase run {run_id} has unknown status {status!r}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"sandbase run {run_id} timed out")
+            time.sleep(self.settings.provider_poll_interval_s)
+
+    def _download_output(
+        self,
+        client: httpx.Client,
+        completed: dict[str, Any],
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        """下载 completed run 的 JSON 输出产物。
+
+        官方文档只声明 completed 后 ``outputs[]`` 每项 ``{url, content_type}``
+        （https://www.sandbase.ai/model/meta/sam-3-1/video-rle/docs）；apply_mask
+        =false 时产物应是逐帧 RLE 的结构化 JSON。**本形态未经真实 completed
+        响应验证**（2026-09-19 三次真实任务均 provider 侧
+        generation_timeout，见 data-verify/sandbase-sam31-calib-20260919/）：
+        取 outputs 里第一个 content_type 含 "json" 的项下载；产物体按同一
+        模型（SAM 3.1 video-rle）的 fal 部署已校准形态（rle/boxes/metadata
+        逐帧对齐）交给 _parse_frame_aligned_result。真实响应落盘后若形态
+        不同，会以 UncalibratedResponseError 确定性致命，不会静默错解析。
+        """
+        output: Any = None
+        for item in completed["outputs"]:
+            if not isinstance(item, dict):
+                continue
+            content_type = str(item.get("content_type") or "").lower()
+            if "json" in content_type and isinstance(item.get("url"), str):
+                output = item
+                break
+        if output is None:
+            raise UncalibratedResponseError(
+                "sandbase completed run has no JSON output; "
+                "uncalibrated response shape"
+            )
+        response, record["output_download"] = providers._send(
+            client, "GET", output["url"]
+        )
+        providers._ensure_success(response, record["output_download"])
+        payload = providers._json_body(response)
+        if not isinstance(payload, dict):
+            raise UncalibratedResponseError(
+                "sandbase output artifact must be an object; "
+                "uncalibrated response shape"
+            )
+        return payload
+
+    # --- 响应解析（按官方文档结构 + 同模型 fal 已校准形态，未经真实验证） ---
+
+    def _parse_result(
+        self, payload: dict[str, Any], targets: list[str], fps: float
+    ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
+        return _parse_frame_aligned_result(payload, targets, fps, "sandbase")
 
 
 def available_providers(settings: Settings) -> list[str]:
-    """FAL_KEY 已配置返回 ["fal_sam3"]，未配置返回 []。
+    """SANDBASE_API_KEY 已配置返回 ["sandbase_sam3"]（主 provider）；
+    未配置则 FAL_KEY 已配置返回 ["fal_sam3"]（后备）；都未配置返回 []。
 
-    只剩 fal SAM-3 一家后本函数实质是"检测是否可用"的门禁；保留列表形态
-    与语义是为了 pipeline 的调用侧（有可用 provider 才触发物品灰块节点）
-    不变。
+    本函数实质是"检测是否可用"的门禁；保留列表形态与语义是为了 pipeline
+    的调用侧（有可用 provider 才触发物品灰块节点）不变。provider 名称一律
+    不出现在公开 API 的参数与响应里。
     """
+    if settings.sandbase_sam3_api_key:
+        return ["sandbase_sam3"]
     if settings.fal_sam3_api_key:
         return ["fal_sam3"]
-    _LOGGER.info("object detect: FAL_KEY is not configured; detection unavailable")
+    _LOGGER.info(
+        "object detect: neither SANDBASE_API_KEY nor FAL_KEY is configured; "
+        "detection unavailable"
+    )
     return []
 
 
-def select_provider(settings: Settings) -> FalSam3GroundingClient | None:
-    """FAL_KEY 已配置返回 fal SAM-3 client；未配置返回 None。"""
-    if not settings.fal_sam3_api_key:
-        return None
-    return FalSam3GroundingClient(settings)
+def select_provider(
+    settings: Settings,
+) -> SandbaseSam3GroundingClient | FalSam3GroundingClient | None:
+    """SANDBASE_API_KEY 已配置返回 sandbase SAM-3 client（主）；否则 FAL_KEY
+    已配置返回 fal SAM-3 client（后备）；都未配置返回 None。"""
+    if settings.sandbase_sam3_api_key:
+        return SandbaseSam3GroundingClient(settings)
+    if settings.fal_sam3_api_key:
+        return FalSam3GroundingClient(settings)
+    return None

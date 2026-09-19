@@ -5927,12 +5927,13 @@ class Pipeline:
             if self._segment_has_replaced_person(element_index, index):
                 # SAM accepts a comma-separated multi-target prompt.  Keep
                 # this deterministic face target last, after the frozen OR
-                # detect labels, so every required block comes from one fal
+                # detect labels, so every required block comes from one SAM
                 # request rather than separate paid detections.
                 object_targets.append("face")
             if object_targets and not self.settings.object_mask_enabled:
-                # OBJECT_MASK_ENABLED=false（如 fal 账号被锁期间临时整体关闭）：
-                # 不发起任何 fal 调用，产物形状与 object_mask_degraded 降级
+                # OBJECT_MASK_ENABLED=false（检测后端不可用期间临时整体关闭：
+                # 2026-09-19 fal 账号被锁、sandbase worker 连续超时）：
+                # 不发起任何检测调用，产物形状与 object_mask_degraded 降级
                 # 路径完全一致——参考视频保持 source-muted、objects_masked 保持
                 # False（提示词按未遮盖处理），仅事件名区分"配置关闭"与"失败"。
                 log.event(
@@ -5956,7 +5957,7 @@ class Pipeline:
                 # 检测产物落盘目录 = 段 work 目录（跨节点重试与
                 # resume-pre-picsart 续跑存活）：解析后的契约 detections 收
                 # object-detections.json，计入下面 output-media 的节点产物
-                # 清单。fal 原始响应的指纹缓存写实例级共享目录
+                # 清单。检测原始响应的指纹缓存写实例级共享目录
                 # <DATA_DIR>/shared/object-detect-cache/（跨项目同指纹零
                 # HTTP，见 object_detect 的落盘纪律注释），段目录下的
                 # object-detect-response.json 仅作项目级缓存的回退读。

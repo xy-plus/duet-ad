@@ -189,6 +189,7 @@ def _send(
     headers: Mapping[str, str] | None = None,
     json_body: Any = _MISSING,
     content: bytes | None = None,
+    files: Mapping[str, Any] | None = None,
     request_body: Any = _MISSING,
 ) -> tuple[httpx.Response, dict[str, Any]]:
     kwargs: dict[str, Any] = {"headers": headers}
@@ -198,6 +199,10 @@ def _send(
             request_body = json_body
     if content is not None:
         kwargs["content"] = content
+    if files is not None:
+        # multipart 上传（如 sandbase /v1/upload）；记录侧由
+        # _request_record 按非 JSON 二进制体落 sha256，不落明文。
+        kwargs["files"] = files
     request = client.build_request(method, url, **kwargs)
     attempts: list[dict[str, Any]] = []
     attempt_number = 0

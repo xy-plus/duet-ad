@@ -254,10 +254,11 @@ def _detect_all(
 ) -> list[ObjectDetection]:
     """One SAM request covers all targets, avoiding a second paid invocation.
 
-    The raw fal response cache is keyed by the complete comma-separated prompt.
-    The project-local fallback is therefore one prompt-level path rather than a
-    per-target path.  SAM does not label boxes by target in a multi-target
-    response, so an empty result is meaningful only for the whole target group.
+    The raw detection response cache is keyed by the complete comma-separated
+    prompt.  The project-local fallback is therefore one prompt-level path
+    rather than a per-target path.  SAM does not label boxes by target in a
+    multi-target response, so an empty result is meaningful only for the whole
+    target group.
     """
     client = detector
     if artifacts_dir is not None and hasattr(detector, "with_cache"):
@@ -284,10 +285,11 @@ def mask_objects(
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
-    omitted, the production fal SAM-3 client is used (requires FAL_KEY).
+    omitted, the production SAM-3 client is used (sandbase 主、fal 后备，
+    见 object_detect.select_provider，需对应平台 key)。
     ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
     解析后的契约 detections 写 object-detections.json（见 _detect_all）；
-    fal 原始响应的指纹缓存写实例级共享目录
+    检测原始响应的指纹缓存写实例级共享目录
     <DATA_DIR>/shared/object-detect-cache/（跨项目命中即零 HTTP，见
     object_detect 的落盘纪律注释），with_cache 传入的本目录
     object-detect-response.json 仅作项目级缓存的回退读。多目标的 SAM 结果
