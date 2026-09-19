@@ -5926,10 +5926,16 @@ class Pipeline:
             )
             if self._segment_has_replaced_person(element_index, index):
                 # SAM accepts a comma-separated multi-target prompt.  Keep
-                # this deterministic face target last, after the frozen OR
-                # detect labels, so every required block comes from one SAM
-                # request rather than separate paid detections.
-                object_targets.append("face")
+                # these deterministic person targets last, after the frozen
+                # OR detect labels, so every required block comes from one
+                # SAM request rather than separate paid detections.  The
+                # whole person plus hair are masked together with the face:
+                # hair and clothing carry identity, and leaving them visible
+                # let H3 copy the source look and visually undo the face
+                # replacement (2026-09-20 化妆品段2).
+                object_targets.extend(
+                    ["human", "human face", "human hair", "human head"]
+                )
             if object_targets and not self.settings.object_mask_enabled:
                 # OBJECT_MASK_ENABLED=false（检测后端不可用期间临时整体关闭：
                 # 2026-09-19 fal 账号被锁、sandbase worker 连续超时，wavespeed
@@ -6078,25 +6084,27 @@ class Pipeline:
                 # editing framework, and leave the following FACE REPLACEMENT
                 # block to carry identity-reference binding details.
                 mask_block = (
-                    "Dark gray (64,64,64) blocks mask faces of people to "
-                    "replace and replaceable objects; never draw or restore "
+                    "Dark gray (64,64,64) blocks mask the heads (faces and "
+                    "hair) of people to replace and replaceable objects; "
+                    "never draw or restore "
                     "what they hide: rebuild people naturally from their "
-                    "descriptions, and rebuild objects only from the provided "
-                    "reference images.\n\n"
+                    "descriptions, hair included, and rebuild objects only "
+                    "from the provided reference images.\n\n"
                 )
                 if self.settings.object_mask_block_opacity < 1.0:
                     # 半透明灰块时把设计意图说死：透出的残影只是位置/运动/构图
                     # 锚点，否则模型会把淡残留当成暗光真实画面去增强重建。
                     mask_block = (
                         "Semi-transparent dark gray (64,64,64) blocks mask "
-                        "faces of people to replace and replaceable objects. "
+                        "the heads (faces and hair) of people to replace and "
+                        "replaceable objects. "
                         "The faint blurred source imagery showing through the blocks "
                         "serves ONLY as position, motion, and composition "
                         "reference: never reconstruct, enhance, sharpen, or "
                         "copy anything visible through the blocks; never draw "
                         "or restore what they hide: rebuild people naturally "
-                        "from their descriptions, and rebuild objects only "
-                        "from the provided reference images.\n\n"
+                        "from their descriptions, hair included, and rebuild "
+                        "objects only from the provided reference images.\n\n"
                     )
             overlay_targets = []
             if processing["remove_subtitle"]:

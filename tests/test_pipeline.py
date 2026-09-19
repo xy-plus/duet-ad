@@ -7361,7 +7361,7 @@ def test_h3_segment_masks_replaced_objects_and_faces_in_one_sam_node(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["the red scarf around the neck", "face"],
+        ["the red scarf around the neck", "human", "human face", "human hair", "human head"],
     )]
     output = json.loads(
         (
@@ -7495,7 +7495,7 @@ def test_h3_segment_object_mask_targets_use_the_detect_label(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["scarf", "face"],
+        ["scarf", "human", "human face", "human hair", "human head"],
     )]
 
 
@@ -7526,7 +7526,7 @@ def test_h3_segment_with_only_a_replaced_person_masks_its_face(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["face"],
+        ["human", "human face", "human hair", "human head"],
     )]
 
 
@@ -7705,7 +7705,7 @@ def test_h3_object_mask_node_collects_detect_artifacts(
     )
 
     targets = [call[2] for call in object_calls][0]
-    assert targets == ["the red scarf around the neck", "the leather wallet", "face"]
+    assert targets == ["the red scarf around the neck", "the leather wallet", "human", "human face", "human hair", "human head"]
     attempt = (
         project / "logs" / "mask-replaceable-objects" / "segment-0001"
         / "attempt-1"
@@ -7738,10 +7738,11 @@ def test_h3_prompt_introduces_one_unified_mask_block_clause(
 
     assert prompt.startswith("This is an editing task on Video 1")
     assert (
-        "Dark gray (64,64,64) blocks mask faces of people to replace and "
-        "replaceable objects; never draw or restore what they hide: rebuild "
-        "people naturally from their descriptions, and rebuild objects only "
-        "from the provided reference images."
+        "Dark gray (64,64,64) blocks mask the heads (faces and hair) of people "
+        "to replace and replaceable objects; never draw or restore what "
+        "they hide: rebuild people naturally from their descriptions, hair "
+        "included, and rebuild objects only from the provided reference "
+        "images."
     ) in prompt
     assert "(128,128,128)" not in prompt
     assert prompt.index("(64,64,64)") < prompt.index("FACE REPLACEMENT")
@@ -7772,13 +7773,13 @@ def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
 
     assert prompt.startswith("This is an editing task on Video 1")
     assert (
-        "Semi-transparent dark gray (64,64,64) blocks mask faces of people "
-        "to replace and replaceable objects. The faint blurred source imagery "
+        "Semi-transparent dark gray (64,64,64) blocks mask the heads (faces and "
+        "hair) of people to replace and replaceable objects. The faint blurred source imagery "
         "showing through the blocks serves ONLY as position, motion, and "
         "composition reference: never reconstruct, enhance, sharpen, or "
         "copy anything visible through the blocks; never draw or restore "
         "what they hide: rebuild people naturally from their descriptions, "
-        "and rebuild objects only from the provided reference images."
+        "hair included, and rebuild objects only from the provided reference images."
     ) in prompt
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
@@ -7894,7 +7895,7 @@ def test_h3_prompt_object_block_clause_without_a_replaced_person(
     assert muted == segment_dir / "source-objects-masked.mp4"
     assert prompt.startswith("This is an editing task on Video 1")
     assert prompt.index("This is an editing task on Video 1") < prompt.index(
-        "Dark gray (64,64,64) blocks mask faces of people"
+        "Dark gray (64,64,64) blocks mask the heads (faces and hair) of people"
     )
 
 
