@@ -443,8 +443,11 @@ def transcribe(
     destination: Path,
     cli: Path,
     model: Path,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run whisper.cpp with byte-safe diagnostics and normalize timed dialogue."""
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
+    """Run whisper.cpp with byte-safe diagnostics and normalize timed dialogue.
+
+    第三返回值是 whisper 在 ``-l auto`` 下直接从音轨检测到的 ISO 语言码
+    （检测不出为 None）；语种判定以它为准，不再靠台词文字反推。"""
     prefix = destination.with_suffix("")
     result = run_command(
         [
@@ -502,7 +505,13 @@ def transcribe(
         json.dumps(lines, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    return lines, {"command": result, "provider_raw": payload}
+    detected = payload.get("result")
+    language_code = (
+        detected.get("language")
+        if isinstance(detected, dict) and isinstance(detected.get("language"), str)
+        else None
+    )
+    return lines, {"command": result, "provider_raw": payload}, language_code
 
 
 def yamnet_analyze(

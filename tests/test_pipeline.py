@@ -44,6 +44,7 @@ from app.pipeline import (
     _validate_dialogue_language,
     _validate_translation_shape,
 )
+from app.doubao_tts import EmptyAudioError
 from app.providers import CodexProcessError, ProviderFailure, ProviderResult
 from app.replacement_sheet import (
     build_replacement_sheet_spec,
@@ -778,10 +779,10 @@ def _install_fake_media(monkeypatch: Any, events: list[str]) -> None:
 
     def transcribe(
         _audio: Path, destination: Path, _cli: Path, _model: Path,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
         lines = [{"text": "source line", "start_s": 0.5, "end_s": 1.5}]
         destination.write_text(json.dumps(lines), encoding="utf-8")
-        return lines, {"provider_raw": {"transcription": ["raw line"]}}
+        return lines, {"provider_raw": {"transcription": ["raw line"]}}, None
 
     def filter_spoken(
         lines: list[dict[str, Any]], _analysis: dict[str, Any],
@@ -2533,6 +2534,41 @@ def test_resolve_dialogue_language_follows_source_dialogue_script(
     )
 
 
+def test_resolve_dialogue_language_prefers_whisper_audio_detection() -> None:
+    """whisper 从音轨直接检测的语种优先于台词文字推断：泰文台词夹英文品牌词
+    时文字推断曾误判英语（bfc85e7f 事故），音轨检测不受影响。"""
+    lines = [{"text": "เลิกท่าแป้งมาร่านหลายไปมาก FF50P EvoWalk CPW"}]
+    assert (
+        _resolve_dialogue_language(SAME_AS_SOURCE_LANGUAGE, lines, "", "th")
+        == "泰语"
+    )
+    # 检测码缺失（旧冻结产物）时回退台词文字推断，泰文字母族仍可判对。
+    assert _resolve_dialogue_language(SAME_AS_SOURCE_LANGUAGE, lines, "") == "泰语"
+    assert (
+        _resolve_dialogue_language(
+            SAME_AS_SOURCE_LANGUAGE, [{"text": "Привет, мир"}], "", "ru",
+        )
+        == "俄语"
+    )
+    assert (
+        _resolve_dialogue_language(
+            SAME_AS_SOURCE_LANGUAGE, [{"text": "مرحبا بالعالم"}], "",
+        )
+        == "阿拉伯语"
+    )
+    # 具体目标语言不受检测码影响。
+    assert _resolve_dialogue_language("日语", lines, "", "th") == "日语"
+
+
+def test_dialogue_language_display_uses_audio_detection() -> None:
+    lines = [{"text": "เลิกท่าแป้งมาร่านหลายไปมาก FF50P EvoWalk CPW"}]
+    assert (
+        _dialogue_language_display(SAME_AS_SOURCE_LANGUAGE, lines, "th") == "泰语"
+    )
+    assert _dialogue_language_display(SAME_AS_SOURCE_LANGUAGE, lines) == "泰语"
+    assert _dialogue_language_display("英语", lines, "th") == "英语"
+
+
 @pytest.mark.parametrize(
     ("brief", "expected"),
     [("介绍产品", "中文"), ("promote the new drop", "英语")],
@@ -2765,7 +2801,7 @@ def test_no_audio_skips_audio_analysis_without_creating_fake_media(
         )
     log = ResearchLog(project)
 
-    yamnet, asr_lines, spoken_lines, decisions = (
+    yamnet, asr_lines, spoken_lines, decisions, language_code = (
         pipeline._analyze_audio_dialogue(
             project_id,
             project,
@@ -2779,6 +2815,7 @@ def test_no_audio_skips_audio_analysis_without_creating_fake_media(
     assert asr_lines == []
     assert spoken_lines == []
     assert decisions == []
+    assert language_code is None
     assert not (project / "work" / "source.wav").exists()
     assert not (project / "work" / "voice_lines.json").exists()
     rows = [
@@ -7207,6 +7244,14 @@ def test_retryable_node_error_excludes_uncalibrated_fal_response() -> None:
     )
 
 
+def test_retryable_node_error_excludes_doubao_empty_audio() -> None:
+    """豆包 TTS 流正常结束但零音频：同一文本+音色重发必然同样结果（如英文
+    音色合成泰文），确定性失败，不得无限重试。"""
+    assert not Pipeline._retryable_node_error(
+        ProviderFailure({}, [], EmptyAudioError("Doubao TTS returned no valid PCM audio"))
+    )
+
+
 def test_node_retries_subprocess_timeouts_until_success(tmp_path: Path) -> None:
     pipeline, log = _node_pipeline(tmp_path, "request-timeout-retry")
     calls = 0
@@ -8456,9 +8501,9 @@ def test_pre_segmentation_resume_reruns_a_node_whose_artifact_is_gone(
 
     def fake_transcribe(
         _audio: Path, output: Path, _cli: Any, _model: Any,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
         output.write_text(json.dumps(spoken), encoding="utf-8")
-        return spoken, {"outcome": "accepted"}
+        return spoken, {"outcome": "accepted"}, "en"
 
     monkeypatch.setattr(media, "transcribe", fake_transcribe)
     monkeypatch.setattr(

@@ -46,6 +46,34 @@ _LANGUAGE_ALIASES: dict[str, tuple[str, ...]] = {
 }
 KNOWN_LANGUAGE_CODES = frozenset(_LANGUAGE_ALIASES)
 
+# ISO 语言码（whisper 检测结果）→ 中文展示标签；目录不支持的语种返回 None，
+# 调用方回退到文字推断。
+LANGUAGE_CODE_LABELS: dict[str, str] = {
+    "zh": "中文",
+    "en": "英语",
+    "th": "泰语",
+    "ja": "日语",
+    "ko": "韩语",
+    "es": "西班牙语",
+    "fr": "法语",
+    "de": "德语",
+    "ru": "俄语",
+    "pt": "葡萄牙语",
+    "id": "印度尼西亚语",
+    "ms": "马来语",
+    "vi": "越南语",
+    "tl": "菲律宾语",
+    "ar": "阿拉伯语",
+    "it": "意大利语",
+}
+
+
+def doubao_voice_language_label(language_code: object) -> str | None:
+    """whisper 检测到的 ISO 语言码 → 目录语种标签；未知/不支持返回 None。"""
+    if not isinstance(language_code, str):
+        return None
+    return LANGUAGE_CODE_LABELS.get(language_code.strip().lower())
+
 # 无人物/旁白台词的兜底音色：按语言选该语种第一条「通用场景」音色。
 _DEFAULT_SCENE = "通用场景"
 

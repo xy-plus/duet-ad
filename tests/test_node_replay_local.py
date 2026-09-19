@@ -236,7 +236,9 @@ def test_whisper_asr(fixture: Fixture, tmp_path: Path) -> None:
     model = Path(payload["model"])
     if not cli.is_file() or not model.is_file():
         pytest.skip(f"whisper.cpp assets missing: {cli} / {model}")
-    lines, record = media.transcribe(audio, tmp_path / "voice_lines.json", cli, model)
+    lines, record, language_code = media.transcribe(
+        audio, tmp_path / "voice_lines.json", cli, model,
+    )
     assert isinstance(lines, list)
     for line in lines:
         assert isinstance(line["text"], str)

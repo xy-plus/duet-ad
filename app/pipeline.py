@@ -47,8 +47,12 @@ from app.providers import (
     ProviderFailure,
     ProviderResult,
 )
-from app.doubao_tts import DoubaoTtsClient
-from app.doubao_voices import DoubaoVoiceCatalog, load_doubao_voice_catalog
+from app.doubao_tts import DoubaoTtsClient, EmptyAudioError
+from app.doubao_voices import (
+    DoubaoVoiceCatalog,
+    doubao_voice_language_label,
+    load_doubao_voice_catalog,
+)
 from app.seedream import (
     SEEDREAM_OUTPUT_HEIGHT,
     SEEDREAM_OUTPUT_SIZE,
@@ -171,12 +175,26 @@ def _script_family(ch: str) -> str | None:
         return "kana"
     if 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F:
         return "hangul"
+    if 0x0E00 <= cp <= 0x0E7F:
+        return "thai"
+    if 0x0400 <= cp <= 0x04FF:
+        return "cyrillic"
+    if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF:
+        return "arabic"
     if "a" <= ch <= "z" or "A" <= ch <= "Z":
         return "latin"
     return None
 
 
-_SCRIPT_LANGUAGE = {"han": "中文", "kana": "日语", "hangul": "韩语", "latin": "英语"}
+_SCRIPT_LANGUAGE = {
+    "han": "中文",
+    "kana": "日语",
+    "hangul": "韩语",
+    "thai": "泰语",
+    "cyrillic": "俄语",
+    "arabic": "阿拉伯语",
+    "latin": "英语",
+}
 _LANGUAGE_FAMILY = {language: family for family, language in _SCRIPT_LANGUAGE.items()}
 
 
@@ -186,12 +204,12 @@ def _dominant_script_language(text: str) -> str | None:
     whisper.cpp runs with ``-l auto`` and does detect a language, but
     media.transcribe only persists the transcript lines into state, so the
     transcript text itself is the strongest available language signal.
-    Kana and hangul are exclusive to Japanese/Korean, so their presence is
-    diagnostic (a decorative の in Chinese copy stays Chinese because its
-    kana volume is dwarfed by han). Han vs latin is decided by majority.
-    Latin-script languages all classify as 英语; that is the documented
-    limit of this heuristic (digits, punctuation and emoji carry no
-    signal)."""
+    Kana, hangul, thai, cyrillic and arabic are exclusive to one language
+    each, so their presence is diagnostic (a decorative の in Chinese copy
+    stays Chinese because its kana volume is dwarfed by han). Han vs latin
+    is decided by majority. Latin-script languages all classify as 英语;
+    that is the documented limit of this heuristic (digits, punctuation
+    and emoji carry no signal)."""
     counts: dict[str, int] = {}
     for ch in text:
         family = _script_family(ch)
@@ -199,14 +217,12 @@ def _dominant_script_language(text: str) -> str | None:
             counts[family] = counts.get(family, 0) + 1
     if not counts:
         return None
-    kana = counts.get("kana", 0)
-    hangul = counts.get("hangul", 0)
     han = counts.get("han", 0)
     latin = counts.get("latin", 0)
-    if kana and kana * 2 >= han and kana >= latin:
-        return "日语"
-    if hangul and hangul * 2 >= han and hangul >= latin:
-        return "韩语"
+    for family in ("kana", "hangul", "thai", "cyrillic", "arabic"):
+        exclusive = counts.get(family, 0)
+        if exclusive and exclusive * 2 >= han and exclusive >= latin:
+            return _SCRIPT_LANGUAGE[family]
     if han and han >= latin:
         return "中文"
     if latin:
@@ -218,17 +234,23 @@ def _resolve_dialogue_language(
     target_language: str,
     voice_lines: list[dict[str, Any]],
     brief: str,
+    source_language_code: str | None = None,
 ) -> str:
     """Resolve the dialogue language deterministically for DeepSeek.
 
     A concrete target passes through unchanged. The same-as-source
-    placeholder inherits the language of the source transcript's dominant
-    script; when the source video has no dialogue there is nothing to
-    inherit, so the brief's dominant script decides (a brief written in
-    Chinese almost always wants Chinese narration). With no signal at all
-    the ambiguity is raised instead of silently guessed."""
+    placeholder inherits the language whisper detected from the source
+    audio track itself (``source_language_code``); only when that signal is
+    absent (old frozen artifacts, unknown code) does the transcript's
+    dominant script decide. When the source video has no dialogue there is
+    nothing to inherit, so the brief's dominant script decides (a brief
+    written in Chinese almost always wants Chinese narration). With no
+    signal at all the ambiguity is raised instead of silently guessed."""
     if target_language != SAME_AS_SOURCE_LANGUAGE:
         return target_language
+    label = doubao_voice_language_label(source_language_code)
+    if label is not None:
+        return label
     source_text = " ".join(
         str(line.get("text") or "")
         for line in voice_lines
@@ -247,17 +269,23 @@ def _resolve_dialogue_language(
 
 
 def _dialogue_language_display(
-    target_language: str, sample_lines: list[dict[str, Any]],
+    target_language: str,
+    sample_lines: list[dict[str, Any]],
+    source_language_code: str | None = None,
 ) -> str:
     """Concrete language label for model payloads.
 
     Models never see the source video, so the same-as-source placeholder is
     noise to them: it is always resolved to a concrete language here (the
-    "与原视频相同" provenance stays in state.json's effective_request). With
-    no dialogue at all the language has no consumer, so the label is empty
-    rather than an invented language."""
+    "与原视频相同" provenance stays in state.json's effective_request).
+    whisper 的音轨语种检测优先；旧冻结产物没有该字段时回退台词文字推断。
+    With no dialogue at all the language has no consumer, so the label is
+    empty rather than an invented language."""
     if target_language != SAME_AS_SOURCE_LANGUAGE:
         return target_language
+    label = doubao_voice_language_label(source_language_code)
+    if label is not None:
+        return label
     text = " ".join(
         str(line.get("text") or "")
         for line in sample_lines
@@ -643,6 +671,9 @@ class Pipeline:
             # the identical request returns the same shape).
             if isinstance(exc.cause, object_detect.UncalibratedResponseError):
                 return False
+            # 豆包 TTS 流正常结束但零音频：同一文本+音色重发必然同样失败。
+            if isinstance(exc.cause, EmptyAudioError):
+                return False
             return not cls._has_deterministic_client_error(exc.record)
         # A full disk (ENOSPC) is transient: the operator frees space and the
         # node must rerun, never kill the project.  Research-log writes are
@@ -1001,7 +1032,7 @@ class Pipeline:
         duration_s = float(source_manifest.get("duration_seconds") or duration_s)
         self.store.update(project_id, duration_s=duration_s)
 
-        yamnet, asr_lines, spoken_lines, voice_decisions = (
+        yamnet, asr_lines, spoken_lines, voice_decisions, source_language_code = (
             self._analyze_audio_dialogue(
                 project_id,
                 project,
@@ -1017,6 +1048,7 @@ class Pipeline:
             asr_voice_lines=asr_lines,
             voice_decisions=voice_decisions,
             vocal_analysis=yamnet,
+            source_language_code=source_language_code,
         )
 
         self._progress(project_id, 18, "scene-detection")
@@ -1240,7 +1272,9 @@ class Pipeline:
         # 条），避免全量目录淹没提示词；“与原视频相同”按台词文字系统解析，
         # 解析不出回退中文子集。提示词行与输出枚举使用同一精选子集。
         language_label = _dialogue_language_display(
-            target_language, translated_lines,
+            target_language,
+            translated_lines,
+            self.store.read(project.name).get("source_language_code"),
         )
         voice_subset = self.voice_catalog.prompt_voices_for_language(language_label)
         voice_types = [voice["voice_type"] for voice in voice_subset]
@@ -1366,7 +1400,9 @@ class Pipeline:
         # 豆包 TTS 按语言选 voice_type；“与原视频相同”在这里解析成具体语言
         # 标签（台词文本的文字证据），解析不出时回落中文音色。
         language_label = _dialogue_language_display(
-            target_language, translated_lines,
+            target_language,
+            translated_lines,
+            self.store.read(project_id).get("source_language_code"),
         )
         default_voice_type = self.voice_catalog.default_voice_type(language_label)
         directory = project / "work" / "dialogue-audio"
@@ -2324,6 +2360,9 @@ class Pipeline:
         log: ResearchLog,
     ) -> None:
         request = self._validated_effective_request(request)
+        source_language_code = self.store.read(project_id).get(
+            "source_language_code"
+        )
         visual_prompts = "\n\n".join(
             f"Segment {item['index']}: {item['visual_prompt']}"
             for item in prepared
@@ -2332,7 +2371,7 @@ class Pipeline:
         if request["dialogue"]["mode"] == "generate":
             brief = request["dialogue"]["brief"]
             resolved_language = _resolve_dialogue_language(
-                target_language, spoken_lines, brief,
+                target_language, spoken_lines, brief, source_language_code,
             )
             self._progress(project_id, 43, "dialogue-generation")
             translated_lines = self._node(
@@ -4754,6 +4793,7 @@ class Pipeline:
         list[dict[str, Any]],
         list[dict[str, Any]],
         list[dict[str, Any]],
+        str | None,
     ]:
         audio = project / "work" / "source.wav"
         asr_output = project / "work" / "voice_lines.json"
@@ -4814,7 +4854,7 @@ class Pipeline:
                 [],
                 lambda: self._skipped_result(([], []), reason),
             )
-            return yamnet, asr_lines, spoken_lines, voice_decisions
+            return yamnet, asr_lines, spoken_lines, voice_decisions, None
 
         self._progress(project_id, 8, "audio")
         run_node(
@@ -4837,13 +4877,19 @@ class Pipeline:
 
         vocal_expected = self._yamnet_has_vocal_signal(yamnet)
 
+        # whisper 的音轨语种检测随 ASR 一起产出；节点输出形状不变（仍为台词
+        # 列表），语种经闭包带出并单独落盘，续跑复用旧 ASR 产物时为 None，
+        # 由下游回退到台词文字推断。
+        detected_language: dict[str, str | None] = {"code": None}
+
         def transcribe_once() -> ProviderResult[list[dict[str, Any]]]:
-            lines, record = media.transcribe(
+            lines, record, language_code = media.transcribe(
                 audio,
                 asr_output,
                 self.settings.asr_cli,
                 self.settings.asr_model,
             )
+            detected_language["code"] = language_code
             return ProviderResult(
                 value=lines,
                 record=record,
@@ -4876,7 +4922,10 @@ class Pipeline:
             [],
             lambda: media.filter_spoken_lines(asr_lines, yamnet),
         )
-        return yamnet, asr_lines, spoken_lines, voice_decisions
+        return (
+            yamnet, asr_lines, spoken_lines, voice_decisions,
+            detected_language["code"],
+        )
 
     @staticmethod
     def _completed_node_value(project: Path, node: str, scope: str) -> Any:

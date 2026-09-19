@@ -528,6 +528,7 @@ def test_transcribe_is_byte_safe_and_applies_master_non_dialogue_filters(
         "hello \ufffd world",
     ]
     payload = {
+        "result": {"language": "zh"},
         "transcription": [
             {
                 "text": text,
@@ -552,7 +553,7 @@ def test_transcribe_is_byte_safe_and_applies_master_non_dialogue_filters(
     monkeypatch.setattr(media, "run_command", fake_run)
     monkeypatch.setattr(media, "_probe_audio_duration", lambda _path: 20.0)
 
-    lines, record = media.transcribe(
+    lines, record, language_code = media.transcribe(
         audio,
         destination,
         tmp_path / "whisper-cli",
@@ -565,6 +566,7 @@ def test_transcribe_is_byte_safe_and_applies_master_non_dialogue_filters(
         {"text": "hello  world", "start_s": 8.0, "end_s": 9.0},
     ]
     assert record["command"]["stdout"] == "diagnostic-\ufffd"
+    assert language_code == "zh"
     assert json.loads(destination.read_text(encoding="utf-8")) == lines
 
 

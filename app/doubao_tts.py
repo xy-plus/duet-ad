@@ -53,6 +53,11 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+class EmptyAudioError(ValueError):
+    """流正常结束（含 finish 事件）但没有任何音频分片：同一文本+音色重发
+    必然得到同样结果，属于确定性失败，禁止重试。"""
+
+
 class DoubaoTtsClient:
     """One-shot Doubao Seed-TTS 2.0 synthesis over HTTP Chunked JSON lines."""
 
@@ -186,7 +191,7 @@ class DoubaoTtsClient:
             raise ValueError("Doubao TTS stream ended without a finish event")
         pcm = b"".join(chunks)
         if not pcm or len(pcm) % 2:
-            raise ValueError("Doubao TTS returned no valid PCM audio")
+            raise EmptyAudioError("Doubao TTS returned no valid PCM audio")
         record["response"]["audio_chunks"] = chunk_count
         record["response"]["pcm_bytes"] = len(pcm)
         return pcm
