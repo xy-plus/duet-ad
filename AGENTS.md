@@ -38,4 +38,4 @@
 
 ## E2E 前置门禁
 
-- 发起 E2E 前先跑节点重放测试（见 `docs/node-replay-tests.md`）：先 `scripts/harvest_node_fixtures.py` 采集 fixtures，再 `pytest tests/test_node_replay_{local,external,boundary}.py -n auto`，全绿才放行 E2E。
+- 发起 E2E 前先跑节点重放测试（见 `docs/node-replay-tests.md`）：先 `scripts/harvest_node_fixtures.py` 采集 fixtures，再 `NODE_REPLAY_LIVE=1 pytest tests/test_node_replay_{local,external,boundary}.py -n auto`（节点重放套件默认跳过，必须显式开启），全绿才放行 E2E。

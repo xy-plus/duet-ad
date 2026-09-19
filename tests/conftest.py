@@ -1,8 +1,11 @@
 """Shared fixtures for the real-input node replay suite.
 
 Loads provider credentials from the same env files the deploy script sources
-(values are never printed), registers the ``live_provider`` marker and gates
-it behind ``NODE_REPLAY_LIVE`` (default on; set to 0 to skip paid calls).
+(values are never printed), registers the ``node_replay`` marker and gates
+it behind ``NODE_REPLAY_LIVE`` (default OFF: the replay suite — CPU-heavy
+local media replays, live DeepSeek contract tests and the paid Seedream
+submit — only runs when explicitly enabled with ``NODE_REPLAY_LIVE=1``, as
+the E2E 前置门禁 does).
 """
 
 from __future__ import annotations
@@ -55,16 +58,17 @@ for _env_file in _ENV_FILES:
 
 
 def _live_enabled() -> bool:
-    return os.environ.get("NODE_REPLAY_LIVE", "1").lower() not in {
-        "0", "false", "no", "off",
+    return os.environ.get("NODE_REPLAY_LIVE", "0").lower() in {
+        "1", "true", "yes", "on",
     }
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "live_provider: real paid provider call (Seedream image);"
-        " disable with NODE_REPLAY_LIVE=0",
+        "node_replay: harvested-input node replay (offline media replays,"
+        " live DeepSeek contract tests, paid Seedream submit);"
+        " enable with NODE_REPLAY_LIVE=1",
     )
 
 
@@ -74,10 +78,11 @@ def pytest_collection_modifyitems(
     if _live_enabled():
         return
     skip = pytest.mark.skip(
-        reason="live paid provider calls disabled via NODE_REPLAY_LIVE=0"
+        reason="node replay suite skipped by default; enable with"
+        " NODE_REPLAY_LIVE=1 (E2E 前置门禁)"
     )
     for item in items:
-        if "live_provider" in item.keywords:
+        if "node_replay" in item.keywords:
             item.add_marker(skip)
 
 

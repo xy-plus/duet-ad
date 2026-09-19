@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from app.doubao_voices import (  # noqa: E402
     DOUBAO_VOICE_CATALOG_PATH,
     KNOWN_LANGUAGE_CODES,
+    PROMPT_VOICE_LIMIT,
     doubao_voice_language_key,
     load_doubao_voice_catalog,
 )
@@ -102,6 +103,32 @@ def test_model_lines_are_compact_one_line_summaries() -> None:
     assert "{" not in lines
     assert all(" - " in line for line in lines.splitlines())
     assert "ja_female_bv522_uranus_bigtts" in lines
+
+
+def test_prompt_subset_is_capped_and_keeps_default_and_genders() -> None:
+    catalog = load_doubao_voice_catalog()
+    zh = catalog.prompt_voices_for_language("中文")
+    assert 0 < len(zh) <= PROMPT_VOICE_LIMIT
+    assert len(zh) < len(catalog.voices_for_language("中文"))
+    # 兜底音色必须在精选子集内，且两种性别都有覆盖（多说话人区分音色）。
+    defaults = catalog.default_voice_type("中文")
+    assert defaults in [voice["voice_type"] for voice in zh]
+    assert {voice["gender"] for voice in zh} == {"female", "male"}
+    # 小语种子集不足上限时原样返回。
+    th = catalog.prompt_voices_for_language("泰语")
+    assert th == catalog.voices_for_language("泰语")
+    # 未知语言回退中文精选子集。
+    assert catalog.prompt_voices_for_language("克林贡语") == zh
+
+
+def test_prompt_lines_drop_language_and_notes_columns() -> None:
+    catalog = load_doubao_voice_catalog()
+    lines = catalog.prompt_lines(catalog.prompt_voices_for_language("中文"))
+    assert "{" not in lines
+    rows = lines.splitlines()
+    assert len(rows) == len(catalog.prompt_voices_for_language("中文"))
+    assert all(len(row.split(" - ")) == 4 for row in rows)
+    assert "方言" not in lines
 
 
 def test_loader_rejects_broken_catalogs(tmp_path: Path) -> None:

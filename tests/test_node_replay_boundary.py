@@ -17,6 +17,9 @@ import pytest
 
 from app.pipeline import Pipeline
 
+pytestmark = pytest.mark.node_replay
+
+
 from node_replay_support import BOUNDARY_PROJECT, FIXTURES_ROOT
 
 

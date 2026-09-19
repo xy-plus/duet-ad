@@ -33,7 +33,7 @@ fixture 的来源项目、attempt 和当时 input/output 的 sha256（字段格�
 
 ```bash
 cd /home/xy/duet-ad1-h3-max-r2v-release
-/home/xy/duet-ad1/.venv/bin/python -m pytest \
+NODE_REPLAY_LIVE=1 /home/xy/duet-ad1/.venv/bin/python -m pytest \
     tests/test_node_replay_local.py \
     tests/test_node_replay_external.py \
     tests/test_node_replay_boundary.py \
@@ -44,9 +44,10 @@ cd /home/xy/duet-ad1-h3-max-r2v-release
 - 凭证：`tests/conftest.py` 自动加载 `~/.config/duet-ad1/service.env`、
   `~/.config/claude/deepseek.env` 和主树 `.env`（与 deploy 脚本同源），
   不打印任何值。缺 DeepSeek 凭证时对应测试 skip。
-- **付费节点**：`seedream-reference-submit` 标记为
-  `live_provider`，默认开启（这是真实验证的要求）。关闭：
-  `NODE_REPLAY_LIVE=0 python -m pytest ...`。
+- **重放门禁**：三个重放文件（local/external/boundary）全部标记为
+  `node_replay`，**默认跳过**——日常 `pytest tests` 不跑真实媒体重放、
+  不触发任何外部/付费调用；E2E 前置门禁如上显式加 `NODE_REPLAY_LIVE=1`
+  才会执行整个重放套件。
 
 ### 成本粗估（每次全量运行）
 

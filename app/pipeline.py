@@ -1236,12 +1236,13 @@ class Pipeline:
                     for order, path in enumerate(originals[1:], 2)
                 ]]
         reference_ids = [f"image_{order}" for order in range(1, len(reference_paths) + 1)]
-        # 音色目录按目标语言过滤后再注入：只给该语种的豆包 2.0 音色子集，
-        # “与原视频相同”按台词文字系统解析，解析不出回退中文子集。
+        # 音色目录先按目标语言过滤，再按场景相关度精选（上限 PROMPT_VOICE_LIMIT
+        # 条），避免全量目录淹没提示词；“与原视频相同”按台词文字系统解析，
+        # 解析不出回退中文子集。提示词行与输出枚举使用同一精选子集。
         language_label = _dialogue_language_display(
             target_language, translated_lines,
         )
-        voice_subset = self.voice_catalog.voices_for_language(language_label)
+        voice_subset = self.voice_catalog.prompt_voices_for_language(language_label)
         voice_types = [voice["voice_type"] for voice in voice_subset]
         planning_context = object_replace_planning_context(element_index)
         payload = {
@@ -1263,7 +1264,7 @@ class Pipeline:
                 if user_reference is not None else None
             ),
             "voice_catalog_sha256": self.voice_catalog.digest,
-            "voice_catalog_lines": self.voice_catalog.model_lines(voice_subset),
+            "voice_catalog_lines": self.voice_catalog.prompt_lines(voice_subset),
         }
         views = product_views.frozen_product_views(project)
         if views is not None and user_reference is not None:

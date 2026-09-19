@@ -2,18 +2,21 @@
 
 DeepSeek nodes call the live API with the harvested payload (vision nodes
 attach the harvested frame images) and assert the answer passes the same
-validator/normalizer the pipeline applies.  ``seedream-reference-submit`` is
-a paid call and marked ``live_provider`` (disable with
-``NODE_REPLAY_LIVE=0``); see docs/node-replay-tests.md for costs.
+validator/normalizer the pipeline applies; ``seedream-reference-submit`` is
+additionally a paid call.  Every test here touches a live provider.  See
+docs/node-replay-tests.md for costs.
 """
 
 from __future__ import annotations
+
+import pytest
+
+pytestmark = pytest.mark.node_replay
 
 import hashlib
 import json
 from pathlib import Path
 
-import pytest
 
 from app.fusion_schema import normalize_fusion_prompt
 from app.object_replace_schema import (
@@ -327,7 +330,6 @@ def test_h3_max_r2v_prompt(fixture: Fixture, deepseek_client, tmp_path: Path) ->
 # -------------------------------------------------- seedream-reference-submit
 
 
-@pytest.mark.live_provider
 @pytest.mark.parametrize(
     "fixture",
     _params("seedream-reference-submit"),

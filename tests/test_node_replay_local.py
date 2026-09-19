@@ -16,6 +16,9 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.node_replay
+
+
 from app import media
 from app.pipeline import Pipeline
 from app.replacement_sheet import (

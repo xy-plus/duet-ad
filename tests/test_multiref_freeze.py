@@ -46,14 +46,19 @@ class _AllGeneratedDeepSeek(_FlowDeepSeek):
         )[0]
         if output_name != OBJECT_REPLACE_OUTPUT_NAME:
             return result
-        for category in ("people", "entities", "scenes"):
+        # 现行策略：场景一律保留，未命中用户参考图的实体保留；只有人物允许
+        # generated_variant 重生成。本用例故意不绑定任何用户图。
+        for patch in result.value["people"].values():
+            patch["matches_user_request"] = False
+            patch["replacement"] = {
+                "source": "generated_variant",
+                "target_visual_description": "generated replacement",
+                "appearance_description": "isolated generated replacement",
+            }
+        for category in ("entities", "scenes"):
             for patch in result.value[category].values():
                 patch["matches_user_request"] = False
-                patch["replacement"] = {
-                    "source": "generated_variant",
-                    "target_visual_description": "generated replacement",
-                    "appearance_description": "isolated generated replacement",
-                }
+                patch["replacement"] = None
         return result
 
 
@@ -406,10 +411,17 @@ def test_all_uploaded_references_reach_h3_when_no_key_binds_them(
     ]
     assert state["status"] == "succeeded"
     assert sheet["user_image_present"] is True
-    assert all(
-        record["replacement"]["source"] == "generated_variant"
+    people = state["enhanced_element_index"]["people"]
+    assert people and all(
+        record["replacement"] is not None
+        and record["replacement"]["source"] == "generated_variant"
         and record["replacement"].get("reference_image_ids") is None
-        for category in ("people", "entities", "scenes")
+        for record in people.values()
+    )
+    # 现行策略：场景与未绑定用户图的实体一律保留。
+    assert all(
+        record["replacement"] is None
+        for category in ("entities", "scenes")
         for record in state["enhanced_element_index"][category].values()
     )
     assert [entry["image_reference"] for entry in sheet["h3_reference_images"]] == [

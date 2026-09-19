@@ -15,9 +15,11 @@ VALIDATION_MESSAGE = (
 
 def _failure_record(status_code, message=VALIDATION_MESSAGE):
     body = (
-        {"status": "error", "reason": f"{PicsartClient.WORKFLOW}_failed", "message": message}
-        if status_code == 422 else
         {"response": {"status": "FAILED", "error": {"message": message}}}
+        if status_code == 200 else
+        # 真实的 422/503 终止信封：顶层 status/reason（见
+        # Pipeline._poll_record_is_terminal_failure 的注释）。
+        {"status": "error", "reason": f"{PicsartClient.WORKFLOW}_failed", "message": message}
     )
     return {"polls": [{"response": {"status_code": status_code, "body": body}}]}
 

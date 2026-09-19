@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,32 @@ KNOWN_LANGUAGE_CODES = frozenset(_LANGUAGE_ALIASES)
 
 # 无人物/旁白台词的兜底音色：按语言选该语种第一条「通用场景」音色。
 _DEFAULT_SCENE = "通用场景"
+
+# 注入 Object Replace 提示词的音色精选规则：完整目录按语言过滤后 zh 仍有 90 条，
+# 全量注入会淹没提示词。按场景相关度排序（靠前更贴合广告短视频配音），组内
+# 男女交替保持性别覆盖，截取前 PROMPT_VOICE_LIMIT 条；输出枚举与提示词一致，
+# 目录外、子集外的 voice_type 都不可输出。
+_PROMPT_SCENE_PRIORITY = (
+    "通用场景",
+    "视频配音",
+    "角色扮演",
+    "有声阅读",
+    "客服场景",
+    "教学场景",
+    "教育场景",
+    "趣味口音",
+    "外语音色",
+)
+PROMPT_VOICE_LIMIT = 20
+
+
+def _scene_rank(voice: dict[str, Any]) -> int:
+    ranks = [
+        _PROMPT_SCENE_PRIORITY.index(scene)
+        for scene in voice["scenes"]
+        if scene in _PROMPT_SCENE_PRIORITY
+    ]
+    return min(ranks) if ranks else len(_PROMPT_SCENE_PRIORITY)
 
 
 def doubao_voice_language_key(language_label: str) -> str:
@@ -111,6 +138,32 @@ class DoubaoVoiceCatalog:
             raise ValueError(f"doubao voice catalog has no {key} voices")
         return subset
 
+    def prompt_voices_for_language(
+        self, language_label: str
+    ) -> tuple[dict[str, Any], ...]:
+        """注入 Object Replace 提示词的精选子集：场景相关度排序、组内男女交替、
+        上限 PROMPT_VOICE_LIMIT 条；兜底音色始终在子集内。提示词行、输出枚举、
+        下游校验必须使用同一子集，不得混用完整目录。"""
+        subset = self.voices_for_language(language_label)
+        if len(subset) <= PROMPT_VOICE_LIMIT:
+            return subset
+        ranked: list[tuple[dict[str, Any], ...]] = []
+        for rank in range(len(_PROMPT_SCENE_PRIORITY) + 1):
+            group = [voice for voice in subset if _scene_rank(voice) == rank]
+            female = [voice for voice in group if voice["gender"] == "female"]
+            male = [voice for voice in group if voice["gender"] == "male"]
+            interleaved: list[dict[str, Any]] = []
+            for pair in itertools.zip_longest(female, male):
+                interleaved.extend(voice for voice in pair if voice is not None)
+            ranked.append(tuple(interleaved))
+        curated = [
+            voice for group in ranked for voice in group
+        ][:PROMPT_VOICE_LIMIT]
+        default = self.default_voice_type(language_label)
+        if all(voice["voice_type"] != default for voice in curated):
+            curated[-1] = self.voice(default)
+        return tuple(curated)
+
     def default_voice_type(self, language_label: str) -> str:
         """该语种的兜底音色：第一条通用场景音色，否则该语种第一条。"""
         subset = self.voices_for_language(language_label)
@@ -135,6 +188,19 @@ class DoubaoVoiceCatalog:
 
     def model_lines(self, voices: tuple[dict[str, Any], ...] | None = None) -> str:
         return "\n".join(self.model_line(voice) for voice in (voices or self.voices))
+
+    @staticmethod
+    def prompt_line(voice: dict[str, Any]) -> str:
+        """提示词精选子集的极简行：语种已由过滤保证、备注冗长，均不下发。"""
+        return " - ".join([
+            voice["voice_type"],
+            voice["name"],
+            voice["gender"],
+            ",".join(voice["scenes"]) or "unspecified",
+        ])
+
+    def prompt_lines(self, voices: tuple[dict[str, Any], ...]) -> str:
+        return "\n".join(self.prompt_line(voice) for voice in voices)
 
 
 def load_doubao_voice_catalog(
