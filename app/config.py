@@ -17,8 +17,16 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MULTIREF_MODES = frozenset({"composed", "direct"})
 ARTIFACT_RETENTION_MODES = frozenset({"full", "lean"})
 
-# 物品检测只走 SAM 3.1 video-rle（实现见 app/object_detect.py）：sandbase.ai
-# 为主 provider（2026-09-19 起），fal.ai 保留作后备。
+# 物品检测只走 SAM 3.1 video-rle（实现见 app/object_detect.py）：provider 链路
+# 顺序 wavespeed → sandbase → fal（2026-09-19：fal 账号被官方 Admin lock、
+# sandbase worker 连续 generation_timeout，两家当前均不可用，故新接入的
+# wavespeed 排第一位）。
+# WaveSpeed SAM3 video-rle：端点均为 <base>/api/v3/...（上传 ticket
+# /api/v3/media/uploads、提交 /api/v3/<model>、轮询
+# /api/v3/predictions/{id}/result），model 是含路径段的完整模型 ID。
+# 凭证环境变量名沿用 WaveSpeed 官方 CLI/SDK 约定 WAVESPEED_API_KEY。
+WAVESPEED_SAM3_API_BASE = "https://api.wavespeed.ai"
+WAVESPEED_SAM3_MODEL = "wavespeed-ai/sam3-video-rle"
 # fal 队列 base 含端点路径，model 为端点末段，提交 URL = <base>/<model>。
 # 凭证环境变量名沿用 fal 平台统一约定 FAL_KEY（不是 FAL_SAM3_API_KEY）。
 # 端点从 sam-3 升级到 sam-3-1（schema 一致，仅多一个可选 max_num_objects，
@@ -93,9 +101,19 @@ class Settings:
     store_lock_enabled: bool = True
     public_api_enabled: bool = False
     public_api_clients_file: Path | None = None
-    # sandbase SAM-3 物品检测主 provider；sandbase_sam3_api_key 缺省 None =
-    # 未配置（SANDBASE_API_KEY 未设），此时回退 fal（fal key 也未配置则物品
-    # 灰块节点不触发）。默认值来自上方 SANDBASE_SAM3_API_BASE /
+    # WaveSpeed SAM-3 物品检测 provider（链路第一位）；wavespeed_sam3_api_key
+    # 缺省 None = 未配置（WAVESPEED_API_KEY 未设），此时回退 sandbase → fal
+    # （都未配置则物品灰块节点不触发）。默认值来自上方
+    # WAVESPEED_SAM3_API_BASE / WAVESPEED_SAM3_MODEL。该模型 schema 只有
+    # video/prompt/point_prompts/box_prompts/apply_mask，没有置信度阈值参数，
+    # 故无 threshold 配置项。直连可用性未实测，暂不引 proxy 配置项（与
+    # sandbase 同处理）。
+    wavespeed_sam3_api_key: str | None = field(default=None, repr=False)
+    wavespeed_sam3_api_base: str = WAVESPEED_SAM3_API_BASE
+    wavespeed_sam3_model: str = WAVESPEED_SAM3_MODEL
+    # sandbase SAM-3 物品检测 provider（链路第二位）；sandbase_sam3_api_key
+    # 缺省 None = 未配置（SANDBASE_API_KEY 未设），此时回退 fal（fal key 也未
+    # 配置则物品灰块节点不触发）。默认值来自上方 SANDBASE_SAM3_API_BASE /
     # SANDBASE_SAM3_MODEL。国内直连 api.sandbase.ai 通畅（2026-09-19 实测），
     # 故没有 proxy 配置项。
     sandbase_sam3_api_key: str | None = field(default=None, repr=False)
@@ -120,8 +138,9 @@ class Settings:
     # object_mask_degraded 降级路径完全一致（参考视频保持 source-muted、
     # 提示词按未遮盖处理），trace 记 object_mask_disabled 以区分配置关闭
     # 与失败降级。缺省 true 维持现状；检测后端不可用期间（2026-09-19 fal
-    # 账号被锁、替代 provider sandbase 的 worker 又连续 generation_timeout）
-    # 在 .env 显式写 false。本开关不进前端、不进公开 API。
+    # 账号被锁、sandbase worker 连续 generation_timeout，wavespeed 已接入
+    # 但输出形态未经真实校准）在 .env 显式写 false。本开关不进前端、不进
+    # 公开 API。
     object_mask_enabled: bool = True
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0
@@ -261,6 +280,39 @@ class Settings:
         if not isinstance(clients_file, Path):
             raise ValueError("PUBLIC_API_CLIENTS_FILE must be a filesystem path")
         object.__setattr__(self, "public_api_clients_file", clients_file)
+        wavespeed_key = self.wavespeed_sam3_api_key
+        if wavespeed_key is not None:
+            if not isinstance(wavespeed_key, str) or not wavespeed_key.strip():
+                raise ValueError("WAVESPEED_API_KEY must be a non-empty value or unset")
+            wavespeed_key = wavespeed_key.strip()
+            if (
+                not wavespeed_key.isascii()
+                or any(not 0x21 <= ord(character) <= 0x7E for character in wavespeed_key)
+            ):
+                raise ValueError("WAVESPEED_API_KEY must be header-safe ASCII")
+            object.__setattr__(self, "wavespeed_sam3_api_key", wavespeed_key)
+        wavespeed_base = (
+            self.wavespeed_sam3_api_base.strip().rstrip("/")
+            if isinstance(self.wavespeed_sam3_api_base, str)
+            else ""
+        )
+        try:
+            wavespeed_base_url = urlsplit(wavespeed_base)
+        except ValueError as exc:
+            raise ValueError(
+                "WAVESPEED_SAM3_API_BASE must be an HTTPS base URL"
+            ) from exc
+        if wavespeed_base_url.scheme != "https" or not wavespeed_base_url.netloc:
+            raise ValueError("WAVESPEED_SAM3_API_BASE must be an HTTPS base URL")
+        object.__setattr__(self, "wavespeed_sam3_api_base", wavespeed_base)
+        wavespeed_model = (
+            self.wavespeed_sam3_model.strip()
+            if isinstance(self.wavespeed_sam3_model, str)
+            else ""
+        )
+        if not _MODEL_PATH_RE.fullmatch(wavespeed_model):
+            raise ValueError("WAVESPEED_SAM3_MODEL must be a valid model identifier")
+        object.__setattr__(self, "wavespeed_sam3_model", wavespeed_model)
         sandbase_key = self.sandbase_sam3_api_key
         if sandbase_key is not None:
             if not isinstance(sandbase_key, str) or not sandbase_key.strip():
@@ -503,6 +555,13 @@ def get_settings() -> Settings:
         # therefore cannot disable the single-worker store lock; tests may do
         # so only by constructing Settings explicitly.
         store_lock_enabled=True,
+        wavespeed_sam3_api_key=os.environ.get("WAVESPEED_API_KEY", "").strip() or None,
+        wavespeed_sam3_api_base=os.environ.get(
+            "WAVESPEED_SAM3_API_BASE", WAVESPEED_SAM3_API_BASE
+        ).strip(),
+        wavespeed_sam3_model=os.environ.get(
+            "WAVESPEED_SAM3_MODEL", WAVESPEED_SAM3_MODEL
+        ).strip(),
         sandbase_sam3_api_key=os.environ.get("SANDBASE_API_KEY", "").strip() or None,
         sandbase_sam3_api_base=os.environ.get(
             "SANDBASE_SAM3_API_BASE", SANDBASE_SAM3_API_BASE

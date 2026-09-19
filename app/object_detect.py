@@ -1,4 +1,4 @@
-"""物品检测：SAM 3.1 video-rle，sandbase.ai 主 provider + fal.ai 后备。
+"""物品检测：SAM 3.1 video-rle，provider 链路 wavespeed → sandbase → fal。
 
 接口契约（object_mask 只面向本契约，不感知 HTTP 细节）：
 
@@ -8,26 +8,32 @@
   不作为 detect 返回形态。
 - ``ObjectDetection``：``{label, timestamp_s, bbox_xyxy_normalized, rle}``；bbox 为
   0–1 浮点、相对帧宽/高，构造时校验（坐标 ∈[0,1]、x0<x1、y0<y1、timestamp≥0）。
+  ``rle`` 一律归一化为 fal 行主序 ``(start, length)`` 对 counts 字符串——下游
+  object_mask._decode_rle_mask 的既有输入格式，各 provider 的原生 RLE 格式
+  （fal 行主序对 / WaveSpeed pycocotools 列主序游程）由本模块的适配层转换，
+  下游零改动。
 - 多目标粒度：SAM 3.1 端点的一次请求接受逗号分隔的 targets，``detect`` 将它们
   原顺序拼为一个 prompt，只发一次请求。已校准的响应仍是一套按帧对齐的
   rle/boxes/metadata，**没有每框所属 target 的字段**；因此多目标结果的
   ``ObjectDetection.label`` 是实际发送的完整 prompt（例如 ``"face, necklace"``），
   表示不可归因的合并检测组，而不是猜测性地归给任一 target。
 
-Provider 布局（2026-09-19）：sandbase.ai 为主（``SandbaseSam3GroundingClient``，
-SANDBASE_API_KEY 配置即用），fal.ai 保留作后备（``FalSam3GroundingClient``，
-FAL_KEY）。背景：2026-09-19 fal 账号被官方 Admin lock（storage upload 403），
-检测后端切换到同一模型（meta SAM 3.1 video-rle）的 sandbase 部署。两家
-provider 的归一化输出形状完全一致，下游 object_mask/pipeline 零改动。
+Provider 布局（2026-09-19）：wavespeed 排第一（``WavespeedSam3GroundingClient``，
+WAVESPEED_API_KEY 配置即用），其后 sandbase（``SandbaseSam3GroundingClient``，
+SANDBASE_API_KEY）、fal（``FalSam3GroundingClient``，FAL_KEY）。背景：
+2026-09-19 fal 账号被官方 Admin lock（storage upload 403），同日接入的
+sandbase 部署模型 worker 连续 generation_timeout，两家当前均不可用，故
+接入第三家 WaveSpeed 并排在链路第一位。三家 provider 的归一化输出形状
+完全一致，下游 object_mask/pipeline 零改动。
 
 为什么只有 SAM 3.1 这一路（2026-09-15 用户拍板）：此前平行接入的 7 家 VLM
 （doubao/qwen/glm/hunyuan/kimi/step/gemini）输出文本 bbox，无法确定性转成
 逐帧掩码，不符合需求，已全部删除；检测路径固定走 SAM-3 video-rle。
 
-缺 key 语义（与人脸节点"model is missing 才致命"对齐）：SANDBASE_API_KEY 与
-FAL_KEY 都未配置 → 物品灰块节点不触发（等同该段无 OR 目标）；配置非法
-（非空但非法的 key/base/model）→ Settings 启动校验报错，即致命。
-provider 名称一律不出现在公开 API 的参数与响应里。
+缺 key 语义（与人脸节点"model is missing 才致命"对齐）：WAVESPEED_API_KEY、
+SANDBASE_API_KEY 与 FAL_KEY 都未配置 → 物品灰块节点不触发（等同该段无 OR
+目标）；配置非法（非空但非法的 key/base/model）→ Settings 启动校验报错，
+即致命。provider 名称一律不出现在公开 API 的参数与响应里。
 
 确定性模型不做"重试 = 重新推理"：空结果即确定答案、畸形结果直接致命
 （重提只会得到同样结果，白花钱）。
@@ -47,6 +53,7 @@ from typing import Any
 
 import cv2
 import httpx
+import numpy as np
 
 from app import providers
 from app.config import Settings
@@ -146,17 +153,31 @@ def _probe_fps(video_path: Path) -> float:
     return fps
 
 
+def _probe_frame_size(video_path: Path) -> tuple[int, int]:
+    """cv2.VideoCapture 读视频帧像素尺寸 (height, width)；读不到抛 ValueError。"""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        capture.release()
+    if width <= 0 or height <= 0:
+        raise ValueError(f"cannot read frame size from video: {video_path}")
+    return (height, width)
+
+
 def _clamp01(value: float) -> float:
     return min(1.0, max(0.0, value))
 
 
-# ==== 检测响应的实例级共享缓存（两个 provider 共用布局） ====
+# ==== 检测响应的实例级共享缓存（三个 provider 共用布局） ====
 # 布局：<DATA_DIR>/shared/object-detect-cache/object-detect-response-<指纹
 # sha256>.json，文件内容 {"fingerprint": ..., <payload_key>: 原始响应}。
 # fal 的 payload_key 是 "fal_response"（2026-09-15 起的既有磁盘格式，不能改，
-# 改名会让存量缓存全部失效、白花钱重调）；sandbase 用 "provider_response"。
-# 指纹含 model 字段，两家 model 字符串不同（"video-rle" vs
-# "meta/sam-3-1/video-rle"），同视频同 prompt 也不会互相命中。
+# 改名会让存量缓存全部失效、白花钱重调）；sandbase/wavespeed 用
+# "provider_response"。指纹含 model 字段，三家 model 字符串不同
+# （"video-rle" / "meta/sam-3-1/video-rle" / "wavespeed-ai/sam3-video-rle"），
+# 同视频同 prompt 也不会互相命中。
 
 
 def _shared_cache_path(settings: Settings, fingerprint: dict[str, Any]) -> Path:
@@ -259,7 +280,8 @@ def _store_cached_response(
 
 
 class UncalibratedResponseError(ValueError):
-    """fal 响应形态与已校准形态不符：确定性错误，重提只会得到同样结果。
+    """检测 provider 响应形态与已校准形态不符：确定性错误，重提只会得到同样
+    结果。
 
     pipeline 的错误分类（``Pipeline._retryable_node_error`` 与
     mask-replaceable-objects 节点的 ``retry_if``）把本类型当作确定性
@@ -652,8 +674,10 @@ class FalSam3GroundingClient:
 
 
 # ==== sandbase_sam3（sandbase.ai SAM 3.1 video-rle）：multipart 上传 + 轮询 ====
-# 2026-09-19 起替代 fal 成为主 provider（fal 账号被官方 Admin lock，storage
-# upload 403；fal 代码保留作后备）。接口事实来自官方文档
+# 2026-09-19 接入时替代 fal 成为主 provider（fal 账号被官方 Admin lock，
+# storage upload 403；fal 代码保留作后备）；同日因其模型 worker 连续
+# generation_timeout 不可用，wavespeed 接入后排到链路第二位。接口事实来自
+# 官方文档
 # https://www.sandbase.ai/model/meta/sam-3-1/video-rle/docs 与 2026-09-19 真实
 # 校准调用（落盘 data-verify/sandbase-sam31-calib-20260919/）：
 # - 本地视频先 POST {base}/v1/upload（multipart 字段名 file，视频固定
@@ -931,30 +955,575 @@ class SandbaseSam3GroundingClient:
         return _parse_frame_aligned_result(payload, targets, fps, "sandbase")
 
 
+# ==== wavespeed_sam3（WaveSpeed SAM3 video-rle）：直传 ticket + 轮询 ====
+# 2026-09-19 接入，排在 provider 链路第一位（fal 账号被官方 Admin lock、
+# sandbase worker 连续 generation_timeout，两家当前均不可用）。接口事实
+# 来源（2026-09-19 查证，均为官方页面/官方客户端源码，未经真实调用验证）：
+# - 提交/轮询/输出形态：官方模型页
+#   https://wavespeed.ai/models/wavespeed-ai/sam3-video-rle 的 README 与
+#   playground 真实输出样例。提交 POST {base}/api/v3/{model}，body
+#   {"video": <URL>, "prompt": <文本>, "apply_mask": false}（prompt 支持
+#   逗号分隔多目标）；响应 {"data": {"id": ...}} 或直接 {"id": ...}（官方
+#   示例代码按 body.get("data", body) 两种兼容，本实现同样处理）。轮询
+#   GET {base}/api/v3/predictions/{id}/result，data.status: completed /
+#   failed / cancelled / timeout / deleted / 其他（处理中）；completed 时
+#   outputs = {"rle_url": "..._rle.json", "video_url": "....mp4"}（字典，
+#   不是 sandbase 那样的列表）。
+# - 上传：视频输入只接受 URL，官方有文件上传端点（文档
+#   https://wavespeed.ai/docs/upload-files-api 与官方 ComfyUI 节点源码
+#   WaveSpeedAI/wavespeed-comfyui py/wavespeed_upload.py，两处一致）：
+#   推荐的直传流程是 POST {base}/api/v3/media/uploads（JSON
+#   {"filename", "size", "content_type"}，Bearer 鉴权）拿一次性 ticket，
+#   响应 {"code": 200, "data": {"download_url": ..., "upload": {"url",
+#   "method", "headers"}}}，再按 ticket 的 method/headers 把文件字节 PUT
+#   到 upload.url（不带 API key），download_url 即可作为模型输入。本实现
+#   只用直传流程；文档另载 legacy 端点 /api/v3/media/upload/binary
+#   （multipart 字段 file），标注为兼容保留，不采用。
+# - RLE 内容格式：官方 README 的解码示例是 pycocotools 标准格式
+#   {"counts": "146301 3 147834 11...", "size": [height, width]}，counts
+#   为空白分隔数字字符串（背景起始交替游程、列主序），与 fal 的行主序
+#   (start,length) 对格式不同，由下方 _decode_pycocotools_counts /
+#   _encode_fal_rle_pairs 适配转换。
+# - **rle_url 指向 JSON 的完整外层结构（逐帧如何组织、多目标如何归组）
+#   官方页面没有写，未经真实响应验证**：本实现按最合理的结构写适配层
+#   （见 _parse_wavespeed_rle_result 头注释），形态不符时抛
+#   UncalibratedResponseError 确定性致命，绝不静默降级或错解析。首次真实
+#   调用后须用落盘的原始响应复核本段假设。
+# - 计价（官方 README）：$0.05/5 秒，按视频时长 5 秒向上取整，封顶 600 秒。
+# 与 fal/sandbase 相同：确定性模型空结果即确定答案、畸形结果直接致命，
+# 都不重提。
+WAVESPEED_PENDING_STATUSES = frozenset(
+    {"CREATED", "STARTING", "QUEUED", "PENDING", "RUNNING", "PROCESSING"}
+)
+WAVESPEED_FAILED_STATUSES = frozenset(
+    {"FAILED", "CANCELLED", "TIMEOUT", "DELETED"}
+)
+
+
+def _decode_pycocotools_counts(
+    counts: Any, size: Any, frame_index: int, provider_name: str
+) -> np.ndarray | None:
+    """pycocotools 非压缩 counts → bool mask；全零（该帧未检出）返回 None。
+
+    counts 语义按官方 README 的 pycocotools 解码示例：空白分隔的非负整数，
+    背景游程起始、0/1 交替，列主序（Fortran order）展平，总和恰为 h*w。
+    任何一点不符（含 sum != h*w）都是未校准形态，抛
+    UncalibratedResponseError——pycocotools 语义是文档假设，真实响应若不同
+    必须致命而不是静默解错。counts 为空字符串视为该帧未检出（与 fal 的 ""
+    语义对齐），返回 None。
+    """
+    if (
+        not isinstance(size, (list, tuple))
+        or len(size) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in size
+        )
+    ):
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} has an invalid size; "
+            "uncalibrated response shape"
+        )
+    height, width = int(size[0]), int(size[1])
+    if not isinstance(counts, str):
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} counts must be a string; "
+            "uncalibrated response shape"
+        )
+    if not counts.strip():
+        return None
+    try:
+        values = [int(value) for value in counts.split()]
+    except ValueError as exc:
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} counts are not integers; "
+            "uncalibrated response shape"
+        ) from exc
+    if not values or any(value < 0 for value in values):
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} counts are invalid; "
+            "uncalibrated response shape"
+        )
+    if sum(values) != height * width:
+        raise UncalibratedResponseError(
+            f"{provider_name} rle frame {frame_index} counts sum "
+            f"{sum(values)} != {height * width} pixels; "
+            "uncalibrated response shape"
+        )
+    flat = np.zeros(height * width, dtype=bool)
+    offset = 0
+    for run_index, run_length in enumerate(values):
+        if run_index % 2 == 1:
+            flat[offset:offset + run_length] = True
+        offset += run_length
+    mask = flat.reshape((height, width), order="F")
+    return mask if mask.any() else None
+
+
+def _encode_fal_rle_pairs(mask: np.ndarray) -> str:
+    """bool mask → fal 行主序 ``(start, length)`` 对 counts 字符串。
+
+    归一化输出契约：ObjectDetection.rle 一律是下游
+    object_mask._decode_rle_mask 的既有输入格式（行主序、C order），
+    WaveSpeed 的 pycocotools 列主序游程在适配层转换，下游零改动。调用方
+    保证 mask 非空，返回字符串必非空。
+    """
+    flat = mask.reshape(-1).view(np.int8)  # C order（行主序）
+    edges = np.diff(np.concatenate(([0], flat, [0])))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return " ".join(
+        f"{start} {end - start}" for start, end in zip(starts, ends)
+    )
+
+
+def _mask_bbox_xyxy_normalized(mask: np.ndarray) -> tuple[float, float, float, float]:
+    """非空 bool mask 的最小外接框，归一化到 [0,1]；必满足 x0<x1、y0<y1。"""
+    height, width = mask.shape
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    return (
+        cols[0] / width,
+        rows[0] / height,
+        (cols[-1] + 1) / width,
+        (rows[-1] + 1) / height,
+    )
+
+
+def _parse_wavespeed_rle_result(
+    payload: dict[str, Any],
+    targets: list[str],
+    fps: float,
+    frame_size: tuple[int, int],
+    provider_name: str = "wavespeed",
+) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
+    """WaveSpeed rle_url 产物 → 归一化 detections（bbox 从 mask 派生）。
+
+    **外层结构假设（未经真实响应验证，2026-09-19 官方页面未载）**：产物是
+    逐帧对齐的序列，接受两种显式包络——顶层 list，或带 "frames" 键的
+    dict；序列下标 = 帧号；每帧条目为 null（未检出）、单个 pycocotools
+    RLE 对象 {"counts", "size"}，或该帧多个 RLE 对象的 list（多目标/多实例
+    合并为并集，与 fal 已校准的"整条 prompt 合并检测组"语义一致）。除此
+    之外的一切形态都抛 UncalibratedResponseError 确定性致命，不做任何
+    猜测性解析。各帧 size 必须与源视频帧尺寸一致（强校准锚点：不符说明
+    对结构或尺寸的理解有误）。bbox 官方输出不提供，由并集 mask 的最小外接
+    框确定性派生；rle 重编码为 fal 行主序对格式（下游零改动）。多 target
+    无归属字段，label 为实际发送的完整逗号分隔 prompt（与 fal/sandbase
+    同语义）。
+    """
+    if not isinstance(payload, dict) or "rle_artifact" not in payload:
+        raise UncalibratedResponseError(
+            f"{provider_name} cached payload lacks rle_artifact; "
+            "uncalibrated response shape"
+        )
+    artifact = payload["rle_artifact"]
+    if isinstance(artifact, list):
+        frame_entries: list[Any] = artifact
+    elif isinstance(artifact, dict) and isinstance(artifact.get("frames"), list):
+        frame_entries = artifact["frames"]
+    else:
+        raise UncalibratedResponseError(
+            f"{provider_name} rle artifact must be a frame list or an object "
+            "with a frames list; uncalibrated response shape"
+        )
+    video_height, video_width = frame_size
+    prompt = ", ".join(target.strip() for target in targets)
+    detections: list[ObjectDetection] = []
+    frames: list[dict[str, Any]] = []
+    for frame_index, entry in enumerate(frame_entries):
+        if entry is None:
+            frames.append({
+                "frame_index": frame_index,
+                "label": prompt,
+                "score": None,
+                "box": None,
+                "rle": None,
+            })
+            continue
+        masks = entry if isinstance(entry, list) else [entry]
+        union: np.ndarray | None = None
+        for item in masks:
+            if not isinstance(item, dict):
+                raise UncalibratedResponseError(
+                    f"{provider_name} rle frame {frame_index} entry must be an "
+                    "rle object; uncalibrated response shape"
+                )
+            size = item.get("size")
+            if (
+                isinstance(size, (list, tuple))
+                and len(size) == 2
+                and all(isinstance(value, int) and not isinstance(value, bool)
+                        for value in size)
+                and (int(size[0]), int(size[1])) != (video_height, video_width)
+            ):
+                raise UncalibratedResponseError(
+                    f"{provider_name} rle frame {frame_index} size "
+                    f"{list(size)} != video frame size "
+                    f"{[video_height, video_width]}; uncalibrated response shape"
+                )
+            mask = _decode_pycocotools_counts(
+                item.get("counts"), size, frame_index, provider_name
+            )
+            if mask is not None:
+                union = mask if union is None else union | mask
+        if union is None:
+            frames.append({
+                "frame_index": frame_index,
+                "label": prompt,
+                "score": None,
+                "box": None,
+                "rle": None,
+            })
+            continue
+        bbox = _mask_bbox_xyxy_normalized(union)
+        rle = _encode_fal_rle_pairs(union)
+        frames.append({
+            "frame_index": frame_index,
+            "label": prompt,
+            "score": None,
+            "box": list(bbox),
+            "rle": rle,
+        })
+        detections.append(
+            ObjectDetection(
+                label=prompt,
+                timestamp_s=frame_index / fps,
+                bbox_xyxy_normalized=bbox,
+                rle=rle,
+            )
+        )
+    return detections, frames
+
+
+class WavespeedSam3GroundingClient:
+    """WaveSpeed SAM3 video-rle：归一化输出与 fal/sandbase provider 完全一致。
+
+    产物复用语义与 fal/sandbase client 相同（实例级共享缓存，同指纹零
+    HTTP；缓存实现见模块级 _shared_cache_path 等函数，落盘纪律搜索锚点
+    "落盘纪律"）。指纹键为 video_sha256/prompt/model（该模型无置信度阈值
+    参数），靠 model 字符串与其他 provider 天然隔离；payload_key 用
+    "provider_response"。缓存 payload = {"completed_outputs": 轮询
+    completed 的原始 outputs 字典（rle_url/video_url 原样保留）,
+    "rle_artifact": rle_url 下载的原始 JSON}——原始响应字段一个不丢。
+    """
+
+    provider_name = "wavespeed_sam3"
+    _PAYLOAD_KEY = "provider_response"
+
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.BaseTransport | None = None,
+        cache_path: Path | None = None,
+    ) -> None:
+        self.settings = settings
+        self.transport = transport
+        self.cache_path = cache_path
+        self.last_frames: list[dict[str, Any]] = []
+
+    def with_cache(self, cache_path: Path) -> "WavespeedSam3GroundingClient":
+        """返回挂同一 settings/transport、带旧版项目级回退读路径的新实例。"""
+        return WavespeedSam3GroundingClient(
+            self.settings, transport=self.transport, cache_path=cache_path
+        )
+
+    def detect(
+        self, video_path: Path, targets: list[str]
+    ) -> list[ObjectDetection]:
+        if any(not isinstance(target, str) or not target.strip() for target in targets):
+            raise ValueError("object detect targets must be non-empty strings")
+        if not targets:
+            return []
+        api_key = self.settings.wavespeed_sam3_api_key
+        if not api_key:
+            raise ValueError(
+                "wavespeed_sam3 API key is not configured; "
+                "the object mask node must not run"
+            )
+        content = Path(video_path).read_bytes()
+        if not content:
+            raise ValueError(f"object detect video input is empty: {video_path}")
+        fps = _probe_fps(video_path)
+        frame_size = _probe_frame_size(video_path)
+        prompt = ", ".join(target.strip() for target in targets)
+        fingerprint = {
+            "video_sha256": hashlib.sha256(content).hexdigest(),
+            "prompt": prompt,
+            "model": self.settings.wavespeed_sam3_model,
+        }
+        payload, record = _load_cached_response(
+            self.settings,
+            self.cache_path,
+            fingerprint,
+            self._PAYLOAD_KEY,
+            self.provider_name,
+        )
+        if payload is None:
+            payload, record = self._run_flow(api_key, video_path, content, prompt)
+            _store_cached_response(
+                self.settings,
+                fingerprint,
+                self._PAYLOAD_KEY,
+                payload,
+                self.provider_name,
+            )
+        try:
+            detections, self.last_frames = self._parse_result(
+                payload, targets, fps, frame_size
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ProviderFailure(record, [], exc) from exc
+        return detections
+
+    # --- wavespeed 流程（每步 HTTP 走 providers._send 语义） ---
+
+    def _run_flow(
+        self, api_key: str, video_path: Path, content: bytes, prompt: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        record: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.settings.request_timeout_s,
+            "transport": self.transport,
+        }
+        try:
+            with httpx.Client(**client_kwargs) as client:
+                file_url = self._upload(client, api_key, video_path, content, record)
+                prediction_id = self._submit(client, api_key, file_url, prompt, record)
+                outputs = self._poll_result(client, api_key, prediction_id, record)
+                artifact = self._download_rle(client, outputs, record)
+                return {
+                    "completed_outputs": outputs,
+                    "rle_artifact": artifact,
+                }, record
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    @staticmethod
+    def _headers(api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
+
+    def _upload(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        video_path: Path,
+        content: bytes,
+        record: dict[str, Any],
+    ) -> str:
+        """官方直传流程：POST ticket → 按 ticket 把字节 PUT 到一次性 URL。
+
+        ticket 端点与响应形态来自官方文档 upload-files-api 与官方 ComfyUI
+        节点源码（见段头注释），未经真实响应验证；ticket 的 upload.url 按
+        官方要求视为不透明值逐字使用。PUT 不带 API key（ticket URL 本身是
+        临时凭证）。
+        """
+        response, record["upload_ticket"] = providers._send(
+            client,
+            "POST",
+            f"{self.settings.wavespeed_sam3_api_base}/api/v3/media/uploads",
+            headers={**self._headers(api_key), "Content-Type": "application/json"},
+            json_body={
+                "filename": Path(video_path).name,
+                "size": len(content),
+                "content_type": "video/mp4",
+            },
+        )
+        providers._ensure_success(response, record["upload_ticket"])
+        body = providers._json_body(response)
+        data = body.get("data") if isinstance(body, dict) else None
+        upload = data.get("upload") if isinstance(data, dict) else None
+        download_url = data.get("download_url") if isinstance(data, dict) else None
+        if (
+            not isinstance(download_url, str)
+            or not download_url.startswith("https://")
+            or not isinstance(upload, dict)
+            or not isinstance(upload.get("url"), str)
+            or not upload["url"]
+        ):
+            raise ValueError(
+                "wavespeed upload ticket response lacks download_url/upload.url"
+            )
+        method = str(upload.get("method") or "PUT").upper()
+        if method not in {"PUT", "POST"}:
+            raise ValueError(
+                f"wavespeed upload ticket has unsupported method {method!r}"
+            )
+        upload_headers = upload.get("headers")
+        if not isinstance(upload_headers, dict):
+            upload_headers = {}
+        put_response, record["upload_put"] = providers._send(
+            client,
+            method,
+            upload["url"],
+            headers={str(key): str(value) for key, value in upload_headers.items()},
+            content=content,
+        )
+        providers._ensure_success(put_response, record["upload_put"])
+        return download_url
+
+    def _submit(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        file_url: str,
+        prompt: str,
+        record: dict[str, Any],
+    ) -> str:
+        # 请求体按官方模型页示例显式提交：apply_mask=False（mask 不渲进视频，
+        # 只要 RLE JSON）；point/box prompts 本链路永远没有坐标输入，不传。
+        # 该模型 schema 无 detection_threshold 参数（与 fal/sandbase 不同）。
+        body = {
+            "video": file_url,
+            "prompt": prompt,
+            "apply_mask": False,
+        }
+        response, record["submit"] = providers._send(
+            client,
+            "POST",
+            f"{self.settings.wavespeed_sam3_api_base}/api/v3/"
+            f"{self.settings.wavespeed_sam3_model}",
+            headers={**self._headers(api_key), "Content-Type": "application/json"},
+            json_body=body,
+        )
+        providers._ensure_success(response, record["submit"])
+        payload = providers._json_body(response)
+        # 官方示例代码按 body.get("data", body) 兼容两种响应包络。
+        data = payload.get("data", payload) if isinstance(payload, dict) else None
+        prediction_id = data.get("id") if isinstance(data, dict) else None
+        if isinstance(prediction_id, bool):
+            prediction_id = None
+        elif isinstance(prediction_id, int):
+            prediction_id = str(prediction_id)
+        if not isinstance(prediction_id, str) or not prediction_id:
+            raise ValueError("wavespeed submit response has no id")
+        return prediction_id
+
+    def _poll_result(
+        self,
+        client: httpx.Client,
+        api_key: str,
+        prediction_id: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        record["polls"] = []
+        poll_url = (
+            f"{self.settings.wavespeed_sam3_api_base}/api/v3/predictions/"
+            f"{prediction_id}/result"
+        )
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        while True:
+            response, exchange = providers._send(
+                client, "GET", poll_url, headers=self._headers(api_key)
+            )
+            record["polls"].append(exchange)
+            providers._ensure_success(response, exchange)
+            body = providers._json_body(response)
+            if not isinstance(body, dict):
+                raise ValueError("wavespeed poll response must be an object")
+            data = body.get("data", body)
+            if not isinstance(data, dict):
+                raise ValueError("wavespeed poll response data must be an object")
+            status = str(data.get("status") or "").upper()
+            if status == "COMPLETED":
+                outputs = data.get("outputs")
+                if (
+                    not isinstance(outputs, dict)
+                    or not isinstance(outputs.get("rle_url"), str)
+                    or not outputs["rle_url"]
+                ):
+                    raise UncalibratedResponseError(
+                        "wavespeed completed prediction has no outputs.rle_url; "
+                        "uncalibrated response shape"
+                    )
+                return outputs
+            if status in WAVESPEED_FAILED_STATUSES:
+                error = data.get("error")
+                raise ValueError(
+                    f"wavespeed prediction {prediction_id} {status.lower()}: "
+                    + json.dumps(error, ensure_ascii=False)
+                )
+            if status not in WAVESPEED_PENDING_STATUSES:
+                raise ValueError(
+                    f"wavespeed prediction {prediction_id} has unknown status "
+                    f"{status!r}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"wavespeed prediction {prediction_id} timed out"
+                )
+            time.sleep(self.settings.provider_poll_interval_s)
+
+    def _download_rle(
+        self,
+        client: httpx.Client,
+        outputs: dict[str, Any],
+        record: dict[str, Any],
+    ) -> Any:
+        """下载 completed prediction 的 RLE JSON 产物（outputs.rle_url，官方
+        样例为 cloudfront 公开 URL，无需鉴权）。outputs.video_url（预览
+        mp4）不下载，随 outputs 原始字段一起进缓存落盘。"""
+        response, record["rle_download"] = providers._send(
+            client, "GET", outputs["rle_url"]
+        )
+        providers._ensure_success(response, record["rle_download"])
+        payload = providers._json_body(response)
+        if not isinstance(payload, (dict, list)):
+            raise UncalibratedResponseError(
+                "wavespeed rle artifact must be an object or a list; "
+                "uncalibrated response shape"
+            )
+        return payload
+
+    # --- 响应解析（外层结构假设未经真实响应验证，见解析函数头注释） ---
+
+    def _parse_result(
+        self,
+        payload: dict[str, Any],
+        targets: list[str],
+        fps: float,
+        frame_size: tuple[int, int],
+    ) -> tuple[list[ObjectDetection], list[dict[str, Any]]]:
+        return _parse_wavespeed_rle_result(
+            payload, targets, fps, frame_size, "wavespeed"
+        )
+
+
 def available_providers(settings: Settings) -> list[str]:
-    """SANDBASE_API_KEY 已配置返回 ["sandbase_sam3"]（主 provider）；
-    未配置则 FAL_KEY 已配置返回 ["fal_sam3"]（后备）；都未配置返回 []。
+    """WAVESPEED_API_KEY 已配置返回 ["wavespeed_sam3"]（链路第一位）；未配置
+    则 SANDBASE_API_KEY 已配置返回 ["sandbase_sam3"]；再未配置则 FAL_KEY 已
+    配置返回 ["fal_sam3"]；都未配置返回 []。
 
     本函数实质是"检测是否可用"的门禁；保留列表形态与语义是为了 pipeline
     的调用侧（有可用 provider 才触发物品灰块节点）不变。provider 名称一律
     不出现在公开 API 的参数与响应里。
     """
+    if settings.wavespeed_sam3_api_key:
+        return ["wavespeed_sam3"]
     if settings.sandbase_sam3_api_key:
         return ["sandbase_sam3"]
     if settings.fal_sam3_api_key:
         return ["fal_sam3"]
     _LOGGER.info(
-        "object detect: neither SANDBASE_API_KEY nor FAL_KEY is configured; "
-        "detection unavailable"
+        "object detect: none of WAVESPEED_API_KEY, SANDBASE_API_KEY, FAL_KEY "
+        "is configured; detection unavailable"
     )
     return []
 
 
 def select_provider(
     settings: Settings,
-) -> SandbaseSam3GroundingClient | FalSam3GroundingClient | None:
-    """SANDBASE_API_KEY 已配置返回 sandbase SAM-3 client（主）；否则 FAL_KEY
-    已配置返回 fal SAM-3 client（后备）；都未配置返回 None。"""
+) -> (
+    WavespeedSam3GroundingClient
+    | SandbaseSam3GroundingClient
+    | FalSam3GroundingClient
+    | None
+):
+    """按链路顺序返回第一个已配置 key 的 client：wavespeed → sandbase →
+    fal；都未配置返回 None。"""
+    if settings.wavespeed_sam3_api_key:
+        return WavespeedSam3GroundingClient(settings)
     if settings.sandbase_sam3_api_key:
         return SandbaseSam3GroundingClient(settings)
     if settings.fal_sam3_api_key:

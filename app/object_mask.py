@@ -285,8 +285,8 @@ def mask_objects(
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
-    omitted, the production SAM-3 client is used (sandbase 主、fal 后备，
-    见 object_detect.select_provider，需对应平台 key)。
+    omitted, the production SAM-3 client is used (wavespeed → sandbase →
+    fal 链路顺序，见 object_detect.select_provider，需对应平台 key)。
     ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
     解析后的契约 detections 写 object-detections.json（见 _detect_all）；
     检测原始响应的指纹缓存写实例级共享目录

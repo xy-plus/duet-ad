@@ -16,9 +16,11 @@ from app.object_detect import (
     FalSam3GroundingClient,
     ObjectDetection,
     SandbaseSam3GroundingClient,
+    WavespeedSam3GroundingClient,
     available_providers,
     select_provider,
 )
+from app.object_mask import _decode_rle_mask
 from app.providers import ProviderFailure
 
 
@@ -1373,3 +1375,606 @@ def test_sandbase_cache_fingerprint_mismatch_refetches(
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
     client.detect(video, ["bottle"])
     assert handler.state["submits"] == 2  # type: ignore[attr-defined]
+
+
+# ==== wavespeed_sam3（WaveSpeed SAM3 video-rle）：2026-09-19 接入，链路第一位 ====
+# 流程：POST /api/v3/media/uploads（ticket）→ PUT 字节到 ticket 的一次性
+# URL（不带 API key）→ POST /api/v3/{model} 提交 →
+# GET /api/v3/predictions/{id}/result 轮询（completed/failed/cancelled/
+# timeout/deleted 终态）→ GET outputs.rle_url 下载 RLE JSON。
+# 接口事实来源与"外层结构未经真实响应验证"声明见 app/object_detect.py
+# wavespeed 段头注释；本段全部用合成 fixture，严禁真实 API 调用。
+
+
+def _wavespeed_settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "wavespeed_sam3_api_key": "wavespeed-secret",
+        "wavespeed_sam3_api_base": "https://wavespeed.test",
+        "wavespeed_sam3_model": "wavespeed-ai/sam3-video-rle",
+        "provider_poll_interval_s": 0.01,
+    }
+    values.update(overrides)
+    return _settings(tmp_path, **values)
+
+
+def _wavespeed_handler(
+    completed: object | None,
+    *,
+    artifact: object | None = None,
+    observed: dict[str, object] | None = None,
+    statuses: tuple[str, ...] = ("processing", "completed"),
+    submit_status: int = 200,
+    ticket_status: int = 200,
+    put_status: int = 200,
+    bare_submit_id: bool = False,
+) -> object:
+    """wavespeed 上传 ticket + PUT + 提交/轮询/RLE 下载全链路 mock。"""
+    state = {"tickets": 0, "puts": 0, "submits": 0, "polls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/api/v3/media/uploads":
+            state["tickets"] += 1
+            assert request.headers["authorization"] == "Bearer wavespeed-secret"
+            if observed is not None:
+                observed["ticket_body"] = json.loads(request.content)
+            if ticket_status != 200:
+                return httpx.Response(
+                    ticket_status, json={"code": 401, "message": "invalid API key"}
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "message": "success",
+                    "data": {
+                        "download_url": "https://cdn.wavespeed.test/files/clip.mp4",
+                        "upload": {
+                            "url": "https://upload.wavespeed.test/put/clip",
+                            "method": "PUT",
+                            "headers": {"x-upload-token": "ticket-token"},
+                        },
+                    },
+                },
+            )
+        if request.method == "PUT" and path == "/put/clip":
+            state["puts"] += 1
+            # ticket URL 本身是临时凭证：PUT 不带 API key，带 ticket 给的 headers。
+            assert "authorization" not in request.headers
+            assert request.headers["x-upload-token"] == "ticket-token"
+            return httpx.Response(put_status)
+        if request.method == "POST" and path == (
+            "/api/v3/wavespeed-ai/sam3-video-rle"
+        ):
+            state["submits"] += 1
+            assert request.headers["authorization"] == "Bearer wavespeed-secret"
+            if observed is not None:
+                observed["submit_body"] = json.loads(request.content)
+            if submit_status != 200:
+                return httpx.Response(
+                    submit_status, json={"code": 401, "message": "invalid API key"}
+                )
+            # 官方示例代码兼容 {"data": {"id": ...}} 与裸 {"id": ...} 两种包络。
+            if bare_submit_id:
+                return httpx.Response(200, json={"id": "pred-1"})
+            return httpx.Response(200, json={"data": {"id": "pred-1"}})
+        if request.method == "GET" and path == "/api/v3/predictions/pred-1/result":
+            status = statuses[min(state["polls"], len(statuses) - 1)]
+            state["polls"] += 1
+            if status == "completed":
+                return httpx.Response(200, json=completed)
+            if status in {"failed", "cancelled", "timeout", "deleted"}:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 200,
+                        "data": {
+                            "id": "pred-1",
+                            "status": status,
+                            "error": {"message": "exploded"},
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"code": 200, "data": {"id": "pred-1", "status": status}},
+            )
+        if request.method == "GET" and path == "/files/rle.json":
+            return httpx.Response(200, json=artifact)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    handler.state = state  # type: ignore[attr-defined]
+    return handler
+
+
+def _wavespeed_client(
+    settings: Settings, handler: object
+) -> WavespeedSam3GroundingClient:
+    return WavespeedSam3GroundingClient(
+        settings, transport=httpx.MockTransport(handler)
+    )
+
+
+def _wavespeed_completed(**overrides: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "id": "pred-1",
+        "model": "wavespeed-ai/sam3-video-rle",
+        "status": "completed",
+        "outputs": {
+            "rle_url": "https://cdn.wavespeed.test/files/rle.json",
+            "video_url": "https://cdn.wavespeed.test/files/out.mp4",
+        },
+        "error": None,
+    }
+    data.update(overrides)
+    return {"code": 200, "message": "success", "data": data}
+
+
+def test_wavespeed_requires_api_key(tmp_path: Path, video: Path) -> None:
+    client = _wavespeed_client(
+        _wavespeed_settings(tmp_path, wavespeed_sam3_api_key=None),
+        lambda request: httpx.Response(200),
+    )
+    with pytest.raises(ValueError, match="wavespeed_sam3 API key"):
+        client.detect(video, ["bottle"])
+
+
+def test_wavespeed_empty_targets_return_empty(tmp_path: Path, video: Path) -> None:
+    client = _wavespeed_client(
+        _wavespeed_settings(tmp_path), lambda request: httpx.Response(200)
+    )
+    assert client.detect(video, []) == []
+
+
+def test_wavespeed_ticket_client_error_is_fatal_without_retry(
+    tmp_path: Path, video: Path
+) -> None:
+    """ticket 4xx 是确定性错误：致命不重传、不提交。"""
+    handler = _wavespeed_handler(None, ticket_status=401)
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+    assert handler.state["tickets"] == 1  # type: ignore[attr-defined]
+    assert handler.state["puts"] == 0  # type: ignore[attr-defined]
+    assert handler.state["submits"] == 0  # type: ignore[attr-defined]
+
+
+def test_wavespeed_ticket_without_download_url_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/api/v3/media/uploads":
+            return httpx.Response(200, json={"code": 200, "data": {}})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+
+
+def test_wavespeed_put_failure_is_fatal(tmp_path: Path, video: Path) -> None:
+    handler = _wavespeed_handler(None, put_status=403)
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+    assert handler.state["puts"] == 1  # type: ignore[attr-defined]
+    assert handler.state["submits"] == 0  # type: ignore[attr-defined]
+
+
+def test_wavespeed_submit_unauthorized_is_fatal_without_retry(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _wavespeed_handler(None, submit_status=401)
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_wavespeed_submit_without_id_is_fatal(tmp_path: Path, video: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/api/v3/media/uploads":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "data": {
+                        "download_url": "https://cdn.wavespeed.test/files/clip.mp4",
+                        "upload": {"url": "https://upload.wavespeed.test/put/clip"},
+                    },
+                },
+            )
+        if request.method == "PUT" and path == "/put/clip":
+            return httpx.Response(200)
+        if request.method == "POST" and path == (
+            "/api/v3/wavespeed-ai/sam3-video-rle"
+        ):
+            return httpx.Response(200, json={"data": {"status": "processing"}})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure):
+        client.detect(video, ["bottle"])
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "timeout", "deleted"])
+def test_wavespeed_terminal_failure_status_is_fatal(
+    tmp_path: Path, video: Path, status: str
+) -> None:
+    """任务级失败：failed/cancelled/timeout/deleted 均为终态失败，致命不重提。"""
+    handler = _wavespeed_handler(None, statuses=(status,))
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, ValueError)
+    assert "exploded" in str(excinfo.value.cause)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_wavespeed_unknown_status_is_fatal(tmp_path: Path, video: Path) -> None:
+    handler = _wavespeed_handler(None, statuses=("exploding",))
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, ValueError)
+
+
+def test_wavespeed_poll_timeout_raises_provider_failure(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _wavespeed_handler(None, statuses=("processing",))
+    settings = _wavespeed_settings(
+        tmp_path, provider_poll_interval_s=0.0, provider_poll_timeout_s=0.0
+    )
+    client = _wavespeed_client(settings, handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, TimeoutError)
+
+
+def test_wavespeed_completed_without_rle_url_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """completed 但 outputs 没有 rle_url = 未校准形态：确定性致命，标记类型。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(
+            outputs={"video_url": "https://cdn.wavespeed.test/files/out.mp4"}
+        )
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["bottle"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+# --- wavespeed 成功链路（合成 fixture，外层结构未经真实响应验证） ---
+# fixture 的合成方式与假设结构声明见文件内 _comment；视频为 320x240@2fps，
+# size=[240,320]。期望 bbox 手工计算（矩形行列 ÷ 帧宽高），rle 用下游真实的
+# object_mask._decode_rle_mask 做往返验证（证明归一化输出下游零改动可消费）。
+_WAVESPEED_SAM3_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "wavespeed_sam3_video_rle_response.json"
+)
+_WAVESPEED_SAM3_ARTIFACT = json.loads(
+    _WAVESPEED_SAM3_FIXTURE.read_text(encoding="utf-8")
+)
+
+
+def _rect_mask(rows: slice, cols: slice) -> np.ndarray:
+    mask = np.zeros((240, 320), dtype=bool)
+    mask[rows, cols] = True
+    return mask
+
+
+# (timestamp_s, bbox, 期望 mask)；frame 2 为 null（未检出），不在期望里。
+_WAVESPEED_SAM3_EXPECTED = [
+    (0.0, (0.25, 0.25, 0.5, 0.5), _rect_mask(slice(60, 120), slice(80, 160))),
+    (
+        0.5,
+        (0.0, 0.0, 1.0, 1.0),
+        _rect_mask(slice(0, 10), slice(0, 10))
+        | _rect_mask(slice(230, 240), slice(310, 320)),
+    ),
+    (
+        1.5,
+        (0.625, 100 / 240, 0.6875, 110 / 240),
+        _rect_mask(slice(100, 110), slice(200, 220)),
+    ),
+]
+
+
+def _assert_wavespeed_detections(
+    result: list[ObjectDetection], prompt: str
+) -> None:
+    assert len(result) == len(_WAVESPEED_SAM3_EXPECTED)
+    for detection, (timestamp_s, bbox, mask) in zip(
+        result, _WAVESPEED_SAM3_EXPECTED
+    ):
+        assert detection.label == prompt
+        assert detection.timestamp_s == timestamp_s
+        assert detection.bbox_xyxy_normalized == bbox
+        assert detection.rle is not None
+        # 归一化 rle 必须能被下游既有解码器还原为原 mask（行主序对格式）。
+        assert np.array_equal(
+            _decode_rle_mask(detection.rle, 320, 240), mask
+        )
+
+
+def test_wavespeed_detect_full_flow(tmp_path: Path, video: Path) -> None:
+    """ticket → PUT → 提交 → 轮询 → 下载 RLE → 解析全链路；多 target 合成一个
+    prompt；frame 1 的两个 RLE 对象合并为并集。"""
+    observed: dict[str, object] = {}
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
+        observed=observed,
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    _assert_wavespeed_detections(result, "handheld fan, face")
+    assert observed["ticket_body"] == {
+        "filename": "clip.mp4",
+        "size": len(video.read_bytes()),
+        "content_type": "video/mp4",
+    }
+    assert observed["submit_body"] == {
+        "video": "https://cdn.wavespeed.test/files/clip.mp4",
+        "prompt": "handheld fan, face",
+        "apply_mask": False,
+    }
+    assert handler.state["tickets"] == 1  # type: ignore[attr-defined]
+    assert handler.state["puts"] == 1  # type: ignore[attr-defined]
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    assert len(client.last_frames) == 4
+    assert client.last_frames[0]["frame_index"] == 0
+    assert client.last_frames[2]["box"] is None  # frame 2 null = 未检出
+    assert client.last_frames[2]["rle"] is None
+    assert {frame["label"] for frame in client.last_frames} == (
+        {"handheld fan, face"}
+    )
+
+
+def test_wavespeed_bare_submit_id_envelope(tmp_path: Path, video: Path) -> None:
+    """提交响应裸 {"id": ...}（无 data 包络）同样兼容（官方示例两种形态）。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        artifact=_WAVESPEED_SAM3_ARTIFACT,
+        bare_submit_id=True,
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    _assert_wavespeed_detections(result, "handheld fan, face")
+
+
+def test_wavespeed_artifact_bare_frame_list_envelope(
+    tmp_path: Path, video: Path
+) -> None:
+    """rle 产物为顶层逐帧 list（无 frames 键包络）解析结果一致。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact=_WAVESPEED_SAM3_ARTIFACT["frames"]
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    result = client.detect(video, ["handheld fan", "face"])
+    _assert_wavespeed_detections(result, "handheld fan, face")
+
+
+def test_wavespeed_empty_result_is_not_retried(tmp_path: Path, video: Path) -> None:
+    """空结果是确定答案：返回空列表，不重提（省钱纪律）。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact={"frames": []}
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    assert client.detect(video, ["handheld fan"]) == []
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_wavespeed_artifact_not_frame_structure_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """产物既不是逐帧 list 也不是带 frames 键的 dict = 未校准形态：致命。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact={"unexpected": 1}
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+
+
+def test_wavespeed_artifact_scalar_is_fatal(tmp_path: Path, video: Path) -> None:
+    handler = _wavespeed_handler(_wavespeed_completed(), artifact=123)
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+
+
+def test_wavespeed_artifact_counts_sum_mismatch_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """counts 总和 != h*w（不符合 pycocotools 语义）= 未校准形态：致命。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        artifact={"frames": [{"counts": "0 10 0", "size": [240, 320]}]},
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+
+
+def test_wavespeed_artifact_size_mismatch_video_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    """size 与源视频帧尺寸不符 = 未校准形态：确定性致命（强校准锚点）。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        # 120*160=19200 全背景游程：counts 自身合法，仅尺寸与视频不符。
+        artifact={"frames": [{"counts": "19200", "size": [120, 160]}]},
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+
+
+def test_wavespeed_artifact_malformed_counts_is_fatal(
+    tmp_path: Path, video: Path
+) -> None:
+    handler = _wavespeed_handler(
+        _wavespeed_completed(),
+        artifact={"frames": [{"counts": "not-a-number", "size": [240, 320]}]},
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.detect(video, ["handheld fan"])
+    assert isinstance(excinfo.value.cause, object_detect.UncalibratedResponseError)
+
+
+# --- wavespeed 产物落盘与复用（与 fal/sandbase 同一实例级共享缓存布局） ---
+
+
+def test_wavespeed_shared_cache_cross_project_reuse(
+    tmp_path: Path, video: Path
+) -> None:
+    """实例级共享：同指纹（同视频同 prompt）跨项目零 HTTP 复用；payload_key
+    为 provider_response，指纹含 model 与其他 provider 缓存天然隔离。
+    缓存 payload 保留 completed outputs 原始字段（rle_url/video_url 一个不
+    丢）与 rle_url 下载的原始 JSON。"""
+    settings = _wavespeed_settings(tmp_path)
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact=_WAVESPEED_SAM3_ARTIFACT
+    )
+    client = WavespeedSam3GroundingClient(
+        settings,
+        transport=httpx.MockTransport(handler),
+        cache_path=(
+            tmp_path / "projects" / "a" / "work" / "segments" / "0001"
+            / "object-detect-response.json"
+        ),
+    )
+    first = client.detect(video, ["handheld fan", "face"])
+    _assert_wavespeed_detections(first, "handheld fan, face")
+    shared = _shared_cache_files(settings)
+    assert len(shared) == 1
+    cached = json.loads(shared[0].read_text(encoding="utf-8"))
+    payload = cached["provider_response"]
+    assert payload["completed_outputs"] == {
+        "rle_url": "https://cdn.wavespeed.test/files/rle.json",
+        "video_url": "https://cdn.wavespeed.test/files/out.mp4",
+    }
+    assert payload["rle_artifact"] == _WAVESPEED_SAM3_ARTIFACT
+    assert cached["fingerprint"]["prompt"] == "handheld fan, face"
+    assert cached["fingerprint"]["model"] == "wavespeed-ai/sam3-video-rle"
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    reused = WavespeedSam3GroundingClient(
+        settings,
+        transport=httpx.MockTransport(fail_handler),
+        cache_path=(
+            tmp_path / "projects" / "b" / "work" / "segments" / "0001"
+            / "object-detect-response.json"
+        ),
+    )
+    assert reused.detect(video, ["handheld fan", "face"]) == first
+    assert [entry["rle"] for entry in reused.last_frames] == [
+        entry["rle"] for entry in client.last_frames
+    ]
+
+
+def test_wavespeed_cache_fingerprint_mismatch_refetches(
+    tmp_path: Path, video: Path
+) -> None:
+    """target 变化 = 新任务：指纹不匹配则重新调用。"""
+    handler = _wavespeed_handler(
+        _wavespeed_completed(), artifact=_WAVESPEED_SAM3_ARTIFACT
+    )
+    client = _wavespeed_client(_wavespeed_settings(tmp_path), handler)
+    client.detect(video, ["handheld fan"])
+    assert handler.state["submits"] == 1  # type: ignore[attr-defined]
+    client.detect(video, ["bottle"])
+    assert handler.state["submits"] == 2  # type: ignore[attr-defined]
+
+
+# --- 可用性门禁与 client 构造（wavespeed → sandbase → fal 链路顺序） ---
+
+
+def test_available_providers_prefers_wavespeed(tmp_path: Path) -> None:
+    settings = _wavespeed_settings(
+        tmp_path,
+        sandbase_sam3_api_key="sandbase-secret",
+        fal_sam3_api_key="fal-secret",
+    )
+    assert available_providers(settings) == ["wavespeed_sam3"]
+
+
+def test_available_providers_falls_back_to_sandbase(tmp_path: Path) -> None:
+    settings = _sandbase_settings(tmp_path, fal_sam3_api_key="fal-secret")
+    assert available_providers(settings) == ["sandbase_sam3"]
+
+
+def test_select_provider_returns_wavespeed_client(tmp_path: Path) -> None:
+    client = select_provider(
+        _wavespeed_settings(tmp_path, sandbase_sam3_api_key="sandbase-secret")
+    )
+    assert isinstance(client, WavespeedSam3GroundingClient)
+
+
+def test_select_provider_falls_back_to_sandbase(tmp_path: Path) -> None:
+    client = select_provider(
+        _sandbase_settings(tmp_path, fal_sam3_api_key="fal-secret")
+    )
+    assert isinstance(client, SandbaseSam3GroundingClient)
+
+
+# --- wavespeed_sam3 配置校验 ---
+
+
+def test_settings_wavespeed_sam3_defaults(tmp_path: Path) -> None:
+    settings = _wavespeed_settings(tmp_path)
+    assert settings.wavespeed_sam3_api_key == "wavespeed-secret"
+    assert settings.wavespeed_sam3_api_base == "https://wavespeed.test"
+    assert settings.wavespeed_sam3_model == "wavespeed-ai/sam3-video-rle"
+
+
+def test_settings_wavespeed_sam3_api_key_defaults_to_none(tmp_path: Path) -> None:
+    assert _settings(tmp_path).wavespeed_sam3_api_key is None
+
+
+def test_settings_rejects_non_ascii_wavespeed_key(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="WAVESPEED_API_KEY"):
+        _settings(tmp_path, wavespeed_sam3_api_key="k€y")
+
+
+def test_settings_rejects_invalid_wavespeed_sam3_model(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="WAVESPEED_SAM3_MODEL"):
+        _settings(tmp_path, wavespeed_sam3_model="bad model!")
+
+
+def test_settings_rejects_non_https_wavespeed_sam3_api_base(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="WAVESPEED_SAM3_API_BASE"):
+        _settings(tmp_path, wavespeed_sam3_api_base="http://wavespeed.test")
+
+
+def test_get_settings_reads_wavespeed_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.setenv("WAVESPEED_API_KEY", "  wavespeed-key ")
+    settings = get_settings()
+    assert settings.wavespeed_sam3_api_key == "wavespeed-key"
+    assert settings.wavespeed_sam3_api_base == "https://api.wavespeed.ai"
+    assert settings.wavespeed_sam3_model == "wavespeed-ai/sam3-video-rle"
+
+
+def test_get_settings_wavespeed_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-deepseek")
+    monkeypatch.delenv("WAVESPEED_API_KEY", raising=False)
+    settings = get_settings()
+    assert settings.wavespeed_sam3_api_key is None

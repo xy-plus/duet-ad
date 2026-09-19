@@ -5932,7 +5932,8 @@ class Pipeline:
                 object_targets.append("face")
             if object_targets and not self.settings.object_mask_enabled:
                 # OBJECT_MASK_ENABLED=false（检测后端不可用期间临时整体关闭：
-                # 2026-09-19 fal 账号被锁、sandbase worker 连续超时）：
+                # 2026-09-19 fal 账号被锁、sandbase worker 连续超时，wavespeed
+                # 已接入但输出形态未经真实校准）：
                 # 不发起任何检测调用，产物形状与 object_mask_degraded 降级
                 # 路径完全一致——参考视频保持 source-muted、objects_masked 保持
                 # False（提示词按未遮盖处理），仅事件名区分"配置关闭"与"失败"。
