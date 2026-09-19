@@ -171,6 +171,19 @@ def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None
     assert "运动、出现时机、强度和轨迹" in skill
     assert "不得重新编排其形态或出现时机" in skill
     assert "唯一绑定" not in skill
+    assert "为每个绑定用户参考图的被替换商品补写一段“属性与用法”" in skill
+    assert "不是一张贴图，而是有自身类别、结构、功能和使用方式的完整物品" in skill
+    assert "必须符合该物品自身的属性与使用逻辑" in skill
+    assert "以商品自身的真实使用方式为准" in skill
+    assert "不属于变形或改变产品" in skill
+    assert "仍以参考图为唯一基准" in skill
+    for over_specific_rule in (
+        "出料口",
+        "喷头",
+        "拿反",
+        "功能端必须朝向",
+    ):
+        assert over_specific_rule not in skill
 
 
 def _output(
