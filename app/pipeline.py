@@ -5925,7 +5925,23 @@ class Pipeline:
                 # detect labels, so every required block comes from one fal
                 # request rather than separate paid detections.
                 object_targets.append("face")
-            if object_targets and object_detect.available_providers(self.settings):
+            if object_targets and not self.settings.object_mask_enabled:
+                # OBJECT_MASK_ENABLED=false（如 fal 账号被锁期间临时整体关闭）：
+                # 不发起任何 fal 调用，产物形状与 object_mask_degraded 降级
+                # 路径完全一致——参考视频保持 source-muted、objects_masked 保持
+                # False（提示词按未遮盖处理），仅事件名区分"配置关闭"与"失败"。
+                log.event(
+                    "object_mask_disabled",
+                    scope=scope,
+                    targets=object_targets,
+                    reason="OBJECT_MASK_ENABLED=false",
+                    impact=(
+                        "replaceable faces and objects stay visible in "
+                        "the reference video; H3 may copy their source "
+                        "appearance"
+                    ),
+                )
+            elif object_targets and object_detect.available_providers(self.settings):
                 # This unified SAM node degrades on ANY failure: after the
                 # node's own retries the render continues on the unmasked
                 # stream. No configured provider means it never runs (the

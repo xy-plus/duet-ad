@@ -10,6 +10,7 @@ def _settings(
     picsart_proxy: str | None = None,
     object_mask_block_opacity: float = 1.0,
     object_mask_block_blur: int = 31,
+    object_mask_enabled: bool = True,
 ) -> Settings:
     return Settings(
         access_token="test",
@@ -17,6 +18,7 @@ def _settings(
         picsart_proxy=picsart_proxy,
         object_mask_block_opacity=object_mask_block_opacity,
         object_mask_block_blur=object_mask_block_blur,
+        object_mask_enabled=object_mask_enabled,
     )
 
 
@@ -98,3 +100,37 @@ def test_get_settings_reads_object_mask_block_blur_env(monkeypatch: pytest.Monke
     monkeypatch.setenv("OBJECT_MASK_BLOCK_BLUR", "15")
 
     assert get_settings().object_mask_block_blur == 15
+
+
+def test_settings_defaults_object_mask_enabled() -> None:
+    assert _settings().object_mask_enabled is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_settings_accepts_object_mask_enabled(enabled: bool) -> None:
+    assert _settings(object_mask_enabled=enabled).object_mask_enabled is enabled
+
+
+@pytest.mark.parametrize("enabled", [0, 1, "true", "false", None])
+def test_settings_rejects_non_bool_object_mask_enabled(enabled: object) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_ENABLED"):
+        _settings(object_mask_enabled=enabled)
+
+
+def test_get_settings_defaults_object_mask_enabled_to_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+
+    assert get_settings().object_mask_enabled is True
+
+
+def test_get_settings_reads_object_mask_enabled_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_ENABLED", "false")
+
+    assert get_settings().object_mask_enabled is False

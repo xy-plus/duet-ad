@@ -7542,6 +7542,45 @@ def test_h3_segment_object_mask_skipped_without_available_provider(
     assert not (project / "logs" / "mask-replaceable-objects").exists()
 
 
+def test_h3_segment_object_mask_disabled_by_config_skips_fal_entirely(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    # The fixture leaves a provider available (["fal_sam3"]): only the config
+    # switch gates the node here, mirroring a locked fal account with FAL_KEY
+    # still set. The fake mask_objects doubles as a sentinel — any fal-side
+    # invocation would record a call.
+    monkeypatch.setattr(
+        pipeline,
+        "settings",
+        replace(pipeline.settings, object_mask_enabled=False),
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+
+    _item, prompt, muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    # Same artifact shape as the object_mask_degraded path: muted reference
+    # stream, no mask node logs, no dark gray clause in the frozen prompt —
+    # only the trace event names the cause as config, not failure.
+    assert muted == segment_dir / "source-muted.mp4"
+    assert object_calls == []
+    assert not (project / "logs" / "mask-replaceable-objects").exists()
+    assert "(64,64,64)" not in prompt
+    trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
+    assert "object_mask_disabled" in trace
+    assert "OBJECT_MASK_ENABLED=false" in trace
+    assert "object_mask_degraded" not in trace
+
+
 def test_object_mask_failure_degrades_to_muted_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:

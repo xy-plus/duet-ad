@@ -93,6 +93,13 @@ class Settings:
     # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高）；
     # 合法区间 (0, 1]，加载期校验。
     fal_sam3_threshold: float = 0.3
+    # 物品灰块节点总开关：false 时 mask-replaceable-objects 完全不触发，
+    # 不发起任何 fal 调用（无上传、无重试、无等待），行为与
+    # object_mask_degraded 降级路径完全一致（参考视频保持 source-muted、
+    # 提示词按未遮盖处理），trace 记 object_mask_disabled 以区分配置关闭
+    # 与失败降级。缺省 true 维持现状；fal 账号不可用期间在 .env 显式写
+    # false。本开关不进前端、不进公开 API。
+    object_mask_enabled: bool = True
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0
     # 泄漏残影的高斯模糊核，仅在 opacity<1 时生效；必须为正奇数像素。
@@ -314,6 +321,8 @@ class Settings:
         ):
             raise ValueError("FAL_SAM3_THRESHOLD must be a number in (0, 1]")
         object.__setattr__(self, "fal_sam3_threshold", float(threshold))
+        if isinstance(self.object_mask_enabled, bool) is not True:
+            raise ValueError("OBJECT_MASK_ENABLED must be a boolean")
         object_mask_block_opacity = self.object_mask_block_opacity
         if (
             isinstance(object_mask_block_opacity, bool)
@@ -432,6 +441,7 @@ def get_settings() -> Settings:
         ).strip(),
         fal_proxy=os.environ.get("FAL_PROXY", "").strip() or None,
         fal_sam3_threshold=fal_sam3_threshold,
+        object_mask_enabled=_bool("OBJECT_MASK_ENABLED", True),
         object_mask_block_opacity=object_mask_block_opacity,
         object_mask_block_blur=object_mask_block_blur,
     )
