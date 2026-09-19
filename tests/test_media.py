@@ -718,3 +718,36 @@ def test_replace_audio_track_overwrites_audio_and_keeps_video(tmp_path: Path):
     assert info["has_audio"] is True
     assert info["duration_s"] == pytest.approx(1.0, abs=0.05)
     assert _max_volume(video) > -30.0
+
+
+def test_probe_classifies_unrecognized_container_as_permanent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def fake_run(argv, **_kwargs):
+        raise media.CommandError(
+            argv, 1, "", "source.mp4: Invalid data found when processing input"
+        )
+
+    monkeypatch.setattr(media, "run_command", fake_run)
+    with pytest.raises(media.UnrecognizedMediaError, match="not a valid video"):
+        media.probe(tmp_path / "source.mp4")
+
+
+def test_probe_other_ffprobe_failures_stay_command_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def fake_run(argv, **_kwargs):
+        raise media.CommandError(argv, 1, "", "Resource temporarily unavailable")
+
+    monkeypatch.setattr(media, "run_command", fake_run)
+    with pytest.raises(media.CommandError) as caught:
+        media.probe(tmp_path / "source.mp4")
+    assert not isinstance(caught.value, media.UnrecognizedMediaError)
+
+
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffprobe unavailable")
+def test_probe_real_html_file_is_permanently_unrecognized(tmp_path: Path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"<!DOCTYPE html><html><body>Log in to continue</body></html>")
+    with pytest.raises(media.UnrecognizedMediaError):
+        media.probe(source)

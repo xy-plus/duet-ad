@@ -99,6 +99,25 @@ class MediaError(RuntimeError):
     """A deterministic media invariant could not be satisfied."""
 
 
+class UnrecognizedMediaError(MediaError):
+    """ffprobe cannot identify the container: the bytes are permanently not
+    media (e.g. an HTML login wall saved as the source).  Retrying the
+    identical local file can never succeed, so the pipeline must fail fast
+    instead of backing off."""
+
+
+_FFPROBE_UNRECOGNIZED_MARKERS = (
+    "invalid data found",
+    "moov atom not found",
+    "unknown format",
+)
+
+
+def _ffprobe_unrecognized(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return any(marker in lowered for marker in _FFPROBE_UNRECOGNIZED_MARKERS)
+
+
 def run_command(
     argv: list[str],
     *,
@@ -234,15 +253,23 @@ def _probe_packet_duration(path: Path, stream: Mapping[str, object]) -> float | 
 
 
 def probe(path: Path) -> dict[str, Any]:
-    result = run_command(
-        [
-            "ffprobe", "-v", "error", "-show_entries",
-            "stream=index,codec_type,codec_name,pix_fmt,width,height,duration,"
-            "duration_ts,start_time,time_base,avg_frame_rate,r_frame_rate,nb_frames",
-            "-of", "json", str(path),
-        ],
-        timeout=60,
-    )
+    try:
+        result = run_command(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "stream=index,codec_type,codec_name,pix_fmt,width,height,duration,"
+                "duration_ts,start_time,time_base,avg_frame_rate,r_frame_rate,nb_frames",
+                "-of", "json", str(path),
+            ],
+            timeout=60,
+        )
+    except CommandError as exc:
+        if _ffprobe_unrecognized(exc.stderr):
+            detail = exc.stderr.strip().splitlines()[-1] if exc.stderr.strip() else "unrecognized container"
+            raise UnrecognizedMediaError(
+                f"source file is not a valid video: {detail}"
+            ) from exc
+        raise
     payload = json.loads(result["stdout"])
     video = next(
         stream

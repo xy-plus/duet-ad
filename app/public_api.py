@@ -102,6 +102,7 @@ _CREATE_ERROR_MAP = {
     "unsupported_replacement_image": (415, "unsupported_replacement_media_type", "参考图格式不受支持"),
     "invalid_reference_url": (422, "invalid_source_video_url", "视频链接不是可访问的公网 HTTPS 地址"),
     "reference_url_forbidden": (422, "invalid_source_video_url", "视频链接不是可访问的公网 HTTPS 地址"),
+    "reference_not_video": (422, "invalid_source_video_url", "链接解析到的不是视频（视频可能不存在、设为私密、需要登录或受地区限制），请检查链接或直接上传视频文件"),
     "tiktok_resolution_failed": (422, "source_video_resolution_failed", "TikTok 视频解析失败，请稍后重试或上传视频文件"),
     "reference_too_large": (413, "source_too_large", "原视频超过大小限制"),
 }

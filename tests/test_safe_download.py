@@ -280,3 +280,79 @@ def test_redirect_limit_is_manual_and_bounded(tmp_path: Path):
             max_redirects=2,
         )
     assert caught.value.code == "reference_redirect_limit"
+
+
+LOGIN_WALL_HTML = (
+    b'<!DOCTYPE html><html><head><title>Log in to TikTok</title></head>'
+    b'<body><div id="captcha-verify-container">'
+    b"Couldn't find this page. The video may not be available."
+    b"</div></body></html>"
+)
+
+
+def test_html_login_wall_content_type_is_rejected_and_never_published(tmp_path: Path):
+    async def resolver(_hostname: str, _port: int):
+        return [PUBLIC_V4]
+
+    destination = tmp_path / "source.mp4"
+    destination.write_bytes(b"existing")
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            content=LOGIN_WALL_HTML,
+        )
+    )
+    with pytest.raises(ReferenceDownloadError) as caught:
+        run_download("https://cdn.example/v/7678258555106905365", destination, transport, resolver)
+    assert caught.value.code == "reference_not_video"
+    assert caught.value.status_code == 422
+    assert "不是视频" in caught.value.message
+    assert destination.read_bytes() == b"existing"
+    assert list(tmp_path.glob(".source.mp4.*.tmp")) == []
+
+
+@pytest.mark.parametrize("head", [
+    LOGIN_WALL_HTML,                       # lying/absent Content-Type: sniff catches it
+    b"\xef\xbb\xbf  \r\n" + LOGIN_WALL_HTML,  # BOM + leading whitespace before markup
+    b"<HTML><BODY>please log in</BODY></HTML>",
+])
+def test_html_body_is_rejected_by_sniff_regardless_of_content_type(tmp_path: Path, head: bytes):
+    async def resolver(_hostname: str, _port: int):
+        return [PUBLIC_V4]
+
+    destination = tmp_path / "source.mp4"
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "application/octet-stream"},
+            stream=ChunkStream(head[:7], head[7:]),
+        )
+    )
+    with pytest.raises(ReferenceDownloadError) as caught:
+        run_download("https://cdn.example/video", destination, transport, resolver)
+    assert caught.value.code == "reference_not_video"
+    assert not destination.exists()
+    assert list(tmp_path.glob(".source.mp4.*.tmp")) == []
+
+
+@pytest.mark.parametrize("body", [
+    b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2avc1mp41" + b"\x00" * 64,  # ISO BMFF mp4/mov
+    b"\x1a\x45\xdf\xa3\x93\x42\x82\x88webm" + b"\x00" * 64,                        # WebM/MKV EBML
+    b"\x47\x40\x11\x10" + b"\x00" * 64,                                           # MPEG-TS sync byte
+    b"RIFF\x24\x00\x00\x00AVI LIST" + b"\x00" * 64,                               # AVI
+])
+def test_video_container_magic_bytes_pass_sniff(tmp_path: Path, body: bytes):
+    async def resolver(_hostname: str, _port: int):
+        return [PUBLIC_V4]
+
+    destination = tmp_path / "source.mp4"
+    size = run_download(
+        "https://cdn.example/video",
+        destination,
+        httpx.MockTransport(lambda _request: httpx.Response(200, content=body)),
+        resolver,
+        max_bytes=4096,
+    )
+    assert size == len(body)
+    assert destination.read_bytes() == body

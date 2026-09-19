@@ -743,6 +743,33 @@ def test_private_source_url_is_rejected_before_download(tmp_path, monkeypatch):
     assert response.json()["error"]["code"] == "invalid_source_video_url"
 
 
+def test_html_source_url_fails_creation_with_invalid_source_video_url(tmp_path, monkeypatch):
+    from app.safe_download import ReferenceDownloadError
+
+    settings, auth, _ = _public_setup(tmp_path)
+
+    async def html_download(*_args, **_kwargs):
+        raise ReferenceDownloadError(
+            "reference_not_video",
+            "链接解析到的不是视频（视频可能不存在、设为私密、需要登录或受地区限制），请检查链接或直接上传视频文件",
+            status_code=422,
+        )
+
+    monkeypatch.setattr("app.main.download_reference_url", html_download)
+    app = create_app(settings, pipeline_factory=manual_factory)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/video-generations",
+            headers={**auth, "Idempotency-Key": "htmlurl0001"},
+            files={"source_video_url": (None, "https://m.tiktok.com/v/7678258555106905365.html")},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_source_video_url"
+    assert "不是视频" in response.json()["error"]["message"]
+    assert response.json()["error"]["field"] == "source_video_url"
+
+
 @pytest.mark.parametrize("limit", ["", "0", "101", "-1", "+1", "01", "1.0", " 1 "])
 def test_credit_transaction_limit_is_strict(tmp_path, limit):
     settings, auth, _ = _public_setup(tmp_path)

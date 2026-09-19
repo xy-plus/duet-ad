@@ -23,6 +23,15 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 DEFAULT_PORTS = {"http": 80, "https": 443}
 TIKWM_API = "https://www.tikwm.com/api/"
 
+# Downloaded bytes must be a video, not a login wall / captcha / error page.
+# Deterministic sniffing: no video container (mp4 ftyp, EBML, RIFF, Ogg,
+# MPEG-TS/PS, ASF...) starts with optional whitespace/BOM followed by `<`,
+# while every HTML or markup error page does.
+SNIFF_BYTES = 4096
+_HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+_HTML_LEADING_WHITESPACE = b" \t\r\n\x0b\x0c"
+_UTF8_BOM = b"\xef\xbb\xbf"
+
 # Public DoH candidates sharing the dns-json wire format, tried in order.
 # The numeric ones bootstrap without DNS; the domain ones are resolved by the
 # proxy itself, which is where these queries go anyway.
@@ -94,6 +103,22 @@ class ReferenceDownloadError(RuntimeError):
         self.code = code
         self.message = message
         self.status_code = status_code
+
+
+def _not_video_error() -> ReferenceDownloadError:
+    return ReferenceDownloadError(
+        "reference_not_video",
+        "链接解析到的不是视频（视频可能不存在、设为私密、需要登录或受地区限制），请检查链接或直接上传视频文件",
+        status_code=422,
+    )
+
+
+def _looks_like_html(head: bytes) -> bool:
+    stripped = head
+    if stripped.startswith(_UTF8_BOM):
+        stripped = stripped[len(_UTF8_BOM):]
+    stripped = stripped.lstrip(_HTML_LEADING_WHITESPACE)
+    return stripped.startswith(b"<")
 
 
 @dataclass(frozen=True)
@@ -346,6 +371,9 @@ async def download_reference_url(
                             "视频链接返回了不受支持的压缩编码",
                             status_code=502,
                         )
+                    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if media_type in _HTML_CONTENT_TYPES:
+                        raise _not_video_error()
 
                     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     descriptor, temporary_name = tempfile.mkstemp(
@@ -355,6 +383,7 @@ async def download_reference_url(
                     )
                     temporary = Path(temporary_name)
                     total = 0
+                    head = bytearray()
                     try:
                         with os.fdopen(descriptor, "wb", closefd=True) as handle:
                             async for chunk in response.aiter_bytes():
@@ -367,7 +396,15 @@ async def download_reference_url(
                                         "链接视频超过大小限制",
                                         status_code=413,
                                     )
+                                if head is not None:
+                                    head.extend(chunk)
+                                    if len(head) >= SNIFF_BYTES:
+                                        if _looks_like_html(head):
+                                            raise _not_video_error()
+                                        head = None
                                 handle.write(chunk)
+                            if head is not None and _looks_like_html(head):
+                                raise _not_video_error()
                             handle.flush()
                             os.fsync(handle.fileno())
                         os.chmod(temporary, 0o600)

@@ -939,7 +939,7 @@ X-Request-ID: req_0123456789abcdef0123456789abcdef
 | `422` | `invalid_dialogue_brief` | `generate` 模式缺少台词描述，或非 `generate` 模式携带了 `dialogue_brief` | 按模式规则提供或省略 |
 | `422` | `dialogue_brief_too_long` | 台词描述超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
 | `422` | `replacement_instruction_too_long` | 替换说明超过 1,000 个 UTF-16 字符单元 | 缩短内容 |
-| `422` | `invalid_source_video_url` | URL 不符合公网 HTTPS 规则或无法访问 | 修改 URL |
+| `422` | `invalid_source_video_url` | URL 不符合公网 HTTPS 规则、无法访问，或解析到的内容不是视频（登录墙/错误页） | 修改 URL，或直接上传视频文件 |
 | `422` | `invalid_create_request` | 包含未知或重复字段，或 `replacement_image` 超过 4 张 | 仅重复提交 `replacement_image`，且最多 4 张；其他字段各提交一次 |
 | `422` | `invalid_generation_request` | 生成参数组合无效 | 根据能力接口重新提交参数 |
 | `422` | `invalid_request` | 请求字段类型或结构不符合 v1 合同 | 按字段定义修正请求 |

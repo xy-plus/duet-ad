@@ -695,6 +695,11 @@ class Pipeline:
         # defensive leftovers.  TypeError/KeyError/AttributeError stay fatal
         # (programmer-bug semantics).
         if isinstance(exc, (ValueError, media.MediaError, AssertionError)):
+            # ffprobe 对本地源文件报"无法识别容器"是永久性结论：字节根本不
+            # 是视频（如下载节点存下的 HTML 登录墙），重试一万次也一样，
+            # 直接判死让项目带清晰 error 进入 failed，不进退避重试。
+            if isinstance(exc, media.UnrecognizedMediaError):
+                return False
             return True
         return False
 

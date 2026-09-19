@@ -7252,6 +7252,21 @@ def test_retryable_node_error_excludes_doubao_empty_audio() -> None:
     )
 
 
+def test_retryable_node_error_excludes_unrecognized_source_media() -> None:
+    """ffprobe 对本地源文件判定"不是视频"是永久性结论（HTML 登录墙存成
+    source.mp4 的僵尸项目根因）：必须直接 failed，不得 1800s 无限重试。"""
+    assert not Pipeline._retryable_node_error(
+        media.UnrecognizedMediaError(
+            "source file is not a valid video: Invalid data found when processing input"
+        )
+    )
+    # 瞬时故障保持可重试：其他 ffprobe 失败、超时。
+    assert Pipeline._retryable_node_error(
+        media.CommandError(["ffprobe"], 1, "", "Resource temporarily unavailable")
+    )
+    assert Pipeline._retryable_node_error(subprocess.TimeoutExpired(["ffprobe"], 60))
+
+
 def test_node_retries_subprocess_timeouts_until_success(tmp_path: Path) -> None:
     pipeline, log = _node_pipeline(tmp_path, "request-timeout-retry")
     calls = 0
