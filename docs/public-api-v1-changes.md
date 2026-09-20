@@ -8,8 +8,8 @@
 |---|---|
 | `POST /api/v1/video-generations` 与 `POST .../quotes` | 需要审核时添加 multipart 文本字段 `prompt_review=true`；省略或 `false` 即保持原直通行为 |
 | `GET /api/v1/video-generations/{job_id}` | `status` 枚举新增 `awaiting_prompt_review`（非终态；不确认则任务静止，不发生后续付费生成） |
-| `GET /api/v1/video-generations/{job_id}/prompt-review` | 新增：读取每段可编辑的提示词主体；仅 `awaiting_prompt_review` 与 `succeeded`（只读展示）可读，其余状态 `409 prompt_review_not_available` |
-| `POST /api/v1/video-generations/{job_id}/prompt-review/confirm` | 新增：JSON `{"segments":[{"segment_index":1,"prompt":"..."}]}`，段集合须与读取结果一致、每段非空；成功 `202` 回到 `queued` 继续生成；非审核暂停状态 `409 prompt_review_not_pending` |
+| `GET /api/v1/video-generations/{job_id}/prompt-review` | 新增：读取每段提示词的可编辑部分（不含后端注入内容和主体末尾的权威替换计划块）；仅 `awaiting_prompt_review` 与 `succeeded`（只读展示）可读，其余状态 `409 prompt_review_not_available` |
+| `POST /api/v1/video-generations/{job_id}/prompt-review/confirm` | 新增：JSON `{"segments":[{"segment_index":1,"prompt":"..."}]}`，段集合须与读取结果一致、`prompt` 只含可编辑部分（固定部分由后端用冻结原文拼接，请求文本无法改动）；成功 `202` 回到 `queued` 继续生成；非审核暂停状态 `409 prompt_review_not_pending` |
 
 最小审核示例：
 

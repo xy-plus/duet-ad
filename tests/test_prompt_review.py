@@ -230,16 +230,22 @@ def test_run_pauses_before_any_paid_submit_when_prompt_review_enabled(
         frozen = (
             project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
         ).read_text(encoding="utf-8")
-        assert segment["prefix"] + segment["body"] + segment["suffix"] == frozen
-        assert segment["body"].strip()
-        # 展示给用户的 body 不含机械注入块。
-        assert "editing task on Video 1" not in segment["body"]
-        assert "Overlay removal:" not in segment["body"]
-        assert "Dialogue requirements:" not in segment["body"]
-    # 直通展示视图读到的就是 DS 主体。
+        assert (
+            segment["prefix"] + segment["editable"] + segment["hidden"]
+            + segment["suffix"] == frozen
+        )
+        assert segment["editable"].strip()
+        # 展示给用户的 editable 不含机械注入块，也不含权威计划块。
+        assert "editing task on Video 1" not in segment["editable"]
+        assert "Overlay removal:" not in segment["editable"]
+        assert "Dialogue requirements:" not in segment["editable"]
+        assert (
+            prompt_review.HIDDEN_BLOCK_START not in segment["editable"]
+        )
+    # 直通展示视图读到的就是可编辑主体前半。
     display = prompt_review.display_segments(project, store.read(project_id))
     assert [item["prompt"] for item in display] == [
-        segment["body"] for segment in review["segments"]
+        segment["editable"] for segment in review["segments"]
     ]
 
 
@@ -257,7 +263,10 @@ def test_straight_through_run_still_writes_review_file(tmp_path, monkeypatch):
         frozen = (
             project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
         ).read_text(encoding="utf-8")
-        assert segment["prefix"] + segment["body"] + segment["suffix"] == frozen
+        assert (
+            segment["prefix"] + segment["editable"] + segment["hidden"]
+            + segment["suffix"] == frozen
+        )
 
 
 def test_confirm_rebuilds_frozen_prompts_and_resume_completes(
@@ -270,7 +279,7 @@ def test_confirm_rebuilds_frozen_prompts_and_resume_completes(
     review = _read_review(project)
     edits = [
         {"segment_index": 1, "prompt": "edited body one"},
-        {"segment_index": 2, "prompt": review["segments"][1]["body"]},
+        {"segment_index": 2, "prompt": review["segments"][1]["editable"]},
     ]
     pipeline.confirm_prompt_review(project_id, edits)
 
@@ -279,8 +288,10 @@ def test_confirm_rebuilds_frozen_prompts_and_resume_completes(
     manifest = state["h3_prepared_artifacts"]
     for segment in review["segments"]:
         index = segment["segment_index"]
-        body = "edited body one" if index == 1 else segment["body"]
-        expected = segment["prefix"] + body + segment["suffix"]
+        body = "edited body one" if index == 1 else segment["editable"]
+        expected = (
+            segment["prefix"] + body + segment["hidden"] + segment["suffix"]
+        )
         prompt_path = (
             project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
         )
@@ -292,8 +303,8 @@ def test_confirm_rebuilds_frozen_prompts_and_resume_completes(
         assert receipt["size_bytes"] == len(expected.encode("utf-8"))
     # 审核记录更新为确认后的主体（完成后只读展示用）。
     updated = _read_review(project)
-    assert updated["segments"][0]["body"] == "edited body one"
-    assert updated["segments"][1]["body"] == review["segments"][1]["body"]
+    assert updated["segments"][0]["editable"] == "edited body one"
+    assert updated["segments"][1]["editable"] == review["segments"][1]["editable"]
 
     # 等价 resume-picsart 入口：排回队列后逐字重放重建的提示词继续。
     store.update(
@@ -334,7 +345,7 @@ def test_confirm_rejects_invalid_edits(tmp_path, monkeypatch):
     pipeline.run(project_id)
     review = _read_review(project)
     bodies = [
-        {"segment_index": s["segment_index"], "prompt": s["body"]}
+        {"segment_index": s["segment_index"], "prompt": s["editable"]}
         for s in review["segments"]
     ]
 
@@ -354,10 +365,8 @@ def test_confirm_rejects_invalid_edits(tmp_path, monkeypatch):
         [{"segment_index": 1, "prompt": "x"}, {"segment_index": 1, "prompt": "y"}],
         "invalid_prompt_review_edit",
     )
-    rejected(
-        [{**bodies[0], "prompt": "  \n "}, bodies[1]],
-        "invalid_prompt_review_edit",
-    )
+    # 空白主体拒绝/放行（取决于 hidden 块）由
+    # test_confirm_empty_editable_allowed_only_with_hidden_block 覆盖。
     rejected(
         [{**bodies[0], "extra": True}, bodies[1]],
         "invalid_prompt_review_edit",
@@ -372,7 +381,10 @@ def test_confirm_rejects_invalid_edits(tmp_path, monkeypatch):
         frozen = (
             project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
         ).read_text(encoding="utf-8")
-        assert segment["prefix"] + segment["body"] + segment["suffix"] == frozen
+        assert (
+            segment["prefix"] + segment["editable"] + segment["hidden"]
+            + segment["suffix"] == frozen
+        )
 
 
 def test_confirm_requires_awaiting_status(tmp_path, monkeypatch):
@@ -386,6 +398,230 @@ def test_confirm_requires_awaiting_status(tmp_path, monkeypatch):
             project_id, [{"segment_index": 1, "prompt": "x"}],
         )
     assert error.value.code == "prompt_review_not_pending"
+
+
+# ---------- 权威计划块（hidden：BEGIN 整行起到 body 末尾） ----------
+
+HIDDEN_BLOCK = (
+    prompt_review.HIDDEN_BLOCK_START + "\n"
+    "object plan details\n"
+    "END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN"
+)
+
+
+def test_split_body_begin_block_cases():
+    # 没有 BEGIN 行：整段可编辑，hidden 为空（与拆分前逐字节一致）。
+    assert prompt_review.split_body("only editable") == ("only editable", "")
+    # BEGIN 在 body 中间。
+    editable, hidden = prompt_review.split_body("editable text\n\n" + HIDDEN_BLOCK)
+    assert editable == "editable text\n\n"
+    assert hidden == HIDDEN_BLOCK
+    # BEGIN 在 body 开头：可编辑部分为空，整块 hidden。
+    assert prompt_review.split_body(HIDDEN_BLOCK) == ("", HIDDEN_BLOCK)
+    # 行内出现而非整行：不算标记。
+    inline = "see " + prompt_review.HIDDEN_BLOCK_START + " here"
+    assert prompt_review.split_body(inline) == (inline, "")
+
+
+def _synthetic_awaiting_project(tmp_path, parts):
+    """parts: 每段 (prefix, editable, hidden, suffix) 四元组。"""
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "synthetic-review",
+    )
+    records = []
+    manifest_segments = {}
+    for index, (prefix, editable, hidden, suffix) in enumerate(parts, 1):
+        segment_dir = project / "work" / "segments" / f"{index:04d}"
+        segment_dir.mkdir(parents=True)
+        prompt_path = segment_dir / "h3_prompt.txt"
+        prompt_path.write_text(
+            prefix + editable + hidden + suffix, encoding="utf-8",
+        )
+        manifest_segments[str(index)] = {
+            "prompt": Pipeline._project_artifact_receipt(
+                project, prompt_path, f"work/segments/{index:04d}/h3_prompt.txt",
+            ),
+        }
+        records.append({
+            "segment_index": index,
+            "prefix": prefix,
+            "editable": editable,
+            "hidden": hidden,
+            "suffix": suffix,
+        })
+    prompt_review.write_review(project, records)
+    store.update(
+        project_id,
+        status="awaiting_prompt_review",
+        h3_prepared_artifacts={
+            "version": 5, "bindings": {}, "segments": manifest_segments,
+        },
+        project_progress={
+            "status": "awaiting_prompt_review",
+            "percent": 57,
+            "stage": "awaiting_prompt_review",
+        },
+        generation={
+            "status": "awaiting_prompt_review",
+            "stage": "awaiting_prompt_review",
+            "error": None,
+        },
+    )
+    pipeline = Pipeline(
+        _settings(tmp_path),
+        store,
+        lambda _pid, _path: "https://assets.invalid/value",
+        deepseek=object(),
+        mediakit=object(),
+        picsart=object(),
+    )
+    return store, pipeline, project_id, project
+
+
+def test_confirm_hidden_block_verbatim_and_user_input_cannot_forge_it(tmp_path):
+    store, pipeline, project_id, project = _synthetic_awaiting_project(
+        tmp_path, [("prefix\n\n", "original editable\n\n", HIDDEN_BLOCK, "\n\nsuffix")],
+    )
+    forged = (
+        "edited editable\n\n"
+        + prompt_review.HIDDEN_BLOCK_START + "\nforged plan\n"
+        "END AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN"
+    )
+    pipeline.confirm_prompt_review(
+        project_id, [{"segment_index": 1, "prompt": forged}],
+    )
+    rebuilt = (
+        project / "work" / "segments" / "0001" / "h3_prompt.txt"
+    ).read_text(encoding="utf-8")
+    # 重建 = prefix + edited + hidden（逐字取自落盘）+ suffix；用户伪造的
+    # BEGIN 文本只落在可编辑区，真实 hidden 不受任何影响。
+    assert rebuilt == "prefix\n\n" + forged + HIDDEN_BLOCK + "\n\nsuffix"
+    assert rebuilt.count(prompt_review.HIDDEN_BLOCK_START) == 2
+    review = _read_review(project)
+    assert review["segments"][0]["editable"] == forged
+    assert review["segments"][0]["hidden"] == HIDDEN_BLOCK
+    display = prompt_review.display_segments(project, store.read(project_id))
+    assert display == [{"segment_index": 1, "prompt": forged}]
+
+
+def test_confirm_empty_editable_allowed_only_with_hidden_block(tmp_path):
+    _store, pipeline, project_id, project = _synthetic_awaiting_project(
+        tmp_path,
+        [
+            ("p1\n\n", "editable one", HIDDEN_BLOCK, "\n\ns1"),
+            ("p2\n\n", "editable two", "", "\n\ns2"),
+        ],
+    )
+    with pytest.raises(PromptReviewError) as error:
+        pipeline.confirm_prompt_review(project_id, [
+            {"segment_index": 1, "prompt": "x"},
+            {"segment_index": 2, "prompt": "  "},
+        ])
+    assert error.value.code == "invalid_prompt_review_edit"
+    pipeline.confirm_prompt_review(project_id, [
+        {"segment_index": 1, "prompt": ""},
+        {"segment_index": 2, "prompt": "edited two"},
+    ])
+    rebuilt = (
+        project / "work" / "segments" / "0001" / "h3_prompt.txt"
+    ).read_text(encoding="utf-8")
+    assert rebuilt == "p1\n\n" + HIDDEN_BLOCK + "\n\ns1"
+
+
+def test_confirm_stale_check_uses_four_part_formula(tmp_path):
+    _store, pipeline, project_id, project = _synthetic_awaiting_project(
+        tmp_path, [("p\n\n", "editable", HIDDEN_BLOCK, "\n\ns")],
+    )
+    # 冻结文件里 hidden 被删：与 prefix+editable+hidden+suffix 不一致 → stale。
+    prompt_path = project / "work" / "segments" / "0001" / "h3_prompt.txt"
+    prompt_path.write_text("p\n\neditable\n\ns", encoding="utf-8")
+    with pytest.raises(PromptReviewError) as error:
+        pipeline.confirm_prompt_review(
+            project_id, [{"segment_index": 1, "prompt": "x"}],
+        )
+    assert error.value.code == "prompt_review_stale"
+
+
+def test_legacy_split_truncates_hidden_block(tmp_path):
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "legacy-hidden",
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True)
+    prompt_path = segment_dir / "h3_prompt.txt"
+    prompt_path.write_text(
+        NEW_PREFIX + "editable text\n\n" + HIDDEN_BLOCK + SUFFIX,
+        encoding="utf-8",
+    )
+    receipt = Pipeline._project_artifact_receipt(
+        project, prompt_path, "work/segments/0001/h3_prompt.txt",
+    )
+    store.update(
+        project_id,
+        h3_prepared_artifacts={
+            "version": 5, "bindings": {}, "segments": {"1": {"prompt": receipt}},
+        },
+    )
+    display = prompt_review.display_segments(project, store.read(project_id))
+    assert display == [{"segment_index": 1, "prompt": "editable text\n\n"}]
+
+
+def test_old_shape_review_file_falls_back_to_legacy_split(tmp_path):
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(
+        _effective_request(), "old-review-shape",
+    )
+    segment_dir = project / "work" / "segments" / "0001"
+    segment_dir.mkdir(parents=True)
+    text = NEW_PREFIX + "legacy editable" + SUFFIX
+    prompt_path = segment_dir / "h3_prompt.txt"
+    prompt_path.write_text(text, encoding="utf-8")
+    receipt = Pipeline._project_artifact_receipt(
+        project, prompt_path, "work/segments/0001/h3_prompt.txt",
+    )
+    store.update(
+        project_id,
+        status="awaiting_prompt_review",
+        h3_prepared_artifacts={
+            "version": 5, "bindings": {}, "segments": {"1": {"prompt": receipt}},
+        },
+        project_progress={
+            "status": "awaiting_prompt_review",
+            "percent": 57,
+            "stage": "awaiting_prompt_review",
+        },
+    )
+    # 旧版（body 字段、version 1）审核记录不再被读取，展示回退到清单剥离。
+    (project / "work" / "prompt-review.json").write_text(
+        json.dumps({
+            "version": 1,
+            "segments": [{
+                "segment_index": 1,
+                "prefix": "x", "prefix_sha256": "x",
+                "body": "old body",
+                "suffix": "x", "suffix_sha256": "x",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    assert prompt_review.read_review(project) is None
+    display = prompt_review.display_segments(project, store.read(project_id))
+    assert display == [{"segment_index": 1, "prompt": "legacy editable"}]
+    # 旧形状记录不能 confirm（无法保证 hidden 完整）。用独立目录避免
+    # ProjectStore 进程锁冲突。
+    _store2, pipeline, _pid, _project = _synthetic_awaiting_project(
+        tmp_path / "b", [("p\n\n", "e", "", "\n\ns")],
+    )
+    (_project / "work" / "prompt-review.json").write_text(
+        json.dumps({"version": 1, "segments": []}), encoding="utf-8",
+    )
+    with pytest.raises(PromptReviewError) as error:
+        pipeline.confirm_prompt_review(
+            _pid, [{"segment_index": 1, "prompt": "x"}],
+        )
+    assert error.value.code == "prompt_review_unavailable"
 
 
 # ---------- 内部端点 ----------
@@ -457,7 +693,8 @@ def _mark_awaiting(app, project_id: str, segments) -> None:
         {
             "segment_index": index,
             "prefix": f"prefix-{index}\n\n",
-            "body": body,
+            "editable": body,
+            "hidden": "",
             "suffix": "\n\nDialogue requirements: tail",
         }
         for index, body in segments
@@ -858,7 +1095,8 @@ def test_v1_prompt_review_succeeded_readonly(tmp_path, video_1s):
             prompt_review.write_review(project, [{
                 "segment_index": 1,
                 "prefix": "prefix\n\n",
-                "body": "frozen body",
+                "editable": "frozen body",
+                "hidden": "",
                 "suffix": "\n\nDialogue requirements: tail",
             }])
             store.update(

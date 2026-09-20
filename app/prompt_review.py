@@ -1,17 +1,20 @@
-"""提示词审核/编辑：三段结构的落盘、读取与历史项目主体剥离。
+"""提示词审核/编辑：四段结构的落盘、读取与历史项目主体剥离。
 
 H3 最终提示词 = prefix（后端机械注入：编辑框架 editing_block + 遮盖条款
-mask_block + 人物替换块 face_block）+ body（DeepSeek fusion 生成的主体，
-唯一可被用户审核/编辑的部分）+ suffix（后端机械注入：Overlay removal +
-Dialogue requirements 尾部）。注入部分一律不展示、不可编辑；confirm 时由
-后端用冻结的 prefix/suffix 重新机械拼接。
+mask_block + 人物替换块 face_block）+ editable（DeepSeek fusion 主体中可审
+核/编辑的前半）+ hidden（主体末尾的权威替换计划块：从整行
+"BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN" 起（含该行）到主体
+末尾，含 END 标记整段）+ suffix（后端机械注入：Overlay removal +
+Dialogue requirements 尾部）。prefix/suffix/hidden 一律不展示、不可编辑；
+confirm 时由后端用冻结原文重新机械拼接，用户输入无法影响它们。
 
-无论是否开启审核开关，_run_h3_segments 在冻结 H3 产物后都把三段结构落盘
+无论是否开启审核开关，_run_h3_segments 在冻结 H3 产物后都把四段结构落盘
 work/prompt-review.json：审核暂停的项目靠它在 confirm 时重建最终提示词并
 重算 h3_prepared_artifacts 回执；直通/已完成项目靠它在前端只读展示冻结的
-DS 主体。历史项目没有该文件，用 split_frozen_prompt_body 从冻结
-h3_prompt.txt 做 best-effort 剥离；剥不出（注入边界无法确定）就返回空
-segments，绝不展示注入内容。
+可编辑主体。历史项目没有该文件，用 split_frozen_prompt_body 从冻结
+h3_prompt.txt 做 best-effort 剥离，再按 BEGIN 行截断；剥不出（注入边界无
+法确定）就返回空 segments，绝不展示注入内容。body 里没有 BEGIN 行的段
+hidden 为空、整段可编辑，重建结果与拆分前逐字节一致。
 """
 
 from __future__ import annotations
@@ -22,12 +25,20 @@ import os
 from pathlib import Path
 from typing import Any
 
-PROMPT_REVIEW_VERSION = 1
+from app.fusion_schema import AUTHORITY_BEGIN
+
+PROMPT_REVIEW_VERSION = 2
 PROMPT_REVIEW_RELATIVE_PATH = "work/prompt-review.json"
 
-_SEGMENT_KEYS = frozenset(
-    {"segment_index", "prefix", "prefix_sha256", "body", "suffix", "suffix_sha256"}
-)
+_SEGMENT_KEYS = frozenset({
+    "segment_index", "prefix", "prefix_sha256",
+    "editable", "hidden", "suffix", "suffix_sha256",
+})
+
+# 权威替换计划块的开始标记（整行；fusion_schema.AUTHORITY_BEGIN，由
+# normalize_fusion_prompt 拼接到主体末尾）。该行起（含该行）到 body 末尾
+# 为 hidden。
+HIDDEN_BLOCK_START = AUTHORITY_BEGIN
 
 # 已知注入块的开头文案（新旧两版）。冻结提示词以这些块开头时逐块剥掉；
 # 块都以 "\n\n" 收尾（见 pipeline._prepare_h3_segment 的组装）。
@@ -59,6 +70,20 @@ class PromptReviewError(ValueError):
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def split_body(body: str) -> tuple[str, str]:
+    """把 DS 主体在首个 BEGIN 整行处拆成 (editable, hidden)。
+
+    hidden 从 BEGIN 行开头（含该行）到 body 末尾；没有 BEGIN 行时 hidden 为
+    空、editable 为整个 body（与拆分前逐字节一致）。
+    """
+    position = 0
+    for line in body.splitlines(keepends=True):
+        if line.strip() == HIDDEN_BLOCK_START:
+            return body[:position], body[position:]
+        position += len(line)
+    return body, ""
 
 
 def split_frozen_prompt_body(text: str) -> str | None:
@@ -95,14 +120,15 @@ def write_review(
     project: Path,
     segments: list[dict[str, Any]],
 ) -> Path:
-    """把每段 {segment_index, prefix, body, suffix} 落盘 work/prompt-review.json。"""
+    """把每段 {segment_index, prefix, editable, hidden, suffix} 落盘。"""
     records = []
     for segment in segments:
         records.append({
             "segment_index": segment["segment_index"],
             "prefix": segment["prefix"],
             "prefix_sha256": _sha256_text(segment["prefix"]),
-            "body": segment["body"],
+            "editable": segment["editable"],
+            "hidden": segment["hidden"],
             "suffix": segment["suffix"],
             "suffix_sha256": _sha256_text(segment["suffix"]),
         })
@@ -129,7 +155,7 @@ def write_review(
 
 
 def read_review(project: Path) -> dict[str, Any] | None:
-    """读取并校验冻结的审核记录；缺失或损坏返回 None（confirm 侧再拒绝）。"""
+    """读取并校验冻结的审核记录；缺失、旧版或损坏返回 None。"""
     target = project / PROMPT_REVIEW_RELATIVE_PATH
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
@@ -148,7 +174,7 @@ def read_review(project: Path) -> dict[str, Any] | None:
         index = segment["segment_index"]
         if isinstance(index, bool) or not isinstance(index, int) or index < 1:
             return None
-        for field in ("prefix", "body", "suffix"):
+        for field in ("prefix", "editable", "hidden", "suffix"):
             if not isinstance(segment[field], str):
                 return None
         if (
@@ -162,16 +188,16 @@ def read_review(project: Path) -> dict[str, Any] | None:
 def display_segments(
     project: Path, state: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """只读展示视图：[{"segment_index": N, "prompt": DS 主体}]。
+    """只读展示视图：[{"segment_index": N, "prompt": 可编辑主体前半}]。
 
     优先读 prompt-review.json；没有则从冻结清单逐段剥离 h3_prompt.txt
-    （剥离前先校验文件与清单回执一致）。任何一段剥不出来整个项目返回空，
-    避免部分段展示注入内容、部分段缺失的混合视图。
+    （剥离前先校验文件与清单回执一致），再按 BEGIN 行截断。任何一段剥不
+    出来整个项目返回空，避免部分段展示注入内容、部分段缺失的混合视图。
     """
     review = read_review(project)
     if review is not None:
         return [
-            {"segment_index": segment["segment_index"], "prompt": segment["body"]}
+            {"segment_index": segment["segment_index"], "prompt": segment["editable"]}
             for segment in sorted(
                 review["segments"], key=lambda item: item["segment_index"]
             )
@@ -209,5 +235,6 @@ def display_segments(
         body = split_frozen_prompt_body(text)
         if body is None:
             return []
-        result.append({"segment_index": int(key), "prompt": body})
+        editable, _hidden = split_body(body)
+        result.append({"segment_index": int(key), "prompt": editable})
     return result

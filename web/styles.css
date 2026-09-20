@@ -1378,19 +1378,33 @@ input, textarea { font-family: inherit; }
   .drawer-backdrop { display: none !important; }
 }
 
-/* ===== 提示词审核区块 ===== */
-.prompt-review-list { display: grid; gap: 14px; }
+/* ===== 提示词审核面板 ===== */
+.prompt-review-panel {
+  background: var(--card);
+  border: 1px solid rgba(0, 0, 0, .08);
+  border-radius: var(--radius-card);
+  padding: 18px 20px;
+}
+.prompt-review-body { display: grid; gap: 14px; }
 .prompt-review-tip { margin: 0; font-size: 13px; color: var(--text-2); }
-.prompt-review-segment-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.prompt-review-switcher {
+  justify-self: start;
+  font-size: 14px;
+  padding: 6px 10px;
+  border: 1px solid rgba(0, 0, 0, .12);
+  border-radius: 10px;
+  background: var(--bg);
+  color: inherit;
+}
 .prompt-review-textarea {
   width: 100%;
-  min-height: 140px;
+  min-height: 160px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   line-height: 1.6;
   resize: vertical;
 }
-.prompt-review-textarea[readonly] { background: #F5F5F7; color: var(--text-2); }
+.prompt-review-textarea[readonly] { background: var(--bg); color: var(--text-2); }
 
 /* ===== Reduced motion ===== */
 @media (prefers-reduced-motion: reduce) {

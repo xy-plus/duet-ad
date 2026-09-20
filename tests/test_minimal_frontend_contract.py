@@ -433,6 +433,17 @@ def test_prompt_review_ui_states_are_wired():
     assert '"/prompt-review"' in review
     assert '"/prompt-review/confirm"' in review
     assert "确认并继续生成" in review
+    # 面板 + 下拉切换分段 + 共用单编辑框，未确认编辑在内存暂存。
+    assert '"res-section prompt-review-panel"' in review
+    assert 'el("select", "prompt-review-switcher")' in review
+    assert '"分段 " + segment.segment_index' in review
+    assert "edits.set(current, textarea.value)" in review
+    assert "textarea.value = edits.get(current)" in review
+    assert 'editable ? "提示词审核" : "冻结提示词"' in review
+    assert "prompt-review-segment" not in review  # 旧的逐段裸露编辑框已移除
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".prompt-review-panel" in css
+    assert ".prompt-review-switcher" in css
 
 
 def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair():

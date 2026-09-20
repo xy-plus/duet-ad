@@ -2293,10 +2293,12 @@ class Pipeline:
         project: Path,
         h3_inputs: list[tuple[dict[str, Any], str, Path, str]],
     ) -> None:
-        """落盘每段提示词的三段结构（直通项目也落，供完成后只读展示）。
+        """落盘每段提示词的四段结构（直通项目也落，供完成后只读展示）。
 
-        替换掉 _prepare_h3_segment 的测试替身不产出 prompt_parts，此时跳过
-        落盘；生产路径的真实 _prepare_h3_segment 永远带齐三段。
+        body 在权威替换计划块（BEGIN AUTHORITATIVE ... 整行）处拆成
+        editable + hidden：hidden 不展示、不可编辑，confirm 时逐字取自本
+        文件。替换掉 _prepare_h3_segment 的测试替身不产出 prompt_parts，
+        此时跳过落盘；生产路径的真实 _prepare_h3_segment 永远带齐三段。
         """
         segments: list[dict[str, Any]] = []
         for item, _final_prompt, _muted, _fusion_input_sha256 in sorted(
@@ -2305,7 +2307,14 @@ class Pipeline:
             parts = item.get("prompt_parts")
             if not isinstance(parts, dict):
                 return
-            segments.append({"segment_index": int(item["index"]), **parts})
+            editable, hidden = prompt_review.split_body(parts["body"])
+            segments.append({
+                "segment_index": int(item["index"]),
+                "prefix": parts["prefix"],
+                "editable": editable,
+                "hidden": hidden,
+                "suffix": parts["suffix"],
+            })
         prompt_review.write_review(project, segments)
 
     def _run_h3_segments(
@@ -4698,11 +4707,14 @@ class Pipeline:
     def confirm_prompt_review(
         self, project_id: str, edits: list[dict[str, Any]],
     ) -> None:
-        """确认审核后的提示词主体：重建 h3_prompt.txt 并重算冻结清单回执。
+        """确认审核后的可编辑主体：重建 h3_prompt.txt 并重算冻结清单回执。
 
-        只校验、不写状态；状态迁移（queued + picsart_resume_queued）与续跑
-        调度由调用方在确认成功后完成（resume-picsart 等价入口逐字重放
-        h3_prompt.txt）。先全量校验再落盘，任何一段非法都不动文件。
+        重建公式：final = prefix + edited + hidden + suffix——hidden（权威
+        替换计划块）与 prefix/suffix 逐字取自冻结的审核记录，用户传入的
+        任何内容（包括伪造的 BEGIN 文本）都无法影响它们。只校验、不写状
+        态；状态迁移（queued + picsart_resume_queued）与续跑调度由调用方
+        在确认成功后完成（resume-picsart 等价入口逐字重放 h3_prompt.txt）。
+        先全量校验再落盘，任何一段非法都不动文件。
         """
         project = self.store.path(project_id)
         state = self.store.read(project_id)
@@ -4735,7 +4747,11 @@ class Pipeline:
                 raise PromptReviewError(
                     "invalid_prompt_review_edit", "segment_index 必须是整数"
                 )
-            if not isinstance(body, str) or not body.strip():
+            if not isinstance(body, str) or (
+                not body.strip() and not frozen.get(index, {}).get("hidden")
+            ):
+                # 有 hidden 块的段允许把可编辑前半清空；没有隐藏块的段保持
+                # 原有的非空约束（与拆分前行为一致）。
                 raise PromptReviewError(
                     "invalid_prompt_review_edit", "提示词主体不能为空"
                 )
@@ -4774,15 +4790,16 @@ class Pipeline:
                 raise PromptReviewError(
                     "prompt_review_unavailable", "冻结的 H3 提示词文件不可用"
                 ) from None
-            prefix, body, suffix = (
-                segment["prefix"], segment["body"], segment["suffix"],
+            prefix, editable, hidden, suffix = (
+                segment["prefix"], segment["editable"],
+                segment["hidden"], segment["suffix"],
             )
-            if current != prefix + body + suffix:
+            if current != prefix + editable + hidden + suffix:
                 # 冻结提示词与审核记录不一致（例如并发重备）：拒绝覆盖。
                 raise PromptReviewError(
                     "prompt_review_stale", "冻结提示词已变化，请重新审核"
                 )
-            final = prefix + normalized[index] + suffix
+            final = prefix + normalized[index] + hidden + suffix
             stripped = final.strip()
             if not stripped or len(stripped) > PICSART_PROMPT_MAX_CHARS:
                 raise PromptReviewError(
@@ -4809,7 +4826,8 @@ class Pipeline:
                 {
                     "segment_index": index,
                     "prefix": frozen[index]["prefix"],
-                    "body": normalized[index],
+                    "editable": normalized[index],
+                    "hidden": frozen[index]["hidden"],
                     "suffix": frozen[index]["suffix"],
                 }
                 for index in sorted(frozen)
@@ -4821,7 +4839,7 @@ class Pipeline:
             edited=[
                 index
                 for index in sorted(rebuilt)
-                if normalized[index] != frozen[index]["body"]
+                if normalized[index] != frozen[index]["editable"]
             ],
         )
 
@@ -6388,8 +6406,11 @@ class Pipeline:
                 for line in item["dialogue"]
             )
             # 三段结构：prefix/suffix 是后端机械注入（用户不可见不可编辑），
-            # body 是 DeepSeek fusion 主体（提示词审核的唯一可编辑部分）。
-            # final_prompt 由三段拼接而成，与历史组装逐字节一致。
+            # body 是 DeepSeek fusion 主体。body 里从 BEGIN AUTHORITATIVE
+            # OBJECT REPLACEMENT AND VOICE PLAN 整行起到末尾的权威计划块同样
+            # 不可见不可编辑——审核落盘时由 _write_prompt_review 再拆成
+            # editable + hidden。final_prompt 由三段拼接而成，与历史组装逐字
+            # 节一致。
             prompt_prefix = editing_block + mask_block + face_block
             prompt_suffix = overlay_block + (
                 "\n\nDialogue requirements: Audio 1 is this segment's "

@@ -1222,45 +1222,60 @@ function videoSection(detail, file, title, sub) {
   return sec;
 }
 
-/* 提示词审核区块：awaiting_prompt_review 时可编辑 + 确认继续；
-   succeeded 时只读展示冻结的 DS 提示词主体（注入部分由后端机械拼接，不展示）。 */
+/* 提示词审核面板：下拉切换分段、共用单编辑框；切换分段时未确认的编辑在
+   内存暂存，切回来不丢。awaiting_prompt_review 时可编辑 + 确认继续；
+   succeeded 时只读展示冻结主体（注入部分由后端机械拼接，不展示）。 */
 function promptReviewSection(detail, editable) {
-  const sec = el("section", "res-section prompt-review-section");
-  const h = el("h3", "res-h3", "生成提示词");
+  const panel = el("section", "res-section prompt-review-panel");
+  const h = el("h3", "res-h3", editable ? "提示词审核" : "冻结提示词");
   h.appendChild(el("span", "res-count", editable ? "审核编辑后确认继续" : "已冻结 · 只读"));
-  sec.appendChild(h);
-  const list = el("div", "prompt-review-list");
-  list.appendChild(el("p", "prompt-review-tip", "正在加载提示词…"));
-  sec.appendChild(list);
+  panel.appendChild(h);
+  const body = el("div", "prompt-review-body");
+  body.appendChild(el("p", "prompt-review-tip", "正在加载提示词…"));
+  panel.appendChild(body);
   apiJSON("/api/conversations/" + detail.id + "/prompt-review").then((data) => {
     const segments = data && Array.isArray(data.segments) ? data.segments : [];
-    list.textContent = "";
+    body.textContent = "";
     if (!segments.length) {
       // 历史项目剥不出注入边界时后端返回空：审核态给提示，只读态整块隐藏。
       if (editable) {
-        list.appendChild(el("p", "prompt-review-tip", "提示词尚未就绪，请稍后刷新页面"));
+        body.appendChild(el("p", "prompt-review-tip", "提示词尚未就绪，请稍后刷新页面"));
       } else {
-        sec.remove();
+        panel.remove();
       }
       return;
     }
     if (editable) {
-      list.appendChild(el("p", "prompt-review-tip",
-        "以下只有 AI 生成的提示词主体可编辑；编辑框架、遮盖条款等注入部分由后端自动拼接，不展示也不可改。"));
+      body.appendChild(el("p", "prompt-review-tip",
+        "只展示 AI 生成的可编辑部分；编辑框架、遮盖条款、权威替换计划等注入部分由后端自动拼接，不展示也不可改。"));
     }
-    const editors = [];
+    // edits 暂存每段当前文本（初始为服务端冻结值），切分段不丢未确认编辑。
+    const edits = new Map(
+      segments.map((segment) => [segment.segment_index, String(segment.prompt || "")])
+    );
+    let current = segments[0].segment_index;
+    const textarea = el("textarea", "setup-textarea prompt-review-textarea");
+    textarea.rows = 10;
+    textarea.spellcheck = false;
+    textarea.readOnly = !editable;
+    textarea.value = edits.get(current);
+    const switcher = el("select", "prompt-review-switcher");
+    switcher.setAttribute("aria-label", "选择分段");
     for (const segment of segments) {
-      const block = el("div", "prompt-review-segment");
-      block.appendChild(el("div", "prompt-review-segment-title", "分段 " + segment.segment_index));
-      const textarea = el("textarea", "setup-textarea prompt-review-textarea");
-      textarea.value = String(segment.prompt || "");
-      textarea.readOnly = !editable;
-      textarea.rows = 8;
-      textarea.spellcheck = false;
-      block.appendChild(textarea);
-      list.appendChild(block);
-      editors.push({ index: segment.segment_index, textarea });
+      const option = el("option", null, "分段 " + segment.segment_index);
+      option.value = String(segment.segment_index);
+      switcher.appendChild(option);
     }
+    switcher.addEventListener("change", () => {
+      edits.set(current, textarea.value);
+      current = Number(switcher.value);
+      textarea.value = edits.get(current);
+    });
+    body.appendChild(switcher);
+    if (editable) {
+      textarea.addEventListener("input", () => edits.set(current, textarea.value));
+    }
+    body.appendChild(textarea);
     if (!editable) return;
     const errorBox = el("p", "inline-error");
     errorBox.hidden = true;
@@ -1275,9 +1290,9 @@ function promptReviewSection(detail, editable) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            segments: editors.map((editor) => ({
-              segment_index: editor.index,
-              prompt: editor.textarea.value,
+            segments: segments.map((segment) => ({
+              segment_index: segment.segment_index,
+              prompt: edits.get(segment.segment_index),
             })),
           }),
         });
@@ -1287,17 +1302,17 @@ function promptReviewSection(detail, editable) {
         showActionError(err, errorBox, [confirm]);
       }
     });
-    list.appendChild(errorBox);
-    list.appendChild(confirm);
+    body.appendChild(errorBox);
+    body.appendChild(confirm);
   }).catch(() => {
     if (editable) {
-      list.textContent = "";
-      list.appendChild(el("p", "prompt-review-tip", "提示词加载失败，请刷新页面重试"));
+      body.textContent = "";
+      body.appendChild(el("p", "prompt-review-tip", "提示词加载失败，请刷新页面重试"));
     } else {
-      sec.remove();
+      panel.remove();
     }
   });
-  return sec;
+  return panel;
 }
 
 function renderResults(detail) {
