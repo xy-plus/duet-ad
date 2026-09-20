@@ -1006,6 +1006,9 @@ input, textarea { font-family: inherit; }
 }
 /* 与上方画幅/清晰度方框拉开距离：间隔 = 容器宽度的 10% */
 .output-config-grid + .subtitle-option { margin-top: 10%; }
+/* 「显示字幕」与「自动继续生成」两个开关之间的间距 = 容器宽度的 5%，
+   与上方 10% 间距同风格（容器宽度相对单位，不写死 px） */
+#subtitle-hint + .subtitle-option { margin-top: 5%; }
 .subtitle-option input {
   appearance: auto;
   width: 20px;

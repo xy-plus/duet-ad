@@ -415,6 +415,11 @@ def test_prompt_review_toggle_defaults_to_straight_through_and_maps_inverted():
     assert 'type="checkbox"' in attrs and "checked" in attrs
     assert 'promptReview: !$("auto-continue").checked' in source
     assert '$("auto-continue").checked = true' in _function_source(source, "resetComposerForNewProject")
+    # 「显示字幕」与「自动继续生成」之间：间距 = 容器宽度的 5%（不写死 px）。
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    assert _css_rule_bodies(css, "#subtitle-hint + .subtitle-option") == [
+        " margin-top: 5%; ",
+    ]
 
 
 def test_prompt_review_ui_states_are_wired():
