@@ -189,7 +189,8 @@ def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None
 def test_fusion_skill_requires_faithful_video1_action_description() -> None:
     # 灰块整人+物品 100% 遮盖后动作信号丢失（化妆品项目挤膏动作消失），
     # 把 5fdb7d7 删掉的"描述原视频动作/运动/镜头"指导合并回来：纯描述，
-    # 不改编不创作，动作以 Video 1 为准、描述仅为辅助。
+    # 不改编不创作。2026-09-20 修订：禁止嵌入"以 Video 1 为准"类兜底声明
+    # （实测会把权威域扩大到外观/身份，H3 向源人物回退）。
     skill = (ROOT / "skills" / "h3-max-r2v-prompt" / "SKILL.md").read_text(
         encoding="utf-8"
     )
@@ -201,8 +202,9 @@ def test_fusion_skill_requires_faithful_video1_action_description() -> None:
     assert "不依赖被遮盖区域的可见内容" in skill
     assert "动作事实" in skill
     assert "不是创作或改编指令" in skill
-    assert "动作与画面一切以 Video 1 实际内容为准" in skill
-    assert "本段文字仅为辅助" in skill
+    assert '不得写入任何"以 Video 1 为准"' in skill
+    assert "以 Video 1 实际内容为准" not in skill
+    assert "本段文字仅为辅助" not in skill
     assert "被替换对象不得写入源外观或源类别特征" in skill
     # 编辑任务框架与后续约束不回退
     assert "这是一次对 Video 1 的编辑任务" in skill
