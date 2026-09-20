@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ PROMPT_REVIEW_RELATIVE_PATH = "work/prompt-review.json"
 _SEGMENT_KEYS = frozenset({
     "segment_index", "prefix", "prefix_sha256",
     "editable", "hidden", "suffix", "suffix_sha256",
+    "start_s", "end_s",
 })
 
 # 权威替换计划块的开始标记（整行；fusion_schema.AUTHORITY_BEGIN，由
@@ -70,6 +72,23 @@ class PromptReviewError(ValueError):
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _valid_time_range(
+    start: Any, end: Any,
+) -> tuple[float | None, float | None]:
+    """段的 start_s/end_s：非负有限数且 start < end 才有效，否则视为 null。"""
+    for value in (start, end):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return None, None
+    if not start < end:
+        return None, None
+    return float(start), float(end)
 
 
 def split_body(body: str) -> tuple[str, str]:
@@ -120,9 +139,12 @@ def write_review(
     project: Path,
     segments: list[dict[str, Any]],
 ) -> Path:
-    """把每段 {segment_index, prefix, editable, hidden, suffix} 落盘。"""
+    """把每段 {segment_index, prefix, editable, hidden, suffix, 时间} 落盘。"""
     records = []
     for segment in segments:
+        start_s, end_s = _valid_time_range(
+            segment.get("start_s"), segment.get("end_s"),
+        )
         records.append({
             "segment_index": segment["segment_index"],
             "prefix": segment["prefix"],
@@ -131,6 +153,8 @@ def write_review(
             "hidden": segment["hidden"],
             "suffix": segment["suffix"],
             "suffix_sha256": _sha256_text(segment["suffix"]),
+            "start_s": start_s,
+            "end_s": end_s,
         })
     payload = (
         json.dumps(
@@ -182,6 +206,10 @@ def read_review(project: Path) -> dict[str, Any] | None:
             or segment["suffix_sha256"] != _sha256_text(segment["suffix"])
         ):
             return None
+        # 脏时间数据不进响应：就地归一化为 null，不整文件判废。
+        segment["start_s"], segment["end_s"] = _valid_time_range(
+            segment.get("start_s"), segment.get("end_s"),
+        )
     return raw
 
 
@@ -197,7 +225,12 @@ def display_segments(
     review = read_review(project)
     if review is not None:
         return [
-            {"segment_index": segment["segment_index"], "prompt": segment["editable"]}
+            {
+                "segment_index": segment["segment_index"],
+                "prompt": segment["editable"],
+                "start_s": segment["start_s"],
+                "end_s": segment["end_s"],
+            }
             for segment in sorted(
                 review["segments"], key=lambda item: item["segment_index"]
             )
@@ -236,5 +269,11 @@ def display_segments(
         if body is None:
             return []
         editable, _hidden = split_body(body)
-        result.append({"segment_index": int(key), "prompt": editable})
+        # 剥离路径拿不到段时间：字段为 null，前端回退显示"分段 N"。
+        result.append({
+            "segment_index": int(key),
+            "prompt": editable,
+            "start_s": None,
+            "end_s": None,
+        })
     return result

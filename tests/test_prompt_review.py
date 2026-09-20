@@ -225,6 +225,10 @@ def test_run_pauses_before_any_paid_submit_when_prompt_review_enabled(
 
     review = _read_review(project)
     assert [segment["segment_index"] for segment in review["segments"]] == [1, 2]
+    # 落盘携带原视频时间区间（前端下拉框"分段 N（Xs ~ Ys）"用）。
+    assert [
+        (segment["start_s"], segment["end_s"]) for segment in review["segments"]
+    ] == [(0.0, 4.2), (4.2, 9.2)]
     for segment in review["segments"]:
         index = segment["segment_index"]
         frozen = (
@@ -242,10 +246,16 @@ def test_run_pauses_before_any_paid_submit_when_prompt_review_enabled(
         assert (
             prompt_review.HIDDEN_BLOCK_START not in segment["editable"]
         )
-    # 直通展示视图读到的就是可编辑主体前半。
+    # 直通展示视图读到的就是可编辑主体前半（含时间区间）。
     display = prompt_review.display_segments(project, store.read(project_id))
-    assert [item["prompt"] for item in display] == [
-        segment["editable"] for segment in review["segments"]
+    assert display == [
+        {
+            "segment_index": segment["segment_index"],
+            "prompt": segment["editable"],
+            "start_s": segment["start_s"],
+            "end_s": segment["end_s"],
+        }
+        for segment in review["segments"]
     ]
 
 
@@ -502,7 +512,9 @@ def test_confirm_hidden_block_verbatim_and_user_input_cannot_forge_it(tmp_path):
     assert review["segments"][0]["editable"] == forged
     assert review["segments"][0]["hidden"] == HIDDEN_BLOCK
     display = prompt_review.display_segments(project, store.read(project_id))
-    assert display == [{"segment_index": 1, "prompt": forged}]
+    assert display == [
+        {"segment_index": 1, "prompt": forged, "start_s": None, "end_s": None},
+    ]
 
 
 def test_confirm_empty_editable_allowed_only_with_hidden_block(tmp_path):
@@ -565,7 +577,78 @@ def test_legacy_split_truncates_hidden_block(tmp_path):
         },
     )
     display = prompt_review.display_segments(project, store.read(project_id))
-    assert display == [{"segment_index": 1, "prompt": "editable text\n\n"}]
+    assert display == [
+        {
+            "segment_index": 1,
+            "prompt": "editable text\n\n",
+            "start_s": None,
+            "end_s": None,
+        },
+    ]
+
+
+def test_review_dirty_time_values_fall_back_to_null(tmp_path):
+    store = ProjectStore(tmp_path / "projects")
+    project_id, project, _state = store.create(_effective_request(), "dirty-times")
+    # 脏时间（负数、区间颠倒/相等、非数、inf、布尔）在落盘时归一化为 null。
+    for start, end in [
+        (-1, 5), (5, 5), (9, 8), ("0", 8), (None, None),
+        (float("inf"), 9), (float("nan"), 9), (True, 9),
+    ]:
+        prompt_review.write_review(project, [{
+            "segment_index": 1, "prefix": "p", "editable": "e", "hidden": "",
+            "suffix": "s", "start_s": start, "end_s": end,
+        }])
+        review = prompt_review.read_review(project)
+        assert review["segments"][0]["start_s"] is None
+        assert review["segments"][0]["end_s"] is None
+    # 绕过 write_review 手写的脏文件在读取时同样归一化，不进响应。
+    (project / "work" / "prompt-review.json").write_text(
+        json.dumps({
+            "version": prompt_review.PROMPT_REVIEW_VERSION,
+            "segments": [{
+                "segment_index": 1,
+                "prefix": "p",
+                "prefix_sha256": prompt_review._sha256_text("p"),
+                "editable": "e",
+                "hidden": "",
+                "suffix": "s",
+                "suffix_sha256": prompt_review._sha256_text("s"),
+                "start_s": -3,
+                "end_s": "junk",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    review = prompt_review.read_review(project)
+    assert review["segments"][0]["start_s"] is None
+    assert review["segments"][0]["end_s"] is None
+    # 合法时间（含整数）原样保留并出现在展示视图里。
+    prompt_review.write_review(project, [{
+        "segment_index": 1, "prefix": "p", "editable": "e", "hidden": "",
+        "suffix": "s", "start_s": 0, "end_s": 8,
+    }])
+    display = prompt_review.display_segments(project, store.read(project_id))
+    assert display == [
+        {"segment_index": 1, "prompt": "e", "start_s": 0.0, "end_s": 8.0},
+    ]
+
+
+def test_confirm_preserves_segment_time_range(tmp_path):
+    _store, pipeline, project_id, project = _synthetic_awaiting_project(
+        tmp_path, [("p\n\n", "editable", HIDDEN_BLOCK, "\n\ns")],
+    )
+    review_path = project / "work" / "prompt-review.json"
+    raw = json.loads(review_path.read_text(encoding="utf-8"))
+    raw["segments"][0]["start_s"] = 1.5
+    raw["segments"][0]["end_s"] = 9.0
+    review_path.write_text(json.dumps(raw), encoding="utf-8")
+    pipeline.confirm_prompt_review(
+        project_id, [{"segment_index": 1, "prompt": "edited"}],
+    )
+    updated = _read_review(project)
+    assert updated["segments"][0]["start_s"] == 1.5
+    assert updated["segments"][0]["end_s"] == 9.0
 
 
 def test_old_shape_review_file_falls_back_to_legacy_split(tmp_path):
@@ -608,7 +691,9 @@ def test_old_shape_review_file_falls_back_to_legacy_split(tmp_path):
     )
     assert prompt_review.read_review(project) is None
     display = prompt_review.display_segments(project, store.read(project_id))
-    assert display == [{"segment_index": 1, "prompt": "legacy editable"}]
+    assert display == [
+        {"segment_index": 1, "prompt": "legacy editable", "start_s": None, "end_s": None},
+    ]
     # 旧形状记录不能 confirm（无法保证 hidden 完整）。用独立目录避免
     # ProjectStore 进程锁冲突。
     _store2, pipeline, _pid, _project = _synthetic_awaiting_project(
@@ -687,17 +772,20 @@ def _create_project(app, request=None) -> str:
 
 
 def _mark_awaiting(app, project_id: str, segments) -> None:
+    """segments: (index, body) 或 (index, body, start_s, end_s) 元组列表。"""
     store = app.state.store
     project = store.path(project_id)
     prompt_review.write_review(project, [
         {
-            "segment_index": index,
-            "prefix": f"prefix-{index}\n\n",
-            "editable": body,
+            "segment_index": segment[0],
+            "prefix": f"prefix-{segment[0]}\n\n",
+            "editable": segment[1],
             "hidden": "",
             "suffix": "\n\nDialogue requirements: tail",
+            "start_s": segment[2] if len(segment) > 2 else None,
+            "end_s": segment[3] if len(segment) > 2 else None,
         }
-        for index, body in segments
+        for segment in segments
     ])
     store.update(
         project_id,
@@ -734,7 +822,10 @@ def test_internal_prompt_review_read_and_confirm(tmp_path):
     try:
         with TestClient(app) as client:
             project_id = _create_project(app)
-            _mark_awaiting(app, project_id, [(1, "body one"), (2, "body two")])
+            _mark_awaiting(app, project_id, [
+                (1, "body one", 0.0, 8.0),
+                (2, "body two", 8.5, 16.0),
+            ])
 
             read = client.get(
                 f"/api/conversations/{project_id}/prompt-review", headers=AUTH,
@@ -743,8 +834,14 @@ def test_internal_prompt_review_read_and_confirm(tmp_path):
             assert read.json() == {
                 "status": "awaiting_prompt_review",
                 "segments": [
-                    {"segment_index": 1, "prompt": "body one"},
-                    {"segment_index": 2, "prompt": "body two"},
+                    {
+                        "segment_index": 1, "prompt": "body one",
+                        "start_s": 0.0, "end_s": 8.0,
+                    },
+                    {
+                        "segment_index": 2, "prompt": "body two",
+                        "start_s": 8.5, "end_s": 16.0,
+                    },
                 ],
             }
 
@@ -859,7 +956,9 @@ def test_internal_prompt_review_legacy_split_and_empty(tmp_path):
             assert read.status_code == 200
             assert read.json() == {
                 "status": "succeeded",
-                "segments": [{"segment_index": 1, "prompt": BODY}],
+                "segments": [
+                    {"segment_index": 1, "prompt": BODY, "start_s": None, "end_s": None},
+                ],
             }
 
             # 剥不出注入边界的历史项目返回空 segments，不展示注入内容。
@@ -978,7 +1077,10 @@ def test_v1_prompt_review_endpoints(tmp_path, video_1s):
             assert read.status_code == 409
             assert read.json()["error"]["code"] == "prompt_review_not_available"
 
-            _mark_awaiting(app, pid, [(1, "body one"), (2, "body two")])
+            _mark_awaiting(app, pid, [
+                (1, "body one", 0.0, 8.0),
+                (2, "body two", 8.0, 16.0),
+            ])
             read = client.get(
                 f"/api/v1/video-generations/{job_id}/prompt-review", headers=auth,
             )
@@ -986,8 +1088,14 @@ def test_v1_prompt_review_endpoints(tmp_path, video_1s):
             assert read.json() == {
                 "status": "awaiting_prompt_review",
                 "segments": [
-                    {"segment_index": 1, "prompt": "body one"},
-                    {"segment_index": 2, "prompt": "body two"},
+                    {
+                        "segment_index": 1, "prompt": "body one",
+                        "start_s": 0.0, "end_s": 8.0,
+                    },
+                    {
+                        "segment_index": 2, "prompt": "body two",
+                        "start_s": 8.0, "end_s": 16.0,
+                    },
                 ],
             }
             job = client.get(
@@ -1113,7 +1221,9 @@ def test_v1_prompt_review_succeeded_readonly(tmp_path, video_1s):
             assert read.status_code == 200
             assert read.json() == {
                 "status": "succeeded",
-                "segments": [{"segment_index": 1, "prompt": "frozen body"}],
+                "segments": [
+                    {"segment_index": 1, "prompt": "frozen body", "start_s": None, "end_s": None},
+                ],
             }
             confirm = client.post(
                 f"/api/v1/video-generations/{job_id}/prompt-review/confirm",

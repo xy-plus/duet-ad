@@ -2314,6 +2314,8 @@ class Pipeline:
                 "editable": editable,
                 "hidden": hidden,
                 "suffix": parts["suffix"],
+                "start_s": item.get("start_s"),
+                "end_s": item.get("end_s"),
             })
         prompt_review.write_review(project, segments)
 
@@ -4829,6 +4831,8 @@ class Pipeline:
                     "editable": normalized[index],
                     "hidden": frozen[index]["hidden"],
                     "suffix": frozen[index]["suffix"],
+                    "start_s": frozen[index]["start_s"],
+                    "end_s": frozen[index]["end_s"],
                 }
                 for index in sorted(frozen)
             ],

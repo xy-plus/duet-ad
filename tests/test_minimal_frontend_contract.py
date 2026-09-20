@@ -436,7 +436,7 @@ def test_prompt_review_ui_states_are_wired():
     # 面板 + 下拉切换分段 + 共用单编辑框，未确认编辑在内存暂存。
     assert '"res-section prompt-review-panel"' in review
     assert 'el("select", "prompt-review-switcher")' in review
-    assert '"分段 " + segment.segment_index' in review
+    assert "segmentOptionLabel(segment)" in review
     assert "edits.set(current, textarea.value)" in review
     assert "textarea.value = edits.get(current)" in review
     assert 'editable ? "提示词审核" : "冻结提示词"' in review
@@ -444,6 +444,22 @@ def test_prompt_review_ui_states_are_wired():
     css = STYLES_CSS.read_text(encoding="utf-8")
     assert ".prompt-review-panel" in css
     assert ".prompt-review-switcher" in css
+
+
+def test_prompt_review_segment_option_shows_source_time_range():
+    result = _run_contract(
+        "[{segment_index:1,start_s:0,end_s:8},{segment_index:2,start_s:8.5,end_s:16},"
+        "{segment_index:3,start_s:null,end_s:null},{segment_index:4,start_s:'x',end_s:9},"
+        "{segment_index:5,end_s:9}]"
+        ".map(contract.segmentOptionLabel)"
+    )
+    assert result == [
+        "分段 1（0s ~ 8s）",
+        "分段 2（8.5s ~ 16s）",
+        "分段 3",
+        "分段 4",
+        "分段 5",
+    ]
 
 
 def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair():

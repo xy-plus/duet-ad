@@ -553,11 +553,13 @@ GET /api/v1/video-generations/{job_id}/prompt-review
 {
   "status": "awaiting_prompt_review",
   "segments": [
-    { "segment_index": 1, "prompt": "AI 生成的第 1 段提示词主体" },
-    { "segment_index": 2, "prompt": "AI 生成的第 2 段提示词主体" }
+    { "segment_index": 1, "prompt": "AI 生成的第 1 段可编辑部分", "start_s": 0, "end_s": 8 },
+    { "segment_index": 2, "prompt": "AI 生成的第 2 段可编辑部分", "start_s": 8.5, "end_s": 16 }
   ]
 }
 ```
+
+`start_s`/`end_s` 是该段在原视频中的时间区间（秒），用于界面标注；历史任务剥离路径拿不到时间时两个字段为 `null`，接入方应回退为仅显示 `segment_index`。
 
 `succeeded` 时返回冻结的已确认主体（只读语义；不支持修改已完成任务并重跑）。`segments` 可能为空数组：历史任务没有可剥离的冻结主体时返回空，绝不展示注入内容。
 

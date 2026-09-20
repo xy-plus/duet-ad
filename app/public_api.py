@@ -224,6 +224,8 @@ class ConfirmQuote(BaseModel):
 class PromptReviewSegment(BaseModel):
     segment_index: int
     prompt: str
+    start_s: float | None = None
+    end_s: float | None = None
 
 
 class PromptReview(BaseModel):

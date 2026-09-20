@@ -1222,6 +1222,22 @@ function videoSection(detail, file, title, sub) {
   return sec;
 }
 
+/* 分段区间标注：秒数保留 1 位小数，整数不显示小数点；缺时间为 null 时回退。 */
+function formatSegmentSecond(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function segmentOptionLabel(segment) {
+  const start = segment && segment.start_s;
+  const end = segment && segment.end_s;
+  const hasRange = typeof start === "number" && Number.isFinite(start)
+    && typeof end === "number" && Number.isFinite(end);
+  return "分段 " + segment.segment_index
+    + (hasRange
+      ? `（${formatSegmentSecond(start)}s ~ ${formatSegmentSecond(end)}s）`
+      : "");
+}
+
 /* 提示词审核面板：下拉切换分段、共用单编辑框；切换分段时未确认的编辑在
    内存暂存，切回来不丢。awaiting_prompt_review 时可编辑 + 确认继续；
    succeeded 时只读展示冻结主体（注入部分由后端机械拼接，不展示）。 */
@@ -1262,7 +1278,7 @@ function promptReviewSection(detail, editable) {
     const switcher = el("select", "prompt-review-switcher");
     switcher.setAttribute("aria-label", "选择分段");
     for (const segment of segments) {
-      const option = el("option", null, "分段 " + segment.segment_index);
+      const option = el("option", null, segmentOptionLabel(segment));
       option.value = String(segment.segment_index);
       switcher.appendChild(option);
     }
@@ -2346,6 +2362,7 @@ if (typeof module !== "undefined" && module.exports) {
     resumeFailedProject,
     runSingleFlightPollCycle,
     safeErrorSummary,
+    segmentOptionLabel,
     setComposerExpanded,
     shortId,
     shouldPollDetail,
