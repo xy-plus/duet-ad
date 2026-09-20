@@ -7361,7 +7361,7 @@ def test_h3_segment_masks_replaced_objects_and_faces_in_one_sam_node(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["the red scarf around the neck", "human", "human face", "human hair", "human head"],
+        ["the red scarf around the neck", "person", "hair"],
     )]
     output = json.loads(
         (
@@ -7495,7 +7495,7 @@ def test_h3_segment_object_mask_targets_use_the_detect_label(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["scarf", "human", "human face", "human hair", "human head"],
+        ["scarf", "person", "hair"],
     )]
 
 
@@ -7526,7 +7526,7 @@ def test_h3_segment_with_only_a_replaced_person_masks_its_face(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["human", "human face", "human hair", "human head"],
+        ["person", "hair"],
     )]
 
 
@@ -7705,7 +7705,7 @@ def test_h3_object_mask_node_collects_detect_artifacts(
     )
 
     targets = [call[2] for call in object_calls][0]
-    assert targets == ["the red scarf around the neck", "the leather wallet", "human", "human face", "human hair", "human head"]
+    assert targets == ["the red scarf around the neck", "the leather wallet", "person", "hair"]
     attempt = (
         project / "logs" / "mask-replaceable-objects" / "segment-0001"
         / "attempt-1"

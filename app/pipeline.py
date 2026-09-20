@@ -5932,10 +5932,11 @@ class Pipeline:
                 # whole person plus hair are masked together with the face:
                 # hair and clothing carry identity, and leaving them visible
                 # let H3 copy the source look and visually undo the face
-                # replacement (2026-09-20 化妆品段2).
-                object_targets.extend(
-                    ["human", "human face", "human hair", "human head"]
-                )
+                # replacement (2026-09-20 化妆品段2).  Wording calibrated by
+                # real WaveSpeed calls: "person, hair" detects; "human",
+                # "human face", "human hair", "human head" all return zero
+                # (data-verify/wavespeed-calib-20260919 round3).
+                object_targets.extend(["person", "hair"])
             if object_targets and not self.settings.object_mask_enabled:
                 # OBJECT_MASK_ENABLED=false（检测后端不可用期间临时整体关闭：
                 # 2026-09-19 fal 账号被锁、sandbase worker 连续超时，wavespeed
