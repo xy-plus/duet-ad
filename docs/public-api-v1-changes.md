@@ -1,5 +1,37 @@
 # 对外 API v1 客户快速迁移指南与差异清单
 
+## 提示词审核（2026-09-21，合同版本 1.4.0）
+
+本次新增可选提示词审核开关 `prompt_review`，默认 `false`（直通，行为与之前完全一致），旧调用无需修改。开启后任务在付费生成前暂停，由接入方审核/编辑 AI 生成的提示词主体并确认后继续。
+
+| 位置 | 客户适配 |
+|---|---|
+| `POST /api/v1/video-generations` 与 `POST .../quotes` | 需要审核时添加 multipart 文本字段 `prompt_review=true`；省略或 `false` 即保持原直通行为 |
+| `GET /api/v1/video-generations/{job_id}` | `status` 枚举新增 `awaiting_prompt_review`（非终态；不确认则任务静止，不发生后续付费生成） |
+| `GET /api/v1/video-generations/{job_id}/prompt-review` | 新增：读取每段可编辑的提示词主体；仅 `awaiting_prompt_review` 与 `succeeded`（只读展示）可读，其余状态 `409 prompt_review_not_available` |
+| `POST /api/v1/video-generations/{job_id}/prompt-review/confirm` | 新增：JSON `{"segments":[{"segment_index":1,"prompt":"..."}]}`，段集合须与读取结果一致、每段非空；成功 `202` 回到 `queued` 继续生成；非审核暂停状态 `409 prompt_review_not_pending` |
+
+最小审核示例：
+
+```bash
+# 1. 创建（或报价）时开启审核
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Idempotency-Key: review_order_20260921_000001' \
+  --form 'source_video_url=https://media.example.com/source.mp4' \
+  --form 'prompt_review=true'
+
+# 2. 轮询任务直到 status == awaiting_prompt_review，然后读取提示词主体
+curl 'https://8.166.140.227:3211/api/v1/video-generations/vg_xxx/prompt-review' \
+  --header 'Authorization: Bearer YOUR_API_KEY'
+
+# 3. 编辑后确认继续
+curl --request POST 'https://8.166.140.227:3211/api/v1/video-generations/vg_xxx/prompt-review/confirm' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data '{"segments":[{"segment_index":1,"prompt":"编辑后的第 1 段主体"}]}'
+```
+
 ## 内部管线更新（2026-09-16，合同版本保持 1.3.0）
 
 本次部署只更新服务端内部生成管线（人脸与物品统一检测遮盖、网络错误自动重试、出口链路代理），接口路径、请求字段、响应结构、错误码、幂等与计费规则全部不变；客户无需任何适配，1.3.0 合同继续有效。

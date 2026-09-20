@@ -233,6 +233,7 @@ function buildMinimalGenerationRequest(input, capability) {
       image_field: normalized.replacement_image_field,
     } : null,
     add_subtitles: !!(input && input.addSubtitles === true),
+    prompt_review: !!(input && input.promptReview === true),
   };
 }
 
@@ -552,12 +553,13 @@ function projectPhaseLabel(detail) {
 function projectProgressModel(detail, nowMs = Date.now()) {
   const value = detail || {};
   const authoritative = value.project_progress;
-  const allowedStates = ["queued", "running", "succeeded", "failed"];
+  const allowedStates = ["queued", "running", "succeeded", "failed", "awaiting_prompt_review"];
   const coherentProgress = authoritative && (
     (authoritative.status === "queued" && authoritative.percent === 0)
     || (authoritative.status === "running" && authoritative.percent >= 1 && authoritative.percent <= 99)
     || (authoritative.status === "succeeded" && authoritative.percent === 100)
     || (authoritative.status === "failed" && authoritative.percent >= 0 && authoritative.percent <= 99)
+    || (authoritative.status === "awaiting_prompt_review" && authoritative.percent >= 1 && authoritative.percent <= 99)
   );
   const progress = authoritative && Number.isInteger(authoritative.percent)
       && authoritative.percent >= 0 && authoritative.percent <= 100
@@ -574,6 +576,7 @@ function projectProgressModel(detail, nowMs = Date.now()) {
     };
 
   const terminal = ["succeeded", "failed"].includes(progress.state);
+  const waiting = progress.state === "awaiting_prompt_review";
   const elapsed = terminal && !value.updated_at
     ? "未知"
     : formatElapsed(value.created_at, terminal ? value.updated_at : null, nowMs)
@@ -585,8 +588,9 @@ function projectProgressModel(detail, nowMs = Date.now()) {
     elapsed,
     phase: progress.state === "succeeded" ? "视频生成完成"
       : progress.state === "failed" ? "视频生成未完成"
-        : projectPhaseLabel(value),
-    loading: !terminal,
+        : waiting ? "等待你审核提示词"
+          : projectPhaseLabel(value),
+    loading: !terminal && !waiting,
   };
 }
 
@@ -943,6 +947,7 @@ function conversationBadge(conversation) {
     }
     if (progress.state === "failed") return { className: "failed", text: "生成失败" };
     if (progress.state === "running") return { className: "processing", text: "生成中" };
+    if (progress.state === "awaiting_prompt_review") return { className: "processing", text: "待审核提示词" };
     return { className: "queued", text: "排队中" };
   }
   const navigationBadges = {
@@ -1217,9 +1222,88 @@ function videoSection(detail, file, title, sub) {
   return sec;
 }
 
+/* 提示词审核区块：awaiting_prompt_review 时可编辑 + 确认继续；
+   succeeded 时只读展示冻结的 DS 提示词主体（注入部分由后端机械拼接，不展示）。 */
+function promptReviewSection(detail, editable) {
+  const sec = el("section", "res-section prompt-review-section");
+  const h = el("h3", "res-h3", "生成提示词");
+  h.appendChild(el("span", "res-count", editable ? "审核编辑后确认继续" : "已冻结 · 只读"));
+  sec.appendChild(h);
+  const list = el("div", "prompt-review-list");
+  list.appendChild(el("p", "prompt-review-tip", "正在加载提示词…"));
+  sec.appendChild(list);
+  apiJSON("/api/conversations/" + detail.id + "/prompt-review").then((data) => {
+    const segments = data && Array.isArray(data.segments) ? data.segments : [];
+    list.textContent = "";
+    if (!segments.length) {
+      // 历史项目剥不出注入边界时后端返回空：审核态给提示，只读态整块隐藏。
+      if (editable) {
+        list.appendChild(el("p", "prompt-review-tip", "提示词尚未就绪，请稍后刷新页面"));
+      } else {
+        sec.remove();
+      }
+      return;
+    }
+    if (editable) {
+      list.appendChild(el("p", "prompt-review-tip",
+        "以下只有 AI 生成的提示词主体可编辑；编辑框架、遮盖条款等注入部分由后端自动拼接，不展示也不可改。"));
+    }
+    const editors = [];
+    for (const segment of segments) {
+      const block = el("div", "prompt-review-segment");
+      block.appendChild(el("div", "prompt-review-segment-title", "分段 " + segment.segment_index));
+      const textarea = el("textarea", "setup-textarea prompt-review-textarea");
+      textarea.value = String(segment.prompt || "");
+      textarea.readOnly = !editable;
+      textarea.rows = 8;
+      textarea.spellcheck = false;
+      block.appendChild(textarea);
+      list.appendChild(block);
+      editors.push({ index: segment.segment_index, textarea });
+    }
+    if (!editable) return;
+    const errorBox = el("p", "inline-error");
+    errorBox.hidden = true;
+    errorBox.setAttribute("role", "alert");
+    const confirm = el("button", "btn btn-primary", "确认并继续生成");
+    confirm.type = "button";
+    confirm.addEventListener("click", async () => {
+      confirm.disabled = true;
+      errorBox.hidden = true;
+      try {
+        await apiJSON("/api/conversations/" + detail.id + "/prompt-review/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            segments: editors.map((editor) => ({
+              segment_index: editor.index,
+              prompt: editor.textarea.value,
+            })),
+          }),
+        });
+        await loadDetail(detail.id, true);
+      } catch (err) {
+        if (handleAuthError(err)) return;
+        showActionError(err, errorBox, [confirm]);
+      }
+    });
+    list.appendChild(errorBox);
+    list.appendChild(confirm);
+  }).catch(() => {
+    if (editable) {
+      list.textContent = "";
+      list.appendChild(el("p", "prompt-review-tip", "提示词加载失败，请刷新页面重试"));
+    } else {
+      sec.remove();
+    }
+  });
+  return sec;
+}
+
 function renderResults(detail) {
   const frag = document.createDocumentFragment();
   if (detail.has_video === true) {
+    frag.appendChild(promptReviewSection(detail, false));
     frag.appendChild(videoSection(detail, "generated.mp4", "新视频", "已完成"));
   }
   return frag;
@@ -1270,6 +1354,8 @@ function renderStable(detail) {
   const progress = projectProgressModel(detail);
   if (progress.state === "failed") {
     inner.appendChild(renderFail(detail));
+  } else if (progress.state === "awaiting_prompt_review") {
+    inner.appendChild(promptReviewSection(detail, true));
   } else if (progress.state === "succeeded" && detail.has_video === true) {
     inner.appendChild(renderResults(detail));
   }
@@ -1872,6 +1958,7 @@ function applyProjectComposer(detail) {
 
 function resetComposerForNewProject() {
   $("add-subtitles").checked = false;
+  $("auto-continue").checked = true;
   state.viewingSubmittedConfig = false;
   state.file = null;
   $("file-input").value = "";
@@ -1996,6 +2083,7 @@ async function handleSend(event) {
       replacementImageCount: state.replacementImages.length,
       replacementInstruction: $("replacement-instruction").value,
       addSubtitles: $("add-subtitles").checked,
+      promptReview: !$("auto-continue").checked,
     }, capability);
   } catch (err) {
     setComposerError(err.message);

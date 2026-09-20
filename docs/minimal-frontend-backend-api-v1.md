@@ -89,7 +89,12 @@
 }
 ```
 
-`generation_request.version` 必须严格等于整数 `1`；其公开结构由上例中的 `output`、`processing`、`dialogue` 和 `replacement_guidance` 定义。
+`generation_request.version` 必须严格等于整数 `1`；其公开结构由上例中的 `output`、`processing`、`dialogue` 和 `replacement_guidance` 定义，另有三个可选布尔开关：`add_subtitles`（成片叠加字幕）与 `prompt_review`（提示词审核，见第 4.1 节），缺省均为 `false`。
+
+### 提示词审核开关（prompt_review）
+
+- `prompt_review: false`（缺省）：现有链路直通，进入 H3 生成前不停顿。
+- `prompt_review: true`：后端在冻结 H3 前置产物后、任何付费提交前暂停，项目进入 `awaiting_prompt_review` 状态，等待用户审核/编辑提示词并确认后继续（见第 4.1 节）。
 
 `dialogue` 只接受两种封闭形态：
 
@@ -200,10 +205,43 @@
 ```
 
 - `percent`：整数 `0..100`。
-- `status`：`queued | running | succeeded | failed`。
-- `queued=0`，`running=1..99`，最终视频可读取后才允许 `succeeded=100`。
+- `status`：`queued | running | awaiting_prompt_review | succeeded | failed`。
+- `queued=0`，`running=1..99`，`awaiting_prompt_review=1..99`，最终视频可读取后才允许 `succeeded=100`。
+- `awaiting_prompt_review` 只在创建时显式传 `prompt_review: true` 出现：H3 前置产物已冻结、尚未发生任何付费提交，项目静止等待确认；后端重启不会自动恢复它，只能由 confirm 接口继续。
 - 不返回内部阶段或分段进度。
 - 成片可用时 `has_video=true`，成片读取接口固定为 `GET /api/conversations/{id}/files/generated.mp4`。
+
+## 4.1 提示词审核/编辑
+
+`prompt_review: true` 的项目进入 `awaiting_prompt_review` 后，用下面两个内部接口完成审核。只展示 DeepSeek 生成的提示词主体（body）；后端机械注入的部分（编辑框架、遮盖条款、PERSON REPLACEMENT 块、Overlay removal、Dialogue requirements 尾部）一律不展示、不可编辑，confirm 时由后端用冻结的原文重新机械拼接。
+
+`GET /api/conversations/{id}/prompt-review`：
+
+```json
+{
+  "status": "awaiting_prompt_review",
+  "segments": [
+    { "segment_index": 1, "prompt": "DeepSeek 生成的第 1 段提示词主体" }
+  ]
+}
+```
+
+任何状态都可读：`awaiting_prompt_review` 时供编辑回填；`succeeded`/`failed` 时展示冻结主体（只读语义，前端在已完成项目里把每段主体渲染为只读编辑框）。历史项目没有冻结的审核记录时，后端从冻结的 `h3_prompt.txt` best-effort 剥离主体；剥不出来就返回空 `segments`，绝不展示注入内容。
+
+`POST /api/conversations/{id}/prompt-review/confirm`（确认并继续）：
+
+```json
+{
+  "segments": [
+    { "segment_index": 1, "prompt": "用户编辑后的第 1 段主体" }
+  ]
+}
+```
+
+- 仅 `awaiting_prompt_review` 状态可确认，否则 `409 prompt_review_not_pending`。
+- `segments` 的段集合必须与冻结记录完全一致；每段 `prompt` 非空；重建后的完整提示词不超过长度限制，否则 `422 invalid_prompt_review_edit`。
+- 确认成功返回 `202`：后端重建 `prefix + 编辑后主体 + suffix` 写回各段冻结提示词、重算冻结清单回执，项目回到 `queued` 并走 resume-picsart 等价路径继续生成。
+- 不确认就永远不会发生付费提交；放弃项目无需任何操作。
 
 ## 5. 最小错误合同
 

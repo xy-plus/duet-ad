@@ -344,6 +344,7 @@ def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
         },
         "replacement_guidance": None,
         "add_subtitles": False,
+        "prompt_review": False,
     }
     same_request = json.loads(json.dumps(request))
     same_request["dialogue"]["target_language"] = "与原视频相同"
@@ -398,6 +399,40 @@ def test_subtitle_toggle_is_sent_in_actual_multipart_and_restored():
     assert 'addSubtitles: $("add-subtitles").checked' in source
     assert '$("add-subtitles").checked = false' in _function_source(source, "resetComposerForNewProject")
     assert '$("add-subtitles").checked' not in _function_source(source, "loadMinimalCreationCapability")
+
+
+def test_prompt_review_toggle_defaults_to_straight_through_and_maps_inverted():
+    source = APP_JS.read_text(encoding="utf-8")
+    result = _run_contract(
+        "(()=>{const capability=" + json.dumps(_capability()) + ";"
+        "const base={aspectRatio:'9:16',resolution:'480p',targetLanguage:'日语'};"
+        "return [false,true].map((promptReview)=>"
+        "contract.buildMinimalGenerationRequest({...base,promptReview},capability).prompt_review);})()"
+    )
+    assert result == [False, True]
+    attrs = _tag_attrs(INDEX_HTML.read_text(encoding="utf-8"), "input", "auto-continue")
+    # 开关默认打开 = 直通（prompt_review=false）；关闭 = 暂停审核。
+    assert 'type="checkbox"' in attrs and "checked" in attrs
+    assert 'promptReview: !$("auto-continue").checked' in source
+    assert '$("auto-continue").checked = true' in _function_source(source, "resetComposerForNewProject")
+
+
+def test_prompt_review_ui_states_are_wired():
+    source = APP_JS.read_text(encoding="utf-8")
+    progress = _function_source(source, "projectProgressModel")
+    assert '"awaiting_prompt_review"' in progress
+    assert "等待你审核提示词" in progress
+    badge = _function_source(source, "conversationBadge")
+    assert "awaiting_prompt_review" in badge
+    stable = _function_source(source, "renderStable")
+    assert 'progress.state === "awaiting_prompt_review"' in stable
+    assert "promptReviewSection(detail, true)" in stable
+    results = _function_source(source, "renderResults")
+    assert "promptReviewSection(detail, false)" in results
+    review = _function_source(source, "promptReviewSection")
+    assert '"/prompt-review"' in review
+    assert '"/prompt-review/confirm"' in review
+    assert "确认并继续生成" in review
 
 
 def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair():
@@ -663,8 +698,10 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
     mounted_results = re.findall(
         r"frag\.appendChild\((.*?)\);", results_renderer, flags=re.DOTALL
     )
+    # 冻结提示词只读区块挂在最终视频上方；剥不出内容时它自己移除。
     assert mounted_results == [
-        'videoSection(detail, "generated.mp4", "新视频", "已完成")'
+        "promptReviewSection(detail, false)",
+        'videoSection(detail, "generated.mp4", "新视频", "已完成")',
     ]
     assert results_renderer.count("videoSection(") == 1
 

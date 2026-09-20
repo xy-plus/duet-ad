@@ -62,6 +62,8 @@ from app.seedream import (
     reset_attempt as _seedream_reset_attempt,
 )
 from app.research_log import ResearchLog
+from app import prompt_review
+from app.prompt_review import PromptReviewError
 from app.store import ProjectStore, replacement_input_paths
 from app.video_maker_schemas import (
     VISUAL_PROMPT_SCHEMA,
@@ -2286,6 +2288,26 @@ class Pipeline:
             },
         )
 
+    @staticmethod
+    def _write_prompt_review(
+        project: Path,
+        h3_inputs: list[tuple[dict[str, Any], str, Path, str]],
+    ) -> None:
+        """落盘每段提示词的三段结构（直通项目也落，供完成后只读展示）。
+
+        替换掉 _prepare_h3_segment 的测试替身不产出 prompt_parts，此时跳过
+        落盘；生产路径的真实 _prepare_h3_segment 永远带齐三段。
+        """
+        segments: list[dict[str, Any]] = []
+        for item, _final_prompt, _muted, _fusion_input_sha256 in sorted(
+            h3_inputs, key=lambda value: int(value[0]["index"])
+        ):
+            parts = item.get("prompt_parts")
+            if not isinstance(parts, dict):
+                return
+            segments.append({"segment_index": int(item["index"]), **parts})
+        prompt_review.write_review(project, segments)
+
     def _run_h3_segments(
         self,
         project_id: str,
@@ -2297,8 +2319,12 @@ class Pipeline:
         replacement_sheet_path: Path | None,
         request: dict[str, Any],
         log: ResearchLog,
-    ) -> list[Path]:
-        """Cross both free-work barriers before scheduling any paid submit."""
+    ) -> list[Path] | None:
+        """Cross both free-work barriers before scheduling any paid submit.
+
+        Returns None when the prompt-review switch paused the run after the
+        freeze: callers must stop before stitching; the confirm endpoint
+        continues via the resume-picsart equivalent path."""
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, len(prepared)),
         ) as pool:
@@ -2323,6 +2349,34 @@ class Pipeline:
                 replacement_sheet=replacement_sheet,
                 request=request,
             )
+            self._write_prompt_review(project, h3_inputs)
+            if (
+                self._validated_effective_request(request).get("prompt_review")
+                is True
+            ):
+                # 提示词审核开关：冻结后、任何付费提交前暂停。 confirm 走
+                # resume-picsart 等价入口逐字重放重建后的 h3_prompt.txt。
+                log.event(
+                    "prompt_review_awaiting",
+                    segments=[
+                        int(item["index"]) for item, *_rest in h3_inputs
+                    ],
+                )
+                self.store.update(
+                    project_id,
+                    status="awaiting_prompt_review",
+                    project_progress={
+                        "status": "awaiting_prompt_review",
+                        "percent": 57,
+                        "stage": "awaiting_prompt_review",
+                    },
+                    generation={
+                        "status": "awaiting_prompt_review",
+                        "stage": "awaiting_prompt_review",
+                        "error": None,
+                    },
+                )
+                return None
             preflight_futures = [
                 pool.submit(
                     self._prepare_picsart_segment,
@@ -2601,6 +2655,9 @@ class Pipeline:
             request,
             log,
         )
+        if outputs is None:
+            # 提示词审核暂停：产物已冻结，confirm 后走 resume-picsart 继续。
+            return
 
         final = project / "output" / "generated.mp4"
         join_modes = self._validated_join_modes(prepared)
@@ -4562,6 +4619,10 @@ class Pipeline:
                 request,
                 log,
             )
+            if outputs is None:
+                # 提示词审核暂停：重新准备的产物已冻结，confirm 后继续。
+                log.event("h3_prep_resume_paused_for_prompt_review")
+                return
 
             final = project / "output" / "generated.mp4"
             join_modes = self._validated_join_modes(prepared)
@@ -4633,6 +4694,136 @@ class Pipeline:
                     },
                 },
             )
+
+    def confirm_prompt_review(
+        self, project_id: str, edits: list[dict[str, Any]],
+    ) -> None:
+        """确认审核后的提示词主体：重建 h3_prompt.txt 并重算冻结清单回执。
+
+        只校验、不写状态；状态迁移（queued + picsart_resume_queued）与续跑
+        调度由调用方在确认成功后完成（resume-picsart 等价入口逐字重放
+        h3_prompt.txt）。先全量校验再落盘，任何一段非法都不动文件。
+        """
+        project = self.store.path(project_id)
+        state = self.store.read(project_id)
+        if state.get("status") != "awaiting_prompt_review":
+            raise PromptReviewError(
+                "prompt_review_not_pending", "项目不在等待提示词审核状态"
+            )
+        review = prompt_review.read_review(project)
+        if review is None:
+            raise PromptReviewError(
+                "prompt_review_unavailable", "冻结的提示词审核记录不可用"
+            )
+        frozen = {
+            segment["segment_index"]: segment for segment in review["segments"]
+        }
+        if not isinstance(edits, list) or not edits:
+            raise PromptReviewError(
+                "invalid_prompt_review_edit", "segments 必须是非空数组"
+            )
+        normalized: dict[int, str] = {}
+        for edit in edits:
+            if not isinstance(edit, dict) or set(edit) != {"segment_index", "prompt"}:
+                raise PromptReviewError(
+                    "invalid_prompt_review_edit",
+                    "每段只能包含 segment_index 与 prompt",
+                )
+            index = edit["segment_index"]
+            body = edit["prompt"]
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise PromptReviewError(
+                    "invalid_prompt_review_edit", "segment_index 必须是整数"
+                )
+            if not isinstance(body, str) or not body.strip():
+                raise PromptReviewError(
+                    "invalid_prompt_review_edit", "提示词主体不能为空"
+                )
+            if index in normalized:
+                raise PromptReviewError(
+                    "invalid_prompt_review_edit", "segment_index 不能重复"
+                )
+            normalized[index] = body
+        if set(normalized) != set(frozen):
+            raise PromptReviewError(
+                "invalid_prompt_review_edit", "段集合必须与冻结的审核记录一致"
+            )
+        manifest = state.get("h3_prepared_artifacts")
+        manifest_segments = (
+            manifest.get("segments") if isinstance(manifest, dict) else None
+        )
+        if (
+            not isinstance(manifest_segments, dict)
+            or set(manifest_segments) != {str(index) for index in frozen}
+            or not all(
+                isinstance(value, dict) for value in manifest_segments.values()
+            )
+        ):
+            raise PromptReviewError(
+                "prompt_review_unavailable", "冻结的 H3 产物清单不可用"
+            )
+        rebuilt: dict[int, str] = {}
+        for index in sorted(frozen):
+            segment = frozen[index]
+            prompt_path = (
+                project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
+            )
+            try:
+                current = prompt_path.read_text(encoding="utf-8")
+            except OSError:
+                raise PromptReviewError(
+                    "prompt_review_unavailable", "冻结的 H3 提示词文件不可用"
+                ) from None
+            prefix, body, suffix = (
+                segment["prefix"], segment["body"], segment["suffix"],
+            )
+            if current != prefix + body + suffix:
+                # 冻结提示词与审核记录不一致（例如并发重备）：拒绝覆盖。
+                raise PromptReviewError(
+                    "prompt_review_stale", "冻结提示词已变化，请重新审核"
+                )
+            final = prefix + normalized[index] + suffix
+            stripped = final.strip()
+            if not stripped or len(stripped) > PICSART_PROMPT_MAX_CHARS:
+                raise PromptReviewError(
+                    "invalid_prompt_review_edit",
+                    f"分段 {index} 重建后的提示词为空或超过长度限制",
+                )
+            rebuilt[index] = final
+        for index in sorted(rebuilt):
+            prompt_path = (
+                project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
+            )
+            prompt_path.write_text(rebuilt[index], encoding="utf-8")
+            manifest_segments[str(index)]["prompt"] = (
+                self._project_artifact_receipt(
+                    project,
+                    prompt_path,
+                    f"work/segments/{index:04d}/h3_prompt.txt",
+                )
+            )
+        self.store.update(project_id, h3_prepared_artifacts=manifest)
+        prompt_review.write_review(
+            project,
+            [
+                {
+                    "segment_index": index,
+                    "prefix": frozen[index]["prefix"],
+                    "body": normalized[index],
+                    "suffix": frozen[index]["suffix"],
+                }
+                for index in sorted(frozen)
+            ],
+        )
+        ResearchLog(project).event(
+            "prompt_review_confirmed",
+            segments=sorted(rebuilt),
+            edited=[
+                index
+                for index in sorted(rebuilt)
+                if normalized[index] != frozen[index]["body"]
+            ],
+        )
 
     def validate_r2v_resume(self, project_id: str) -> None:
         self._load_r2v_resume(project_id)
@@ -6196,7 +6387,11 @@ class Pipeline:
                 f"[{line['start_s']:.3f}-{line['end_s']:.3f}s] {line['text']}"
                 for line in item["dialogue"]
             )
-            final_prompt = editing_block + mask_block + face_block + prompt + overlay_block + (
+            # 三段结构：prefix/suffix 是后端机械注入（用户不可见不可编辑），
+            # body 是 DeepSeek fusion 主体（提示词审核的唯一可编辑部分）。
+            # final_prompt 由三段拼接而成，与历史组装逐字节一致。
+            prompt_prefix = editing_block + mask_block + face_block
+            prompt_suffix = overlay_block + (
                 "\n\nDialogue requirements: Audio 1 is this segment's "
                 "pre-recorded dialogue speech track in the target language. "
                 "Every speaking person must lip-sync precisely to Audio 1: "
@@ -6208,6 +6403,12 @@ class Pipeline:
                 if dialogue
                 else "\n\nDo not add captions, subtitles, or new dialogue."
             )
+            final_prompt = prompt_prefix + prompt + prompt_suffix
+            item["prompt_parts"] = {
+                "prefix": prompt_prefix,
+                "body": prompt,
+                "suffix": prompt_suffix,
+            }
             (segment_dir / "h3_prompt.txt").write_text(
                 final_prompt, encoding="utf-8",
             )

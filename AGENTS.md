@@ -23,6 +23,8 @@
 
 只有续跑门禁明确拒绝且无法对账时，才新建项目重跑。
 
+提示词审核状态 `awaiting_prompt_review`（创建时 `prompt_review=true` 的项目在 H3 冻结后暂停）不参与 auto-resume：重启后原样保留，只能由 `POST /api/conversations/{id}/prompt-review/confirm`（对外 v1 为 `/api/v1/video-generations/{id}/prompt-review/confirm`）确认后继续，确认等价走 resume-picsart 路径。
+
 ## 部署
 
 - 共享 venv 在 `/home/xy/duet-ad1/.venv`（历史路径，duet-ad1 目录已删但 venv 保留）：全部后端（3212/3222/3242/3302）的 run-backend 脚本都 exec 这里的 uvicorn，删除会导致所有后端重启即死。

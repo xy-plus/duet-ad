@@ -15,7 +15,13 @@ from typing import Any
 
 PROJECT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-PUBLIC_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
+# awaiting_prompt_review：创建时打开提示词审核开关的项目在 H3 冻结后暂停、
+# 等待用户确认提示词。它不是 queued/running，重启恢复
+# （fail_incomplete_after_restart/auto-resume）天然不动它，只能由
+# prompt-review/confirm 显式继续（等价 resume-picsart 入口）。
+PUBLIC_STATUSES = frozenset(
+    {"queued", "running", "succeeded", "failed", "awaiting_prompt_review"}
+)
 PROJECT_STATE_SCHEMA = "duet.project-state"
 PROJECT_STATE_VERSION = 1
 IDEMPOTENCY_INDEX_VERSION = 1
@@ -39,11 +45,13 @@ class IdempotencyIndexUnavailable(RuntimeError):
 
 
 def generation_request_sha256(value: Any) -> str:
-    """The optional off switch preserves the fingerprint of legacy requests."""
+    """The optional off switches preserve the fingerprint of legacy requests."""
     if isinstance(value, dict):
         value = dict(value)
         if value.get("add_subtitles") is False:
             value.pop("add_subtitles")
+        if value.get("prompt_review") is False:
+            value.pop("prompt_review")
     return canonical_json_sha256(value)
 
 

@@ -27,6 +27,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
 from app.pipeline import SAME_AS_SOURCE_LANGUAGE, Pipeline
+from app import prompt_review as prompt_review_store
+from app.prompt_review import PromptReviewError
 from app.research_log import ResearchLog
 from app.safe_download import ReferenceDownloadError, Resolver, download_reference_url, resolve_addresses
 from app.store import (
@@ -252,7 +254,7 @@ def _parse_generation_request(
         <= set(value)
         <= {
             "version", "output", "processing", "dialogue", "replacement_guidance",
-            "add_subtitles",
+            "add_subtitles", "prompt_review",
         }
     ):
         raise _error(
@@ -265,6 +267,9 @@ def _parse_generation_request(
     add_subtitles = value.get("add_subtitles", False)
     if type(add_subtitles) is not bool:
         raise _error(422, "invalid_generation_request", "generation_request.add_subtitles 必须为布尔值")
+    prompt_review = value.get("prompt_review", False)
+    if type(prompt_review) is not bool:
+        raise _error(422, "invalid_generation_request", "generation_request.prompt_review 必须为布尔值")
 
     output = value["output"]
     if (
@@ -377,6 +382,7 @@ def _parse_generation_request(
         ),
         "replacement_guidance": normalized_guidance,
         "add_subtitles": add_subtitles,
+        "prompt_review": prompt_review,
         "fusion": {"agent": internal_fusion_agent},
     }
 
@@ -575,7 +581,9 @@ def create_app(
         try:
             getattr(app.state.pipeline, operation)(project_id)
             state = app.state.store.read(project_id)
-            if state["status"] not in {"succeeded", "failed"}:
+            if state["status"] not in {
+                "succeeded", "failed", "awaiting_prompt_review",
+            }:
                 app.state.store.mark_failed(
                     project_id,
                     code="pipeline_incomplete",
@@ -1104,6 +1112,81 @@ def create_app(
         task.add_done_callback(app.state.tasks.discard)
         return state
 
+    def apply_prompt_review_confirmation(
+        project_id: str, segments: Any,
+    ) -> dict[str, Any]:
+        """确认审核后的提示词：重建冻结提示词并把项目排回 Picsart 提交队列。
+
+        内外两个 API 共用；抛 PromptReviewError（code 原样映射到各 API 的
+        错误码）。确认成功后由调用方调度 resume_r2v（须在事件循环上）。
+        """
+        with app.state.resume_lock:
+            app.state.pipeline.confirm_prompt_review(project_id, segments)
+            return app.state.store.update(
+                project_id,
+                status="queued",
+                has_video=False,
+                project_progress={
+                    "status": "queued",
+                    "percent": 0,
+                    "stage": "picsart_resume_queued",
+                },
+                generation={
+                    "status": "queued",
+                    "stage": "picsart_resume_queued",
+                    "error": None,
+                },
+                error=None,
+            )
+
+    @app.get(
+        "/api/conversations/{project_id}/prompt-review",
+        dependencies=[Depends(require_auth)],
+    )
+    async def prompt_review_read(project_id: str, request: Request):
+        store = _store(request)
+        state = _read_project(store, project_id)
+        segments = prompt_review_store.display_segments(
+            store.path(project_id), state,
+        )
+        return {"status": state.get("status"), "segments": segments}
+
+    @app.post(
+        "/api/conversations/{project_id}/prompt-review/confirm",
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    async def prompt_review_confirm(project_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict) or set(body) != {"segments"}:
+            raise _error(
+                400,
+                "invalid_prompt_review_edit",
+                '请求体必须是 {"segments":[{"segment_index":N,"prompt":"..."}]}',
+            )
+        try:
+            state = apply_prompt_review_confirmation(
+                project_id, body["segments"],
+            )
+        except PromptReviewError as exc:
+            status = 409 if exc.code in {
+                "prompt_review_not_pending",
+                "prompt_review_unavailable",
+                "prompt_review_stale",
+            } else 422
+            raise _error(status, exc.code, exc.message) from None
+        except (FileNotFoundError, OSError):
+            raise _error(404, "conversation_not_found", "会话不存在") from None
+        task = asyncio.create_task(
+            asyncio.to_thread(pipeline_entry, project_id, "resume_r2v")
+        )
+        app.state.tasks.add(task)
+        task.add_done_callback(app.state.tasks.discard)
+        return state
+
     @app.get("/api/conversations/{project_id}/creation-input/replacement-image", dependencies=[Depends(require_auth)])
     async def replacement(project_id: str, request: Request):
         store = _store(request)
@@ -1213,6 +1296,7 @@ def create_app(
             start_pipeline=start_pipeline,
             valid_generated_video=valid_generated_video,
             progress_for=progress_for,
+            apply_prompt_review_confirmation=apply_prompt_review_confirmation,
         )
 
     web = Path(__file__).resolve().parents[1] / "web"

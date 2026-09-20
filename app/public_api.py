@@ -39,14 +39,16 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError, field_validator
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
 from app import media, public_api_auth, public_artifacts, public_credits, public_quotes
+from app import prompt_review as prompt_review_store
 from app.config import Settings
+from app.prompt_review import PromptReviewError
 from app.main import (
     DIALOGUE_BRIEF_MAX_CHARS,
     REPLACEMENT_INSTRUCTION_MAX_CHARS,
@@ -88,6 +90,7 @@ _CREATE_FIELDS = {
     "dialogue_mode",
     "dialogue_brief",
     "add_subtitles",
+    "prompt_review",
 }
 _STRICT_LIMIT_RE = re.compile(r"^(?:[1-9]|[1-9][0-9]|100)$")
 _UNKNOWN_SUBMISSION_STATUSES = frozenset({"submission_started", "unknown"})
@@ -180,7 +183,10 @@ class JobError(BaseModel):
 
 class Job(BaseModel):
     id: str
-    status: Literal["queued", "running", "succeeded", "failed", "submission_unknown"]
+    status: Literal[
+        "queued", "running", "succeeded", "failed",
+        "submission_unknown", "awaiting_prompt_review",
+    ]
     progress: Progress
     parameters: Parameters
     billing: Billing
@@ -213,6 +219,27 @@ class ConfirmQuote(BaseModel):
         if value is not True:
             raise ValueError("confirm must be true")
         return value
+
+
+class PromptReviewSegment(BaseModel):
+    segment_index: int
+    prompt: str
+
+
+class PromptReview(BaseModel):
+    status: Literal["awaiting_prompt_review", "succeeded"]
+    segments: list[PromptReviewSegment]
+
+
+class PromptReviewConfirmSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    segment_index: StrictInt
+    prompt: str = Field(min_length=1)
+
+
+class PromptReviewConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    segments: list[PromptReviewConfirmSegment] = Field(min_length=1)
 
 
 class CreditBalance(BaseModel):
@@ -513,6 +540,7 @@ def install(
     start_pipeline,
     valid_generated_video,
     progress_for,
+    apply_prompt_review_confirmation,
 ) -> None:
     """Install public-only routes.  Call only when explicitly enabled."""
 
@@ -762,6 +790,8 @@ def install(
                 status = "failed"
             elif meta.get("status") == "queued":
                 status = "queued"
+            elif meta.get("status") == "awaiting_prompt_review":
+                status = "awaiting_prompt_review"
             else:
                 status = "running"
         except public_artifacts.PublicArtifactError as exc:
@@ -864,6 +894,7 @@ def install(
                 "target_language": None,
                 "dialogue_mode": "auto_rewrite",
                 "add_subtitles": False,
+                "prompt_review": False,
             },
             allowed_output_combinations=[
                 {"aspect_ratio": aspect, "resolution": resolution}
@@ -938,6 +969,7 @@ def install(
         dialogue_mode: Annotated[str | None, Form()] = None,
         dialogue_brief: Annotated[str | None, Form()] = None,
         add_subtitles: Annotated[bool, Form()] = False,
+        prompt_review: Annotated[bool, Form()] = False,
     ):
         limiter.check(identity.owner_id, "create", 10)
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1033,6 +1065,7 @@ def install(
             ),
             "replacement_guidance": None if instruction is None else {"instruction": instruction, "image_field": "replacement_image"},
             "add_subtitles": add_subtitles,
+            "prompt_review": prompt_review,
         }
         is_quote = request.url.path.endswith("/quotes")
         idem_digest = _idempotency_digest(
@@ -1045,6 +1078,7 @@ def install(
             "dialogue_mode": mode,
             "dialogue_brief": brief,
             "add_subtitles": add_subtitles,
+            "prompt_review": prompt_review,
             "replacement_instruction": instruction,
             "source_kind": "upload" if source_video is not None else "url",
             "source_url": normalized_url,
@@ -1056,9 +1090,11 @@ def install(
             "replacement_image": replacement_image is not None,
             "add_subtitles": add_subtitles,
         }
-        # Preserve pre-subtitle idempotency hashes for the unchanged default.
+        # Preserve pre-feature idempotency hashes for the unchanged defaults.
         if not add_subtitles:
             descriptor.pop("add_subtitles")
+        if not prompt_review:
+            descriptor.pop("prompt_review")
         try:
             existing_quote = None
             if is_quote:
@@ -1321,8 +1357,115 @@ def install(
     ):
         limiter.check(identity.owner_id, "read", 120)
         job, _ = await run_in_threadpool(project, identity.owner_id, job_id)
-        if job.status in {"queued", "running", "submission_unknown"}:
+        if job.status in {"queued", "running", "submission_unknown", "awaiting_prompt_review"}:
             response.headers["Retry-After"] = str(job.poll_after_seconds)
+        return job
+
+    @router.get(
+        "/video-generations/{job_id}/prompt-review",
+        response_model=PromptReview,
+        dependencies=[Depends(no_query)],
+        responses={409: {"model": ErrorEnvelope}},
+    )
+    async def get_prompt_review(
+        job_id: str,
+        identity: public_api_auth.Principal = Depends(principal),
+    ):
+        limiter.check(identity.owner_id, "read", 120)
+
+        def read():
+            cid, meta = _load_owned(store, identity.owner_id, job_id)
+            status = meta.get("status")
+            if status not in {"awaiting_prompt_review", "succeeded"}:
+                raise PublicAPIError(
+                    409,
+                    "prompt_review_not_available",
+                    "仅等待提示词审核或已完成的任务可读取提示词",
+                )
+            segments = prompt_review_store.display_segments(
+                store.path(cid), meta,
+            )
+            return {"status": status, "segments": segments}
+
+        try:
+            return await run_in_threadpool(read)
+        except PublicAPIError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PublicAPIError(503, "job_state_invalid", "任务状态不可用") from None
+
+    @router.post(
+        "/video-generations/{job_id}/prompt-review/confirm",
+        response_model=Job,
+        status_code=202,
+        dependencies=[Depends(no_query)],
+        openapi_extra={"requestBody": {"required": True, "content": {
+            "application/json": {"schema": PromptReviewConfirm.model_json_schema()}}}},
+        responses={409: {"model": ErrorEnvelope}, 422: {"model": ErrorEnvelope}},
+    )
+    async def confirm_prompt_review(
+        job_id: str,
+        request: Request,
+        response: Response,
+        identity: public_api_auth.Principal = Depends(principal),
+    ):
+        limiter.check(identity.owner_id, "create", 10)
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise PublicAPIError(415, "unsupported_media_type", "确认请求必须使用 application/json")
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate field")
+                result[key] = value
+            return result
+
+        try:
+            raw_body = bytearray()
+            async for chunk in request.stream():
+                if len(raw_body) + len(chunk) > 1024 * 1024:
+                    raise ValueError("oversized confirmation")
+                raw_body.extend(chunk)
+            body = json.loads(raw_body, object_pairs_hook=unique_object)
+            confirmed = PromptReviewConfirm.model_validate(body)
+        except (ValueError, UnicodeDecodeError):
+            raise PublicAPIError(
+                422,
+                "invalid_prompt_review_edit",
+                '请求正文必须为 {"segments":[{"segment_index":N,"prompt":"..."}]}',
+            ) from None
+        edits = [segment.model_dump() for segment in confirmed.segments]
+
+        def confirm():
+            cid, meta = _load_owned(store, identity.owner_id, job_id)
+            if meta.get("status") != "awaiting_prompt_review":
+                raise PublicAPIError(
+                    409,
+                    "prompt_review_not_pending",
+                    "任务不在等待提示词审核状态",
+                )
+            apply_prompt_review_confirmation(cid, edits)
+            return cid
+
+        try:
+            project_id = await run_in_threadpool(confirm)
+        except PublicAPIError:
+            raise
+        except PromptReviewError as exc:
+            status = 409 if exc.code in {
+                "prompt_review_not_pending",
+                "prompt_review_unavailable",
+                "prompt_review_stale",
+            } else 422
+            raise PublicAPIError(status, exc.code, exc.message) from None
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PublicAPIError(503, "job_state_invalid", "任务状态不可用") from None
+        start_pipeline(project_id, "resume_r2v")
+        job, _ = await run_in_threadpool(project, identity.owner_id, job_id)
+        response.status_code = 202
+        response.headers["Location"] = f"/api/v1/video-generations/{job_id}"
+        response.headers["Retry-After"] = "5"
         return job
 
     @router.get(
@@ -1482,7 +1625,7 @@ def install(
         await no_query(request)
         return get_openapi(
             title="Duet Video Generation API",
-            version="1.2.0",
+            version="1.4.0",
             description="Asynchronous server-to-server video generation API.",
             routes=router.routes,
         )

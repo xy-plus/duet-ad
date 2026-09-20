@@ -1378,6 +1378,20 @@ input, textarea { font-family: inherit; }
   .drawer-backdrop { display: none !important; }
 }
 
+/* ===== 提示词审核区块 ===== */
+.prompt-review-list { display: grid; gap: 14px; }
+.prompt-review-tip { margin: 0; font-size: 13px; color: var(--text-2); }
+.prompt-review-segment-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.prompt-review-textarea {
+  width: 100%;
+  min-height: 140px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+}
+.prompt-review-textarea[readonly] { background: #F5F5F7; color: var(--text-2); }
+
 /* ===== Reduced motion ===== */
 @media (prefers-reduced-motion: reduce) {
   *,

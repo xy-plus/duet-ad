@@ -8,14 +8,16 @@ Duet API 用于提交视频生成任务，并在任务完成后返回最终视�
 
 生成请求支持可选字幕开关 `add_subtitles`，默认关闭；开启后在最终成片中叠加台词字幕。直接创建和报价都支持该参数，已有调用省略它即可保持原行为。
 
+本合同版本 `1.4.0` 新增提示词审核开关 `prompt_review`（默认关闭）：开启后任务在进入付费生成前暂停到 `awaiting_prompt_review`，接入方读取、编辑并确认提示词后才继续；并新增对应的读取与确认接口。省略该参数即保持原直通行为。
+
 视频生成通常需要数分钟，因此接口采用异步模式：创建任务后立即返回任务 ID；接入方使用任务 ID 查询状态；成功后再下载视频。
 
 ## 基本信息
 
 | 项目 | 值 |
 |---|---|
-| 合同版本 | `1.3.0` |
-| 文档更新日期 | `2026-09-15` |
+| 合同版本 | `1.4.0` |
+| 文档更新日期 | `2026-09-21` |
 | 联调环境 | `https://8.166.140.227:3211` |
 | API 前缀 | `/api/v1` |
 | 鉴权 | HTTP Bearer API Key |
@@ -58,11 +60,13 @@ API Key 对应一个账户。这个账户拥有自己的任务和积分；不同
 | `POST` | `/api/v1/video-generations/quotes/{quote_id}/confirm` | 用户确认报价后创建异步任务 | 1.2.0 新增 |
 | `POST` | `/api/v1/video-generations` | 创建异步生成任务 | 保持兼容 |
 | `GET` | `/api/v1/video-generations/{job_id}` | 查询任务状态、结果和费用 | 保持兼容 |
+| `GET` | `/api/v1/video-generations/{job_id}/prompt-review` | 读取等待审核/已完成任务的可编辑提示词主体 | 1.4.0 新增 |
+| `POST` | `/api/v1/video-generations/{job_id}/prompt-review/confirm` | 确认（可编辑）提示词并继续生成 | 1.4.0 新增 |
 | `GET` | `/api/v1/video-generations/{job_id}/content` | 下载视频，支持单段 Range | 保持兼容 |
 | `HEAD` | `/api/v1/video-generations/{job_id}/content` | 读取视频元数据，不下载正文 | 保持兼容 |
 | `GET` | `/api/v1/account/credits` | 查询积分余额 | 保持兼容 |
 | `GET` | `/api/v1/account/credit-transactions` | 查询积分流水 | 保持兼容 |
-| `GET` | `/api/v1/openapi.json` | 获取公共 API 的 OpenAPI 描述 | 1.2.0 加入报价与确认路径 |
+| `GET` | `/api/v1/openapi.json` | 获取公共 API 的 OpenAPI 描述 | 1.4.0 加入提示词审核路径 |
 
 ---
 
@@ -181,7 +185,7 @@ Content-Type: multipart/form-data
 
 请求的 multipart 字段、输入限制和鉴权与下文“创建视频生成任务”完全相同，`Idempotency-Key` 必填。必须提交本次计划生成所需的完整输入：视频文件或 URL，以及需要的语言、画幅、清晰度、台词和替换参数。
 
-需要字幕时，在报价 multipart 中添加文本字段 `add_subtitles=true`。该开关与媒体和其他参数一起冻结；确认接口仍只接受 JSON `{"confirm":true}`，不能在确认时添加或修改字幕开关。需要改变开关时用新 Key 重新报价。Quote 响应不新增字幕字段；确认后的 Job 通过 `parameters.add_subtitles` 返回实际冻结值。
+需要字幕时，在报价 multipart 中添加文本字段 `add_subtitles=true`。该开关与媒体和其他参数一起冻结；确认接口仍只接受 JSON `{"confirm":true}`，不能在确认时添加或修改字幕开关。需要改变开关时用新 Key 重新报价。Quote 响应不新增字幕字段；确认后的 Job 通过 `parameters.add_subtitles` 返回实际冻结值。提示词审核开关 `prompt_review` 同理：在报价 multipart 中以 `prompt_review=true` 冻结，确认报价后任务进入生成流程并在付费生成前暂停等待审核。
 
 服务端下载或接收视频、读取实际时长，并保存本次媒体与生成参数；不创建生成任务、不调用生成模型，也不产生 `reserve`、`capture` 或 `release` 积分流水。客户端无需事先知道视频时长。确认会复用报价保存的输入，不重新下载 URL 或重新上传文件；修改任何输入需要重新报价。
 
@@ -361,6 +365,7 @@ Content-Disposition: form-data; name="replacement_instruction"
 | `resolution` | string | 否 | `768p` | `768p`、`480p` | 输出清晰度 |
 | `target_language` | string | 否 | 与原视频相同 | 去除首尾空白后不能为空；最多 80 个 UTF-16 字符单元 | 对白目标语言，例如 `中文`、`English` |
 | `add_subtitles` | boolean | 否 | `false` | multipart 文本 `true`、`false` | 在最终成片上叠加台词字幕；参数随任务冻结，幂等重试必须保持一致 |
+| `prompt_review` | boolean | 否 | `false` | multipart 文本 `true`、`false` | 提示词审核开关；开启后任务在付费生成前暂停到 `awaiting_prompt_review`，确认提示词后才继续（见“提示词审核”节）；幂等重试必须保持一致 |
 | `dialogue_mode` | string | 否 | `auto_rewrite` | `auto_rewrite`、`generate` | 台词模式；`auto_rewrite` 翻译并自然改写原台词，`generate` 按 `dialogue_brief` 描述自动生成台词 |
 | `dialogue_brief` | string | 条件必填 | 无 | 去除首尾空白后不能为空；最多 1,000 个 UTF-16 字符单元 | 口播台词的内容描述；`dialogue_mode` 为 `generate` 时必填，其余模式不允许提供 |
 | `replacement_image` | binary，可重复 | 条件必填 | 无 | 1–4 张 JPEG、PNG、WebP，每张最大 10 MiB；按 multipart 出现顺序编号 | 参考图，不预设图片类型或用途；必须与 `replacement_instruction` 同时提供，单图客户端无需变更 |
@@ -521,11 +526,60 @@ HTTP `200 OK`，响应体为 Job 对象。任务仍在处理时，响应头包�
 |---|---:|---|---|
 | `queued` | 否 | 已接收，等待处理 | 按 `Retry-After` 继续查询 |
 | `running` | 否 | 正在处理 | 每 5～10 秒继续查询 |
+| `awaiting_prompt_review` | 否 | 已暂停，等待审核提示词（仅创建时 `prompt_review=true` 出现） | 读取并确认提示词；不确认则任务静止，不发生后续付费生成 |
 | `succeeded` | 是 | 已成功生成并完成扣费 | 使用 `content_url` 下载视频 |
 | `failed` | 是 | 明确失败，冻结积分已释放 | 停止查询；如需重做，由业务明确创建新任务 |
 | `submission_unknown` | 否 | 上游是否接收任务暂时无法确认 | 继续查询原任务并联系支持，绝对不要重新创建 |
 
 进度百分比表示大致处理阶段，不是剩余时间预估。进度可能在某个值停留较长时间。
+
+---
+
+## 提示词审核（prompt_review）
+
+创建任务（直接创建或报价确认）时传入 `prompt_review=true`，任务在冻结全部生成前置产物后、任何付费生成提交前暂停，Job `status` 变为 `awaiting_prompt_review`。此时可以读取每段由 AI 生成的提示词主体，编辑后确认继续；不确认任务就永远静止，不会发生后续付费提交。
+
+提示词分为主体与注入部分：接口只暴露 AI 生成的提示词主体（`prompt` 字段）；后端机械注入的编辑框架、遮盖条款等固定内容不展示、不可编辑，确认时由后端用冻结原文重新拼接。
+
+### 读取提示词
+
+```http
+GET /api/v1/video-generations/{job_id}/prompt-review
+```
+
+仅 `awaiting_prompt_review` 与 `succeeded` 状态可读取，其余状态返回 `409 prompt_review_not_available`。成功响应 `200 OK`：
+
+```json
+{
+  "status": "awaiting_prompt_review",
+  "segments": [
+    { "segment_index": 1, "prompt": "AI 生成的第 1 段提示词主体" },
+    { "segment_index": 2, "prompt": "AI 生成的第 2 段提示词主体" }
+  ]
+}
+```
+
+`succeeded` 时返回冻结的已确认主体（只读语义；不支持修改已完成任务并重跑）。`segments` 可能为空数组：历史任务没有可剥离的冻结主体时返回空，绝不展示注入内容。
+
+### 确认并继续
+
+```http
+POST /api/v1/video-generations/{job_id}/prompt-review/confirm
+Content-Type: application/json
+```
+
+```json
+{
+  "segments": [
+    { "segment_index": 1, "prompt": "编辑后的第 1 段主体" },
+    { "segment_index": 2, "prompt": "第 2 段主体原文" }
+  ]
+}
+```
+
+- 仅 `awaiting_prompt_review` 状态可确认，其余状态返回 `409 prompt_review_not_pending`；确认是单次状态迁移，重复确认同样返回 `409`。
+- `segments` 的段集合必须与读取结果完全一致；每段 `prompt` 不能为空；拼接注入部分后的完整提示词超过长度限制时返回 `422 invalid_prompt_review_edit`。
+- 成功返回 `202 Accepted` 和 Job 对象，任务回到 `queued` 并继续生成；之后按既有轮询规则查询。
 
 ---
 
