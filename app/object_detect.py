@@ -1,4 +1,4 @@
-"""物品检测：SAM 3.1 video-rle，provider 链路 wavespeed → sandbase → fal。
+"""物品检测：SAM 3.1 video-rle，provider 链路 fal → wavespeed → sandbase。
 
 接口契约（object_mask 只面向本契约，不感知 HTTP 细节）：
 
@@ -18,13 +18,15 @@
   ``ObjectDetection.label`` 是实际发送的完整 prompt（例如 ``"face, necklace"``），
   表示不可归因的合并检测组，而不是猜测性地归给任一 target。
 
-Provider 布局（2026-09-19）：wavespeed 排第一（``WavespeedSam3GroundingClient``，
-WAVESPEED_API_KEY 配置即用），其后 sandbase（``SandbaseSam3GroundingClient``，
-SANDBASE_API_KEY）、fal（``FalSam3GroundingClient``，FAL_KEY）。背景：
-2026-09-19 fal 账号被官方 Admin lock（storage upload 403），同日接入的
-sandbase 部署模型 worker 连续 generation_timeout，两家当前均不可用，故
-接入第三家 WaveSpeed 并排在链路第一位。三家 provider 的归一化输出形状
-完全一致，下游 object_mask/pipeline 零改动。
+Provider 布局（2026-09-20）：fal 排第一（``FalSam3GroundingClient``，
+FAL_KEY 配置即用），其后 wavespeed（``WavespeedSam3GroundingClient``，
+WAVESPEED_API_KEY）、sandbase（``SandbaseSam3GroundingClient``，
+SANDBASE_API_KEY）。背景：2026-09-19 fal 旧账号被官方 Admin lock、同日
+接入的 sandbase 模型 worker 连续 generation_timeout，故临时接入 WaveSpeed
+救急；2026-09-20 换新 fal 账号后回到 fal 优先——fal 跑 SAM 3.1 且
+detection_threshold 可调（文档建议文本 prompt 失败时降到 0.2-0.3），
+wavespeed 跑 SAM 3 且无阈值参数，实测词表稍长就整组零检出（校准 round4）。
+三家 provider 的归一化输出形状完全一致，下游 object_mask/pipeline 零改动。
 
 为什么只有 SAM 3.1 这一路（2026-09-15 用户拍板）：此前平行接入的 7 家 VLM
 （doubao/qwen/glm/hunyuan/kimi/step/gemini）输出文本 bbox，无法确定性转成
@@ -975,8 +977,8 @@ class SandbaseSam3GroundingClient:
 
 
 # ==== wavespeed_sam3（WaveSpeed SAM3 video-rle）：直传 ticket + 轮询 ====
-# 2026-09-19 接入，排在 provider 链路第一位（fal 账号被官方 Admin lock、
-# sandbase worker 连续 generation_timeout，两家当前均不可用）。接口事实
+# 2026-09-19 接入救急（当时 fal 被锁、sandbase worker 故障）；2026-09-20
+# fal 换号恢复后降为链路第二位后备。接口事实
 # 已经 2026-09-19 一次真实付费调用校准（原始响应落盘
 # data-verify/wavespeed-calib-20260919/，结构逐项核对见该目录 README）：
 # - 上传：视频输入只接受 URL，官方直传流程（文档
@@ -1549,22 +1551,22 @@ class WavespeedSam3GroundingClient:
 
 
 def available_providers(settings: Settings) -> list[str]:
-    """WAVESPEED_API_KEY 已配置返回 ["wavespeed_sam3"]（链路第一位）；未配置
-    则 SANDBASE_API_KEY 已配置返回 ["sandbase_sam3"]；再未配置则 FAL_KEY 已
-    配置返回 ["fal_sam3"]；都未配置返回 []。
+    """FAL_KEY 已配置返回 ["fal_sam3"]（链路第一位）；未配置则
+    WAVESPEED_API_KEY 已配置返回 ["wavespeed_sam3"]；再未配置则
+    SANDBASE_API_KEY 已配置返回 ["sandbase_sam3"]；都未配置返回 []。
 
     本函数实质是"检测是否可用"的门禁；保留列表形态与语义是为了 pipeline
     的调用侧（有可用 provider 才触发物品灰块节点）不变。provider 名称一律
     不出现在公开 API 的参数与响应里。
     """
+    if settings.fal_sam3_api_key:
+        return ["fal_sam3"]
     if settings.wavespeed_sam3_api_key:
         return ["wavespeed_sam3"]
     if settings.sandbase_sam3_api_key:
         return ["sandbase_sam3"]
-    if settings.fal_sam3_api_key:
-        return ["fal_sam3"]
     _LOGGER.info(
-        "object detect: none of WAVESPEED_API_KEY, SANDBASE_API_KEY, FAL_KEY "
+        "object detect: none of FAL_KEY, WAVESPEED_API_KEY, SANDBASE_API_KEY "
         "is configured; detection unavailable"
     )
     return []
@@ -1578,12 +1580,12 @@ def select_provider(
     | FalSam3GroundingClient
     | None
 ):
-    """按链路顺序返回第一个已配置 key 的 client：wavespeed → sandbase →
-    fal；都未配置返回 None。"""
+    """按链路顺序返回第一个已配置 key 的 client：fal → wavespeed →
+    sandbase；都未配置返回 None。"""
+    if settings.fal_sam3_api_key:
+        return FalSam3GroundingClient(settings)
     if settings.wavespeed_sam3_api_key:
         return WavespeedSam3GroundingClient(settings)
     if settings.sandbase_sam3_api_key:
         return SandbaseSam3GroundingClient(settings)
-    if settings.fal_sam3_api_key:
-        return FalSam3GroundingClient(settings)
     return None

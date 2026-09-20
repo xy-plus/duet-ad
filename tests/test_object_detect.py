@@ -1060,15 +1060,15 @@ def test_sandbase_poll_timeout_raises_provider_failure(
     assert isinstance(excinfo.value.cause, TimeoutError)
 
 
-# --- 可用性门禁与 client 构造（sandbase 主、fal 后备） ---
+# --- 可用性门禁与 client 构造（fal → wavespeed → sandbase 链路下 sandbase 侧） ---
 
 
-def test_available_providers_prefers_sandbase(tmp_path: Path) -> None:
-    settings = _sandbase_settings(tmp_path, fal_sam3_api_key="fal-secret")
+def test_available_providers_sandbase_only(tmp_path: Path) -> None:
+    settings = _sandbase_settings(tmp_path)
     assert available_providers(settings) == ["sandbase_sam3"]
 
 
-def test_available_providers_falls_back_to_fal(tmp_path: Path) -> None:
+def test_available_providers_fal_only(tmp_path: Path) -> None:
     settings = _settings(tmp_path, fal_sam3_api_key="fal-secret")
     assert available_providers(settings) == ["fal_sam3"]
 
@@ -1971,24 +1971,40 @@ def test_wavespeed_cache_fingerprint_mismatch_refetches(
     assert handler.state["submits"] == 2  # type: ignore[attr-defined]
 
 
-# --- 可用性门禁与 client 构造（wavespeed → sandbase → fal 链路顺序） ---
+# --- 可用性门禁与 client 构造（fal → wavespeed → sandbase 链路顺序） ---
 
 
-def test_available_providers_prefers_wavespeed(tmp_path: Path) -> None:
+def test_available_providers_prefers_fal(tmp_path: Path) -> None:
     settings = _wavespeed_settings(
         tmp_path,
         sandbase_sam3_api_key="sandbase-secret",
         fal_sam3_api_key="fal-secret",
     )
+    assert available_providers(settings) == ["fal_sam3"]
+
+
+def test_available_providers_falls_back_to_wavespeed(tmp_path: Path) -> None:
+    settings = _wavespeed_settings(tmp_path, sandbase_sam3_api_key="sandbase-secret")
     assert available_providers(settings) == ["wavespeed_sam3"]
 
 
 def test_available_providers_falls_back_to_sandbase(tmp_path: Path) -> None:
-    settings = _sandbase_settings(tmp_path, fal_sam3_api_key="fal-secret")
+    settings = _sandbase_settings(tmp_path)
     assert available_providers(settings) == ["sandbase_sam3"]
 
 
-def test_select_provider_returns_wavespeed_client(tmp_path: Path) -> None:
+def test_select_provider_returns_fal_client(tmp_path: Path) -> None:
+    client = select_provider(
+        _wavespeed_settings(
+            tmp_path,
+            sandbase_sam3_api_key="sandbase-secret",
+            fal_sam3_api_key="fal-secret",
+        )
+    )
+    assert isinstance(client, FalSam3GroundingClient)
+
+
+def test_select_provider_falls_back_to_wavespeed(tmp_path: Path) -> None:
     client = select_provider(
         _wavespeed_settings(tmp_path, sandbase_sam3_api_key="sandbase-secret")
     )
@@ -1996,9 +2012,7 @@ def test_select_provider_returns_wavespeed_client(tmp_path: Path) -> None:
 
 
 def test_select_provider_falls_back_to_sandbase(tmp_path: Path) -> None:
-    client = select_provider(
-        _sandbase_settings(tmp_path, fal_sam3_api_key="fal-secret")
-    )
+    client = select_provider(_sandbase_settings(tmp_path))
     assert isinstance(client, SandbaseSam3GroundingClient)
 
 
