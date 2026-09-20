@@ -7393,7 +7393,7 @@ def test_segment_replaced_object_targets_prefers_detect_label_then_falls_back(
                 "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
                 "replacement": {"source": "generated_variant"},
             },
-            # 未替换或不在本段的记录不产生 target。
+            # 未替换的记录不产生 target。
             "entity-04": {
                 "source_visual_description": "other segment",
                 "occurrences": [{"segment_index": 2, "frame_orders": [1]}],
@@ -7409,11 +7409,10 @@ def test_segment_replaced_object_targets_prefers_detect_label_then_falls_back(
         },
     }
 
-    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
+    # 合并全项目被替换物，不按段过滤：strap 虽只在段2出镜也并入。
+    assert Pipeline._replaced_object_targets(element_index) == [
         "handbag",
         "legacy source description",
-    ]
-    assert Pipeline._segment_replaced_object_targets(element_index, 2) == [
         "strap",
     ]
 
@@ -7436,7 +7435,7 @@ def test_segment_replaced_object_targets_deduplicates_detect_labels_in_order() -
         },
     }
 
-    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
+    assert Pipeline._replaced_object_targets(element_index) == [
         "cat food bag",
         "pet feeder",
     ]
@@ -7466,7 +7465,7 @@ def test_segment_replaced_object_targets_skip_transient_physical_effects() -> No
         },
     }
 
-    assert Pipeline._segment_replaced_object_targets(element_index, 1) == [
+    assert Pipeline._replaced_object_targets(element_index) == [
         "cold pack"
     ]
 

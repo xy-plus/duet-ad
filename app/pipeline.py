@@ -84,7 +84,7 @@ MASTER_EMPTY_ASR_SIGNAL = 51 / 256
 _NO_REUSABLE_OUTPUT: Any = object()
 # These labels describe transient or ambient physical phenomena, rather than
 # objects with an identity that needs replacement.  Object Replace normally
-# omits them; _segment_replaced_object_targets checks every synonym phrase as
+# omits them; _replaced_object_targets checks every synonym phrase as
 # defense in depth for imperfect or frozen planning output.
 _TRANSIENT_PHYSICAL_EFFECT_DETECT_LABELS = frozenset(
     {
@@ -5535,11 +5535,19 @@ class Pipeline:
         )
 
     @classmethod
-    def _segment_replaced_object_targets(
-        cls, element_index: dict[str, Any], segment_index: int
+    def _replaced_object_targets(
+        cls, element_index: dict[str, Any]
     ) -> list[str]:
-        """Detection prompts of the OR-flagged entities to mask here.
+        """Merged, deduplicated detection prompts of every OR-flagged entity.
 
+        The frozen element index is project-wide and finalized before any
+        segment processing starts, so the merged list is the same for every
+        segment: per-segment occurrence filtering is deliberately NOT applied
+        (2026-09-20 用户拍板"每段都带被替换物品的提示词，不怕多只怕少"）。
+        occurrence 规划来自关键帧抽样，会漏掉边缘帧的短暂出镜（化妆品段2
+        管子边缘露出但未规划进段2），漏遮会让 H3 看到源物品并抄回源外观；
+        多带的代价只是该段检测 prompt 里多几个词，fal 调用次数不变（每段
+        仍各一次，检测必须跑在各自的分段视频上）。
         Detection runs on the SOURCE video, so each target must name the
         source object with a short generic English label: long Chinese
         descriptions detect poorly (measured: fal SAM 3 found nothing in
@@ -5564,10 +5572,8 @@ class Pipeline:
             return []
         targets: list[str] = []
         for record in entities.values():
-            if (
-                not isinstance(record, dict)
-                or not isinstance(record.get("replacement"), dict)
-                or not cls._appears_in_segment(record, segment_index)
+            if not isinstance(record, dict) or not isinstance(
+                record.get("replacement"), dict
             ):
                 continue
             detect_label = record["replacement"].get("detect_label")
@@ -5590,10 +5596,8 @@ class Pipeline:
         return list(dict.fromkeys(targets))
 
     @classmethod
-    def _segment_has_replaced_object(
-        cls, element_index: dict[str, Any], segment_index: int
-    ) -> bool:
-        return bool(cls._segment_replaced_object_targets(element_index, segment_index))
+    def _has_replaced_object(cls, element_index: dict[str, Any]) -> bool:
+        return bool(cls._replaced_object_targets(element_index))
 
     @classmethod
     def _fusion_authority_block(
@@ -5921,9 +5925,7 @@ class Pipeline:
                 lambda _value: [muted],
             )
             objects_masked = False
-            object_targets = self._segment_replaced_object_targets(
-                element_index, index
-            )
+            object_targets = self._replaced_object_targets(element_index)
             if self._segment_has_replaced_person(element_index, index):
                 # SAM accepts a comma-separated multi-target prompt.  Keep
                 # these deterministic person targets last, after the frozen
@@ -6051,7 +6053,7 @@ class Pipeline:
             processing = self._validated_effective_request(request)["processing"]
             has_replaced_content = (
                 self._segment_has_replaced_person(element_index, index)
-                or self._segment_has_replaced_object(element_index, index)
+                or self._has_replaced_object(element_index)
             )
             editing_block = (
                 "This is an editing task on Video 1, not a generation task: keep "
