@@ -186,6 +186,31 @@ def test_fusion_skill_does_not_restore_raw_appearance_for_replacements() -> None
         assert over_specific_rule not in skill
 
 
+def test_fusion_skill_requires_faithful_video1_action_description() -> None:
+    # 灰块整人+物品 100% 遮盖后动作信号丢失（化妆品项目挤膏动作消失），
+    # 把 5fdb7d7 删掉的"描述原视频动作/运动/镜头"指导合并回来：纯描述，
+    # 不改编不创作，动作以 Video 1 为准、描述仅为辅助。
+    skill = (ROOT / "skills" / "h3-max-r2v-prompt" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "主体开头先写一段对 Video 1 的忠实动作描述" in skill
+    assert "动作、运动、姿态变化、画面位置与运动方向" in skill
+    assert "镜头运动、机位、构图、速度、节奏和转场" in skill
+    assert "描述对象始终是源视频 Video 1 本身，不是替换后的画面" in skill
+    assert "不依赖被遮盖区域的可见内容" in skill
+    assert "动作事实" in skill
+    assert "不是创作或改编指令" in skill
+    assert "动作与画面一切以 Video 1 实际内容为准" in skill
+    assert "本段文字仅为辅助" in skill
+    assert "被替换对象不得写入源外观或源类别特征" in skill
+    # 编辑任务框架与后续约束不回退
+    assert "这是一次对 Video 1 的编辑任务" in skill
+    assert "绝不改编或创作" in skill
+    assert "不得新增、重新编排或补充叙事" in skill
+    assert "整段动作描述统一由第 1 条承担" in skill
+
+
 def _output(
     element_index: dict[str, Any],
     digest: str,
