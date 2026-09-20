@@ -229,6 +229,7 @@ def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
         "interpolated_frames": 2,
         "targets": {"mug": {"detections": 2, "detected_frames": 2}},
         "flow_compensated_frames": 0,
+        "degraded_bbox_fallback_frames": 0,
     }
     assert detector.calls == [(source, ["mug"])]
     capture = cv2.VideoCapture(str(destination))
@@ -314,6 +315,7 @@ def test_mask_objects_holds_the_last_position_then_disappears(
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 1, "detected_frames": 1}},
         "flow_compensated_frames": 0,
+        "degraded_bbox_fallback_frames": 0,
     }
     frames = _read_frames(destination)
     assert len(frames) == 20
@@ -357,6 +359,7 @@ def test_mask_objects_matches_simultaneous_boxes_to_tracks_by_iou(
         "interpolated_frames": 1,
         "targets": {"mug": {"detections": 4, "detected_frames": 2}},
         "flow_compensated_frames": 0,
+        "degraded_bbox_fallback_frames": 0,
     }
     frames = _read_frames(destination)
     for frame in frames:
@@ -391,6 +394,7 @@ def test_mask_objects_without_detections_leaves_frames_untouched(
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 0, "detected_frames": 0}},
         "flow_compensated_frames": 0,
+        "degraded_bbox_fallback_frames": 0,
     }
     frames = _read_frames(destination)
     assert len(frames) == 3
@@ -456,6 +460,7 @@ def test_mask_objects_blocks_total_counts_anchor_frames_once(
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 3, "detected_frames": 3}},
         "flow_compensated_frames": 0,
+        "degraded_bbox_fallback_frames": 0,
     }
 
 
@@ -915,3 +920,151 @@ def test_mask_objects_flow_compensation_covers_multiple_targets(
         region = frame2[y:y + 24, x_mid - 4:x_mid + 20]
         grayish = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
         assert grayish > 0.5, f"target near x={x_mid} not compensated"
+
+
+# ==== 退化帧 bbox 回退（_degraded_labels / mask_objects 集成） ====
+# 规则见 app/object_mask.py OBJECT_MASK_DEGRADED_AREA_RATIO 与
+# _degraded_labels 头注释：mask 面积 < 同帧插值 bbox 面积 × 0.5 的 label
+# 视为目标丢失退化帧，其 bbox 不再被 mask 抑制、与残缺 mask 并集渲染。
+# 与光流空洞补偿互斥：退化帧有 mask（非空洞），空洞帧无 mask（无从退化）。
+
+
+def _degraded_video(path: Path, frames: int = 5) -> None:
+    _solid_video(path, frames=frames, fps=1.0, size=_FLOW_SIZE)
+
+
+def test_degraded_labels_area_boundary() -> None:
+    """面积判定单元：严格小于阈值才退化；无 bbox / 无 mask 的 label 不参与。"""
+    width, height = _FLOW_SIZE
+    full_box = [(16, 12, 144, 108)]  # 128x96 = 12288 px
+    half_mask = np.zeros((height, width), dtype=bool)
+    half_mask[12:12 + 96, 16:16 + 64] = True  # 64x96 = 6144 = 恰好 50%
+    tiny_mask = np.zeros((height, width), dtype=bool)
+    tiny_mask[40:48, 60:68] = True  # 64 px << 50%
+    assert object_mask._degraded_labels(
+        {"mug": [tiny_mask]}, {"mug": full_box}, width, height
+    ) == {"mug"}
+    assert object_mask._degraded_labels(
+        {"mug": [half_mask]}, {"mug": full_box}, width, height
+    ) == set()  # 恰好 50% 不退化（严格小于）
+    assert object_mask._degraded_labels(
+        {"mug": [tiny_mask]}, {"mug": []}, width, height
+    ) == set()  # 无 bbox 不回退
+    assert object_mask._degraded_labels(
+        {"mug": [tiny_mask]}, {"other": full_box}, width, height
+    ) == set()  # bbox 必须同 label
+
+
+def test_mask_objects_degraded_frame_falls_back_to_bbox(tmp_path: Path) -> None:
+    """退化帧（帧 2 mask 骤降为 8x8 碎片，bbox 不变）：该帧 bbox 与残 mask
+    并集渲染，stats 记 degraded_bbox_fallback_frames；正常帧不受影响。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=5)
+    bbox = (0.2, 0.2, 0.8, 0.8)  # x32..128, y24..96
+    detections = [
+        _rle_detection(f, 32, 24, 128, 96, "mug", *_FLOW_SIZE)
+        for f in (0, 1, 3, 4)
+    ]
+    detections.append(
+        ObjectDetection(
+            label="mug", timestamp_s=2.0, bbox_xyxy_normalized=bbox,
+            rle=_rect_rle(60, 40, 68, 48, *_FLOW_SIZE),  # 8x8=64px ≈ bbox 的 0.9%
+        )
+    )
+    out = tmp_path / "out.mp4"
+    stats = object_mask.mask_objects(
+        source, out, ["mug"], detector=_SparseDetector(detections),
+    )
+    assert stats["degraded_bbox_fallback_frames"] == 1
+    assert stats["flow_compensated_frames"] == 0
+    frames = _read_frames(out)
+    # 帧 2：bbox 兜底区域（远离残 mask）被灰块覆盖
+    point = frames[2][30, 40].astype(int)  # (y=30, x=40) 在 bbox 内、残 mask 外
+    assert np.abs(point - 64).max() <= 12
+    # 正常帧（帧 1）：mask == bbox，照旧全盖
+    point1 = frames[1][30, 40].astype(int)
+    assert np.abs(point1 - 64).max() <= 12
+
+
+def test_mask_objects_healthy_mask_keeps_bbox_suppressed(tmp_path: Path) -> None:
+    """正常帧（mask 面积 ≈ bbox 的 58% > 阈值）：bbox 仍被 mask 抑制，
+    bbox 内 mask 外的区域不画块——语义不变。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=3)
+    detections = [
+        # bbox x32..128 y24..96（6912px）；mask x44..116 y32..88（4032px=58%）
+        _rle_detection(f, 44, 32, 116, 88, "mug", *_FLOW_SIZE) for f in (0, 1, 2)
+    ]
+    # detection 的 bbox 字段单独给大框（mask 小于 bbox，模拟检测 mask 略收缩）
+    detections = [
+        ObjectDetection(
+            label=d.label, timestamp_s=d.timestamp_s,
+            bbox_xyxy_normalized=(0.2, 0.2, 0.8, 0.8), rle=d.rle,
+        )
+        for d in detections
+    ]
+    out = tmp_path / "out.mp4"
+    stats = object_mask.mask_objects(
+        source, out, ["mug"], detector=_SparseDetector(detections),
+    )
+    assert stats["degraded_bbox_fallback_frames"] == 0
+    # bbox 内、mask 外且远离羽化边的点（x=36,y=28）保持原画面
+    point = _read_frames(out)[1][28, 36].astype(int)
+    assert np.abs(point - np.array([10, 20, 30])).max() <= 12
+
+
+def test_mask_objects_maskless_anchor_keeps_interpolated_bbox(
+    tmp_path: Path,
+) -> None:
+    """mask 缺失帧（rle=None 的 bbox 锚点）：既有插值 bbox 行为不变，
+    不计退化回退。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=5)
+    detections = [
+        _rle_detection(0, 32, 24, 128, 96, "mug", *_FLOW_SIZE),
+        ObjectDetection(  # 帧 2：只有 bbox 没有 mask
+            label="mug", timestamp_s=2.0,
+            bbox_xyxy_normalized=(0.2, 0.2, 0.8, 0.8), rle=None,
+        ),
+        _rle_detection(4, 32, 24, 128, 96, "mug", *_FLOW_SIZE),
+    ]
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["mug"], detector=_SparseDetector(detections),
+    )
+    assert stats["degraded_bbox_fallback_frames"] == 0
+    assert stats["frames_with_block"] == 5  # 帧 2 由插值 bbox 覆盖（既有行为）
+
+
+def test_mask_objects_degraded_fallback_is_per_label(tmp_path: Path) -> None:
+    """多目标独立判定：label A mask 骤降回退 bbox；label B 正常、bbox 仍被
+    其 mask 抑制（B 的 bbox 内 mask 外区域不画块）。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=3)
+    detections = []
+    for f in (0, 1, 2):
+        # A：bbox x8..72 y6..108（6528px）；帧 1 mask 骤降为 8x8 碎片
+        a_rle = (
+            _rect_rle(30, 50, 38, 58, *_FLOW_SIZE)
+            if f == 1
+            else _rect_rle(8, 6, 72, 108, *_FLOW_SIZE)
+        )
+        detections.append(ObjectDetection(
+            label="obj-a", timestamp_s=float(f),
+            bbox_xyxy_normalized=(0.05, 0.05, 0.45, 0.9), rle=a_rle,
+        ))
+        # B：bbox x88..152 y6..108；mask x96..144 y16..98（3936px=60%，健康）
+        detections.append(ObjectDetection(
+            label="obj-b", timestamp_s=float(f),
+            bbox_xyxy_normalized=(0.55, 0.05, 0.95, 0.9),
+            rle=_rect_rle(96, 16, 144, 98, *_FLOW_SIZE),
+        ))
+    out = tmp_path / "out.mp4"
+    stats = object_mask.mask_objects(
+        source, out, ["obj-a", "obj-b"], detector=_SparseDetector(detections),
+    )
+    assert stats["degraded_bbox_fallback_frames"] == 1
+    frame1 = _read_frames(out)[1]
+    # A 的 bbox 兜底区域（x=20,y=30：bbox 内、残 mask 外）被灰块覆盖
+    assert np.abs(frame1[30, 20].astype(int) - 64).max() <= 12
+    # B 的 bbox 内、mask 外区域（x=90,y=10）保持原画面（B 未退化、不回退）
+    assert np.abs(frame1[10, 90].astype(int) - np.array([10, 20, 30])).max() <= 12

@@ -4,7 +4,10 @@ fal SAM-3 receives all requested objects and, when a person is replaced,
 ``face`` in one comma-separated prompt.  Its calibrated multi-target response
 is a single unlabelled per-frame union, so every returned RLE mask receives the
 same deep gray (64,64,64) block; sparse/legacy anchors without a mask use their
-bbox rectangle. Sparse anchors first discard local area
+bbox rectangle, and frames whose mask area collapses below
+``OBJECT_MASK_DEGRADED_AREA_RATIO`` of the interpolated bbox area render the
+bbox alongside the fragmentary mask (degraded-frame fallback, see
+``_degraded_labels``). Sparse anchors first discard local area
 glitches, then are filled by local linear interpolation; a track that loses its box is held for
 ``OBJECT_MASK_HOLD_FRAMES`` frames.  Short runs of consecutive block-less
 frames (≤ ``OBJECT_MASK_FLOW_GAP_MAX_FRAMES``) between two blocked frames are
@@ -48,6 +51,13 @@ OBJECT_MASK_RLE_FEATHER_KERNEL = 7
 # 前后边界帧的遮盖 mask warp 过来（算法选型见 _flow_compensated_masks 头
 # 注释）。只补中间空洞，不向首检出帧之前/末检出帧之后延伸。
 OBJECT_MASK_FLOW_GAP_MAX_FRAMES = 3
+# 退化帧回退：同 label 的 rle mask 面积 < 同帧插值 bbox 面积 × 此比值时，
+# 该帧视为"目标丢失的退化帧"（真实案例 bb5f36f6 seg0001 帧 200-210：
+# SAM 丢失 person 只剩 hair 碎片 mask，面积比约 17%；正常帧 mask/bbox 面积
+# 比 ≈99%——0.5 远在两侧分布之外，不会误判正常帧）。回退后该 label 的
+# 插值 bbox 不再被 mask 抑制，与残缺 mask 并集渲染（见 _degraded_labels
+# 头注释的取舍说明）。
+OBJECT_MASK_DEGRADED_AREA_RATIO = 0.5
 
 
 class ObjectMaskError(RuntimeError):
@@ -321,6 +331,37 @@ def _flow_compensated_masks(
     return compensated
 
 
+# 与光流空洞补偿的分工：光流只补"整帧无块"（无 mask 且无 bbox，通常是整帧
+# 目标丢失且 track 断开/超续盖窗口）；本节补"有残缺 mask 的退化帧"（mask
+# 在但面积骤降），两者互斥——退化帧有 mask 所以不是空洞帧，空洞帧没有
+# mask 所以无从判定退化。
+def _degraded_labels(
+    masks_by_label: dict[str, list[np.ndarray]],
+    boxes_by_label: dict[str, list[tuple[int, int, int, int]]],
+    width: int,
+    height: int,
+) -> set[str]:
+    """逐 label 判定退化帧：该 label 的 mask 并集面积 < 同帧插值 bbox 并集
+    面积 × OBJECT_MASK_DEGRADED_AREA_RATIO 时，该 label 在本帧退化。
+
+    bbox 来源不限于两锚点插值——续盖（hold）框同样参与：它仍是该目标最近
+    的已知位置，比残缺 mask 更可能覆盖全身。取舍：回退采用"bbox 与残缺
+    mask 并集"而非"纯 bbox 替换"——并集同样确定（不引入 mask 是否可信的
+    二次判断），且保留残缺 mask 里的真实检测细节（如头发轮廓的羽化边）。
+    逐 label 独立判定：一个目标退化不影响其他目标的 mask 优先语义。
+    """
+    degraded: set[str] = set()
+    for label, label_masks in masks_by_label.items():
+        label_boxes = boxes_by_label.get(label)
+        if not label_boxes:
+            continue
+        mask_area = int(_union_block_mask(label_masks, [], width, height).sum())
+        box_area = int(_union_block_mask([], label_boxes, width, height).sum())
+        if box_area > 0 and mask_area < box_area * OBJECT_MASK_DEGRADED_AREA_RATIO:
+            degraded.add(label)
+    return degraded
+
+
 def _production_detector() -> Any:
     client = select_provider(get_settings())
     if client is None:
@@ -437,11 +478,25 @@ def mask_objects(
             encoding="utf-8",
         )
     hold_frame_set: set[int] = set()
-    boxes_by_frame = _frame_boxes(detections, fps, hold_frames=hold_frame_set)
-    rles_by_frame: dict[int, list[str]] = {}
+    # 逐 label 维护 track 结构（_frame_boxes 内部本就按 label 分组，逐 label
+    # 调用结果与合并调用一致）：退化帧回退要按 label 独立比较 mask 与 bbox
+    # 面积，渲染时按 label 决定是否保留该 label 的 bbox。
+    detection_labels = list(dict.fromkeys(d.label for d in detections))
+    boxes_by_frame_per_label = {
+        label: _frame_boxes(
+            [d for d in detections if d.label == label],
+            fps,
+            hold_frames=hold_frame_set,
+        )
+        for label in detection_labels
+    }
+    rles_by_frame_label: dict[int, dict[str, list[str]]] = {}
     for detection in detections:
         if detection.rle is not None:
-            rles_by_frame.setdefault(round(detection.timestamp_s * fps), []).append(detection.rle)
+            frame_key = round(detection.timestamp_s * fps)
+            rles_by_frame_label.setdefault(frame_key, {}).setdefault(
+                detection.label, []
+            ).append(detection.rle)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=".objects-masked-",
@@ -452,7 +507,7 @@ def mask_objects(
         raw = Path(handle.name)
     stats: dict[str, Any] = {
         "frames": 0, "frames_with_block": 0, "blocks_total": 0,
-        "flow_compensated_frames": 0,
+        "flow_compensated_frames": 0, "degraded_bbox_fallback_frames": 0,
     }
     try:
         writer = cv2.VideoWriter(
@@ -476,15 +531,40 @@ def mask_objects(
             ok, frame = capture.read()
             if not ok:
                 break
-            boxes = [
-                pixel_box
-                for bbox in boxes_by_frame.get(frame_index, [])
-                if (pixel_box := _pixel_box(bbox, width, height)) is not None
+            masks_by_label: dict[str, list[np.ndarray]] = {}
+            for label, label_rles in (
+                rles_by_frame_label.get(frame_index) or {}
+            ).items():
+                masks_by_label[label] = [
+                    _decode_rle_mask(rle, width, height) for rle in label_rles
+                ]
+            boxes_by_label: dict[str, list[tuple[int, int, int, int]]] = {}
+            for label, per_label_boxes in boxes_by_frame_per_label.items():
+                pixel_boxes = [
+                    pixel_box
+                    for bbox in per_label_boxes.get(frame_index, [])
+                    if (pixel_box := _pixel_box(bbox, width, height)) is not None
+                ]
+                if pixel_boxes:
+                    boxes_by_label[label] = pixel_boxes
+            # 退化帧回退（_degraded_labels 头注释）：mask 面积骤降的 label
+            # 不再"mask 抛弃 bbox"，插值 bbox 与残缺 mask 并集渲染兜底全身；
+            # 其余 label 维持 mask 优先（real anchors supersede bbox）。
+            fallback_labels = _degraded_labels(
+                masks_by_label, boxes_by_label, width, height
+            )
+            if fallback_labels:
+                stats["degraded_bbox_fallback_frames"] += 1
+            masks = [
+                mask for label_masks in masks_by_label.values()
+                for mask in label_masks
             ]
-            masks = [_decode_rle_mask(rle, width, height)
-                     for rle in rles_by_frame.get(frame_index, [])]
-            if masks:
-                boxes = []  # real anchors supersede bbox; bridge frames remain rectangles
+            boxes = [
+                box
+                for label, label_boxes in boxes_by_label.items()
+                if label in fallback_labels or label not in masks_by_label
+                for box in label_boxes
+            ]
             stats["frames"] += 1
             frame_index += 1
             if not boxes and not masks:
