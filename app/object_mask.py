@@ -6,7 +6,10 @@ is a single unlabelled per-frame union, so every returned RLE mask receives the
 same deep gray (64,64,64) block; sparse/legacy anchors without a mask use their
 bbox rectangle. Sparse anchors first discard local area
 glitches, then are filled by local linear interpolation; a track that loses its box is held for
-``OBJECT_MASK_HOLD_FRAMES`` frames.  The output uses the usual mp4v -> ffmpeg
+``OBJECT_MASK_HOLD_FRAMES`` frames.  Short runs of consecutive block-less
+frames (≤ ``OBJECT_MASK_FLOW_GAP_MAX_FRAMES``) between two blocked frames are
+filled by bidirectional dense-optical-flow mask propagation (see
+``_flow_compensated_masks``).  The output uses the usual mp4v -> ffmpeg
 H.264/yuv420p pipeline.
 
 Pipeline integration (app/pipeline.py): ``mask-replaceable-objects`` consumes
@@ -41,6 +44,10 @@ OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
 OBJECT_MASK_GLITCH_WINDOW_FRAMES = 15
 OBJECT_MASK_GLITCH_AREA_RATIO = 0.6
 OBJECT_MASK_RLE_FEATHER_KERNEL = 7
+# 短时空洞补偿：连续无块帧 ≤ 此值且前后都有有块帧时，用双向稠密光流把
+# 前后边界帧的遮盖 mask warp 过来（算法选型见 _flow_compensated_masks 头
+# 注释）。只补中间空洞，不向首检出帧之前/末检出帧之后延伸。
+OBJECT_MASK_FLOW_GAP_MAX_FRAMES = 3
 
 
 class ObjectMaskError(RuntimeError):
@@ -236,6 +243,84 @@ def _apply_object_rle_mask(frame: np.ndarray, mask: np.ndarray, *, opacity: floa
                        + np.asarray(replacement, dtype=np.float64) * alpha).astype(np.uint8)
 
 
+# ==== 短时空洞的双向光流补偿（mask propagation） ====
+# 算法选型（2026-09-20 调研）：视频目标分割（VOS）对"关键帧之间 mask 空洞"
+# 的标准解法是 mask propagation——用稠密光流把已有 mask 沿运动场 warp 到
+# 空洞帧（VS-ReID, arXiv:1708.00197；DAVIS 2018 Mask Propagation Network；
+# NeurIPS 2023 双向光流对照实验；CVAT 等标注工具的 track/interpolate 同族）。
+# 复刻其最简确定性形态：空洞帧 mask = 前向 warp（前一有块帧 mask 经光流
+# 拉到空洞帧）与后向 warp（后一有块帧 mask 同理）按距离线性混合后阈值化。
+# 光流用 OpenCV 现成的 cv2.DISOpticalFlow（PRESET_MEDIUM，实时稠密、逆查
+# 稳定），warp 用 cv2.remap 反向采样，零新依赖。光流一律在**原始画面**（未
+# 画灰块）上计算——灰块会破坏运动场估计。
+
+
+def _union_block_mask(
+    masks: list[np.ndarray],
+    boxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """一帧的实际遮盖区域（rle mask 与 bbox 矩形的并集），uint8 0/1。"""
+    union = np.zeros((height, width), dtype=np.uint8)
+    for mask in masks:
+        union |= mask.astype(np.uint8)
+    for x0, y0, x1, y1 in boxes:
+        union[y0:y1, x0:x1] = 1
+    return union
+
+
+def _flow_warp_mask(
+    source_gray: np.ndarray,
+    source_mask: np.ndarray,
+    target_gray: np.ndarray,
+    dis: cv2.DISOpticalFlow,
+) -> np.ndarray:
+    """把 source 帧的 mask 经稠密光流 warp 到 target 帧坐标（反向 warping）。
+
+    光流方向 target→source（dis.calc(target, source)），remap 时对 target
+    的每个像素回采 source 中对应位置的 mask 值，得到 float 掩码图（[0,1]）。
+    """
+    flow = dis.calc(target_gray, source_gray, None)
+    height, width = source_mask.shape
+    grid_x, grid_y = np.meshgrid(
+        np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)
+    )
+    return cv2.remap(
+        source_mask.astype(np.float32),
+        grid_x + flow[..., 0],
+        grid_y + flow[..., 1],
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def _flow_compensated_masks(
+    prev_gray: np.ndarray,
+    prev_mask: np.ndarray,
+    next_gray: np.ndarray,
+    next_mask: np.ndarray,
+    gap_grays: list[np.ndarray],
+    dis: cv2.DISOpticalFlow,
+) -> list[np.ndarray]:
+    """逐空洞帧生成补偿 mask：双向 warp 按到边界的距离线性混合，≥0.5 阈值化。
+
+    第 i 个空洞帧（0 基，共 n 个）的前向权重 (n-i)/(n+1)、后向权重
+    (i+1)/(n+1)：离哪个边界近就多信哪个。返回与 gap_grays 等长的 bool mask
+    列表；调用方保证空洞非空且两侧边界都存在（中间空洞才补偿）。
+    """
+    count = len(gap_grays)
+    compensated: list[np.ndarray] = []
+    for index, gap_gray in enumerate(gap_grays):
+        ratio = (index + 1) / (count + 1)
+        warped_prev = _flow_warp_mask(prev_gray, prev_mask, gap_gray, dis)
+        warped_next = _flow_warp_mask(next_gray, next_mask, gap_gray, dis)
+        blended = (1.0 - ratio) * warped_prev + ratio * warped_next
+        compensated.append(blended >= 0.5)
+    return compensated
+
+
 def _production_detector() -> Any:
     client = select_provider(get_settings())
     if client is None:
@@ -365,7 +450,10 @@ def mask_objects(
         delete=False,
     ) as handle:
         raw = Path(handle.name)
-    stats: dict[str, Any] = {"frames": 0, "frames_with_block": 0, "blocks_total": 0}
+    stats: dict[str, Any] = {
+        "frames": 0, "frames_with_block": 0, "blocks_total": 0,
+        "flow_compensated_frames": 0,
+    }
     try:
         writer = cv2.VideoWriter(
             str(raw),
@@ -375,7 +463,15 @@ def mask_objects(
         )
         if not writer.isOpened():
             raise ObjectMaskError("could not open the object mask writer")
+        # 无块帧先缓冲不写：等到下一个有块帧（或视频结束）时，若空洞 ≤
+        # OBJECT_MASK_FLOW_GAP_MAX_FRAMES 且两侧都有有块帧，用双向光流把
+        # 边界帧的遮盖 mask warp 过来补上；否则原样写出（首尾不延伸）。
         frame_index = 0
+        dis_flow: cv2.DISOpticalFlow | None = None
+        pending_gap: list[np.ndarray] = []
+        # 最近有块帧的（原始灰度图, 遮盖 union mask）；光流必须用画灰块之前
+        # 的原图，灰块会破坏运动场估计。
+        last_blocked: tuple[np.ndarray, np.ndarray] | None = None
         while True:
             ok, frame = capture.read()
             if not ok:
@@ -390,6 +486,52 @@ def mask_objects(
             if masks:
                 boxes = []  # real anchors supersede bbox; bridge frames remain rectangles
             stats["frames"] += 1
+            frame_index += 1
+            if not boxes and not masks:
+                pending_gap.append(frame)
+                continue
+            if pending_gap:
+                gap_frames, pending_gap = pending_gap, []
+                if (
+                    last_blocked is not None
+                    and len(gap_frames) <= OBJECT_MASK_FLOW_GAP_MAX_FRAMES
+                ):
+                    if dis_flow is None:
+                        dis_flow = cv2.DISOpticalFlow.create(
+                            cv2.DISOPTICAL_FLOW_PRESET_MEDIUM
+                        )
+                    prev_gray, prev_mask = last_blocked
+                    next_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    next_mask = _union_block_mask(masks, boxes, width, height)
+                    gap_grays = [
+                        cv2.cvtColor(gap_frame, cv2.COLOR_BGR2GRAY)
+                        for gap_frame in gap_frames
+                    ]
+                    for gap_frame, compensated_mask in zip(
+                        gap_frames,
+                        _flow_compensated_masks(
+                            prev_gray, prev_mask,
+                            next_gray, next_mask,
+                            gap_grays, dis_flow,
+                        ),
+                    ):
+                        # 补偿帧与检测帧走同一渲染路径（feather + 透明度混合）
+                        blurred_gap = (
+                            cv2.GaussianBlur(gap_frame, (block_blur, block_blur), 0)
+                            if block_opacity < 1.0
+                            else None
+                        )
+                        _apply_object_rle_mask(
+                            gap_frame, compensated_mask,
+                            opacity=block_opacity, blurred_frame=blurred_gap,
+                        )
+                        stats["blocks_total"] += 1
+                        stats["frames_with_block"] += 1
+                        stats["flow_compensated_frames"] += 1
+                        writer.write(gap_frame)
+                else:
+                    for gap_frame in gap_frames:
+                        writer.write(gap_frame)
             stats["blocks_total"] += len(boxes) + len(masks)
             if boxes or masks:
                 stats["frames_with_block"] += 1
@@ -398,6 +540,8 @@ def mask_objects(
                 if (boxes or masks) and block_opacity < 1.0
                 else None
             )
+            source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            union_mask = _union_block_mask(masks, boxes, width, height)
             for mask in masks:
                 _apply_object_rle_mask(frame, mask, opacity=block_opacity,
                                        blurred_frame=blurred_frame)
@@ -406,7 +550,10 @@ def mask_objects(
                     frame, box, opacity=block_opacity, blurred_frame=blurred_frame
                 )
             writer.write(frame)
-            frame_index += 1
+            last_blocked = (source_gray, union_mask)
+        # 视频以空洞结尾（无后边界）：不向后延伸，原样写出。
+        for gap_frame in pending_gap:
+            writer.write(gap_frame)
         capture.release()
         writer.release()
         if stats["frames"] < 1:

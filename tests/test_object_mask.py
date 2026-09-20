@@ -228,6 +228,7 @@ def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
         "hold_frames": 4,
         "interpolated_frames": 2,
         "targets": {"mug": {"detections": 2, "detected_frames": 2}},
+        "flow_compensated_frames": 0,
     }
     assert detector.calls == [(source, ["mug"])]
     capture = cv2.VideoCapture(str(destination))
@@ -312,6 +313,7 @@ def test_mask_objects_holds_the_last_position_then_disappears(
         "hold_frames": OBJECT_MASK_HOLD_FRAMES,
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 1, "detected_frames": 1}},
+        "flow_compensated_frames": 0,
     }
     frames = _read_frames(destination)
     assert len(frames) == 20
@@ -354,6 +356,7 @@ def test_mask_objects_matches_simultaneous_boxes_to_tracks_by_iou(
         "hold_frames": 0,
         "interpolated_frames": 1,
         "targets": {"mug": {"detections": 4, "detected_frames": 2}},
+        "flow_compensated_frames": 0,
     }
     frames = _read_frames(destination)
     for frame in frames:
@@ -387,6 +390,7 @@ def test_mask_objects_without_detections_leaves_frames_untouched(
         "hold_frames": 0,
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 0, "detected_frames": 0}},
+        "flow_compensated_frames": 0,
     }
     frames = _read_frames(destination)
     assert len(frames) == 3
@@ -451,6 +455,7 @@ def test_mask_objects_blocks_total_counts_anchor_frames_once(
         "hold_frames": 0,
         "interpolated_frames": 0,
         "targets": {"mug": {"detections": 3, "detected_frames": 3}},
+        "flow_compensated_frames": 0,
     }
 
 
@@ -678,3 +683,235 @@ def test_mask_objects_fal_artifacts_and_fingerprint_reuse(tmp_path: Path) -> Non
         detector=reused, detect_artifacts_dir=tmp_path / "other-project-segment",
     )
     assert stats2["blocks_total"] == stats["blocks_total"]
+
+
+# ==== 短时空洞的双向光流补偿（_flow_compensated_masks / mask_objects 集成） ====
+# 算法与取舍见 app/object_mask.py 的段头注释。测试用固定种子噪声背景 +
+# 匀速移动的亮方块（光流可跟踪），检测产物用合成 fal 行主序 rle；空洞
+# 通过打断 track（锚点 IoU=0 的两段）+ monkeypatch 续盖帧数为 0 构造。
+
+
+def _rect_rle(
+    x0: int, y0: int, x1: int, y1: int, width: int, height: int
+) -> str:
+    """矩形区域 → fal 行主序 (start, length) 对 counts 字符串。"""
+    pairs = []
+    for row in range(y0, y1):
+        pairs.append(f"{row * width + x0} {x1 - x0}")
+    return " ".join(pairs)
+
+
+def _rle_detection(
+    frame: int, x0: int, y0: int, x1: int, y1: int, label: str,
+    width: int, height: int,
+) -> ObjectDetection:
+    bbox = (x0 / width, y0 / height, x1 / width, y1 / height)
+    return ObjectDetection(
+        label=label,
+        timestamp_s=float(frame),  # 测试视频 fps=1.0，时间戳 = 帧号
+        bbox_xyxy_normalized=bbox,
+        rle=_rect_rle(x0, y0, x1, y1, width, height),
+    )
+
+
+_FLOW_SIZE = (160, 120)  # (width, height)
+_FLOW_SQUARE = 24  # 亮方块边长
+
+
+def _moving_square_frame(
+    square_x: int, square_y: int, background: np.ndarray
+) -> np.ndarray:
+    frame = background.copy()
+    frame[square_y:square_y + _FLOW_SQUARE, square_x:square_x + _FLOW_SQUARE] = 240
+    return frame
+
+
+def _moving_square_video(
+    path: Path, frames: int, x0: int, y0: int, dx_per_frame: int
+) -> np.ndarray:
+    """固定种子噪声背景 + 匀速右移的亮方块；返回背景数组供断言复用。"""
+    rng = np.random.default_rng(42)
+    background = rng.integers(10, 40, (_FLOW_SIZE[1], _FLOW_SIZE[0], 3), dtype=np.uint8)
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 1.0, _FLOW_SIZE
+    )
+    if not writer.isOpened():
+        pytest.skip("OpenCV mp4v encoder unavailable")
+    for frame_index in range(frames):
+        writer.write(
+            _moving_square_frame(x0 + dx_per_frame * frame_index, y0, background)
+        )
+    writer.release()
+    return background
+
+
+def _flow_dis() -> cv2.DISOpticalFlow:
+    return cv2.DISOpticalFlow.create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+
+
+def _gray_of(frame: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _square_mask(x: int, y: int) -> np.ndarray:
+    mask = np.zeros((_FLOW_SIZE[1], _FLOW_SIZE[0]), dtype=np.uint8)
+    mask[y:y + _FLOW_SQUARE, x:x + _FLOW_SQUARE] = 1
+    return mask
+
+
+def test_flow_compensated_masks_lands_on_true_gap_position() -> None:
+    """单元：前帧方块 x=10、后帧 x=18、空洞帧真实 x=14（匀速）；补偿 mask
+    与真实位置的 IoU 应显著 > 0。"""
+    background = np.random.default_rng(42).integers(
+        10, 40, (_FLOW_SIZE[1], _FLOW_SIZE[0], 3), dtype=np.uint8
+    )
+    prev = _moving_square_frame(10, 40, background)
+    gap = _moving_square_frame(14, 40, background)
+    next_ = _moving_square_frame(18, 40, background)
+    compensated = object_mask._flow_compensated_masks(
+        _gray_of(prev), _square_mask(10, 40),
+        _gray_of(next_), _square_mask(18, 40),
+        [_gray_of(gap)],
+        _flow_dis(),
+    )
+    truth = _square_mask(14, 40).astype(bool)
+    got = compensated[0]
+    intersection = int((got & truth).sum())
+    union = int((got | truth).sum())
+    assert intersection / union > 0.5
+    assert int(got.sum()) > 200
+
+
+def test_mask_objects_fills_single_frame_gap(tmp_path: Path, monkeypatch) -> None:
+    """单帧空洞（续盖=0 + 两侧 label 不同强制断轨——生产空洞来自整帧目标
+    丢失，bbox 插值同 track 会盖住空洞，这是构造真空洞的测试接缝）：
+    补偿 1 帧且落在真实位置。"""
+    monkeypatch.setattr(object_mask, "OBJECT_MASK_HOLD_FRAMES", 0)
+    source = tmp_path / "src.mp4"
+    _moving_square_video(source, frames=5, x0=6, y0=40, dx_per_frame=4)
+    # 帧 0/1 方块 x=6/10（label A）；帧 3/4 x=18/22（label B）；帧 2 空洞，
+    # 方块真实位置 x=14。
+    detections = [
+        _rle_detection(0, 6, 40, 30, 64, "obj-pre", *_FLOW_SIZE),
+        _rle_detection(1, 10, 40, 34, 64, "obj-pre", *_FLOW_SIZE),
+        _rle_detection(3, 18, 40, 42, 64, "obj-post", *_FLOW_SIZE),
+        _rle_detection(4, 22, 40, 46, 64, "obj-post", *_FLOW_SIZE),
+    ]
+    out = tmp_path / "out.mp4"
+    stats = object_mask.mask_objects(
+        source, out, ["obj-pre", "obj-post"], detector=_SparseDetector(detections),
+    )
+    assert stats["flow_compensated_frames"] == 1
+    assert stats["frames"] == 5
+    assert stats["frames_with_block"] == 5  # 空洞被补上
+    frame2 = _read_frames(out)[2]
+    # 空洞帧真实方块位置 x=14：该区域应已被灰块覆盖
+    region = frame2[40:40 + _FLOW_SQUARE, 12:12 + _FLOW_SQUARE]
+    grayish = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
+    assert grayish > 0.5
+
+
+def test_mask_objects_fills_two_frame_gap(tmp_path: Path, monkeypatch) -> None:
+    """两帧空洞：逐帧位置权重混合，两帧都补偿。"""
+    monkeypatch.setattr(object_mask, "OBJECT_MASK_HOLD_FRAMES", 0)
+    source = tmp_path / "src.mp4"
+    _moving_square_video(source, frames=6, x0=6, y0=40, dx_per_frame=4)
+    detections = [
+        _rle_detection(0, 6, 40, 30, 64, "obj-pre", *_FLOW_SIZE),
+        _rle_detection(1, 10, 40, 34, 64, "obj-pre", *_FLOW_SIZE),
+        _rle_detection(4, 22, 40, 46, 64, "obj-post", *_FLOW_SIZE),
+        _rle_detection(5, 26, 40, 50, 64, "obj-post", *_FLOW_SIZE),
+    ]
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["obj-pre", "obj-post"],
+        detector=_SparseDetector(detections),
+    )
+    assert stats["flow_compensated_frames"] == 2
+    assert stats["frames_with_block"] == 6
+
+
+def test_mask_objects_gap_longer_than_max_not_filled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """连续无块帧 > OBJECT_MASK_FLOW_GAP_MAX_FRAMES：不补偿，原样输出。"""
+    monkeypatch.setattr(object_mask, "OBJECT_MASK_HOLD_FRAMES", 0)
+    source = tmp_path / "src.mp4"
+    _moving_square_video(source, frames=7, x0=6, y0=40, dx_per_frame=4)
+    detections = [
+        _rle_detection(0, 6, 40, 30, 64, "obj-pre", *_FLOW_SIZE),
+        _rle_detection(5, 26, 40, 50, 64, "obj-post", *_FLOW_SIZE),
+        _rle_detection(6, 30, 40, 54, 64, "obj-post", *_FLOW_SIZE),
+    ]
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["obj-pre", "obj-post"],
+        detector=_SparseDetector(detections),
+    )
+    assert stats["flow_compensated_frames"] == 0
+    assert stats["frames_with_block"] == 3  # 帧 1-4 空洞保持裸露
+
+
+def test_mask_objects_head_and_tail_gaps_not_extended(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """首检出帧之前/末检出帧之后的空洞不延伸补偿。"""
+    monkeypatch.setattr(object_mask, "OBJECT_MASK_HOLD_FRAMES", 0)
+    source = tmp_path / "src.mp4"
+    _moving_square_video(source, frames=8, x0=6, y0=40, dx_per_frame=4)
+    detections = [
+        _rle_detection(3, 18, 40, 42, 64, "obj", *_FLOW_SIZE),
+        _rle_detection(4, 22, 40, 46, 64, "obj", *_FLOW_SIZE),
+    ]
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["obj"],
+        detector=_SparseDetector(detections),
+    )
+    assert stats["flow_compensated_frames"] == 0
+    assert stats["frames"] == 8
+    assert stats["frames_with_block"] == 2  # 只有帧 3/4 有块
+
+
+def test_mask_objects_flow_compensation_covers_multiple_targets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """多目标：两个 label 各自的 mask 并集一起被光流补偿。"""
+    monkeypatch.setattr(object_mask, "OBJECT_MASK_HOLD_FRAMES", 0)
+    source = tmp_path / "src.mp4"
+    frames = 5
+    rng = np.random.default_rng(7)
+    background = rng.integers(
+        10, 40, (_FLOW_SIZE[1], _FLOW_SIZE[0], 3), dtype=np.uint8
+    )
+    writer = cv2.VideoWriter(
+        str(source), cv2.VideoWriter_fourcc(*"mp4v"), 1.0, _FLOW_SIZE
+    )
+    if not writer.isOpened():
+        pytest.skip("OpenCV mp4v encoder unavailable")
+    for frame_index in range(frames):
+        frame = background.copy()
+        # 目标 A 右移、目标 B 左移，空洞帧（帧 2）两者都在中间位置
+        frame[20:44, 6 + 4 * frame_index:30 + 4 * frame_index] = 240
+        frame[70:94, 100 - 4 * frame_index:124 - 4 * frame_index] = 240
+        writer.write(frame)
+    writer.release()
+    detections = [
+        _rle_detection(0, 6, 20, 30, 44, "obj-a-pre", *_FLOW_SIZE),
+        _rle_detection(1, 10, 20, 34, 44, "obj-a-pre", *_FLOW_SIZE),
+        _rle_detection(3, 18, 20, 42, 44, "obj-a-post", *_FLOW_SIZE),
+        _rle_detection(4, 22, 20, 46, 44, "obj-a-post", *_FLOW_SIZE),
+        _rle_detection(0, 100, 70, 124, 94, "obj-b-pre", *_FLOW_SIZE),
+        _rle_detection(1, 96, 70, 120, 94, "obj-b-pre", *_FLOW_SIZE),
+        _rle_detection(3, 88, 70, 112, 94, "obj-b-post", *_FLOW_SIZE),
+        _rle_detection(4, 84, 70, 108, 94, "obj-b-post", *_FLOW_SIZE),
+    ]
+    out = tmp_path / "out.mp4"
+    stats = object_mask.mask_objects(
+        source, out,
+        ["obj-a-pre", "obj-a-post", "obj-b-pre", "obj-b-post"],
+        detector=_SparseDetector(detections),
+    )
+    assert stats["flow_compensated_frames"] == 1
+    frame2 = _read_frames(out)[2]
+    for (y, x_mid) in ((20, 14), (70, 92)):  # 帧 2 两目标真实位置附近
+        region = frame2[y:y + 24, x_mid - 4:x_mid + 20]
+        grayish = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
+        assert grayish > 0.5, f"target near x={x_mid} not compensated"
