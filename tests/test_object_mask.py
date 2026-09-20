@@ -230,6 +230,8 @@ def test_mask_objects_covers_the_box_with_dark_gray_and_preserves_timing(
         "targets": {"mug": {"detections": 2, "detected_frames": 2}},
         "flow_compensated_frames": 0,
         "degraded_bbox_fallback_frames": 0,
+        "person_frames_with_block": 0,
+        "object_frames_with_block": 8,
     }
     assert detector.calls == [(source, ["mug"])]
     capture = cv2.VideoCapture(str(destination))
@@ -316,6 +318,8 @@ def test_mask_objects_holds_the_last_position_then_disappears(
         "targets": {"mug": {"detections": 1, "detected_frames": 1}},
         "flow_compensated_frames": 0,
         "degraded_bbox_fallback_frames": 0,
+        "person_frames_with_block": 0,
+        "object_frames_with_block": 1 + OBJECT_MASK_HOLD_FRAMES,
     }
     frames = _read_frames(destination)
     assert len(frames) == 20
@@ -360,6 +364,8 @@ def test_mask_objects_matches_simultaneous_boxes_to_tracks_by_iou(
         "targets": {"mug": {"detections": 4, "detected_frames": 2}},
         "flow_compensated_frames": 0,
         "degraded_bbox_fallback_frames": 0,
+        "person_frames_with_block": 0,
+        "object_frames_with_block": 3,
     }
     frames = _read_frames(destination)
     for frame in frames:
@@ -395,6 +401,8 @@ def test_mask_objects_without_detections_leaves_frames_untouched(
         "targets": {"mug": {"detections": 0, "detected_frames": 0}},
         "flow_compensated_frames": 0,
         "degraded_bbox_fallback_frames": 0,
+        "person_frames_with_block": 0,
+        "object_frames_with_block": 0,
     }
     frames = _read_frames(destination)
     assert len(frames) == 3
@@ -461,6 +469,8 @@ def test_mask_objects_blocks_total_counts_anchor_frames_once(
         "targets": {"mug": {"detections": 3, "detected_frames": 3}},
         "flow_compensated_frames": 0,
         "degraded_bbox_fallback_frames": 0,
+        "person_frames_with_block": 0,
+        "object_frames_with_block": 3,
     }
 
 
@@ -1068,3 +1078,164 @@ def test_mask_objects_degraded_fallback_is_per_label(tmp_path: Path) -> None:
     assert np.abs(frame1[30, 20].astype(int) - 64).max() <= 12
     # B 的 bbox 内、mask 外区域（x=90,y=10）保持原画面（B 未退化、不回退）
     assert np.abs(frame1[10, 90].astype(int) - np.array([10, 20, 30])).max() <= 12
+
+
+# ==== 分组检测 + 分类透明度渲染（人物组 100% 不透明 / 物品组 opacity+模糊） ====
+# 规则见 mask_objects docstring：组归属由调用方显式传入（person_targets），
+# 不按 label 字符串内容猜测；两组非空各发一次 detect，指纹缓存按组 prompt
+# 自然分开。
+
+
+class _GroupPromptDetector:
+    """按 targets 列表分组的 seam：记录每次调用的组，按组返回 detections。"""
+
+    def __init__(self, hits: dict[tuple[str, ...], list[ObjectDetection]]) -> None:
+        self.hits = hits
+        self.calls: list[list[str]] = []
+
+    def detect(self, video_path: Path, targets: list[str]) -> list[ObjectDetection]:
+        self.calls.append(list(targets))
+        return list(self.hits.get(tuple(targets), []))
+
+
+def test_mask_objects_grouped_detection_calls(tmp_path: Path) -> None:
+    """两组非空各发一次 detect（物品组 + 人物组），组 prompt 内容精确；
+    产物 object-detections.json 记录 person_targets。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=1)
+    detector = _GroupPromptDetector({
+        ("scarf",): [_rle_detection(0, 8, 6, 40, 40, "scarf", *_FLOW_SIZE)],
+        ("person", "hair"): [
+            _rle_detection(0, 88, 6, 152, 108, "person, hair", *_FLOW_SIZE)
+        ],
+    })
+    artifacts = tmp_path / "segment"
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", ["scarf"],
+        person_targets=["person", "hair"],
+        detector=detector, detect_artifacts_dir=artifacts,
+    )
+    assert detector.calls == [["scarf"], ["person", "hair"]]
+    assert stats["object_frames_with_block"] == 1
+    assert stats["person_frames_with_block"] == 1
+    payload = json.loads(
+        (artifacts / "object-detections.json").read_text(encoding="utf-8")
+    )
+    assert payload["targets"] == ["scarf"]
+    assert payload["person_targets"] == ["person", "hair"]
+    assert [d["label"] for d in payload["detections"]] == [
+        "scarf", "person, hair"
+    ]
+
+
+def test_mask_objects_single_group_makes_one_call(tmp_path: Path) -> None:
+    """只物品组 / 只人物组：各一次 detect；人物组渲染用 person 参数。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=1)
+    object_only = _GroupPromptDetector({
+        ("scarf",): [_rle_detection(0, 8, 6, 40, 40, "scarf", *_FLOW_SIZE)],
+    })
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out1.mp4", ["scarf"], detector=object_only,
+    )
+    assert object_only.calls == [["scarf"]]
+    assert stats["person_frames_with_block"] == 0
+    assert stats["object_frames_with_block"] == 1
+    person_only = _GroupPromptDetector({
+        ("person", "hair"): [
+            _rle_detection(0, 8, 6, 40, 40, "person, hair", *_FLOW_SIZE)
+        ],
+    })
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out2.mp4", [],
+        person_targets=["person", "hair"], detector=person_only,
+    )
+    assert person_only.calls == [["person", "hair"]]
+    assert stats["person_frames_with_block"] == 1
+    assert stats["object_frames_with_block"] == 0
+
+
+def test_mask_objects_person_group_renders_opaque_object_group_translucent(
+    tmp_path: Path,
+) -> None:
+    """分类渲染：物品 opacity=0.5 时人物组区域仍是纯 (64,64,64) 实心填充，
+    物品组区域是 64 与模糊原画面的混合。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=1)  # 静态纯色背景 (10,20,30)
+    detector = _GroupPromptDetector({
+        ("scarf",): [_rle_detection(0, 8, 6, 40, 40, "scarf", *_FLOW_SIZE)],
+        ("person", "hair"): [
+            _rle_detection(0, 88, 6, 152, 108, "person, hair", *_FLOW_SIZE)
+        ],
+    })
+    out = tmp_path / "out.mp4"
+    object_mask.mask_objects(
+        source, out, ["scarf"],
+        person_targets=["person", "hair"],
+        detector=detector,
+        block_opacity=0.5, block_blur=31, person_block_opacity=1.0,
+    )
+    frame = _read_frames(out)[0].astype(int)
+    # 人物区内部（远离羽化边）：纯 64 实心
+    person_px = frame[60, 120]
+    assert np.abs(person_px - 64).max() <= 6
+    # 物品区内部：0.5×64 + 0.5×模糊背景(10,20,30) ≈ (37,42,47)，远离 64
+    object_px = frame[24, 24]
+    assert np.abs(object_px - np.array([37, 42, 47])).max() <= 10
+    assert np.abs(object_px - 64).max() > 12  # 确实半透明而非实心
+
+
+def test_mask_objects_degraded_fallback_uses_person_params(tmp_path: Path) -> None:
+    """退化帧回退在人物 label 下工作：mask 骤降回退 bbox，且按人物参数
+    （100% 不透明）渲染——物品 opacity=0.5 不影响人物组。"""
+    source = tmp_path / "src.mp4"
+    _degraded_video(source, frames=3)
+    detections = [
+        _rle_detection(f, 8, 6, 152, 108, "person, hair", *_FLOW_SIZE)
+        for f in (0, 2)
+    ]
+    detections.append(ObjectDetection(
+        label="person, hair", timestamp_s=1.0,
+        bbox_xyxy_normalized=(0.05, 0.05, 0.95, 0.9),
+        rle=_rect_rle(70, 50, 78, 58, *_FLOW_SIZE),  # 帧 1 mask 碎成 8x8
+    ))
+    stats = object_mask.mask_objects(
+        source, tmp_path / "out.mp4", [],
+        person_targets=["person", "hair"],
+        detector=_SparseDetector(detections),
+        block_opacity=0.5, person_block_opacity=1.0,
+    )
+    assert stats["degraded_bbox_fallback_frames"] == 1
+    # 帧 1 bbox 兜底区域按人物参数渲染：纯实心 64（非半透明混合）
+    point = _read_frames(tmp_path / "out.mp4")[1][30, 20].astype(int)
+    assert np.abs(point - 64).max() <= 6
+
+
+def test_mask_objects_flow_compensation_uses_person_params_at_person_boundary(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """光流空洞补偿在人物 label 边界下工作：补偿 mask 的渲染参数跟随边界
+    组归属（任一边界含人物组块即人物参数，宁可从严）。"""
+    monkeypatch.setattr(object_mask, "OBJECT_MASK_HOLD_FRAMES", 0)
+    source = tmp_path / "src.mp4"
+    _moving_square_video(source, frames=5, x0=6, y0=40, dx_per_frame=4)
+    detections = [
+        # 前边界：人物组（帧 0/1，x=6/10）；后边界：物品组（帧 3/4，x=18/22）
+        _rle_detection(0, 6, 40, 30, 64, "person, hair", *_FLOW_SIZE),
+        _rle_detection(1, 10, 40, 34, 64, "person, hair", *_FLOW_SIZE),
+        _rle_detection(3, 18, 40, 42, 64, "scarf", *_FLOW_SIZE),
+        _rle_detection(4, 22, 40, 46, 64, "scarf", *_FLOW_SIZE),
+    ]
+    out = tmp_path / "out.mp4"
+    stats = object_mask.mask_objects(
+        source, out, ["scarf"],
+        person_targets=["person", "hair"],
+        detector=_SparseDetector(detections),
+        block_opacity=0.5, block_blur=31, person_block_opacity=1.0,
+    )
+    assert stats["flow_compensated_frames"] == 1
+    # 补偿帧（帧 2）按人物参数渲染：纯实心 64，半透明混合不可用
+    frame2 = _read_frames(out)[2]
+    region = frame2[40:64, 12:36]
+    solid = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
+    assert solid > 0.5

@@ -374,27 +374,31 @@ def _production_detector() -> Any:
 
 def _detect_all(
     source: Path,
-    targets: list[str],
+    target_groups: list[list[str]],
     detector: Any,
     artifacts_dir: Path | None,
 ) -> list[ObjectDetection]:
-    """One SAM request covers all targets, avoiding a second paid invocation.
+    """每组 targets 一次 SAM 请求（分组调用）。
 
-    The raw detection response cache is keyed by the complete comma-separated
-    prompt.  The project-local fallback is therefore one prompt-level path
-    rather than a per-target path.  SAM does not label boxes by target in a
-    multi-target response, so an empty result is meaningful only for the whole
-    target group.
+    fal/wavespeed 的逗号多目标返回是逐帧合并 mask，无法归因到具体词；
+    人物组与物品组必须分组渲染不同透明度（人物 100% 防身份泄漏、物品
+    99%+模糊保动作锚点），所以检测也按组分开调用，detection label（=
+    该组的完整逗号 prompt）天然携带组归属。每组内部的多个词仍合并为一
+    次调用；每组的原始响应缓存按各自完整 prompt 指纹自然分开。空结果
+    只对该组有意义，逐组记日志。
     """
     client = detector
     if artifacts_dir is not None and hasattr(detector, "with_cache"):
         client = detector.with_cache(artifacts_dir / "object-detect-response.json")
-    detections = client.detect(source, targets)
-    if not detections:
-        _LOGGER.warning(
-            "object mask: target group %r got no detections",
-            ", ".join(target.strip() for target in targets),
-        )
+    detections: list[ObjectDetection] = []
+    for group_targets in target_groups:
+        group_detections = client.detect(source, group_targets)
+        if not group_detections:
+            _LOGGER.warning(
+                "object mask: target group %r got no detections",
+                ", ".join(target.strip() for target in group_targets),
+            )
+        detections.extend(group_detections)
     return detections
 
 
@@ -403,16 +407,24 @@ def mask_objects(
     destination: Path,
     targets: list[str],
     *,
+    person_targets: list[str] | None = None,
     detector: Any | None = None,
     detect_artifacts_dir: Path | None = None,
     block_opacity: float = 1.0,
     block_blur: int = 31,
+    person_block_opacity: float = 1.0,
 ) -> dict[str, Any]:
     """Cover every detected replaceable object with a deep gray block,
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
     omitted, the production SAM-3 client is used (wavespeed → sandbase →
     fal 链路顺序，见 object_detect.select_provider，需对应平台 key)。
+    检测分组：``targets`` 是物品组（OR 合并检测词），``person_targets``
+    是人物组（换人时 pipeline 显式传入 ["person", "hair"]）；两组非空时
+    各发一次 detect，组归属由此显式传入，不按 label 字符串内容猜测。
+    渲染按组分类：人物组 label 的 mask/bbox 用 ``person_block_opacity``
+    （默认 1.0 纯填充不模糊——2% 残影即身份泄漏实测），物品组用
+    ``block_opacity``/``block_blur``（99%+ 模糊保动作锚点）。
     ``detect_artifacts_dir`` 是检测产物落盘目录（项目 work 目录内）：
     解析后的契约 detections 写 object-detections.json（见 _detect_all）；
     检测原始响应的指纹缓存写实例级共享目录
@@ -428,6 +440,15 @@ def mask_objects(
         raise ObjectMaskError("object mask source video is invalid")
     if any(not isinstance(target, str) or not target.strip() for target in targets):
         raise ObjectMaskError("object mask targets must be non-empty strings")
+    person_targets = list(person_targets) if person_targets is not None else []
+    if any(
+        not isinstance(target, str) or not target.strip()
+        for target in person_targets
+    ):
+        raise ObjectMaskError("object mask person targets must be non-empty strings")
+    # 人物组 label = 该组完整逗号 prompt（client 端 join 的确定性结果，
+    # 与 detections 里的 label 逐字一致）。
+    person_label = ", ".join(target.strip() for target in person_targets) or None
     if (
         isinstance(block_opacity, bool)
         or not isinstance(block_opacity, (int, float))
@@ -436,6 +457,16 @@ def mask_objects(
     ):
         raise ObjectMaskError("object mask block opacity must be a number in (0, 1]")
     block_opacity = float(block_opacity)
+    if (
+        isinstance(person_block_opacity, bool)
+        or not isinstance(person_block_opacity, (int, float))
+        or not np.isfinite(float(person_block_opacity))
+        or not 0.0 < float(person_block_opacity) <= 1.0
+    ):
+        raise ObjectMaskError(
+            "object mask person block opacity must be a number in (0, 1]"
+        )
+    person_block_opacity = float(person_block_opacity)
     if isinstance(block_blur, bool) or not isinstance(block_blur, int) or block_blur < 1 or block_blur % 2 != 1:
         raise ObjectMaskError("object mask block blur must be a positive odd integer")
     capture = cv2.VideoCapture(str(source))
@@ -447,19 +478,21 @@ def mask_objects(
     if width < 1 or height < 1 or fps <= 0:
         capture.release()
         raise ObjectMaskError("object mask source metadata is incomplete")
-    if detector is None and targets:
+    target_groups = [group for group in (targets, person_targets) if group]
+    if detector is None and target_groups:
         detector = _production_detector()
     detections = (
-        _detect_all(source, targets, detector, detect_artifacts_dir)
-        if targets
+        _detect_all(source, target_groups, detector, detect_artifacts_dir)
+        if target_groups
         else []
     )
-    if detect_artifacts_dir is not None and targets:
+    if detect_artifacts_dir is not None and target_groups:
         detect_artifacts_dir.mkdir(parents=True, exist_ok=True)
         (detect_artifacts_dir / "object-detections.json").write_text(
             json.dumps(
                 {
                     "targets": list(targets),
+                    "person_targets": list(person_targets),
                     "detections": [
                         {
                             "label": detection.label,
@@ -508,6 +541,7 @@ def mask_objects(
     stats: dict[str, Any] = {
         "frames": 0, "frames_with_block": 0, "blocks_total": 0,
         "flow_compensated_frames": 0, "degraded_bbox_fallback_frames": 0,
+        "person_frames_with_block": 0, "object_frames_with_block": 0,
     }
     try:
         writer = cv2.VideoWriter(
@@ -525,8 +559,9 @@ def mask_objects(
         dis_flow: cv2.DISOpticalFlow | None = None
         pending_gap: list[np.ndarray] = []
         # 最近有块帧的（原始灰度图, 遮盖 union mask）；光流必须用画灰块之前
-        # 的原图，灰块会破坏运动场估计。
-        last_blocked: tuple[np.ndarray, np.ndarray] | None = None
+        # 的原图，灰块会破坏运动场估计。第三个元素是该帧是否画了人物组块
+        # （光流补偿帧的分类参数按边界帧组归属决定，见循环内注释）。
+        last_blocked: tuple[np.ndarray, np.ndarray, bool] | None = None
         while True:
             ok, frame = capture.read()
             if not ok:
@@ -555,19 +590,36 @@ def mask_objects(
             )
             if fallback_labels:
                 stats["degraded_bbox_fallback_frames"] += 1
-            masks = [
-                mask for label_masks in masks_by_label.values()
-                for mask in label_masks
-            ]
-            boxes = [
-                box
-                for label, label_boxes in boxes_by_label.items()
-                if label in fallback_labels or label not in masks_by_label
-                for box in label_boxes
-            ]
+            # 逐 label 分类渲染：人物组 label 用 person_block_opacity（默认
+            # 1.0 纯填充不模糊，防身份泄漏），物品组 label 用
+            # block_opacity/block_blur（99%+ 模糊保动作锚点）。
+            label_runs: list[
+                tuple[str, list[np.ndarray], list[tuple[int, int, int, int]], float]
+            ] = []
+            for label in detection_labels:
+                label_masks = masks_by_label.get(label, [])
+                label_boxes = boxes_by_label.get(label, [])
+                if label_masks and label not in fallback_labels:
+                    label_boxes = []
+                if not label_masks and not label_boxes:
+                    continue
+                label_runs.append((
+                    label,
+                    label_masks,
+                    label_boxes,
+                    person_block_opacity if label == person_label else block_opacity,
+                ))
+            masks = [mask for _l, ms, _b, _o in label_runs for mask in ms]
+            boxes = [box for _l, _m, bs, _o in label_runs for box in bs]
+            painted_person = any(
+                label == person_label for label, _m, _b, _o in label_runs
+            )
+            painted_object = any(
+                label != person_label for label, _m, _b, _o in label_runs
+            )
             stats["frames"] += 1
             frame_index += 1
-            if not boxes and not masks:
+            if not label_runs:
                 pending_gap.append(frame)
                 continue
             if pending_gap:
@@ -580,13 +632,20 @@ def mask_objects(
                         dis_flow = cv2.DISOpticalFlow.create(
                             cv2.DISOPTICAL_FLOW_PRESET_MEDIUM
                         )
-                    prev_gray, prev_mask = last_blocked
+                    prev_gray, prev_mask, prev_had_person = last_blocked
                     next_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     next_mask = _union_block_mask(masks, boxes, width, height)
                     gap_grays = [
                         cv2.cvtColor(gap_frame, cv2.COLOR_BGR2GRAY)
                         for gap_frame in gap_frames
                     ]
+                    # 补偿 mask 是边界帧的并集（可能混两类 label）：任一
+                    # 边界含人物组块即按人物参数渲染（身份泄漏宁可从严）。
+                    compensated_opacity = (
+                        person_block_opacity
+                        if prev_had_person or painted_person
+                        else block_opacity
+                    )
                     for gap_frame, compensated_mask in zip(
                         gap_frames,
                         _flow_compensated_masks(
@@ -598,39 +657,49 @@ def mask_objects(
                         # 补偿帧与检测帧走同一渲染路径（feather + 透明度混合）
                         blurred_gap = (
                             cv2.GaussianBlur(gap_frame, (block_blur, block_blur), 0)
-                            if block_opacity < 1.0
+                            if compensated_opacity < 1.0
                             else None
                         )
                         _apply_object_rle_mask(
                             gap_frame, compensated_mask,
-                            opacity=block_opacity, blurred_frame=blurred_gap,
+                            opacity=compensated_opacity, blurred_frame=blurred_gap,
                         )
                         stats["blocks_total"] += 1
                         stats["frames_with_block"] += 1
                         stats["flow_compensated_frames"] += 1
+                        stats[
+                            "person_frames_with_block"
+                            if compensated_opacity == person_block_opacity
+                            and (prev_had_person or painted_person)
+                            else "object_frames_with_block"
+                        ] += 1
                         writer.write(gap_frame)
                 else:
                     for gap_frame in gap_frames:
                         writer.write(gap_frame)
             stats["blocks_total"] += len(boxes) + len(masks)
-            if boxes or masks:
-                stats["frames_with_block"] += 1
+            stats["frames_with_block"] += 1
+            if painted_person:
+                stats["person_frames_with_block"] += 1
+            if painted_object:
+                stats["object_frames_with_block"] += 1
             blurred_frame = (
                 cv2.GaussianBlur(frame, (block_blur, block_blur), 0)
-                if (boxes or masks) and block_opacity < 1.0
+                if any(opacity < 1.0 for _l, _m, _b, opacity in label_runs)
                 else None
             )
             source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             union_mask = _union_block_mask(masks, boxes, width, height)
-            for mask in masks:
-                _apply_object_rle_mask(frame, mask, opacity=block_opacity,
-                                       blurred_frame=blurred_frame)
-            for box in boxes:
-                _apply_object_block(
-                    frame, box, opacity=block_opacity, blurred_frame=blurred_frame
-                )
+            for _label, run_masks, run_boxes, opacity in label_runs:
+                for mask in run_masks:
+                    _apply_object_rle_mask(frame, mask, opacity=opacity,
+                                           blurred_frame=blurred_frame)
+                for box in run_boxes:
+                    _apply_object_block(
+                        frame, box, opacity=opacity, blurred_frame=blurred_frame
+                    )
             writer.write(frame)
-            last_blocked = (source_gray, union_mask)
+            last_blocked = (source_gray, union_mask, painted_person)
         # 视频以空洞结尾（无后边界）：不向后延伸，原样写出。
         for gap_frame in pending_gap:
             writer.write(gap_frame)

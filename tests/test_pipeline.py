@@ -7290,7 +7290,7 @@ def _prepare_h3_object_mask_fixture(
     monkeypatch: Any,
 ) -> tuple[
     Pipeline, Path, dict[str, Any], dict[str, Any], dict[str, Any],
-    list[tuple[Path, Path, list[str]]],
+    list[tuple[Path, Path, list[str]]], list[dict[str, Any]],
 ]:
     pipeline, project, item, enhanced_index, replacement_sheet = (
         _prepare_h3_person_fixture(tmp_path, monkeypatch)
@@ -7307,6 +7307,7 @@ def _prepare_h3_object_mask_fixture(
         },
     }
     object_calls: list[tuple[Path, Path, list[str]]] = []
+    object_kwargs: list[dict[str, Any]] = []
 
     def fake_mask_objects(
         source_path: Path,
@@ -7315,6 +7316,7 @@ def _prepare_h3_object_mask_fixture(
         **kwargs: Any,
     ) -> dict[str, Any]:
         object_calls.append((source_path, destination, list(targets)))
+        object_kwargs.append(kwargs)
         destination.write_bytes(source_path.read_bytes() + b"-objects-masked")
         # 模仿真实 mask_objects 的产物落盘：合并 prompt 的一个响应 JSON +
         # 解析后的 detections JSON，供节点 output-media 收编。
@@ -7326,7 +7328,13 @@ def _prepare_h3_object_mask_fixture(
             (artifacts_dir / "object-detections.json").write_text(
                 "{}", encoding="utf-8"
             )
-        return {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
+        return {
+            "frames": 1,
+            "frames_with_block": 1,
+            "blocks_total": 1,
+            "person_frames_with_block": 1 if kwargs.get("person_targets") else 0,
+            "object_frames_with_block": 1 if targets else 0,
+        }
 
     monkeypatch.setattr(object_mask, "mask_objects", fake_mask_objects)
     monkeypatch.setattr(
@@ -7334,13 +7342,14 @@ def _prepare_h3_object_mask_fixture(
     )
     return (
         pipeline, project, item, enhanced_index, replacement_sheet, object_calls,
+        object_kwargs,
     )
 
 
 def test_h3_segment_masks_replaced_objects_and_faces_in_one_sam_node(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     segment_dir = project / "work" / "segments" / "0001"
@@ -7354,22 +7363,29 @@ def test_h3_segment_masks_replaced_objects_and_faces_in_one_sam_node(
         ResearchLog(project),
     )
 
-    # The unified SAM mask consumes the muted stream and receives frozen OR
-    # labels plus the deterministic face target in one invocation.
+    # 分组调用：物品组（OR 检测词）与人物组（person/hair）分两次 detect，
+    # 人物组经 person_targets 显式传入（分类渲染的归属依据）。
     assert muted == segment_dir / "source-objects-masked.mp4"
     assert muted.read_bytes() == b"source-objects-masked"
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["the red scarf around the neck", "person", "hair"],
+        ["the red scarf around the neck"],
     )]
+    assert _object_kwargs[0]["person_targets"] == ["person", "hair"]
     output = json.loads(
         (
             project / "logs" / "mask-replaceable-objects" / "segment-0001"
             / "attempt-1" / "output.json"
         ).read_text(encoding="utf-8")
     )
-    assert output == {"frames": 1, "frames_with_block": 1, "blocks_total": 1}
+    assert output == {
+        "frames": 1,
+        "frames_with_block": 1,
+        "blocks_total": 1,
+        "person_frames_with_block": 1,
+        "object_frames_with_block": 1,
+    }
 
 
 def test_segment_replaced_object_targets_prefers_detect_label_then_falls_back(
@@ -7473,7 +7489,7 @@ def test_segment_replaced_object_targets_skip_transient_physical_effects() -> No
 def test_h3_segment_object_mask_targets_use_the_detect_label(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     enhanced_index["entities"]["entity-01"]["replacement"]["detect_label"] = (
@@ -7494,14 +7510,15 @@ def test_h3_segment_object_mask_targets_use_the_detect_label(
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["scarf", "person", "hair"],
+        ["scarf"],
     )]
+    assert _object_kwargs[0]["person_targets"] == ["person", "hair"]
 
 
 def test_h3_segment_with_only_a_replaced_person_masks_its_face(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     enhanced_index["entities"] = {
@@ -7522,17 +7539,19 @@ def test_h3_segment_with_only_a_replaced_person_masks_its_face(
     )
 
     assert muted == segment_dir / "source-objects-masked.mp4"
+    # 只有人物组：物品组为空列表，人物组单独一次 detect。
     assert object_calls == [(
         segment_dir / "source-muted.mp4",
         segment_dir / "source-objects-masked.mp4",
-        ["person", "hair"],
+        [],
     )]
+    assert _object_kwargs[0]["person_targets"] == ["person", "hair"]
 
 
 def test_h3_segment_object_mask_skipped_without_available_provider(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     # No configured/available detection provider is the missing-key case:
@@ -7559,7 +7578,7 @@ def test_h3_segment_object_mask_skipped_without_available_provider(
 def test_h3_segment_object_mask_disabled_by_config_skips_fal_entirely(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     # The fixture leaves a provider available (["fal_sam3"]): only the config
@@ -7598,7 +7617,7 @@ def test_h3_segment_object_mask_disabled_by_config_skips_fal_entirely(
 def test_object_mask_failure_degrades_to_muted_reference(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
 
@@ -7639,7 +7658,7 @@ def test_object_mask_uncalibrated_fal_response_degrades_without_retry(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
     """fal 未校准响应形态是确定性错误：节点一次尝试即降级，不退避重试。"""
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
 
@@ -7681,7 +7700,7 @@ def test_h3_object_mask_node_collects_detect_artifacts(
 ) -> None:
     """节点产物清单：output-media 收盖块视频 + 合并 prompt 响应 JSON +
     解析 detections JSON（input-media 收输入视频，沿用既有节点纪律）。"""
-    pipeline, project, item, enhanced_index, replacement_sheet, object_calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, object_calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     enhanced_index["entities"]["entity-02"] = {
@@ -7704,7 +7723,8 @@ def test_h3_object_mask_node_collects_detect_artifacts(
     )
 
     targets = [call[2] for call in object_calls][0]
-    assert targets == ["the red scarf around the neck", "the leather wallet", "person", "hair"]
+    assert targets == ["the red scarf around the neck", "the leather wallet"]
+    assert _object_kwargs[0]["person_targets"] == ["person", "hair"]
     attempt = (
         project / "logs" / "mask-replaceable-objects" / "segment-0001"
         / "attempt-1"
@@ -7722,7 +7742,7 @@ def test_h3_object_mask_node_collects_detect_artifacts(
 def test_h3_prompt_introduces_one_unified_mask_block_clause(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
 
@@ -7754,7 +7774,7 @@ def test_h3_prompt_introduces_one_unified_mask_block_clause(
 def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     pipeline.settings = replace(
@@ -7770,20 +7790,61 @@ def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
         ResearchLog(project),
     )
 
+    # 混合模式：人物块全不透明 + 物品块半透明模糊，文案必须分别说清。
     assert prompt.startswith("This is an editing task on Video 1")
     assert (
-        "Semi-transparent dark gray (64,64,64) blocks mask the heads (faces and "
-        "hair) of people to replace and replaceable objects. The faint blurred source imagery "
-        "showing through the blocks serves ONLY as position, motion, and "
-        "composition reference: never reconstruct, enhance, sharpen, or "
-        "copy anything visible through the blocks; never draw or restore "
-        "what they hide: rebuild people naturally from their descriptions, "
-        "hair included, and rebuild objects only from the provided reference images."
+        "Dark gray (64,64,64) blocks fully conceal the heads "
+        "(faces and hair) of people to replace; "
+        "semi-transparent dark gray blocks mask replaceable "
+        "objects. The faint blurred source imagery showing "
+        "through the object blocks serves ONLY as position, "
+        "motion, and composition reference: never reconstruct, "
+        "enhance, sharpen, or copy anything visible through "
+        "the blocks; never draw or restore what any block "
+        "hides: rebuild people naturally from their "
+        "descriptions, hair included, and rebuild objects only "
+        "from the provided reference images."
     ) in prompt
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
     ).read_text(encoding="utf-8")
     assert frozen == prompt
+
+
+def test_h3_prompt_person_only_blocks_stay_opaque_when_opacity_below_one(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """只有人物组有块（物品组未请求）且物品 opacity<1：人物块不透明，
+    文案不提残影。"""
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
+        _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
+    )
+    pipeline.settings = replace(
+        pipeline.settings, object_mask_block_opacity=0.9,
+    )
+    # 物品无替换（实体不带 replacement），只有人物组
+    enhanced_index["entities"] = {
+        "entity-02": {
+            "source_visual_description": "a kept prop",
+            "occurrences": [{"segment_index": 1, "frame_orders": [1]}],
+        },
+    }
+
+    _item, prompt, _muted, _fusion_sha256 = pipeline._prepare_h3_segment(
+        project,
+        item,
+        enhanced_index,
+        replacement_sheet,
+        _effective_request(),
+        ResearchLog(project),
+    )
+
+    assert "Semi-transparent" not in prompt
+    assert (
+        "Dark gray (64,64,64) blocks mask the heads (faces and hair) of people "
+        "to replace and replaceable objects; never draw or restore what "
+        "they hide"
+    ) in prompt
 
 
 def test_h3_prompt_object_block_clause_absent_without_object_masking(
@@ -7812,7 +7873,7 @@ def test_h3_prompt_object_block_clause_absent_without_object_masking(
 def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
 
@@ -7840,7 +7901,7 @@ def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
 def test_h3_prompt_object_block_clause_absent_when_no_block_was_painted(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
 
@@ -7876,7 +7937,7 @@ def test_h3_prompt_object_block_clause_absent_when_no_block_was_painted(
 def test_h3_prompt_object_block_clause_without_a_replaced_person(
     tmp_path: Path, monkeypatch: Any,
 ) -> None:
-    pipeline, project, item, enhanced_index, replacement_sheet, _calls = (
+    pipeline, project, item, enhanced_index, replacement_sheet, _calls, _object_kwargs = (
         _prepare_h3_object_mask_fixture(tmp_path, monkeypatch)
     )
     del enhanced_index["people"]["person-01"]["replacement"]

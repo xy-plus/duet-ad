@@ -11,6 +11,7 @@ def _settings(
     object_mask_block_opacity: float = 1.0,
     object_mask_block_blur: int = 31,
     object_mask_enabled: bool = True,
+    object_mask_person_block_opacity: float = 1.0,
 ) -> Settings:
     return Settings(
         access_token="test",
@@ -19,6 +20,7 @@ def _settings(
         object_mask_block_opacity=object_mask_block_opacity,
         object_mask_block_blur=object_mask_block_blur,
         object_mask_enabled=object_mask_enabled,
+        object_mask_person_block_opacity=object_mask_person_block_opacity,
     )
 
 
@@ -134,3 +136,30 @@ def test_get_settings_reads_object_mask_enabled_env(
     monkeypatch.setenv("OBJECT_MASK_ENABLED", "false")
 
     assert get_settings().object_mask_enabled is False
+
+
+def test_settings_defaults_person_block_opacity_to_solid() -> None:
+    assert _settings().object_mask_person_block_opacity == 1.0
+
+
+@pytest.mark.parametrize("opacity", [0.05, 0.99, 1.0])
+def test_settings_accepts_person_block_opacity(opacity: float) -> None:
+    assert _settings(
+        object_mask_person_block_opacity=opacity
+    ).object_mask_person_block_opacity == float(opacity)
+
+
+@pytest.mark.parametrize("opacity", [0, -0.1, 1.1, float("inf"), float("nan"), True])
+def test_settings_rejects_invalid_person_block_opacity(opacity: float) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_PERSON_BLOCK_OPACITY"):
+        _settings(object_mask_person_block_opacity=opacity)
+
+
+def test_get_settings_reads_person_block_opacity_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_PERSON_BLOCK_OPACITY", "0.98")
+
+    assert get_settings().object_mask_person_block_opacity == pytest.approx(0.98)

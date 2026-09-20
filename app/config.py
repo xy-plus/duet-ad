@@ -149,6 +149,11 @@ class Settings:
     object_mask_enabled: bool = True
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0
+    # 人物组（person/hair）灰块不透明度，默认 1.0 纯实心（64,64,64）填充、
+    # 不做模糊混合：实测 98% 不透明度的 2% 残影就足够 H3 认出源脸（身份
+    # 泄漏），人物块必须全不透明；物品组沿用 object_mask_block_opacity
+    # （99%+模糊，保动作锚点）。合法区间 (0, 1]，加载期校验。
+    object_mask_person_block_opacity: float = 1.0
     # 泄漏残影的高斯模糊核，仅在 opacity<1 时生效；必须为正奇数像素。
     object_mask_block_blur: int = 31
 
@@ -467,6 +472,19 @@ class Settings:
         object.__setattr__(
             self, "object_mask_block_opacity", float(object_mask_block_opacity)
         )
+        person_block_opacity = self.object_mask_person_block_opacity
+        if (
+            isinstance(person_block_opacity, bool)
+            or not isinstance(person_block_opacity, (int, float))
+            or not math.isfinite(float(person_block_opacity))
+            or not 0.0 < float(person_block_opacity) <= 1.0
+        ):
+            raise ValueError(
+                "OBJECT_MASK_PERSON_BLOCK_OPACITY must be a number in (0, 1]"
+            )
+        object.__setattr__(
+            self, "object_mask_person_block_opacity", float(person_block_opacity)
+        )
         object_mask_block_blur = self.object_mask_block_blur
         if (
             isinstance(object_mask_block_blur, bool)
@@ -521,6 +539,14 @@ def get_settings() -> Settings:
         )
     except ValueError as exc:
         raise ValueError("OBJECT_MASK_BLOCK_BLUR must be a positive odd integer") from exc
+    try:
+        object_mask_person_block_opacity = float(
+            os.environ.get("OBJECT_MASK_PERSON_BLOCK_OPACITY", "1.0").strip()
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "OBJECT_MASK_PERSON_BLOCK_OPACITY must be a number in (0, 1]"
+        ) from exc
     return Settings(
         access_token=access_token,
         multiref_mode=multiref_mode,
@@ -599,4 +625,5 @@ def get_settings() -> Settings:
         object_mask_enabled=_bool("OBJECT_MASK_ENABLED", True),
         object_mask_block_opacity=object_mask_block_opacity,
         object_mask_block_blur=object_mask_block_blur,
+        object_mask_person_block_opacity=object_mask_person_block_opacity,
     )

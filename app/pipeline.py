@@ -5925,21 +5925,19 @@ class Pipeline:
                 lambda _value: [muted],
             )
             objects_masked = False
+            mask_stats: dict[str, Any] | None = None
             object_targets = self._replaced_object_targets(element_index)
+            # 人物组与物品组分开检测、分类渲染：fal/wavespeed 的逗号多目标
+            # 返回逐帧合并 mask，无法归因到具体词，而人物块必须 100% 不透明
+            # （2% 残影即身份泄漏实测）物品块 99%+ 模糊（保动作锚点），只能
+            # 分组调用（每段最多 2 次检测，2026-09-20 用户拍板接受）。
+            # 人物措辞经真实校准："person, hair" 可检出；"human"/"human
+            # face"/"human hair"/"human head" 全零检出
+            #（data-verify/wavespeed-calib-20260919 round3）。
+            person_targets: list[str] = []
             if self._segment_has_replaced_person(element_index, index):
-                # SAM accepts a comma-separated multi-target prompt.  Keep
-                # these deterministic person targets last, after the frozen
-                # OR detect labels, so every required block comes from one
-                # SAM request rather than separate paid detections.  The
-                # whole person plus hair are masked together with the face:
-                # hair and clothing carry identity, and leaving them visible
-                # let H3 copy the source look and visually undo the face
-                # replacement (2026-09-20 化妆品段2).  Wording calibrated by
-                # real WaveSpeed calls: "person, hair" detects; "human",
-                # "human face", "human hair", "human head" all return zero
-                # (data-verify/wavespeed-calib-20260919 round3).
-                object_targets.extend(["person", "hair"])
-            if object_targets and not self.settings.object_mask_enabled:
+                person_targets = ["person", "hair"]
+            if (object_targets or person_targets) and not self.settings.object_mask_enabled:
                 # OBJECT_MASK_ENABLED=false（检测后端不可用期间临时整体关闭：
                 # 2026-09-19 fal 账号被锁、sandbase worker 连续超时，wavespeed
                 # 已接入并当日完成输出标定、尚未在真实项目启用）：
@@ -5949,7 +5947,7 @@ class Pipeline:
                 log.event(
                     "object_mask_disabled",
                     scope=scope,
-                    targets=object_targets,
+                    targets=object_targets + person_targets,
                     reason="OBJECT_MASK_ENABLED=false",
                     impact=(
                         "replaceable faces and objects stay visible in "
@@ -5957,7 +5955,9 @@ class Pipeline:
                         "appearance"
                     ),
                 )
-            elif object_targets and object_detect.available_providers(self.settings):
+            elif (
+                object_targets or person_targets
+            ) and object_detect.available_providers(self.settings):
                 # This unified SAM node degrades on ANY failure: after the
                 # node's own retries the render continues on the unmasked
                 # stream. No configured provider means it never runs (the
@@ -5995,15 +5995,24 @@ class Pipeline:
                             "source": muted,
                             "output": object_masked,
                             "targets": object_targets,
+                            "person_targets": person_targets,
                             "block_opacity": self.settings.object_mask_block_opacity,
                             "block_blur": self.settings.object_mask_block_blur,
+                            # 分类参数进节点输入指纹：改动即触发重渲。
+                            "person_block_opacity": (
+                                self.settings.object_mask_person_block_opacity
+                            ),
                         },
                         [muted],
                         lambda: object_mask.mask_objects(
                             muted, object_masked, object_targets,
+                            person_targets=person_targets,
                             detect_artifacts_dir=detect_artifacts_dir,
                             block_opacity=self.settings.object_mask_block_opacity,
                             block_blur=self.settings.object_mask_block_blur,
+                            person_block_opacity=(
+                                self.settings.object_mask_person_block_opacity
+                            ),
                         ),
                         lambda _value: [
                             path
@@ -6038,7 +6047,7 @@ class Pipeline:
                         log.event(
                             "object_mask_no_blocks",
                             scope=scope,
-                            targets=object_targets,
+                            targets=object_targets + person_targets,
                             stats=mask_stats,
                             impact=(
                                 "no target could be located, so no dark gray "
@@ -6083,31 +6092,66 @@ class Pipeline:
                 )
             mask_block = ""
             if objects_masked:
-                # Keep the compact mask instruction first after the fixed
-                # editing framework, and leave the following FACE REPLACEMENT
-                # block to carry identity-reference binding details.
-                mask_block = (
-                    "Dark gray (64,64,64) blocks mask the heads (faces and "
-                    "hair) of people to replace and replaceable objects; "
-                    "never draw or restore "
-                    "what they hide: rebuild people naturally from their "
-                    "descriptions, hair included, and rebuild objects only "
-                    "from the provided reference images.\n\n"
-                )
-                if self.settings.object_mask_block_opacity < 1.0:
-                    # 半透明灰块时把设计意图说死：透出的残影只是位置/运动/构图
-                    # 锚点，否则模型会把淡残留当成暗光真实画面去增强重建。
+                # 文案必须匹配参考流的真实内容：人物块 100% 不透明（防身份
+                # 泄漏），物品块在 opacity<1.0 时是半透明模糊（残影仅作
+                # 位置/运动/构图锚点）。两组覆盖率取 mask_stats 的分组计数；
+                # 无分组计数时按请求的组兜底。
+                person_blocked = bool(person_targets)
+                object_blocked = bool(object_targets)
+                if mask_stats is not None and "person_frames_with_block" in mask_stats:
+                    person_blocked = (
+                        mask_stats["person_frames_with_block"] > 0
+                    )
+                    object_blocked = (
+                        mask_stats["object_frames_with_block"] > 0
+                    )
+                if (
+                    person_blocked
+                    and object_blocked
+                    and self.settings.object_mask_block_opacity < 1.0
+                ):
+                    # 混合模式：人物块不透明 + 物品块半透明。残影意图说死，
+                    # 否则模型会把淡残留当成暗光真实画面去增强重建。
+                    mask_block = (
+                        "Dark gray (64,64,64) blocks fully conceal the heads "
+                        "(faces and hair) of people to replace; "
+                        "semi-transparent dark gray blocks mask replaceable "
+                        "objects. The faint blurred source imagery showing "
+                        "through the object blocks serves ONLY as position, "
+                        "motion, and composition reference: never reconstruct, "
+                        "enhance, sharpen, or copy anything visible through "
+                        "the blocks; never draw or restore what any block "
+                        "hides: rebuild people naturally from their "
+                        "descriptions, hair included, and rebuild objects only "
+                        "from the provided reference images.\n\n"
+                    )
+                elif (
+                    object_blocked
+                    and not person_blocked
+                    and self.settings.object_mask_block_opacity < 1.0
+                ):
+                    # 仅物品组半透明：文案不提人物块（参考流里没有）。
                     mask_block = (
                         "Semi-transparent dark gray (64,64,64) blocks mask "
-                        "the heads (faces and hair) of people to replace and "
                         "replaceable objects. "
                         "The faint blurred source imagery showing through the blocks "
                         "serves ONLY as position, motion, and composition "
                         "reference: never reconstruct, enhance, sharpen, or "
                         "copy anything visible through the blocks; never draw "
-                        "or restore what they hide: rebuild people naturally "
-                        "from their descriptions, hair included, and rebuild "
-                        "objects only from the provided reference images.\n\n"
+                        "or restore what they hide: rebuild objects only from "
+                        "the provided reference images.\n\n"
+                    )
+                else:
+                    # Keep the compact mask instruction first after the fixed
+                    # editing framework, and leave the following FACE REPLACEMENT
+                    # block to carry identity-reference binding details.
+                    mask_block = (
+                        "Dark gray (64,64,64) blocks mask the heads (faces and "
+                        "hair) of people to replace and replaceable objects; "
+                        "never draw or restore "
+                        "what they hide: rebuild people naturally from their "
+                        "descriptions, hair included, and rebuild objects only "
+                        "from the provided reference images.\n\n"
                     )
             overlay_targets = []
             if processing["remove_subtitle"]:
