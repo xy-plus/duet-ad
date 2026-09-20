@@ -539,7 +539,7 @@ HTTP `200 OK`，响应体为 Job 对象。任务仍在处理时，响应头包�
 
 创建任务（直接创建或报价确认）时传入 `prompt_review=true`，任务在冻结全部生成前置产物后、任何付费生成提交前暂停，Job `status` 变为 `awaiting_prompt_review`。此时可以读取每段由 AI 生成的提示词主体，编辑后确认继续；不确认任务就永远静止，不会发生后续付费提交。
 
-提示词分为主体与注入部分：接口只暴露 AI 生成的提示词主体（`prompt` 字段）；后端机械注入的编辑框架、遮盖条款等固定内容不展示、不可编辑，确认时由后端用冻结原文重新拼接。
+提示词分为可编辑部分与固定部分：接口只暴露 AI 生成主体中的可编辑部分（`prompt` 字段）；后端机械注入的编辑框架、遮盖条款等固定内容，以及主体末尾的权威替换计划块（从整行 `BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN` 起到主体结束）不展示、不可编辑，确认时由后端用冻结原文重新拼接——confirm 请求中的任何文本都无法改动这些固定部分。
 
 ### 读取提示词
 
@@ -578,7 +578,7 @@ Content-Type: application/json
 ```
 
 - 仅 `awaiting_prompt_review` 状态可确认，其余状态返回 `409 prompt_review_not_pending`；确认是单次状态迁移，重复确认同样返回 `409`。
-- `segments` 的段集合必须与读取结果完全一致；每段 `prompt` 不能为空；拼接注入部分后的完整提示词超过长度限制时返回 `422 invalid_prompt_review_edit`。
+- `segments` 的段集合必须与读取结果完全一致；每段 `prompt` 为可编辑部分（不含权威替换计划块，该块由后端自动保留），无隐藏块的段不允许为空；拼接固定部分后的完整提示词超过长度限制时返回 `422 invalid_prompt_review_edit`。
 - 成功返回 `202 Accepted` 和 Job 对象，任务回到 `queued` 并继续生成；之后按既有轮询规则查询。
 
 ---

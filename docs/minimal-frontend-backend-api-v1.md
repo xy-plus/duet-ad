@@ -213,7 +213,7 @@
 
 ## 4.1 提示词审核/编辑
 
-`prompt_review: true` 的项目进入 `awaiting_prompt_review` 后，用下面两个内部接口完成审核。只展示 DeepSeek 生成的提示词主体（body）；后端机械注入的部分（编辑框架、遮盖条款、PERSON REPLACEMENT 块、Overlay removal、Dialogue requirements 尾部）一律不展示、不可编辑，confirm 时由后端用冻结的原文重新机械拼接。
+`prompt_review: true` 的项目进入 `awaiting_prompt_review` 后，用下面两个内部接口完成审核。只展示 DeepSeek 生成主体中的可编辑部分；后端机械注入的部分（编辑框架、遮盖条款、PERSON REPLACEMENT 块、Overlay removal、Dialogue requirements 尾部）和主体末尾的权威替换计划块（从整行 `BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN` 起）一律不展示、不可编辑，confirm 时由后端用冻结的原文重新机械拼接。
 
 `GET /api/conversations/{id}/prompt-review`：
 
@@ -239,7 +239,7 @@
 ```
 
 - 仅 `awaiting_prompt_review` 状态可确认，否则 `409 prompt_review_not_pending`。
-- `segments` 的段集合必须与冻结记录完全一致；每段 `prompt` 非空；重建后的完整提示词不超过长度限制，否则 `422 invalid_prompt_review_edit`。
+- `segments` 的段集合必须与冻结记录完全一致；`prompt` 为可编辑部分（不含权威替换计划块），有隐藏块的段允许清空；重建后的完整提示词不超过长度限制，否则 `422 invalid_prompt_review_edit`。
 - 确认成功返回 `202`：后端重建 `prefix + 编辑后主体 + suffix` 写回各段冻结提示词、重算冻结清单回执，项目回到 `queued` 并走 resume-picsart 等价路径继续生成。
 - 不确认就永远不会发生付费提交；放弃项目无需任何操作。
 
