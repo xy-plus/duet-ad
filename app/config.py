@@ -135,9 +135,9 @@ class Settings:
     # 国内直连 fal.run 不通时需代理，本机一般为 http://127.0.0.1:7897；
     # None = 直连。
     fal_proxy: str | None = None
-    # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高）；
-    # 合法区间 (0, 1]，加载期校验。
-    fal_sam3_threshold: float = 0.3
+    # SAM 3 文本 prompt 检不出时官方建议降到 0.2-0.3（默认 0.5 偏高），
+    # 本实例固定用 0.2；合法区间 (0, 1]，加载期校验。
+    fal_sam3_threshold: float = 0.2
     # 物品灰块节点总开关：false 时 mask-replaceable-objects 完全不触发，
     # 不发起任何检测调用（无上传、无重试、无等待），行为与
     # object_mask_degraded 降级路径完全一致（参考视频保持 source-muted、
@@ -149,7 +149,7 @@ class Settings:
     object_mask_enabled: bool = True
     # 灰块覆盖不透明度；1.0 保持当前纯实心灰块，低于 1.0 仅供 A/B 测试。
     object_mask_block_opacity: float = 1.0
-    # 人物组（person/hair）灰块不透明度，默认 1.0 纯实心（64,64,64）填充、
+    # 人物组（person/hair）灰块不透明度，默认 1.0 纯实心纯黑（0,0,0）填充、
     # 不做模糊混合：实测 98% 不透明度的 2% 残影就足够 H3 认出源脸（身份
     # 泄漏），人物块必须全不透明；物品组沿用 object_mask_block_opacity
     # （99%+模糊，保动作锚点）。合法区间 (0, 1]，加载期校验。
@@ -521,7 +521,7 @@ def get_settings() -> Settings:
         raise ValueError("SANDBASE_SAM3_THRESHOLD must be a number in (0, 1]") from exc
     try:
         fal_sam3_threshold = float(
-            os.environ.get("FAL_SAM3_THRESHOLD", "0.3").strip()
+            os.environ.get("FAL_SAM3_THRESHOLD", "0.2").strip()
         )
     except ValueError as exc:
         raise ValueError("FAL_SAM3_THRESHOLD must be a number in (0, 1]") from exc

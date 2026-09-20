@@ -67,8 +67,8 @@ def _read_frames(path: Path) -> list[np.ndarray]:
 def _block_columns(frame: np.ndarray) -> np.ndarray:
     """Columns containing pixels painted with the object block fill color.
 
-    The source color (10,20,30) differs from the fill (64,64,64) by >= 34 per
-    channel, so a tolerance of 24 cleanly separates the two even after the
+    The source color (10,20,30) differs from the object fill (255,255,255)
+    by >= 215 per channel, so a tolerance of 24 cleanly separates the two
     lossy mp4v -> H.264 round trip.
     """
     diff = np.abs(
@@ -199,7 +199,8 @@ def test_apply_object_rle_mask_keeps_unmasked_pixels() -> None:
     mask[3:12, 3:12] = True
     object_mask._apply_object_rle_mask(frame, mask, opacity=1.0)
     assert tuple(frame[7, 7]) == OBJECT_BLOCK_FILL
-    assert tuple(frame[0, 0]) == (0, 0, 0)
+    # 白色填充经羽化在远端黑底上取整后最多渗漏到 1（纯黑填充时该渗漏不可见）
+    assert frame[0, 0].max() <= 1
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
@@ -820,9 +821,9 @@ def test_mask_objects_fills_single_frame_gap(tmp_path: Path, monkeypatch) -> Non
     assert stats["frames"] == 5
     assert stats["frames_with_block"] == 5  # 空洞被补上
     frame2 = _read_frames(out)[2]
-    # 空洞帧真实方块位置 x=14：该区域应已被灰块覆盖
+    # 空洞帧真实方块位置 x=14：该区域应已被白块覆盖
     region = frame2[40:40 + _FLOW_SQUARE, 12:12 + _FLOW_SQUARE]
-    grayish = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
+    grayish = (np.abs(region.astype(int) - 255).max(axis=2) <= 12).mean()
     assert grayish > 0.5
 
 
@@ -928,7 +929,7 @@ def test_mask_objects_flow_compensation_covers_multiple_targets(
     frame2 = _read_frames(out)[2]
     for (y, x_mid) in ((20, 14), (70, 92)):  # 帧 2 两目标真实位置附近
         region = frame2[y:y + 24, x_mid - 4:x_mid + 20]
-        grayish = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
+        grayish = (np.abs(region.astype(int) - 255).max(axis=2) <= 12).mean()
         assert grayish > 0.5, f"target near x={x_mid} not compensated"
 
 
@@ -990,10 +991,10 @@ def test_mask_objects_degraded_frame_falls_back_to_bbox(tmp_path: Path) -> None:
     frames = _read_frames(out)
     # 帧 2：bbox 兜底区域（远离残 mask）被灰块覆盖
     point = frames[2][30, 40].astype(int)  # (y=30, x=40) 在 bbox 内、残 mask 外
-    assert np.abs(point - 64).max() <= 12
+    assert np.abs(point - 255).max() <= 12
     # 正常帧（帧 1）：mask == bbox，照旧全盖
     point1 = frames[1][30, 40].astype(int)
-    assert np.abs(point1 - 64).max() <= 12
+    assert np.abs(point1 - 255).max() <= 12
 
 
 def test_mask_objects_healthy_mask_keeps_bbox_suppressed(tmp_path: Path) -> None:
@@ -1075,7 +1076,7 @@ def test_mask_objects_degraded_fallback_is_per_label(tmp_path: Path) -> None:
     assert stats["degraded_bbox_fallback_frames"] == 1
     frame1 = _read_frames(out)[1]
     # A 的 bbox 兜底区域（x=20,y=30：bbox 内、残 mask 外）被灰块覆盖
-    assert np.abs(frame1[30, 20].astype(int) - 64).max() <= 12
+    assert np.abs(frame1[30, 20].astype(int) - 255).max() <= 12
     # B 的 bbox 内、mask 外区域（x=90,y=10）保持原画面（B 未退化、不回退）
     assert np.abs(frame1[10, 90].astype(int) - np.array([10, 20, 30])).max() <= 12
 
@@ -1158,8 +1159,8 @@ def test_mask_objects_single_group_makes_one_call(tmp_path: Path) -> None:
 def test_mask_objects_person_group_renders_opaque_object_group_translucent(
     tmp_path: Path,
 ) -> None:
-    """分类渲染：物品 opacity=0.5 时人物组区域仍是纯 (64,64,64) 实心填充，
-    物品组区域是 64 与模糊原画面的混合。"""
+    """分类渲染：物品 opacity=0.5 时人物组区域仍是纯黑 (0,0,0) 实心填充，
+    物品组区域是纯白 (255,255,255) 与模糊原画面的半透明混合。"""
     source = tmp_path / "src.mp4"
     _degraded_video(source, frames=1)  # 静态纯色背景 (10,20,30)
     detector = _GroupPromptDetector({
@@ -1176,13 +1177,13 @@ def test_mask_objects_person_group_renders_opaque_object_group_translucent(
         block_opacity=0.5, block_blur=31, person_block_opacity=1.0,
     )
     frame = _read_frames(out)[0].astype(int)
-    # 人物区内部（远离羽化边）：纯 64 实心
+    # 人物区内部（远离羽化边）：纯黑实心
     person_px = frame[60, 120]
-    assert np.abs(person_px - 64).max() <= 6
-    # 物品区内部：0.5×64 + 0.5×模糊背景(10,20,30) ≈ (37,42,47)，远离 64
+    assert np.abs(person_px - 0).max() <= 6
+    # 物品区内部：0.5×255 + 0.5×模糊背景(10,20,30) ≈ (132,137,142)
     object_px = frame[24, 24]
-    assert np.abs(object_px - np.array([37, 42, 47])).max() <= 10
-    assert np.abs(object_px - 64).max() > 12  # 确实半透明而非实心
+    assert np.abs(object_px - np.array([132, 137, 142])).max() <= 10
+    assert np.abs(object_px - 255).max() > 60  # 确实半透明而非纯白实心
 
 
 def test_mask_objects_degraded_fallback_uses_person_params(tmp_path: Path) -> None:
@@ -1206,9 +1207,9 @@ def test_mask_objects_degraded_fallback_uses_person_params(tmp_path: Path) -> No
         block_opacity=0.5, person_block_opacity=1.0,
     )
     assert stats["degraded_bbox_fallback_frames"] == 1
-    # 帧 1 bbox 兜底区域按人物参数渲染：纯实心 64（非半透明混合）
+    # 帧 1 bbox 兜底区域按人物参数渲染：纯黑实心（非半透明混合）
     point = _read_frames(tmp_path / "out.mp4")[1][30, 20].astype(int)
-    assert np.abs(point - 64).max() <= 6
+    assert np.abs(point - 0).max() <= 6
 
 
 def test_mask_objects_flow_compensation_uses_person_params_at_person_boundary(
@@ -1234,8 +1235,8 @@ def test_mask_objects_flow_compensation_uses_person_params_at_person_boundary(
         block_opacity=0.5, block_blur=31, person_block_opacity=1.0,
     )
     assert stats["flow_compensated_frames"] == 1
-    # 补偿帧（帧 2）按人物参数渲染：纯实心 64，半透明混合不可用
+    # 补偿帧（帧 2）按人物参数渲染：纯黑实心，半透明混合不可用
     frame2 = _read_frames(out)[2]
     region = frame2[40:64, 12:36]
-    solid = (np.abs(region.astype(int) - 64).max(axis=2) <= 12).mean()
+    solid = (np.abs(region.astype(int) - 0).max(axis=2) <= 12).mean()
     assert solid > 0.5

@@ -1578,8 +1578,9 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     assert result_item["index"] == 1
     assert result_prompt.startswith("This is an editing task on Video 1")
     assert "This is an editing task on Video 1" in result_prompt
-    assert "FACE REPLACEMENT IS MANDATORY" in result_prompt
-    assert "(64,64,64)" not in result_prompt
+    assert "PERSON REPLACEMENT IS MANDATORY" in result_prompt
+    assert "(0,0,0)" not in result_prompt
+    assert "(255,255,255)" not in result_prompt
     assert "Preserve the source motion" in result_prompt
     assert result_muted == segment_dir / "source-muted.mp4"
     assert len(fusion_input_sha256) == 64
@@ -1599,9 +1600,9 @@ def test_h3_prompt_fusion_selects_codex_and_keeps_schema_binding(
     prompt = (segment_dir / "h3_prompt.txt").read_text(encoding="utf-8")
     assert prompt.startswith("This is an editing task on Video 1")
     assert "This is an editing task on Video 1" in prompt
-    assert "FACE REPLACEMENT IS MANDATORY" in prompt
+    assert "PERSON REPLACEMENT IS MANDATORY" in prompt
     assert prompt.index("This is an editing task on Video 1") < prompt.index(
-        "FACE REPLACEMENT IS MANDATORY"
+        "PERSON REPLACEMENT IS MANDATORY"
     ) < prompt.index("Preserve the source motion")
     assert "Audio 1" in prompt
     assert "reference: Image 1, TILE_01" in prompt
@@ -7602,12 +7603,13 @@ def test_h3_segment_object_mask_disabled_by_config_skips_fal_entirely(
     )
 
     # Same artifact shape as the object_mask_degraded path: muted reference
-    # stream, no mask node logs, no dark gray clause in the frozen prompt —
+    # stream, no mask node logs, no mask-block clause in the frozen prompt —
     # only the trace event names the cause as config, not failure.
     assert muted == segment_dir / "source-muted.mp4"
     assert object_calls == []
     assert not (project / "logs" / "mask-replaceable-objects").exists()
-    assert "(64,64,64)" not in prompt
+    assert "(0,0,0)" not in prompt
+    assert "(255,255,255)" not in prompt
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "object_mask_disabled" in trace
     assert "OBJECT_MASK_ENABLED=false" in trace
@@ -7757,14 +7759,22 @@ def test_h3_prompt_introduces_one_unified_mask_block_clause(
 
     assert prompt.startswith("This is an editing task on Video 1")
     assert (
-        "Dark gray (64,64,64) blocks mask the heads (faces and hair) of people "
-        "to replace and replaceable objects; never draw or restore what "
-        "they hide: rebuild people naturally from their descriptions, hair "
-        "included, and rebuild objects only from the provided reference "
-        "images."
+        "Solid black (0,0,0) blocks fully conceal the people "
+        "to replace — face, hair, body and clothing included; "
+        "white blocks mask replaceable objects; never draw or "
+        "restore what they hide: rebuild people naturally from "
+        "their descriptions — face, hairstyle, skin tone, body "
+        "and clothing included — and rebuild objects only from "
+        "the provided reference images. Each rebuilt object "
+        "must match its reference image in identity, shape, "
+        "size, proportions and orientation, behave according "
+        "to its physical nature, and be held, worn or used in "
+        "a way consistent with its function; never reshape, "
+        "rescale or repurpose it to fit the source object it "
+        "replaces."
     ) in prompt
     assert "(128,128,128)" not in prompt
-    assert prompt.index("(64,64,64)") < prompt.index("FACE REPLACEMENT")
+    assert prompt.index("(0,0,0)") < prompt.index("PERSON REPLACEMENT")
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
     ).read_text(encoding="utf-8")
@@ -7793,17 +7803,24 @@ def test_h3_prompt_explains_semi_transparent_blocks_when_opacity_below_one(
     # 混合模式：人物块全不透明 + 物品块半透明模糊，文案必须分别说清。
     assert prompt.startswith("This is an editing task on Video 1")
     assert (
-        "Dark gray (64,64,64) blocks fully conceal the heads "
-        "(faces and hair) of people to replace; "
-        "semi-transparent dark gray blocks mask replaceable "
-        "objects. The faint blurred source imagery showing "
-        "through the object blocks serves ONLY as position, "
-        "motion, and composition reference: never reconstruct, "
-        "enhance, sharpen, or copy anything visible through "
-        "the blocks; never draw or restore what any block "
-        "hides: rebuild people naturally from their "
-        "descriptions, hair included, and rebuild objects only "
-        "from the provided reference images."
+        "Solid black (0,0,0) blocks fully conceal the people "
+        "to replace — face, hair, body and clothing included; "
+        "semi-transparent white (255,255,255) blocks mask "
+        "replaceable objects. The faint blurred source imagery "
+        "showing through the object blocks serves ONLY as "
+        "position, motion, and composition reference: never "
+        "reconstruct, enhance, sharpen, or copy anything "
+        "visible through the blocks; never draw or restore "
+        "what any block hides: rebuild people naturally from "
+        "their descriptions — face, hairstyle, skin tone, body "
+        "and clothing included — and rebuild objects only from "
+        "the provided reference images. Each rebuilt object "
+        "must match its reference image in identity, shape, "
+        "size, proportions and orientation, behave according "
+        "to its physical nature, and be held, worn or used in "
+        "a way consistent with its function; never reshape, "
+        "rescale or repurpose it to fit the source object it "
+        "replaces."
     ) in prompt
     frozen = (
         project / "work" / "segments" / "0001" / "h3_prompt.txt"
@@ -7841,9 +7858,10 @@ def test_h3_prompt_person_only_blocks_stay_opaque_when_opacity_below_one(
 
     assert "Semi-transparent" not in prompt
     assert (
-        "Dark gray (64,64,64) blocks mask the heads (faces and hair) of people "
-        "to replace and replaceable objects; never draw or restore what "
-        "they hide"
+        "Solid black (0,0,0) blocks fully conceal the people "
+        "to replace — face, hair, body and clothing included; "
+        "white blocks mask replaceable objects; never draw or "
+        "restore what they hide"
     ) in prompt
 
 
@@ -7865,9 +7883,10 @@ def test_h3_prompt_object_block_clause_absent_without_object_masking(
 
     assert prompt.startswith("This is an editing task on Video 1")
     assert prompt.index("This is an editing task on Video 1") < prompt.index(
-        "FACE REPLACEMENT IS MANDATORY"
+        "PERSON REPLACEMENT IS MANDATORY"
     )
-    assert "(64,64,64)" not in prompt
+    assert "(0,0,0)" not in prompt
+    assert "(255,255,255)" not in prompt
 
 
 def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
@@ -7893,9 +7912,10 @@ def test_h3_prompt_object_block_clause_absent_when_object_mask_degraded(
         ResearchLog(project),
     )
 
-    # Degraded object masking produced no dark gray blocks, so the frozen
+    # Degraded object masking produced no mask blocks, so the frozen
     # prompt must not claim they exist (resume replays this file verbatim).
-    assert "(64,64,64)" not in prompt
+    assert "(0,0,0)" not in prompt
+    assert "(255,255,255)" not in prompt
 
 
 def test_h3_prompt_object_block_clause_absent_when_no_block_was_painted(
@@ -7924,12 +7944,13 @@ def test_h3_prompt_object_block_clause_absent_when_no_block_was_painted(
         ResearchLog(project),
     )
 
-    # Zero painted blocks means the reference stream carries no dark gray
+    # Zero painted blocks means the reference stream carries no mask
     # block: the prompt must not claim one exists, and the pointlessly
     # re-encoded identical video must not replace the muted stream.
     segment_dir = project / "work" / "segments" / "0001"
     assert muted == segment_dir / "source-muted.mp4"
-    assert "(64,64,64)" not in prompt
+    assert "(0,0,0)" not in prompt
+    assert "(255,255,255)" not in prompt
     trace = (project / "logs" / "trace.jsonl").read_text(encoding="utf-8")
     assert "object_mask_no_blocks" in trace
 
@@ -7955,7 +7976,7 @@ def test_h3_prompt_object_block_clause_without_a_replaced_person(
     assert muted == segment_dir / "source-objects-masked.mp4"
     assert prompt.startswith("This is an editing task on Video 1")
     assert prompt.index("This is an editing task on Video 1") < prompt.index(
-        "Dark gray (64,64,64) blocks mask the heads (faces and hair) of people"
+        "Solid black (0,0,0) blocks fully conceal the people to replace"
     )
 
 

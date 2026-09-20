@@ -242,7 +242,7 @@ def test_fal_sam3_detect_full_flow(tmp_path: Path, video: Path) -> None:
     assert submit_body == {
         "video_url": "https://fal.test/files/clip.mp4",
         "prompt": "handbag",
-        "detection_threshold": 0.3,
+        "detection_threshold": 0.2,
     }
     # 掩码 RLE 本期不消费，但逐帧解析记录（含 rle/score）保留供二期使用。
     assert [entry["rle"] for entry in client.last_frames] == _FAL_SAM3_RESULT["rle"]
@@ -265,7 +265,7 @@ def test_fal_sam3_multi_target_uses_one_comma_separated_request(
     assert observed["submit_body"] == {
         "video_url": "https://fal.test/files/clip.mp4",
         "prompt": "face, necklace",
-        "detection_threshold": 0.3,
+        "detection_threshold": 0.2,
     }
     assert handler.state["submits"] == 1  # type: ignore[attr-defined]
     assert handler.state["uploads"] == 1  # type: ignore[attr-defined]
@@ -582,7 +582,7 @@ def _legacy_cache_payload(video: Path, prompt: str) -> dict[str, object]:
         "fingerprint": {
             "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest(),
             "prompt": prompt,
-            "detection_threshold": 0.3,
+            "detection_threshold": 0.2,
             "model": "video-rle",
         },
         "fal_response": _FAL_SAM3_RESULT,
@@ -613,7 +613,7 @@ def test_fal_sam3_shared_cache_cross_project_reuse(
     cached = json.loads(shared[0].read_text(encoding="utf-8"))
     assert cached["fal_response"] == _FAL_SAM3_RESULT
     assert cached["fingerprint"]["prompt"] == "handbag"
-    assert cached["fingerprint"]["detection_threshold"] == 0.3
+    assert cached["fingerprint"]["detection_threshold"] == 0.2
     assert len(cached["fingerprint"]["video_sha256"]) == 64
 
     def fail_handler(request: httpx.Request) -> httpx.Response:
@@ -765,7 +765,7 @@ def test_fal_sam3_shared_cache_concurrent_writers_leave_valid_file(
 
 def test_settings_fal_sam3_defaults(tmp_path: Path) -> None:
     settings = _fal_settings(tmp_path)
-    assert settings.fal_sam3_threshold == 0.3
+    assert settings.fal_sam3_threshold == 0.2
     assert settings.fal_sam3_api_key == "fal-secret"
     assert settings.fal_sam3_api_base == "https://fal.test/fal-ai/sam-3-1"
     assert settings.fal_sam3_model == "video-rle"
@@ -833,7 +833,7 @@ def test_get_settings_fal_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = get_settings()
     assert settings.fal_sam3_api_key is None
     assert settings.fal_proxy is None
-    assert settings.fal_sam3_threshold == 0.3
+    assert settings.fal_sam3_threshold == 0.2
 
 
 def test_get_settings_ignores_removed_object_detect_providers_env(

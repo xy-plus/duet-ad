@@ -24,7 +24,7 @@ WAVESPEED_API_KEY）、sandbase（``SandbaseSam3GroundingClient``，
 SANDBASE_API_KEY）。背景：2026-09-19 fal 旧账号被官方 Admin lock、同日
 接入的 sandbase 模型 worker 连续 generation_timeout，故临时接入 WaveSpeed
 救急；2026-09-20 换新 fal 账号后回到 fal 优先——fal 跑 SAM 3.1 且
-detection_threshold 可调（文档建议文本 prompt 失败时降到 0.2-0.3），
+detection_threshold 可调（本实例固定 0.2，文档建议文本 prompt 失败时降到 0.2-0.3），
 wavespeed 跑 SAM 3 且无阈值参数，实测词表稍长就整组零检出（校准 round4）。
 三家 provider 的归一化输出形状完全一致，下游 object_mask/pipeline 零改动。
 

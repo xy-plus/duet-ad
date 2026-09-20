@@ -6050,12 +6050,12 @@ class Pipeline:
                             targets=object_targets + person_targets,
                             stats=mask_stats,
                             impact=(
-                                "no target could be located, so no dark gray "
+                                "no target could be located, so no mask "
                                 "block exists in the reference video"
                             ),
                         )
             # The prompt is assembled only after the mask node so its unified
-            # dark-gray clause matches what the reference stream actually
+            # mask-block clause matches what the reference stream actually
             # contains: it appears only when SAM painted at least one block.
             # The frozen h3_prompt.txt is replayed verbatim on resume,
             # keeping the decision stable.
@@ -6081,19 +6081,20 @@ class Pipeline:
             )
             if masks_faces:
                 face_block = (
-                    "FACE REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
+                    "PERSON REPLACEMENT IS MANDATORY AND TAKES PRIORITY OVER "
                     "SOURCE IDENTITY. Each replaced person must use their "
                     "explicitly bound original user reference images when user-bound, "
                     f"or their own tile in {sheet_reference} when generated_variant. "
-                    "Face shape, eyes, nose, mouth, skin tone, and hairstyle follow "
-                    "that per-key appearance authority, never Video 1. Keeping the "
-                    "source face is a failure, even if everything else is "
-                    "correct.\n\n"
+                    "Face shape, eyes, nose, mouth, skin tone, hairstyle, body "
+                    "build, and clothing follow "
+                    "that per-key appearance authority, never Video 1. Keeping "
+                    "any part of the source person's appearance is a failure, "
+                    "even if everything else is correct.\n\n"
                 )
             mask_block = ""
             if objects_masked:
-                # 文案必须匹配参考流的真实内容：人物块 100% 不透明（防身份
-                # 泄漏），物品块在 opacity<1.0 时是半透明模糊（残影仅作
+                # 文案必须匹配参考流的真实内容：人物块 100% 不透明纯黑（防身份
+                # 泄漏），物品块在 opacity<1.0 时是半透明模糊白块（残影仅作
                 # 位置/运动/构图锚点）。两组覆盖率取 mask_stats 的分组计数；
                 # 无分组计数时按请求的组兜底。
                 person_blocked = bool(person_targets)
@@ -6110,20 +6111,27 @@ class Pipeline:
                     and object_blocked
                     and self.settings.object_mask_block_opacity < 1.0
                 ):
-                    # 混合模式：人物块不透明 + 物品块半透明。残影意图说死，
-                    # 否则模型会把淡残留当成暗光真实画面去增强重建。
+                    # 混合模式：人物块纯黑不透明 + 物品块半透明白。残影意图
+                    # 说死，否则模型会把淡残留当成暗光真实画面去增强重建。
                     mask_block = (
-                        "Dark gray (64,64,64) blocks fully conceal the heads "
-                        "(faces and hair) of people to replace; "
-                        "semi-transparent dark gray blocks mask replaceable "
-                        "objects. The faint blurred source imagery showing "
-                        "through the object blocks serves ONLY as position, "
-                        "motion, and composition reference: never reconstruct, "
-                        "enhance, sharpen, or copy anything visible through "
-                        "the blocks; never draw or restore what any block "
-                        "hides: rebuild people naturally from their "
-                        "descriptions, hair included, and rebuild objects only "
-                        "from the provided reference images.\n\n"
+                        "Solid black (0,0,0) blocks fully conceal the people "
+                        "to replace — face, hair, body and clothing included; "
+                        "semi-transparent white (255,255,255) blocks mask "
+                        "replaceable objects. The faint blurred source imagery "
+                        "showing through the object blocks serves ONLY as "
+                        "position, motion, and composition reference: never "
+                        "reconstruct, enhance, sharpen, or copy anything "
+                        "visible through the blocks; never draw or restore "
+                        "what any block hides: rebuild people naturally from "
+                        "their descriptions — face, hairstyle, skin tone, body "
+                        "and clothing included — and rebuild objects only from "
+                        "the provided reference images. Each rebuilt object "
+                        "must match its reference image in identity, shape, "
+                        "size, proportions and orientation, behave according "
+                        "to its physical nature, and be held, worn or used in "
+                        "a way consistent with its function; never reshape, "
+                        "rescale or repurpose it to fit the source object it "
+                        "replaces.\n\n"
                     )
                 elif (
                     object_blocked
@@ -6132,26 +6140,40 @@ class Pipeline:
                 ):
                     # 仅物品组半透明：文案不提人物块（参考流里没有）。
                     mask_block = (
-                        "Semi-transparent dark gray (64,64,64) blocks mask "
+                        "Semi-transparent white (255,255,255) blocks mask "
                         "replaceable objects. "
                         "The faint blurred source imagery showing through the blocks "
                         "serves ONLY as position, motion, and composition "
                         "reference: never reconstruct, enhance, sharpen, or "
                         "copy anything visible through the blocks; never draw "
                         "or restore what they hide: rebuild objects only from "
-                        "the provided reference images.\n\n"
+                        "the provided reference images. Each rebuilt object "
+                        "must match its reference image in identity, shape, "
+                        "size, proportions and orientation, behave according "
+                        "to its physical nature, and be held, worn or used in "
+                        "a way consistent with its function; never reshape, "
+                        "rescale or repurpose it to fit the source object it "
+                        "replaces.\n\n"
                     )
                 else:
                     # Keep the compact mask instruction first after the fixed
-                    # editing framework, and leave the following FACE REPLACEMENT
-                    # block to carry identity-reference binding details.
+                    # editing framework, and leave the following PERSON
+                    # REPLACEMENT block to carry identity-reference binding
+                    # details.
                     mask_block = (
-                        "Dark gray (64,64,64) blocks mask the heads (faces and "
-                        "hair) of people to replace and replaceable objects; "
-                        "never draw or restore "
-                        "what they hide: rebuild people naturally from their "
-                        "descriptions, hair included, and rebuild objects only "
-                        "from the provided reference images.\n\n"
+                        "Solid black (0,0,0) blocks fully conceal the people "
+                        "to replace — face, hair, body and clothing included; "
+                        "white blocks mask replaceable objects; never draw or "
+                        "restore what they hide: rebuild people naturally from "
+                        "their descriptions — face, hairstyle, skin tone, body "
+                        "and clothing included — and rebuild objects only from "
+                        "the provided reference images. Each rebuilt object "
+                        "must match its reference image in identity, shape, "
+                        "size, proportions and orientation, behave according "
+                        "to its physical nature, and be held, worn or used in "
+                        "a way consistent with its function; never reshape, "
+                        "rescale or repurpose it to fit the source object it "
+                        "replaces.\n\n"
                     )
             overlay_targets = []
             if processing["remove_subtitle"]:

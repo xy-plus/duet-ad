@@ -2,9 +2,12 @@
 
 fal SAM-3 receives all requested objects and, when a person is replaced,
 ``face`` in one comma-separated prompt.  Its calibrated multi-target response
-is a single unlabelled per-frame union, so every returned RLE mask receives the
-same deep gray (64,64,64) block; sparse/legacy anchors without a mask use their
-bbox rectangle, and frames whose mask area collapses below
+is a single unlabelled per-frame union; blocks are grouped by detection call:
+the person group is painted as a fully opaque solid black (0,0,0) block (any
+translucency leaks source identity) and the object group as a translucent
+blurred white (255,255,255) block (motion anchor); sparse/legacy anchors
+without a mask use their bbox rectangle, and frames whose mask area collapses
+below
 ``OBJECT_MASK_DEGRADED_AREA_RATIO`` of the interpolated bbox area render the
 bbox alongside the fragmentary mask (degraded-frame fallback, see
 ``_degraded_labels``). Sparse anchors first discard local area
@@ -19,7 +22,7 @@ Pipeline integration (app/pipeline.py): ``mask-replaceable-objects`` consumes
 the muted source directly.  It runs only when there are targets and FAL_KEY is
 configured.  A persistent failure degrades to the unmasked video plus an
 ``object_mask_degraded`` log event; no new gate is added.  H3 receives one
-frozen instruction that the deep-gray blocks conceal faces and replaceable
+frozen instruction that the black/white blocks conceal people and replaceable
 objects, and may reconstruct them only from the descriptions/reference images.
 """
 
@@ -41,7 +44,8 @@ from app.object_detect import ObjectDetection, select_provider
 
 _LOGGER = logging.getLogger(__name__)
 
-OBJECT_BLOCK_FILL = (64, 64, 64)  # deep gray (BGR) mixed into the object box
+OBJECT_BLOCK_FILL = (255, 255, 255)  # 物品组纯白（BGR）块：99%+高斯模糊半透明
+PERSON_BLOCK_FILL = (0, 0, 0)  # 人物组纯黑（BGR）块：100% 不透明实心（防身份泄漏）
 OBJECT_MASK_HOLD_FRAMES = 12  # frames a lost object keeps its last known box
 OBJECT_MASK_MAX_ATTEMPTS = 3  # retry budget for the pipeline node
 OBJECT_MASK_GLITCH_WINDOW_FRAMES = 15
@@ -191,8 +195,9 @@ def _apply_object_block(
     *,
     opacity: float,
     blurred_frame: np.ndarray | None = None,
+    fill: tuple[int, int, int] = OBJECT_BLOCK_FILL,
 ) -> None:
-    """Mix the deep-gray block into the box in place.
+    """Mix the group's block (object white / person black) into the box in place.
 
     ``opacity=1.0`` deliberately retains the direct assignment so the default
     behavior remains byte-for-byte identical to the original solid block.
@@ -200,13 +205,13 @@ def _apply_object_block(
     x0, y0, x1, y1 = box
     region = frame[y0:y1, x0:x1]
     if opacity == 1.0:
-        region[:] = OBJECT_BLOCK_FILL
+        region[:] = fill
         return
     if blurred_frame is None:
         raise ObjectMaskError("blurred frame is required for a translucent object block")
-    fill = np.asarray(OBJECT_BLOCK_FILL, dtype=np.float64)
+    fill_values = np.asarray(fill, dtype=np.float64)
     region[:] = np.rint(
-        fill * opacity + blurred_frame[y0:y1, x0:x1].astype(np.float64) * (1.0 - opacity)
+        fill_values * opacity + blurred_frame[y0:y1, x0:x1].astype(np.float64) * (1.0 - opacity)
     ).astype(np.uint8)
 
 
@@ -238,16 +243,17 @@ def _decode_rle_mask(rle: str, width: int, height: int) -> np.ndarray:
 
 
 def _apply_object_rle_mask(frame: np.ndarray, mask: np.ndarray, *, opacity: float,
-                           blurred_frame: np.ndarray | None = None) -> None:
-    """Feather an RLE mask and apply the ordinary block blend in place."""
+                           blurred_frame: np.ndarray | None = None,
+                           fill: tuple[int, int, int] = OBJECT_BLOCK_FILL) -> None:
+    """Feather an RLE mask and apply the group's block blend in place."""
     alpha = cv2.GaussianBlur(mask.astype(np.float32),
                              (OBJECT_MASK_RLE_FEATHER_KERNEL,) * 2, 0)[..., None]
     if opacity == 1.0:
-        replacement: np.ndarray | tuple[int, int, int] = OBJECT_BLOCK_FILL
+        replacement: np.ndarray | tuple[int, int, int] = fill
     else:
         if blurred_frame is None:
             raise ObjectMaskError("blurred frame is required for a translucent object block")
-        replacement = (np.asarray(OBJECT_BLOCK_FILL) * opacity
+        replacement = (np.asarray(fill, dtype=np.float64) * opacity
                        + blurred_frame.astype(np.float64) * (1.0 - opacity))
     frame[:] = np.rint(frame.astype(np.float64) * (1.0 - alpha)
                        + np.asarray(replacement, dtype=np.float64) * alpha).astype(np.uint8)
@@ -414,7 +420,8 @@ def mask_objects(
     block_blur: int = 31,
     person_block_opacity: float = 1.0,
 ) -> dict[str, Any]:
-    """Cover every detected replaceable object with a deep gray block,
+    """Cover every detected replaceable object with its group's block
+    (person: solid black, objects: translucent blurred white),
     keeping fps/resolution. ``detector`` follows the app/object_detect.py
     contract (detect(video_path, targets) -> list[ObjectDetection]); when
     omitted, the production SAM-3 client is used (wavespeed → sandbase →
@@ -590,11 +597,14 @@ def mask_objects(
             )
             if fallback_labels:
                 stats["degraded_bbox_fallback_frames"] += 1
-            # 逐 label 分类渲染：人物组 label 用 person_block_opacity（默认
-            # 1.0 纯填充不模糊，防身份泄漏），物品组 label 用
-            # block_opacity/block_blur（99%+ 模糊保动作锚点）。
+            # 逐 label 分类渲染：人物组 label 用 person_block_opacity +
+            # 纯黑实心块（默认 1.0 不模糊，防身份泄漏），物品组 label 用
+            # block_opacity/block_blur + 纯白半透明模糊块（保动作锚点）。
             label_runs: list[
-                tuple[str, list[np.ndarray], list[tuple[int, int, int, int]], float]
+                tuple[
+                    str, list[np.ndarray], list[tuple[int, int, int, int]],
+                    float, tuple[int, int, int],
+                ]
             ] = []
             for label in detection_labels:
                 label_masks = masks_by_label.get(label, [])
@@ -603,19 +613,23 @@ def mask_objects(
                     label_boxes = []
                 if not label_masks and not label_boxes:
                     continue
-                label_runs.append((
-                    label,
-                    label_masks,
-                    label_boxes,
-                    person_block_opacity if label == person_label else block_opacity,
-                ))
-            masks = [mask for _l, ms, _b, _o in label_runs for mask in ms]
-            boxes = [box for _l, _m, bs, _o in label_runs for box in bs]
+                if label == person_label:
+                    label_runs.append((
+                        label, label_masks, label_boxes,
+                        person_block_opacity, PERSON_BLOCK_FILL,
+                    ))
+                else:
+                    label_runs.append((
+                        label, label_masks, label_boxes,
+                        block_opacity, OBJECT_BLOCK_FILL,
+                    ))
+            masks = [mask for _l, ms, _b, _o, _f in label_runs for mask in ms]
+            boxes = [box for _l, _m, bs, _o, _f in label_runs for box in bs]
             painted_person = any(
-                label == person_label for label, _m, _b, _o in label_runs
+                label == person_label for label, _m, _b, _o, _f in label_runs
             )
             painted_object = any(
-                label != person_label for label, _m, _b, _o in label_runs
+                label != person_label for label, _m, _b, _o, _f in label_runs
             )
             stats["frames"] += 1
             frame_index += 1
@@ -641,10 +655,12 @@ def mask_objects(
                     ]
                     # 补偿 mask 是边界帧的并集（可能混两类 label）：任一
                     # 边界含人物组块即按人物参数渲染（身份泄漏宁可从严）。
+                    compensated_person = prev_had_person or painted_person
                     compensated_opacity = (
-                        person_block_opacity
-                        if prev_had_person or painted_person
-                        else block_opacity
+                        person_block_opacity if compensated_person else block_opacity
+                    )
+                    compensated_fill = (
+                        PERSON_BLOCK_FILL if compensated_person else OBJECT_BLOCK_FILL
                     )
                     for gap_frame, compensated_mask in zip(
                         gap_frames,
@@ -663,14 +679,14 @@ def mask_objects(
                         _apply_object_rle_mask(
                             gap_frame, compensated_mask,
                             opacity=compensated_opacity, blurred_frame=blurred_gap,
+                            fill=compensated_fill,
                         )
                         stats["blocks_total"] += 1
                         stats["frames_with_block"] += 1
                         stats["flow_compensated_frames"] += 1
                         stats[
                             "person_frames_with_block"
-                            if compensated_opacity == person_block_opacity
-                            and (prev_had_person or painted_person)
+                            if compensated_person
                             else "object_frames_with_block"
                         ] += 1
                         writer.write(gap_frame)
@@ -685,18 +701,19 @@ def mask_objects(
                 stats["object_frames_with_block"] += 1
             blurred_frame = (
                 cv2.GaussianBlur(frame, (block_blur, block_blur), 0)
-                if any(opacity < 1.0 for _l, _m, _b, opacity in label_runs)
+                if any(opacity < 1.0 for _l, _m, _b, opacity, _f in label_runs)
                 else None
             )
             source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             union_mask = _union_block_mask(masks, boxes, width, height)
-            for _label, run_masks, run_boxes, opacity in label_runs:
+            for _label, run_masks, run_boxes, opacity, fill in label_runs:
                 for mask in run_masks:
                     _apply_object_rle_mask(frame, mask, opacity=opacity,
-                                           blurred_frame=blurred_frame)
+                                           blurred_frame=blurred_frame, fill=fill)
                 for box in run_boxes:
                     _apply_object_block(
-                        frame, box, opacity=opacity, blurred_frame=blurred_frame
+                        frame, box, opacity=opacity, blurred_frame=blurred_frame,
+                        fill=fill,
                     )
             writer.write(frame)
             last_blocked = (source_gray, union_mask, painted_person)
