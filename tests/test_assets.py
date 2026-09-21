@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from fastapi_users.exceptions import UserAlreadyExists
 
 from app.config import Settings
 from app.main import create_app
@@ -77,7 +78,12 @@ def make_app(tmp_path: Path, factory=idle_factory, **overrides):
 
 
 def bearer(client: TestClient, email: str, password: str = "user-pass-123") -> dict:
-    client.post("/api/auth/register", json={"email": email, "password": password})
+    # 自助注册已关闭：直接经 UserAuth.create_user 播种（已存在则跳过，如播种
+    # 管理员），再走正常登录拿 bearer token。
+    try:
+        client.portal.call(client.app.state.auth.create_user, email, password)
+    except UserAlreadyExists:
+        pass
     response = client.post("/api/auth/login", json={"email": email, "password": password})
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}

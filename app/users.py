@@ -1,6 +1,7 @@
 """内部用户系统：fastapi-users（SQLAlchemy + aiosqlite + SQLite）标准件适配层。
 
-- 账号体系：邮箱 + 密码（库默认 User 表，argon2 哈希），开放自助注册。
+- 账号体系：邮箱 + 密码（库默认 User 表，argon2 哈希）；自助注册已关闭，
+  账号只来自 INITIAL_ADMIN_* 播种或管理员离线建号（create_user）。
 - 双通道认证：Bearer JWT（API 客户端/脚本）与 Cookie（浏览器，
   HttpOnly + sameSite=lax）共用同一 JWT 策略；两通道同时出现时显式
   Authorization 头优先，避免罐里旧 cookie 抢道。
@@ -11,10 +12,9 @@
   不改 updated_at）；没有 superuser 时跳过，下次启动再迁移。
 
 路由（在 app/main.py 注册，错误风格与内部 API 一致）：
-POST /api/auth/register（库注册路由）、POST /api/auth/login（邮箱+密码，
-成功同时写 cookie 并返回 bearer token）、POST /api/auth/logout（清 cookie；
-JWT 无状态，bearer 端由客户端丢弃）、GET /api/auth/me（当前用户，
-legacy 口令也返回管理员身份）。
+POST /api/auth/login（邮箱+密码，成功同时写 cookie 并返回 bearer token）、
+POST /api/auth/logout（清 cookie；JWT 无状态，bearer 端由客户端丢弃）、
+GET /api/auth/me（当前用户，legacy 口令也返回管理员身份）。
 """
 
 from __future__ import annotations
@@ -60,13 +60,9 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     pass
 
 
-class UserRead(schemas.BaseUser[uuid.UUID]):
-    # 内部工具允许 admin@duet.local 这类保留域邮箱：库默认 EmailStr 的
-    # email-validator 会拒绝 .local，这里放宽为非空字符串。
-    email: str
-
-
 class UserCreate(schemas.BaseUserCreate):
+    # 测试/内部工具会用 admin@duet.local 这类保留域邮箱：库默认 EmailStr 的
+    # email-validator 会拒绝 .local，这里放宽为非空字符串。
     email: str
 
 
@@ -142,14 +138,27 @@ class UserAuth:
         self.fastapi_users = FastAPIUsers[User, uuid.UUID](
             get_user_manager, [self.bearer_backend, self.cookie_backend]
         )
-        self.register_router = self.fastapi_users.get_register_router(
-            UserRead, UserCreate
-        )
         # optional=True：缺失/非法凭据返回 None，由 require_user 统一判 401
         # （旧口令通道在 fastapi-users 之外）。
         self.optional_current_user = self.fastapi_users.current_user(
             optional=True, active=True
         )
+
+    async def create_user(
+        self, email: str, password: str, *, is_superuser: bool = False
+    ) -> User:
+        """建一个账号（自助注册已关闭，仅播种管理员与测试/离线建号使用）。"""
+        async with self._session_maker() as session:
+            manager = self._manager_class(SQLAlchemyUserDatabase(session, User))
+            return await manager.create(
+                UserCreate(
+                    email=email,
+                    password=password,
+                    is_superuser=is_superuser,
+                    is_verified=True,
+                ),
+                safe=False,
+            )
 
     async def setup(self) -> None:
         """建表；首次启动（用户库为空）且配置了 INITIAL_ADMIN_* 时播种管理员。"""
@@ -162,17 +171,10 @@ class UserAuth:
             existing = await session.execute(select(User.id).limit(1))
             if existing.first() is not None:
                 return
-            manager = self._manager_class(SQLAlchemyUserDatabase(session, User))
-            await manager.create(
-                UserCreate(
-                    email=email,
-                    password=self._settings.initial_admin_password,
-                    is_superuser=True,
-                    is_verified=True,
-                ),
-                safe=False,
-            )
-            LOGGER.info("seeded initial admin user %s", email)
+        await self.create_user(
+            email, self._settings.initial_admin_password, is_superuser=True
+        )
+        LOGGER.info("seeded initial admin user %s", email)
 
     async def first_superuser(self) -> User | None:
         async with self._session_maker() as session:

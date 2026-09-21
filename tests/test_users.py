@@ -1,17 +1,19 @@
 """用户系统（app/users.py + main.py 接入）测试。
 
-覆盖：注册/登录/登出/错误密码 401、cookie+bearer 双通道、旧共享口令映射
-管理员、owner 隔离（普通用户看不到他人项目的任何端点）、superuser 全见、
-存量项目归属迁移，以及 rename / favorite 的校验与权限。
+覆盖：自助注册已关闭（404）、登录/登出/错误密码 401、cookie+bearer 双通道、
+旧共享口令映射管理员、owner 隔离（普通用户看不到他人项目的任何端点）、
+superuser 全见、存量项目归属迁移，以及 rename / favorite 的校验与权限。
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from fastapi_users.exceptions import UserAlreadyExists
 
 from app.config import Settings
 from app.main import create_app
@@ -62,8 +64,9 @@ def make_app(tmp_path: Path, **overrides):
     return create_app(make_settings(tmp_path, **overrides), pipeline_factory=idle_factory)
 
 
-def register(client: TestClient, email: str, password: str = "user-pass-123"):
-    return client.post("/api/auth/register", json={"email": email, "password": password})
+def seed_user(app, client: TestClient, email: str, password: str = "user-pass-123"):
+    """自助注册已关闭：测试直接经 UserAuth.create_user 在用户库里播种账号。"""
+    client.portal.call(app.state.auth.create_user, email, password)
 
 
 def login(client: TestClient, email: str, password: str):
@@ -90,16 +93,16 @@ def create_project(client: TestClient, headers: dict, request_id: str) -> dict:
     return response.json()
 
 
-def test_register_login_logout_and_wrong_password(tmp_path: Path):
+def test_registration_closed_and_login_logout_and_wrong_password(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        response = register(client, "alice@duet.local")
-        assert response.status_code == 201
-        body = response.json()
-        assert body["email"] == "alice@duet.local"
-        assert body["is_superuser"] is False
-        # 重复注册 → 库默认 400 REGISTER_USER_ALREADY_EXISTS
-        assert register(client, "alice@duet.local").status_code == 400
+        # 自助注册已关闭：库注册路由不再挂载（POST 落到 SPA 静态回退上时
+        # 表现为 405，路由完全缺失时为 404，两者都说明注册端点已摘除）
+        assert client.post(
+            "/api/auth/register",
+            json={"email": "mallory@duet.local", "password": "user-pass-123"},
+        ).status_code in (404, 405)
+        seed_user(app, client, "alice@duet.local")
         # 错误密码 → 401
         assert login(client, "alice@duet.local", "wrong-pass").status_code == 401
         assert login(client, "nobody@duet.local", "wrong-pass").status_code == 401
@@ -119,7 +122,7 @@ def test_register_login_logout_and_wrong_password(tmp_path: Path):
 def test_cookie_and_bearer_dual_channels(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "bob@duet.local")
+        seed_user(app, client, "bob@duet.local")
         response = login(client, "bob@duet.local", "user-pass-123")
         token = response.json()["access_token"]
         cookie = response.cookies["duet_auth"]
@@ -143,7 +146,7 @@ def test_cookie_and_bearer_dual_channels(tmp_path: Path):
 def test_legacy_token_maps_to_admin(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "carol@duet.local")
+        seed_user(app, client, "carol@duet.local")
         carol = bearer(client, "carol@duet.local")
         created = create_project(client, carol, "legacy-bridge-project")
         # 旧共享口令 → 播种的管理员身份
@@ -162,8 +165,8 @@ def test_legacy_token_maps_to_admin(tmp_path: Path):
 def test_owner_isolation_across_all_endpoints(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "alice@duet.local")
-        register(client, "bob@duet.local")
+        seed_user(app, client, "alice@duet.local")
+        seed_user(app, client, "bob@duet.local")
         alice = bearer(client, "alice@duet.local")
         bob = bearer(client, "bob@duet.local")
         project = create_project(client, alice, "alice-project")
@@ -203,7 +206,7 @@ def test_owner_isolation_across_all_endpoints(tmp_path: Path):
 def test_superuser_sees_everything(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "alice@duet.local")
+        seed_user(app, client, "alice@duet.local")
         alice = bearer(client, "alice@duet.local")
         project = create_project(client, alice, "alice-supervisor-project")
         admin = bearer(client, ADMIN_EMAIL, ADMIN_PASSWORD)
@@ -248,7 +251,7 @@ def test_ownerless_projects_hidden_from_regular_users_until_migrated(tmp_path: P
     project_id, _project, _state = app.state.store.create({}, "unmigrated")
     with TestClient(app) as client:
         # 没有 superuser：迁移跳过，普通用户看不到无主项目
-        register(client, "dave@duet.local")
+        seed_user(app, client, "dave@duet.local")
         dave = bearer(client, "dave@duet.local")
         listing = client.get("/api/conversations", headers=dave).json()
         assert all(item["id"] != project_id for item in listing)
@@ -260,7 +263,7 @@ def test_ownerless_projects_hidden_from_regular_users_until_migrated(tmp_path: P
 def test_rename_validation_and_effect(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "alice@duet.local")
+        seed_user(app, client, "alice@duet.local")
         alice = bearer(client, "alice@duet.local")
         project = create_project(client, alice, "rename-target")
         project_id = project["id"]
@@ -299,7 +302,7 @@ def test_rename_validation_and_effect(tmp_path: Path):
 def test_favorite_toggle_validation_and_list_ordering(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "alice@duet.local")
+        seed_user(app, client, "alice@duet.local")
         alice = bearer(client, "alice@duet.local")
         first = create_project(client, alice, "fav-first")
         second = create_project(client, alice, "fav-second")
@@ -339,8 +342,8 @@ def test_favorite_toggle_validation_and_list_ordering(tmp_path: Path):
 def test_favorite_and_rename_require_ownership(tmp_path: Path):
     app = make_app(tmp_path)
     with TestClient(app) as client:
-        register(client, "alice@duet.local")
-        register(client, "bob@duet.local")
+        seed_user(app, client, "alice@duet.local")
+        seed_user(app, client, "bob@duet.local")
         alice = bearer(client, "alice@duet.local")
         bob = bearer(client, "bob@duet.local")
         project = create_project(client, alice, "ownership-guard")
@@ -367,5 +370,13 @@ def test_admin_seed_only_when_store_is_empty(tmp_path: Path):
     # 第二次启动：用户库非空，不重复播种（管理员仍是唯一用户）
     app2 = create_app(settings, pipeline_factory=idle_factory)
     with TestClient(app2) as client:
-        assert register(client, ADMIN_EMAIL, "other-pass").status_code == 400
         assert login(client, ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200
+        # 重复播种同一邮箱被拒绝，管理员仍是唯一用户
+        with pytest.raises(UserAlreadyExists):
+            seed_user(app2, client, ADMIN_EMAIL, "other-pass")
+        assert (
+            sqlite3.connect(settings.users_db_path)
+            .execute("SELECT COUNT(*) FROM user")
+            .fetchone()[0]
+            == 1
+        )

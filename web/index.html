@@ -39,14 +39,6 @@
       <p id="login-error" class="form-error" role="alert" hidden></p>
       <button id="login-btn" class="btn btn-primary btn-block" type="submit">登录</button>
     </form>
-    <form id="register-form" novalidate hidden>
-      <label class="sr-only" for="register-email">邮箱</label>
-      <input id="register-email" class="text-input" type="email" placeholder="邮箱" autocomplete="username">
-      <label class="sr-only" for="register-password">密码</label>
-      <input id="register-password" class="text-input" type="password" placeholder="密码" autocomplete="new-password">
-      <p id="register-error" class="form-error" role="alert" hidden></p>
-      <button id="register-btn" class="btn btn-primary btn-block" type="submit">注册并登录</button>
-    </form>
     <form id="legacy-form" novalidate hidden>
       <label class="sr-only" for="login-token">旧访问口令</label>
       <input id="login-token" class="text-input" type="password" placeholder="旧访问口令（兼容）" autocomplete="current-password">
@@ -54,7 +46,6 @@
       <button id="legacy-btn" class="btn btn-primary btn-block" type="submit">进入</button>
     </form>
     <div class="login-alt">
-      <button id="login-switch" class="btn btn-ghost btn-block" type="button">注册账号</button>
       <button id="legacy-switch" class="btn btn-ghost btn-block" type="button">使用旧访问口令（兼容）</button>
     </div>
   </div>

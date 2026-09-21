@@ -679,9 +679,6 @@ def create_app(
             raise _error(401, "unauthorized", "口令不正确")
         return {"ok": True}
 
-    # 账号注册（fastapi-users 库路由）：POST /api/auth/register {email, password}
-    app.include_router(auth.register_router, prefix="/api/auth")
-
     @app.post("/api/auth/login")
     async def account_login(
         request: Request,

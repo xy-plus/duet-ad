@@ -173,8 +173,7 @@ input, textarea { font-family: inherit; }
 
 #login-form .btn-block { margin-top: 16px; }
 
-/* 登录页：账号/注册/旧口令三个表单叠放，切换显隐 */
-#register-form .btn-block,
+/* 登录页：账号/旧口令两个表单叠放，切换显隐 */
 #legacy-form .btn-block { margin-top: 16px; }
 .login-card form .text-input + .text-input { margin-top: 10px; }
 .login-alt { margin-top: 14px; display: flex; flex-direction: column; gap: 4px; }

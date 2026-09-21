@@ -722,15 +722,13 @@ function handleAuthError(err) {
 }
 
 /* ===== 登录 / 会话鉴权 ===== */
-/* 登录页三种模式：login（账号密码，主入口）、register（自助注册）、
-   legacy（旧访问口令，兼容入口）。 */
+/* 登录页两种模式：login（账号密码，主入口）、legacy（旧访问口令，兼容入口）。
+   自助注册已关闭，账号由管理员离线创建。 */
 function setLoginMode(mode) {
   $("login-form").hidden = mode !== "login";
-  $("register-form").hidden = mode !== "register";
   $("legacy-form").hidden = mode !== "legacy";
-  $("login-switch").textContent = mode === "register" ? "返回登录" : "注册账号";
   $("legacy-switch").textContent = mode === "legacy" ? "返回登录" : "使用旧访问口令（兼容）";
-  const focusId = mode === "register" ? "register-email" : mode === "legacy" ? "login-token" : "login-email";
+  const focusId = mode === "legacy" ? "login-token" : "login-email";
   setTimeout(() => $(focusId).focus(), 0);
 }
 
@@ -845,41 +843,6 @@ async function doAccountLogin(email, password) {
   } finally {
     btn.disabled = false;
     btn.textContent = "登录";
-  }
-}
-
-async function doRegister(email, password) {
-  const btn = $("register-btn");
-  const errEl = $("register-error");
-  btn.disabled = true;
-  errEl.hidden = true;
-  try {
-    const res = await fetch("/api/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: JSON.stringify({ email, password }),
-    });
-    if (!res.ok) {
-      let message = "注册失败（" + res.status + "），请稍后重试";
-      if (res.status === 400) {
-        try {
-          const data = await res.json();
-          if (data && data.detail === "REGISTER_USER_ALREADY_EXISTS") {
-            message = "该邮箱已注册，请直接登录";
-          }
-        } catch (e) { /* 保留默认提示 */ }
-      }
-      errEl.textContent = message;
-      errEl.hidden = false;
-      return;
-    }
-    await doAccountLogin(email, password);
-  } catch (e) {
-    errEl.textContent = "无法连接服务器，请检查网络后重试";
-    errEl.hidden = false;
-  } finally {
-    btn.disabled = false;
   }
 }
 
@@ -2848,18 +2811,6 @@ function bindEvents() {
     doAccountLogin(email, password);
   });
 
-  $("register-form").addEventListener("submit", (e) => {
-    e.preventDefault();
-    const email = $("register-email").value.trim();
-    const password = $("register-password").value;
-    if (!email || !password) {
-      $("register-error").textContent = "请输入邮箱和密码";
-      $("register-error").hidden = false;
-      return;
-    }
-    doRegister(email, password);
-  });
-
   $("legacy-form").addEventListener("submit", (e) => {
     e.preventDefault();
     const token = $("login-token").value.trim();
@@ -2871,9 +2822,6 @@ function bindEvents() {
     doLogin(token);
   });
 
-  $("login-switch").addEventListener("click", () => {
-    setLoginMode($("register-form").hidden ? "register" : "login");
-  });
   $("legacy-switch").addEventListener("click", () => {
     setLoginMode($("legacy-form").hidden ? "legacy" : "login");
   });
