@@ -213,6 +213,22 @@ def test_fusion_skill_requires_faithful_video1_action_description() -> None:
     assert "整段动作描述统一由第 1 条承担" in skill
 
 
+def test_fusion_skill_requires_chinese_visible_body_before_authority_block() -> None:
+    # 后端在整行 BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN 处拆分：
+    # BEGIN 之前是前端展示给用户审核/编辑的可编辑区，必须用中文；BEGIN 起的
+    # 权威计划块被后端冻结保管、confirm 时逐字拼回，结构/字段/英文措辞不变。
+    skill = (ROOT / "skills" / "h3-max-r2v-prompt" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "输出语言" in skill
+    assert "该行之前的可见主体" in skill
+    assert "一律用中文撰写" in skill
+    assert "权威计划块由后端机械附加" in skill
+    assert "其结构、字段和英文措辞完全固定" in skill
+    assert "不得翻译、改写或复述其中任何内容" in skill
+
+
 def _output(
     element_index: dict[str, Any],
     digest: str,

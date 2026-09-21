@@ -7,6 +7,8 @@ description: 根据原片段描述、Object Replace 增强后的全局对象索�
 
 只生成可直接提交给视频模型的一段提示词，不解释过程。传输格式以本次调用注入的 JSON Schema 为唯一权威：逐字回填固定的 `schema`、`version`、`input_sha256` 和 `segment_index`，把完整提示词放入 `prompt`；不得增删字段，不输出 Markdown。
 
+输出语言：后端会在整行 `BEGIN AUTHORITATIVE OBJECT REPLACEMENT AND VOICE PLAN` 处拆分你的 `prompt`，该行之前的可见主体（动作描述、替换描述等你输出的全部内容）一律用中文撰写；该行起的权威计划块由后端机械附加，其结构、字段和英文措辞完全固定，不属于你的输出，不得翻译、改写或复述其中任何内容。
+
 冻结的 `global_element_index` 是本项目唯一对象身份、替换与人物音色锚点。不得重新识别、重命名、合并或拆分 stable key，不得重新决定替换目标，不得要求读取用户替换说明，也不得根据常识新增替换。逐项读取当前 segment 的 occurrences、replacement、voice、preserve 和 relations。
 
 `replacement_sheet` 是按同一冻结索引生成的项目级单张新形象图版；`h3_reference_images` 给出 H3 图片的有序角色。后端生成的 `stable key -> TILE_XX -> 实际 Image N` 映射是唯一图片引用权威：图版固定为 `Image 1`，用户图按其冻结 `reference_id` 的顺序依次为后续 `Image N`。对 `replacement.source=image_1` 的 stable key，权威块会列出它唯一可用的用户图编号；这些原图是该 key 的外观权威，图版 tile 仅用于定位该 key 和保持跨段映射。不同用户图既不预设为同一商品、同一人物或不同视角，也不得扩散给未绑定 stable key。对 `generated_variant` 的 key，仍只以自身图版 tile 为外观权威，必须忽略全部用户图。多个 stable key 可按冻结计划共享同一组用户图，却仍各自保留身份、occurrences、动作和位置关系，不得合并。同一项目的每个 segment 必须沿用同一张图版和同一套映射，不得重新编号或自行推断图片顺序。
