@@ -1413,9 +1413,11 @@ input, textarea { font-family: inherit; }
 
 /* ===== 历史版本入口与弹窗 ===== */
 /* 按钮在成片区块标题行右侧（res-h3 是 flex，margin-left:auto 靠右）；
-   主题色复用 btn-primary 蓝底，文字覆盖为深色保证可读 */
+   浅蓝底复用色板既有值（badge.processing 同款 accent 12% alpha），
+   文字覆盖为深色保证可读 */
 .history-entry { margin-left: auto; }
-.history-button { color: var(--text); }
+.history-button { background: rgba(0, 113, 227, .12); color: var(--text); }
+.history-button:hover:not(:disabled) { background: rgba(0, 113, 227, .2); }
 body.modal-open { overflow: hidden; }
 .modal-backdrop {
   position: fixed;

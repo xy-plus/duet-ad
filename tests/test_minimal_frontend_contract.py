@@ -472,8 +472,14 @@ def test_generation_history_modal_is_wired():
     # 按钮进成片区块标题行右侧：videoSection 标题行接收 action 并挂进 res-h3。
     section = _function_source(source, "videoSection")
     assert "if (action) h.appendChild(action)" in section
-    # 蓝底黑字：仅覆盖文字色为现有深色变量；res-h3 是 flex，靠右用 margin-left:auto。
-    assert _css_rule_bodies(css, ".history-button") == [" color: var(--text); "]
+    # 浅蓝底黑字：背景复用色板既有浅蓝（badge.processing 同款 accent 12%
+    # alpha），文字为现有深色变量；res-h3 是 flex，靠右用 margin-left:auto。
+    assert _css_rule_bodies(css, ".history-button") == [
+        " background: rgba(0, 113, 227, .12); color: var(--text); ",
+    ]
+    assert _css_rule_bodies(css, ".history-button:hover:not(:disabled)") == [
+        " background: rgba(0, 113, 227, .2); ",
+    ]
     assert _css_rule_bodies(css, ".history-entry") == [" margin-left: auto; "]
     modal = _function_source(source, "openHistoryModal")
     assert '"modal-backdrop"' in modal
