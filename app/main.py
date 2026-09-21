@@ -23,7 +23,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
@@ -41,6 +41,13 @@ from app.store import (
     replacement_receipt_digest,
     generation_request_sha256 as hash_generation_request,
 )
+from app.users import (
+    COOKIE_NAME,
+    SESSION_LIFETIME_S,
+    ResolvedUser,
+    User,
+    UserAuth,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -54,6 +61,7 @@ DIALOGUE_BRIEF_MAX_CHARS = 1000
 UPLOAD_CHUNK_BYTES = MIB
 CREATION_REQUEST_OVERHEAD_BYTES = 4 * MIB
 PROVIDER_ASSET_TTL_S = 24 * 60 * 60
+TITLE_MAX_CHARS = 100
 REPLACEMENT_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 CREATION_FORM_FIELDS = frozenset({
     "file",
@@ -125,10 +133,13 @@ def _error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code, detail={"code": code, "message": message})
 
 
-async def require_auth(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
-    expected = _settings(request).access_token
-    if credentials is None or not hmac.compare_digest(credentials.credentials, expected):
-        raise _error(401, "unauthorized", "登录凭据无效或已过期")
+def _can_access_project(state: dict[str, Any], user: ResolvedUser) -> bool:
+    """superuser 可见全部；普通用户只看到自己的项目。无 owner_id 的存量
+    项目（迁移尚未运行，即用户库还没有 superuser）只对 superuser 可见。"""
+    if user.is_superuser:
+        return True
+    owner = state.get("owner_id")
+    return isinstance(owner, str) and owner == user.id
 
 
 def _read_project(store: ProjectStore, project_id: str) -> dict[str, Any]:
@@ -138,6 +149,16 @@ def _read_project(store: ProjectStore, project_id: str) -> dict[str, Any]:
         raise _error(404, "project_not_found", "项目不存在") from None
     except ProjectStateError:
         raise _error(500, "invalid_project_state", "项目状态不可读取") from None
+
+
+def _owned_project(
+    store: ProjectStore, project_id: str, user: ResolvedUser
+) -> dict[str, Any]:
+    """读项目并做归属鉴权；无权访问与不存在一样是 404（不泄漏存在性）。"""
+    state = _read_project(store, project_id)
+    if not _can_access_project(state, user):
+        raise _error(404, "project_not_found", "项目不存在")
+    return state
 
 
 def _project_file(store: ProjectStore, project_id: str, relative: str) -> Path:
@@ -403,6 +424,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # 用户系统先就绪：建表、播种管理员、迁移存量项目归属，再做重启恢复。
+        await app.state.auth.setup()
+        await app.state.auth.migrate_project_ownership(app.state.store)
         try:
             restarted = app.state.store.fail_incomplete_after_restart()
             for item in restarted:
@@ -421,9 +445,11 @@ def create_app(
             # was still registered at shutdown.
             if not tasks and workers_active == 0:
                 app.state.store.close()
+            await app.state.auth.close()
 
     app = FastAPI(title="Duet H3 Max R2V Research", lifespan=lifespan)
     app.state.settings = configured
+    app.state.auth = UserAuth(configured)
     app.state.store = ProjectStore(
         configured.data_dir / "projects",
         acquire_process_lock=configured.store_lock_enabled,
@@ -434,6 +460,28 @@ def create_app(
     app.state.resume_lock = threading.Lock()
     app.state.pipeline_workers = 0
     app.state.pipeline_workers_lock = threading.Lock()
+
+    auth: UserAuth = app.state.auth
+
+    async def require_user(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+        account: User | None = Depends(auth.optional_current_user),
+    ) -> ResolvedUser:
+        # 迁移桥：旧共享口令（老脚本、旧前端 localStorage 里的 token）映射为
+        # 管理员身份，JWT 解码失败的 Bearer 也落到这条；口令不匹配再尝试
+        # cookie / bearer JWT 双通道（fastapi-users）。
+        if credentials is not None and hmac.compare_digest(
+            credentials.credentials, configured.access_token
+        ):
+            return await auth.resolve_legacy_admin()
+        if account is not None:
+            return ResolvedUser(
+                id=str(account.id),
+                email=account.email,
+                is_superuser=account.is_superuser,
+            )
+        raise _error(401, "unauthorized", "登录凭据无效或已过期")
 
     @app.middleware("http")
     async def reject_oversized_declared_creation_request(
@@ -621,6 +669,8 @@ def create_app(
 
     @app.post("/api/login")
     async def login(request: Request):
+        # 旧共享口令登录（兼容入口）：校验通过即可，前端随后用口令本身做
+        # Bearer 凭据，由 require_user 映射为管理员身份。
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -632,13 +682,87 @@ def create_app(
             raise _error(401, "unauthorized", "口令不正确")
         return {"ok": True}
 
-    @app.get("/api/capabilities", dependencies=[Depends(require_auth)])
-    async def capabilities():
+    # 账号注册（fastapi-users 库路由）：POST /api/auth/register {email, password}
+    app.include_router(auth.register_router, prefix="/api/auth")
+
+    @app.post("/api/auth/login")
+    async def account_login(
+        request: Request,
+        user_manager=Depends(auth.get_user_manager),
+    ):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象")
+        email = body.get("email")
+        password = body.get("password")
+        if (
+            not isinstance(email, str)
+            or not email.strip()
+            or not isinstance(password, str)
+            or not password
+        ):
+            raise _error(400, "invalid_credentials", "email 与 password 必须为非空字符串")
+        user = await user_manager.authenticate(
+            OAuth2PasswordRequestForm(
+                username=email.strip(), password=password, scope=""
+            )
+        )
+        if user is None or not user.is_active:
+            raise _error(401, "unauthorized", "邮箱或密码不正确")
+        token = await auth.get_jwt_strategy().write_token(user)
+        # 双通道：写 HttpOnly cookie（浏览器）并在 body 返回 bearer token（脚本）。
+        response = JSONResponse({
+            "access_token": token,
+            "token_type": "bearer",
+            "user": {
+                "id": str(user.id),
+                "email": user.email,
+                "is_superuser": user.is_superuser,
+            },
+        })
+        response.set_cookie(
+            COOKIE_NAME,
+            token,
+            max_age=SESSION_LIFETIME_S,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=False,
+        )
+        return response
+
+    @app.post("/api/auth/logout")
+    async def account_logout():
+        # JWT 无状态：清 cookie 即登出浏览器通道；bearer token 由客户端丢弃。
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(COOKIE_NAME, path="/")
+        return response
+
+    @app.get("/api/auth/me")
+    async def auth_me(user: ResolvedUser = Depends(require_user)):
+        return {
+            "id": user.id,
+            "email": user.email,
+            "is_superuser": user.is_superuser,
+        }
+
+    @app.get("/api/capabilities")
+    async def capabilities(user: ResolvedUser = Depends(require_user)):
         return _capability()
 
-    @app.get("/api/conversations", dependencies=[Depends(require_auth)])
-    async def conversations(request: Request):
-        return _store(request).list()
+    @app.get("/api/conversations")
+    async def conversations(request: Request, user: ResolvedUser = Depends(require_user)):
+        rows = [
+            state
+            for state in _store(request).list()
+            if _can_access_project(state, user)
+        ]
+        # 收藏优先；组内保持 store.list 的 created_at 倒序（稳定排序）。
+        rows.sort(key=lambda state: state.get("favorite") is not True)
+        return rows
 
     def start_pipeline(project_id: str, operation: str = "run") -> None:
         task = asyncio.create_task(asyncio.to_thread(pipeline_entry, project_id, operation))
@@ -872,7 +996,7 @@ def create_app(
                 "replacement_identity": image_receipts if len(images) > 1 else replacement_receipt,
             }
 
-    @app.post("/api/conversations", status_code=201, dependencies=[Depends(require_auth)])
+    @app.post("/api/conversations", status_code=201)
     async def create_conversation(
         request: Request,
         response: Response,
@@ -881,6 +1005,7 @@ def create_app(
         client_request_id: str | None = Form(default=None),
         generation_request: str | None = Form(default=None),
         replacement_image: list[UploadFile] | None = File(default=None),
+        user: ResolvedUser = Depends(require_user),
     ):
         await _validate_creation_form(request)
         replacement_images = (await request.form()).getlist("replacement_image")
@@ -905,6 +1030,7 @@ def create_app(
                     staged_replacement=staged["staged_replacement"],
                     replacement_snapshots=staged["replacement_snapshots"],
                     staged_replacements=staged["staged_replacements"],
+                    extra_state={"owner_id": user.id},
                 )
         except HTTPException:
             raise
@@ -933,6 +1059,9 @@ def create_app(
 
         response.status_code = 201 if created else 200
         if not created:
+            # 幂等命中：项目属于谁就只能由谁看到重放结果。
+            if not _can_access_project(state, user):
+                raise _error(404, "project_not_found", "项目不存在")
             return state
 
         log = ResearchLog(project)
@@ -955,9 +1084,13 @@ def create_app(
         start_pipeline(project_id)
         return state
 
-    @app.get("/api/conversations/{project_id}", dependencies=[Depends(require_auth)])
-    async def conversation(project_id: str, request: Request):
-        state = _read_project(_store(request), project_id)
+    @app.get("/api/conversations/{project_id}")
+    async def conversation(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
+        state = _owned_project(_store(request), project_id, user)
         # 终态项目的"总耗时"用 trace 推导（前置节点 + 最后一次 H3 生成，
         # 审核暂停/等待不计入）；记录不全的老项目缺省该字段，前端回退墙钟。
         if state.get("status") in {"succeeded", "failed"}:
@@ -966,12 +1099,59 @@ def create_app(
                 state = {**state, "display_duration_s": round(display, 3)}
         return state
 
+    async def _json_object_body(request: Request) -> dict[str, Any]:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象")
+        return body
+
+    @app.post("/api/conversations/{project_id}/rename")
+    async def rename_conversation(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
+        body = await _json_object_body(request)
+        title = body.get("title")
+        if not isinstance(title, str):
+            raise _error(422, "invalid_title", "title 必须为字符串")
+        title = title.strip()
+        if not title:
+            raise _error(422, "invalid_title", "项目名称不能为空")
+        if _utf16_code_units(title) > TITLE_MAX_CHARS:
+            raise _error(
+                422, "invalid_title", f"项目名称最长 {TITLE_MAX_CHARS} 个字符"
+            )
+        store = _store(request)
+        _owned_project(store, project_id, user)
+        return store.update(project_id, title=title)
+
+    @app.post("/api/conversations/{project_id}/favorite")
+    async def favorite_conversation(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
+        body = await _json_object_body(request)
+        favorite = body.get("favorite")
+        if type(favorite) is not bool:
+            raise _error(422, "invalid_favorite", "favorite 必须为布尔值")
+        store = _store(request)
+        _owned_project(store, project_id, user)
+        return store.update(project_id, favorite=favorite)
+
     @app.post(
         "/api/conversations/{project_id}/resume-pre-picsart",
         status_code=202,
-        dependencies=[Depends(require_auth)],
     )
-    async def resume_pre_picsart(project_id: str, request: Request):
+    async def resume_pre_picsart(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -980,7 +1160,7 @@ def create_app(
             raise _error(400, "confirmation_required", "必须明确确认续跑前置产物")
         store = _store(request)
         with app.state.resume_lock:
-            state = _read_project(store, project_id)
+            state = _owned_project(store, project_id, user)
             if state.get("status") != "failed":
                 raise _error(409, "project_not_failed", "只有失败项目可以续跑前置产物")
             try:
@@ -1017,9 +1197,12 @@ def create_app(
     @app.post(
         "/api/conversations/{project_id}/resume-h3-prep",
         status_code=202,
-        dependencies=[Depends(require_auth)],
     )
-    async def resume_h3_prep(project_id: str, request: Request):
+    async def resume_h3_prep(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1028,7 +1211,7 @@ def create_app(
             raise _error(400, "confirmation_required", "必须明确确认重新准备 H3")
         store = _store(request)
         with app.state.resume_lock:
-            state = _read_project(store, project_id)
+            state = _owned_project(store, project_id, user)
             if state.get("status") not in {"failed", "succeeded"}:
                 raise _error(
                     409,
@@ -1075,9 +1258,12 @@ def create_app(
     @app.post(
         "/api/conversations/{project_id}/resume-picsart",
         status_code=202,
-        dependencies=[Depends(require_auth)],
     )
-    async def resume_picsart(project_id: str, request: Request):
+    async def resume_picsart(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1086,7 +1272,7 @@ def create_app(
             raise _error(400, "confirmation_required", "必须明确确认续跑 Picsart")
         store = _store(request)
         with app.state.resume_lock:
-            state = _read_project(store, project_id)
+            state = _owned_project(store, project_id, user)
             if state.get("status") != "failed":
                 raise _error(409, "project_not_failed", "只有失败项目可以续跑 Picsart")
             try:
@@ -1149,11 +1335,14 @@ def create_app(
 
     @app.get(
         "/api/conversations/{project_id}/prompt-review",
-        dependencies=[Depends(require_auth)],
     )
-    async def prompt_review_read(project_id: str, request: Request):
+    async def prompt_review_read(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         store = _store(request)
-        state = _read_project(store, project_id)
+        state = _owned_project(store, project_id, user)
         segments = prompt_review_store.display_segments(
             store.path(project_id), state,
         )
@@ -1162,9 +1351,12 @@ def create_app(
     @app.post(
         "/api/conversations/{project_id}/prompt-review/confirm",
         status_code=202,
-        dependencies=[Depends(require_auth)],
     )
-    async def prompt_review_confirm(project_id: str, request: Request):
+    async def prompt_review_confirm(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1175,6 +1367,7 @@ def create_app(
                 "invalid_prompt_review_edit",
                 '请求体必须是 {"segments":[{"segment_index":N,"prompt":"..."}]}',
             )
+        _owned_project(_store(request), project_id, user)
         try:
             state = apply_prompt_review_confirmation(
                 project_id, body["segments"],
@@ -1197,11 +1390,14 @@ def create_app(
 
     @app.get(
         "/api/conversations/{project_id}/generation-history",
-        dependencies=[Depends(require_auth)],
     )
-    async def generation_history_read(project_id: str, request: Request):
+    async def generation_history_read(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         store = _store(request)
-        state = _read_project(store, project_id)
+        state = _owned_project(store, project_id, user)
         return {
             "versions": prompt_review_store.generation_history(
                 store.path(project_id), state,
@@ -1211,9 +1407,12 @@ def create_app(
     @app.post(
         "/api/conversations/{project_id}/regenerate",
         status_code=202,
-        dependencies=[Depends(require_auth)],
     )
-    async def regenerate_with_edited_prompts(project_id: str, request: Request):
+    async def regenerate_with_edited_prompts(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1226,7 +1425,7 @@ def create_app(
             )
         try:
             with app.state.resume_lock:
-                state = _read_project(_store(request), project_id)
+                state = _owned_project(_store(request), project_id, user)
                 if state.get("status") != "succeeded":
                     raise _error(
                         409,
@@ -1287,10 +1486,14 @@ def create_app(
         task.add_done_callback(app.state.tasks.discard)
         return state
 
-    @app.get("/api/conversations/{project_id}/creation-input/replacement-image", dependencies=[Depends(require_auth)])
-    async def replacement(project_id: str, request: Request):
+    @app.get("/api/conversations/{project_id}/creation-input/replacement-image")
+    async def replacement(
+        project_id: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         store = _store(request)
-        state = _read_project(store, project_id)
+        state = _owned_project(store, project_id, user)
         if state.get("replacement_image_path") != "inputs/replacement-image":
             raise _error(404, "file_not_found", "替换图片不存在")
         path = _project_file(store, project_id, "inputs/replacement-image")
@@ -1298,10 +1501,15 @@ def create_app(
         media_type = snapshot.get("media_type") if snapshot.get("media_type") in REPLACEMENT_MEDIA_TYPES else "application/octet-stream"
         return FileResponse(path, media_type=media_type)
 
-    @app.get("/api/conversations/{project_id}/creation-input/replacement-images/{index}", dependencies=[Depends(require_auth)])
-    async def replacement_at(project_id: str, index: int, request: Request):
+    @app.get("/api/conversations/{project_id}/creation-input/replacement-images/{index}")
+    async def replacement_at(
+        project_id: str,
+        index: int,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         store = _store(request)
-        state = _read_project(store, project_id)
+        state = _owned_project(store, project_id, user)
         paths = state.get("replacement_image_paths", [state["replacement_image_path"]] if state.get("replacement_image_path") else [])
         snapshots = (state.get("creation_input") or {}).get("replacement_images", [(state.get("creation_input") or {}).get("replacement_image") or {}])
         if not 1 <= index <= len(paths) or index > len(snapshots):
@@ -1313,11 +1521,16 @@ def create_app(
         media_type = snapshots[index - 1].get("media_type")
         return FileResponse(path, media_type=media_type if media_type in REPLACEMENT_MEDIA_TYPES else "application/octet-stream")
 
-    @app.get("/api/conversations/{project_id}/files/{relative:path}", dependencies=[Depends(require_auth)])
-    async def project_file(project_id: str, relative: str, request: Request):
+    @app.get("/api/conversations/{project_id}/files/{relative:path}")
+    async def project_file(
+        project_id: str,
+        relative: str,
+        request: Request,
+        user: ResolvedUser = Depends(require_user),
+    ):
         target = PUBLIC_PROJECT_FILES.get(relative)
         store = _store(request)
-        state = _read_project(store, project_id)
+        state = _owned_project(store, project_id, user)
         if target is None:
             # 历史版本成片：output/history/v{N}/generated.mp4，版本号必须在
             # generation_history 里有正式记录才放行（不开放任意路径）。

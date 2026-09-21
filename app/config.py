@@ -156,6 +156,17 @@ class Settings:
     object_mask_person_block_opacity: float = 1.0
     # 泄漏残影的高斯模糊核，仅在 opacity<1 时生效；必须为正奇数像素。
     object_mask_block_blur: int = 31
+    # 用户系统（fastapi-users，实现见 app/users.py）。用户库文件显式落在
+    # DATA_DIR 根下 <DATA_DIR>/users.db，需要改位置时 USERS_DB_PATH 显式覆盖；
+    # 本字段为 None 时由 __post_init__ 落定到该路径（不写魔法字符串到别处）。
+    users_db_path: Path | None = None
+    # 会话 JWT 签名密钥；None 时显式回落为 access_token（同一部署已有的强随机
+    # 密钥，避免多维护一把），需要独立轮换时设 USERS_JWT_SECRET。
+    users_jwt_secret: str | None = field(default=None, repr=False)
+    # 首次启动且用户库为空时播种的管理员账号（is_superuser=true）；两者必须
+    # 同时配置或同时缺省，缺省时不播种（旧共享口令仍映射为合成管理员）。
+    initial_admin_email: str | None = None
+    initial_admin_password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         token = self.access_token.strip() if isinstance(self.access_token, str) else ""
@@ -493,6 +504,37 @@ class Settings:
             or object_mask_block_blur % 2 != 1
         ):
             raise ValueError("OBJECT_MASK_BLOCK_BLUR must be a positive odd integer")
+        users_db_path = self.users_db_path
+        if users_db_path is None:
+            users_db_path = self.data_dir / "users.db"
+        if not isinstance(users_db_path, Path):
+            raise ValueError("USERS_DB_PATH must be a filesystem path")
+        object.__setattr__(self, "users_db_path", users_db_path)
+        jwt_secret = (
+            self.users_jwt_secret.strip()
+            if isinstance(self.users_jwt_secret, str)
+            else self.access_token
+        )
+        if not jwt_secret:
+            raise ValueError("USERS_JWT_SECRET must be a non-empty value or unset")
+        object.__setattr__(self, "users_jwt_secret", jwt_secret)
+        if (self.initial_admin_email is None) != (self.initial_admin_password is None):
+            raise ValueError(
+                "INITIAL_ADMIN_EMAIL 与 INITIAL_ADMIN_PASSWORD 必须同时配置"
+            )
+        if self.initial_admin_email is not None:
+            email = self.initial_admin_email.strip()
+            password = (
+                self.initial_admin_password.strip()
+                if isinstance(self.initial_admin_password, str)
+                else ""
+            )
+            if not email or "@" not in email:
+                raise ValueError("INITIAL_ADMIN_EMAIL must be an email address")
+            if not password:
+                raise ValueError("INITIAL_ADMIN_PASSWORD must be a non-empty value")
+            object.__setattr__(self, "initial_admin_email", email)
+            object.__setattr__(self, "initial_admin_password", password)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -626,4 +668,14 @@ def get_settings() -> Settings:
         object_mask_block_opacity=object_mask_block_opacity,
         object_mask_block_blur=object_mask_block_blur,
         object_mask_person_block_opacity=object_mask_person_block_opacity,
+        users_db_path=(
+            Path(users_db_path).expanduser()
+            if (users_db_path := os.environ.get("USERS_DB_PATH", "").strip())
+            else None
+        ),
+        users_jwt_secret=os.environ.get("USERS_JWT_SECRET", "").strip() or None,
+        initial_admin_email=os.environ.get("INITIAL_ADMIN_EMAIL", "").strip() or None,
+        initial_admin_password=(
+            os.environ.get("INITIAL_ADMIN_PASSWORD", "").strip() or None
+        ),
     )
