@@ -1408,6 +1408,8 @@ input, textarea { font-family: inherit; }
   resize: vertical;
 }
 .prompt-review-textarea[readonly] { background: var(--bg); color: var(--text-2); }
+.history-version-stage { display: grid; gap: 14px; }
+.history-segment-label { font-size: 13px; font-weight: 600; }
 
 /* ===== Reduced motion ===== */
 @media (prefers-reduced-motion: reduce) {

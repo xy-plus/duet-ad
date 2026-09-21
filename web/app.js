@@ -1241,101 +1241,191 @@ function segmentOptionLabel(segment) {
 /* 提示词审核面板：下拉切换分段、共用单编辑框；切换分段时未确认的编辑在
    内存暂存，切回来不丢。awaiting_prompt_review 时可编辑 + 确认继续；
    succeeded 时只读展示冻结主体（注入部分由后端机械拼接，不展示）。 */
-function promptReviewSection(detail, editable) {
+/* 提示词面板：下拉切换分段、共用单编辑框；切换分段时未确认的编辑在内存
+   暂存，切回来不丢。mode: "review"（awaiting，确认继续）/ "regenerate"
+   （succeeded，编辑冻结提示词后重新生成）/ "readonly"（历史版本只读）。
+   注入部分（编辑框架、遮盖条款、权威替换计划、尾部）由后端机械拼接，不展示。 */
+function promptReviewPanel({ title, sub, tip, segments, mode, confirmMessage, onConfirm }) {
+  const editable = mode !== "readonly";
   const panel = el("section", "res-section prompt-review-panel");
-  const h = el("h3", "res-h3", editable ? "提示词审核" : "冻结提示词");
-  h.appendChild(el("span", "res-count", editable ? "审核编辑后确认继续" : "已冻结 · 只读"));
+  const h = el("h3", "res-h3", title);
+  if (sub) h.appendChild(el("span", "res-count", sub));
   panel.appendChild(h);
   const body = el("div", "prompt-review-body");
-  body.appendChild(el("p", "prompt-review-tip", "正在加载提示词…"));
+  if (tip) body.appendChild(el("p", "prompt-review-tip", tip));
+  // edits 暂存每段当前文本（初始为服务端冻结值），切分段不丢未确认编辑。
+  const edits = new Map(
+    segments.map((segment) => [segment.segment_index, String(segment.prompt || "")])
+  );
+  let current = segments[0].segment_index;
+  const textarea = el("textarea", "setup-textarea prompt-review-textarea");
+  textarea.rows = 10;
+  textarea.spellcheck = false;
+  textarea.readOnly = !editable;
+  textarea.value = edits.get(current);
+  const switcher = el("select", "prompt-review-switcher");
+  switcher.setAttribute("aria-label", "选择分段");
+  for (const segment of segments) {
+    const option = el("option", null, segmentOptionLabel(segment));
+    option.value = String(segment.segment_index);
+    switcher.appendChild(option);
+  }
+  switcher.addEventListener("change", () => {
+    edits.set(current, textarea.value);
+    current = Number(switcher.value);
+    textarea.value = edits.get(current);
+  });
+  body.appendChild(switcher);
+  if (editable) {
+    textarea.addEventListener("input", () => edits.set(current, textarea.value));
+  }
+  body.appendChild(textarea);
   panel.appendChild(body);
+  if (mode === "readonly") return panel;
+  const errorBox = el("p", "inline-error");
+  errorBox.hidden = true;
+  errorBox.setAttribute("role", "alert");
+  const confirm = el("button", "btn btn-primary",
+    mode === "review" ? "确认并继续生成" : "重新生成视频");
+  confirm.type = "button";
+  confirm.addEventListener("click", async () => {
+    if (confirmMessage && !window.confirm(confirmMessage)) return;
+    confirm.disabled = true;
+    errorBox.hidden = true;
+    try {
+      await onConfirm(segments.map((segment) => ({
+        segment_index: segment.segment_index,
+        prompt: edits.get(segment.segment_index),
+      })));
+    } catch (err) {
+      if (handleAuthError(err)) return;
+      showActionError(err, errorBox, [confirm]);
+    }
+  });
+  body.appendChild(errorBox);
+  body.appendChild(confirm);
+  return panel;
+}
+
+function promptReviewSection(detail, mode) {
+  const host = el("section", "res-section prompt-review-panel");
+  const h = el("h3", "res-h3", mode === "review" ? "提示词审核" : "冻结提示词");
+  h.appendChild(el("span", "res-count",
+    mode === "review" ? "审核编辑后确认继续" : "可编辑后重新生成"));
+  host.appendChild(h);
+  const body = el("div", "prompt-review-body");
+  body.appendChild(el("p", "prompt-review-tip", "正在加载提示词…"));
+  host.appendChild(body);
   apiJSON("/api/conversations/" + detail.id + "/prompt-review").then((data) => {
     const segments = data && Array.isArray(data.segments) ? data.segments : [];
-    body.textContent = "";
     if (!segments.length) {
-      // 历史项目剥不出注入边界时后端返回空：审核态给提示，只读态整块隐藏。
-      if (editable) {
+      // 历史项目剥不出注入边界时后端返回空：审核态给提示，否则整块隐藏。
+      if (mode === "review") {
+        body.textContent = "";
         body.appendChild(el("p", "prompt-review-tip", "提示词尚未就绪，请稍后刷新页面"));
       } else {
-        panel.remove();
+        host.remove();
       }
       return;
     }
-    if (editable) {
-      body.appendChild(el("p", "prompt-review-tip",
-        "只展示 AI 生成的可编辑部分；编辑框架、遮盖条款、权威替换计划等注入部分由后端自动拼接，不展示也不可改。"));
-    }
-    // edits 暂存每段当前文本（初始为服务端冻结值），切分段不丢未确认编辑。
-    const edits = new Map(
-      segments.map((segment) => [segment.segment_index, String(segment.prompt || "")])
-    );
-    let current = segments[0].segment_index;
-    const textarea = el("textarea", "setup-textarea prompt-review-textarea");
-    textarea.rows = 10;
-    textarea.spellcheck = false;
-    textarea.readOnly = !editable;
-    textarea.value = edits.get(current);
-    const switcher = el("select", "prompt-review-switcher");
-    switcher.setAttribute("aria-label", "选择分段");
-    for (const segment of segments) {
-      const option = el("option", null, segmentOptionLabel(segment));
-      option.value = String(segment.segment_index);
-      switcher.appendChild(option);
-    }
-    switcher.addEventListener("change", () => {
-      edits.set(current, textarea.value);
-      current = Number(switcher.value);
-      textarea.value = edits.get(current);
-    });
-    body.appendChild(switcher);
-    if (editable) {
-      textarea.addEventListener("input", () => edits.set(current, textarea.value));
-    }
-    body.appendChild(textarea);
-    if (!editable) return;
-    const errorBox = el("p", "inline-error");
-    errorBox.hidden = true;
-    errorBox.setAttribute("role", "alert");
-    const confirm = el("button", "btn btn-primary", "确认并继续生成");
-    confirm.type = "button";
-    confirm.addEventListener("click", async () => {
-      confirm.disabled = true;
-      errorBox.hidden = true;
-      try {
-        await apiJSON("/api/conversations/" + detail.id + "/prompt-review/confirm", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            segments: segments.map((segment) => ({
-              segment_index: segment.segment_index,
-              prompt: edits.get(segment.segment_index),
-            })),
-          }),
-        });
+    const panel = promptReviewPanel({
+      title: mode === "review" ? "提示词审核" : "冻结提示词",
+      sub: mode === "review" ? "审核编辑后确认继续" : "可编辑后重新生成",
+      tip: "只展示 AI 生成的可编辑部分；编辑框架、遮盖条款、权威替换计划等注入部分由后端自动拼接，不展示也不可改。",
+      segments,
+      mode,
+      confirmMessage: mode === "regenerate"
+        ? "将复用全部分段、检测、音频等已生成素材，仅按新提示词重新生成视频，会消耗生成额度。确认重新生成吗？"
+        : null,
+      onConfirm: async (edits) => {
+        await apiJSON(
+          "/api/conversations/" + detail.id
+            + (mode === "review" ? "/prompt-review/confirm" : "/regenerate"),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ segments: edits }),
+          },
+        );
         await loadDetail(detail.id, true);
-      } catch (err) {
-        if (handleAuthError(err)) return;
-        showActionError(err, errorBox, [confirm]);
-      }
+      },
     });
-    body.appendChild(errorBox);
-    body.appendChild(confirm);
+    host.replaceWith(panel);
   }).catch(() => {
-    if (editable) {
+    if (mode === "review") {
       body.textContent = "";
       body.appendChild(el("p", "prompt-review-tip", "提示词加载失败，请刷新页面重试"));
     } else {
-      panel.remove();
+      host.remove();
     }
   });
-  return panel;
+  return host;
+}
+
+/* 历史版本面板：列出版本号 + 完成时间，选中某版播放该版视频并查看该版
+   冻结提示词（只读）；当前版本在列表末尾（标记"当前"）。从未重新生成过
+   （只有当前版本）时整块不显示。 */
+function generationHistorySection(detail) {
+  const host = el("section", "res-section prompt-review-panel history-panel");
+  const h = el("h3", "res-h3", "历史版本");
+  host.appendChild(h);
+  const body = el("div", "prompt-review-body");
+  body.appendChild(el("p", "prompt-review-tip", "正在加载历史版本…"));
+  host.appendChild(body);
+  apiJSON("/api/conversations/" + detail.id + "/generation-history").then((data) => {
+    const versions = data && Array.isArray(data.versions) ? data.versions : [];
+    if (versions.length < 2) {
+      host.remove();
+      return;
+    }
+    body.textContent = "";
+    const switcher = el("select", "prompt-review-switcher history-version-switcher");
+    switcher.setAttribute("aria-label", "选择版本");
+    for (const version of versions) {
+      const label = "v" + version.version
+        + "（" + formatProjectTimestamp(version.completed_at) + "）"
+        + (version.current ? " · 当前" : "");
+      const option = el("option", null, label);
+      option.value = String(version.version);
+      switcher.appendChild(option);
+    }
+    body.appendChild(switcher);
+    const stage = el("div", "history-version-stage");
+    body.appendChild(stage);
+    const renderVersion = (version) => {
+      stage.textContent = "";
+      stage.appendChild(videoPlayer(detail, version.video_file));
+      for (const segment of version.segments) {
+        const block = el("div", "history-segment");
+        block.appendChild(el("div", "history-segment-label", segmentOptionLabel(segment)));
+        const textarea = el("textarea", "setup-textarea prompt-review-textarea");
+        textarea.readOnly = true;
+        textarea.rows = 6;
+        textarea.spellcheck = false;
+        textarea.value = String(segment.prompt || "");
+        block.appendChild(textarea);
+        stage.appendChild(block);
+      }
+    };
+    const latest = versions[versions.length - 1];
+    switcher.value = String(latest.version);
+    renderVersion(latest);
+    switcher.addEventListener("change", () => {
+      const selected = versions.find(
+        (version) => version.version === Number(switcher.value)
+      );
+      if (selected) renderVersion(selected);
+    });
+  }).catch(() => host.remove());
+  return host;
 }
 
 function renderResults(detail) {
   const frag = document.createDocumentFragment();
   if (detail.has_video === true) {
-    frag.appendChild(promptReviewSection(detail, false));
+    frag.appendChild(promptReviewSection(detail, "regenerate"));
     frag.appendChild(videoSection(detail, "generated.mp4", "新视频", "已完成"));
+    frag.appendChild(generationHistorySection(detail));
   }
   return frag;
 }
@@ -1386,7 +1476,7 @@ function renderStable(detail) {
   if (progress.state === "failed") {
     inner.appendChild(renderFail(detail));
   } else if (progress.state === "awaiting_prompt_review") {
-    inner.appendChild(promptReviewSection(detail, true));
+    inner.appendChild(promptReviewSection(detail, "review"));
   } else if (progress.state === "succeeded" && detail.has_video === true) {
     inner.appendChild(renderResults(detail));
   }

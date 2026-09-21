@@ -431,24 +431,43 @@ def test_prompt_review_ui_states_are_wired():
     assert "awaiting_prompt_review" in badge
     stable = _function_source(source, "renderStable")
     assert 'progress.state === "awaiting_prompt_review"' in stable
-    assert "promptReviewSection(detail, true)" in stable
+    assert 'promptReviewSection(detail, "review")' in stable
     results = _function_source(source, "renderResults")
-    assert "promptReviewSection(detail, false)" in results
+    assert 'promptReviewSection(detail, "regenerate")' in results
     review = _function_source(source, "promptReviewSection")
     assert '"/prompt-review"' in review
     assert '"/prompt-review/confirm"' in review
-    assert "确认并继续生成" in review
+    assert '"/regenerate"' in review
+    panel = _function_source(source, "promptReviewPanel")
+    assert "确认并继续生成" in panel
+    assert "重新生成视频" in panel
     # 面板 + 下拉切换分段 + 共用单编辑框，未确认编辑在内存暂存。
-    assert '"res-section prompt-review-panel"' in review
-    assert 'el("select", "prompt-review-switcher")' in review
-    assert "segmentOptionLabel(segment)" in review
-    assert "edits.set(current, textarea.value)" in review
-    assert "textarea.value = edits.get(current)" in review
-    assert 'editable ? "提示词审核" : "冻结提示词"' in review
+    assert '"res-section prompt-review-panel"' in panel
+    assert 'el("select", "prompt-review-switcher")' in panel
+    assert "segmentOptionLabel(segment)" in panel
+    assert "edits.set(current, textarea.value)" in panel
+    assert "textarea.value = edits.get(current)" in panel
+    assert 'mode === "review" ? "提示词审核" : "冻结提示词"' in review
     assert "prompt-review-segment" not in review  # 旧的逐段裸露编辑框已移除
+    # regenerate 有付费确认提示。
+    assert "会消耗生成额度" in review
     css = STYLES_CSS.read_text(encoding="utf-8")
     assert ".prompt-review-panel" in css
     assert ".prompt-review-switcher" in css
+
+
+def test_generation_history_panel_is_wired():
+    source = APP_JS.read_text(encoding="utf-8")
+    results = _function_source(source, "renderResults")
+    assert "generationHistorySection(detail)" in results
+    history = _function_source(source, "generationHistorySection")
+    assert '"/generation-history"' in history
+    assert "历史版本" in history
+    assert "videoPlayer(detail, version.video_file)" in history
+    assert 'el("select", "prompt-review-switcher history-version-switcher")' in history
+    assert '" · 当前"' in history
+    assert "versions.length < 2" in history  # 从未重新生成时整块不显示
+    assert "textarea.readOnly = true" in history  # 历史提示词只读
 
 
 def test_prompt_review_segment_option_shows_source_time_range():
@@ -730,10 +749,11 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
     mounted_results = re.findall(
         r"frag\.appendChild\((.*?)\);", results_renderer, flags=re.DOTALL
     )
-    # 冻结提示词只读区块挂在最终视频上方；剥不出内容时它自己移除。
+    # 冻结提示词（可编辑重新生成）在成片上方，历史版本区在成片下方。
     assert mounted_results == [
-        "promptReviewSection(detail, false)",
+        'promptReviewSection(detail, "regenerate")',
         'videoSection(detail, "generated.mp4", "新视频", "已完成")',
+        "generationHistorySection(detail)",
     ]
     assert results_renderer.count("videoSection(") == 1
 

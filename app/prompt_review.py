@@ -277,3 +277,92 @@ def display_segments(
             "end_s": None,
         })
     return result
+
+
+def generation_history(
+    project: Path, state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """视频版本历史：归档版本 + 当前版本（current=True 居末）。
+
+    每项 {version, completed_at, current, video_file, segments}：
+    video_file 是相对 /api/conversations/{id}/files/ 的键；segments 是各段
+    冻结提示词的可编辑部分（归档版本从归档的 final prompt 全文用现有剥离
+    器剥出，剥不出给空列表但保留版本；时间取归档时记录的值）。
+    generation_history 字段损坏时 fail closed 返回空历史（只藏不炸）。
+    """
+    raw_history = state.get("generation_history")
+    versions: list[dict[str, Any]] = []
+    if raw_history is not None:
+        if not isinstance(raw_history, list):
+            return []
+        for entry in raw_history:
+            if (
+                not isinstance(entry, dict)
+                or isinstance(entry.get("version"), bool)
+                or not isinstance(entry.get("version"), int)
+                or entry["version"] < 1
+                or not isinstance(entry.get("segments"), list)
+            ):
+                return []
+            video = entry.get("video")
+            if (
+                not isinstance(video, dict)
+                or video.get("path")
+                != f"output/history/v{entry['version']}/generated.mp4"
+            ):
+                return []
+            segments: list[dict[str, Any]] = []
+            for segment in entry["segments"]:
+                if (
+                    not isinstance(segment, dict)
+                    or not isinstance(segment.get("segment_index"), int)
+                    or not isinstance(segment.get("prompt_path"), str)
+                    or not isinstance(segment.get("prompt_sha256"), str)
+                ):
+                    return []
+                prompt_path = project / segment["prompt_path"]
+                try:
+                    if (
+                        prompt_path.is_symlink()
+                        or not prompt_path.is_file()
+                        or project.resolve() not in prompt_path.resolve().parents
+                    ):
+                        continue
+                    text = prompt_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if (
+                    hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    != segment["prompt_sha256"]
+                ):
+                    continue
+                body = split_frozen_prompt_body(text)
+                if body is None:
+                    continue
+                editable, _hidden = split_body(body)
+                start_s, end_s = _valid_time_range(
+                    segment.get("start_s"), segment.get("end_s"),
+                )
+                segments.append({
+                    "segment_index": segment["segment_index"],
+                    "prompt": editable,
+                    "start_s": start_s,
+                    "end_s": end_s,
+                })
+            segments.sort(key=lambda item: item["segment_index"])
+            versions.append({
+                "version": entry["version"],
+                "completed_at": entry.get("completed_at"),
+                "current": False,
+                "video_file": f"history/v{entry['version']}/generated.mp4",
+                "segments": segments,
+            })
+    if state.get("status") == "succeeded" and state.get("has_video") is True:
+        versions.append({
+            "version": len(versions) + 1,
+            "completed_at": state.get("updated_at"),
+            "current": True,
+            "video_file": "generated.mp4",
+            "segments": display_segments(project, state),
+        })
+    return versions

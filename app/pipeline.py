@@ -4724,14 +4724,113 @@ class Pipeline:
             raise PromptReviewError(
                 "prompt_review_not_pending", "项目不在等待提示词审核状态"
             )
+        frozen = self._prompt_review_frozen_segments(project)
+        normalized = self._validated_prompt_review_edits(frozen, edits)
+        manifest = self._prompt_review_manifest(state, frozen)
+        rebuilt = self._rebuild_frozen_prompts(project, frozen, normalized)
+        self._apply_rebuilt_prompts(
+            project, manifest, frozen, rebuilt, normalized,
+        )
+        self.store.update(project_id, h3_prepared_artifacts=manifest)
+        ResearchLog(project).event(
+            "prompt_review_confirmed",
+            segments=sorted(rebuilt),
+            edited=[
+                index
+                for index in sorted(rebuilt)
+                if normalized[index] != frozen[index]["editable"]
+            ],
+        )
+
+    def regenerate_with_edited_prompts(
+        self, project_id: str, edits: list[dict[str, Any]],
+    ) -> None:
+        """succeeded 项目编辑冻结提示词重提 H3：先归档当前版本，再重建提示词。
+
+        与 confirm 共用同一份编辑校验与四段重建公式；额外先把当前版本
+        （成片、分段成片、各段冻结提示词、submit 证据日志）归档到
+        output/history/v{N}/ 并记入 state.generation_history，然后清空
+        Picsart 回执（已过 _audit_h3_prep_submission_reset 的 fail-closed
+        审计），使 resume-picsart 等价入口以全新提交重放新提示词。只校验
+        与落盘，不写状态；状态迁移与调度由调用方完成。
+        """
+        project = self.store.path(project_id)
+        state = self.store.read(project_id)
+        if state.get("status") != "succeeded":
+            raise PromptReviewError(
+                "regenerate_not_succeeded",
+                "只有已成功项目可以编辑提示词重新生成",
+            )
+        frozen = self._prompt_review_frozen_segments(project)
+        normalized = self._validated_prompt_review_edits(frozen, edits)
+        manifest = self._prompt_review_manifest(state, frozen)
+        history_entry = self._archive_current_generation(
+            project, state, frozen,
+        )
+        rebuilt = self._rebuild_frozen_prompts(project, frozen, normalized)
+        raw_segments = self._validated_stored_segments(
+            state, missing_message="project has no reusable segments",
+        )
+        # 审计旧账本（绑定清单且无 fail-closed 回执）后才允许清零重提。
+        self._audit_h3_prep_submission_reset(project, state, raw_segments)
+        self._apply_rebuilt_prompts(
+            project, manifest, frozen, rebuilt, normalized,
+        )
+        history = state.get("generation_history") or []
+        self.store.update(
+            project_id,
+            h3_prepared_artifacts=manifest,
+            picsart_submission_receipts=None,
+            generation_history=[*history, history_entry],
+        )
+        ResearchLog(project).event(
+            "prompt_regenerate_prepared",
+            archived_version=history_entry["version"],
+            segments=sorted(rebuilt),
+            edited=[
+                index
+                for index in sorted(rebuilt)
+                if normalized[index] != frozen[index]["editable"]
+            ],
+        )
+
+    def _prompt_review_frozen_segments(
+        self, project: Path,
+    ) -> dict[int, dict[str, Any]]:
         review = prompt_review.read_review(project)
         if review is None:
             raise PromptReviewError(
                 "prompt_review_unavailable", "冻结的提示词审核记录不可用"
             )
-        frozen = {
+        return {
             segment["segment_index"]: segment for segment in review["segments"]
         }
+
+    @staticmethod
+    def _prompt_review_manifest(
+        state: dict[str, Any], frozen: dict[int, dict[str, Any]],
+    ) -> dict[str, Any]:
+        manifest = state.get("h3_prepared_artifacts")
+        manifest_segments = (
+            manifest.get("segments") if isinstance(manifest, dict) else None
+        )
+        if (
+            not isinstance(manifest_segments, dict)
+            or set(manifest_segments) != {str(index) for index in frozen}
+            or not all(
+                isinstance(value, dict) for value in manifest_segments.values()
+            )
+        ):
+            raise PromptReviewError(
+                "prompt_review_unavailable", "冻结的 H3 产物清单不可用"
+            )
+        return manifest
+
+    @staticmethod
+    def _validated_prompt_review_edits(
+        frozen: dict[int, dict[str, Any]], edits: list[dict[str, Any]],
+    ) -> dict[int, str]:
+        """编辑请求的形态/段集合/长度校验（confirm 与 regenerate 共用）。"""
         if not isinstance(edits, list) or not edits:
             raise PromptReviewError(
                 "invalid_prompt_review_edit", "segments 必须是非空数组"
@@ -4766,20 +4865,26 @@ class Pipeline:
             raise PromptReviewError(
                 "invalid_prompt_review_edit", "段集合必须与冻结的审核记录一致"
             )
-        manifest = state.get("h3_prepared_artifacts")
-        manifest_segments = (
-            manifest.get("segments") if isinstance(manifest, dict) else None
-        )
-        if (
-            not isinstance(manifest_segments, dict)
-            or set(manifest_segments) != {str(index) for index in frozen}
-            or not all(
-                isinstance(value, dict) for value in manifest_segments.values()
+        for index, body in normalized.items():
+            segment = frozen[index]
+            final = (
+                segment["prefix"] + body + segment["hidden"] + segment["suffix"]
             )
-        ):
-            raise PromptReviewError(
-                "prompt_review_unavailable", "冻结的 H3 产物清单不可用"
-            )
+            stripped = final.strip()
+            if not stripped or len(stripped) > PICSART_PROMPT_MAX_CHARS:
+                raise PromptReviewError(
+                    "invalid_prompt_review_edit",
+                    f"分段 {index} 重建后的提示词为空或超过长度限制",
+                )
+        return normalized
+
+    @staticmethod
+    def _rebuild_frozen_prompts(
+        project: Path,
+        frozen: dict[int, dict[str, Any]],
+        normalized: dict[int, str],
+    ) -> dict[int, str]:
+        """stale 校验 + 四段重建（confirm 与 regenerate 共用，不落盘）。"""
         rebuilt: dict[int, str] = {}
         for index in sorted(frozen):
             segment = frozen[index]
@@ -4801,14 +4906,19 @@ class Pipeline:
                 raise PromptReviewError(
                     "prompt_review_stale", "冻结提示词已变化，请重新审核"
                 )
-            final = prefix + normalized[index] + hidden + suffix
-            stripped = final.strip()
-            if not stripped or len(stripped) > PICSART_PROMPT_MAX_CHARS:
-                raise PromptReviewError(
-                    "invalid_prompt_review_edit",
-                    f"分段 {index} 重建后的提示词为空或超过长度限制",
-                )
-            rebuilt[index] = final
+            rebuilt[index] = prefix + normalized[index] + hidden + suffix
+        return rebuilt
+
+    def _apply_rebuilt_prompts(
+        self,
+        project: Path,
+        manifest: dict[str, Any],
+        frozen: dict[int, dict[str, Any]],
+        rebuilt: dict[int, str],
+        normalized: dict[int, str],
+    ) -> None:
+        """写回各段 h3_prompt.txt、重算清单 prompt 回执、更新审核记录。"""
+        manifest_segments = manifest["segments"]
         for index in sorted(rebuilt):
             prompt_path = (
                 project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt"
@@ -4821,7 +4931,6 @@ class Pipeline:
                     f"work/segments/{index:04d}/h3_prompt.txt",
                 )
             )
-        self.store.update(project_id, h3_prepared_artifacts=manifest)
         prompt_review.write_review(
             project,
             [
@@ -4837,15 +4946,119 @@ class Pipeline:
                 for index in sorted(frozen)
             ],
         )
-        ResearchLog(project).event(
-            "prompt_review_confirmed",
-            segments=sorted(rebuilt),
-            edited=[
-                index
-                for index in sorted(rebuilt)
-                if normalized[index] != frozen[index]["editable"]
-            ],
+
+    def _archive_current_generation(
+        self,
+        project: Path,
+        state: dict[str, Any],
+        frozen: dict[int, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """把当前成功版本归档到 output/history/v{N}/ 并返回历史条目。
+
+        先归档再重跑：成片与分段成片移动/复制进归档目录，各段冻结提示词
+        全文存 prompts/segment-XXXX.txt，旧 submit 证据日志随之迁入（回执
+        账本随后清零，resume 门禁要求无账本时不得遗留 submit 痕迹；证据不
+        删除、只随版本归档）。归档目录已存在或产物缺失都 fail closed。
+        """
+        raw_history = state.get("generation_history")
+        if raw_history is not None and (
+            not isinstance(raw_history, list)
+            or any(
+                not isinstance(entry, dict)
+                or isinstance(entry.get("version"), bool)
+                or not isinstance(entry.get("version"), int)
+                or entry["version"] < 1
+                for entry in raw_history
+            )
+        ):
+            raise PromptReviewError(
+                "regenerate_unavailable", "生成历史状态损坏，拒绝归档"
+            )
+        history = raw_history or []
+        version = (
+            max(entry["version"] for entry in history) + 1 if history else 1
         )
+        archive_root = project / "output" / "history" / f"v{version}"
+        if archive_root.exists():
+            raise PromptReviewError(
+                "regenerate_unavailable", "历史归档目录已存在，拒绝覆盖"
+            )
+        final_video = project / "output" / "generated.mp4"
+        if (
+            not final_video.is_file()
+            or final_video.is_symlink()
+            or final_video.stat().st_size < 1
+        ):
+            raise PromptReviewError(
+                "regenerate_unavailable", "当前成片缺失，无法归档"
+            )
+        archive_segments: list[dict[str, Any]] = []
+        segment_moves: list[tuple[Path, Path]] = []
+        for index in sorted(frozen):
+            segment_dir = project / "work" / "segments" / f"{index:04d}"
+            prompt_path = segment_dir / "h3_prompt.txt"
+            try:
+                prompt_text = prompt_path.read_text(encoding="utf-8")
+            except OSError:
+                raise PromptReviewError(
+                    "regenerate_unavailable", "冻结提示词缺失，无法归档"
+                ) from None
+            segment_output = self._completed_resume_output(
+                project, segment_dir, self._segment_scope(index),
+            )
+            if segment_output is None:
+                raise PromptReviewError(
+                    "regenerate_unavailable",
+                    f"分段 {index} 的成片缺失，无法归档",
+                )
+            archive_segments.append({
+                "segment_index": index,
+                "prompt_sha256": hashlib.sha256(
+                    prompt_text.encode("utf-8")
+                ).hexdigest(),
+                "prompt_path": (
+                    f"output/history/v{version}/prompts/segment-{index:04d}.txt"
+                ),
+                "start_s": frozen[index]["start_s"],
+                "end_s": frozen[index]["end_s"],
+            })
+            segment_moves.append((
+                segment_output,
+                archive_root / "segments" / f"segment-{index:04d}.mp4",
+            ))
+        submit_logs = [
+            path
+            for path in sorted((project / "logs").glob("picsart*-submit"))
+            if path.is_dir()
+        ]
+        (archive_root / "prompts").mkdir(parents=True, mode=0o700)
+        (archive_root / "segments").mkdir(mode=0o700)
+        shutil.copy2(final_video, archive_root / "generated.mp4")
+        for index in sorted(frozen):
+            segment_dir = project / "work" / "segments" / f"{index:04d}"
+            shutil.copy2(
+                segment_dir / "h3_prompt.txt",
+                archive_root / "prompts" / f"segment-{index:04d}.txt",
+            )
+        for source, destination in segment_moves:
+            # 分段成片移走（不是复制）：resume 路径发现旧成片会直接复用而
+            # 不重提，移入归档既保历史又强制新版本全新提交。
+            os.replace(source, destination)
+        if submit_logs:
+            logs_archive = archive_root / "submit-logs"
+            logs_archive.mkdir(mode=0o700)
+            for directory in submit_logs:
+                os.rename(directory, logs_archive / directory.name)
+        return {
+            "version": version,
+            "completed_at": state.get("updated_at"),
+            "video": self._project_artifact_receipt(
+                project,
+                archive_root / "generated.mp4",
+                f"output/history/v{version}/generated.mp4",
+            ),
+            "segments": archive_segments,
+        }
 
     def validate_r2v_resume(self, project_id: str) -> None:
         self._load_r2v_resume(project_id)

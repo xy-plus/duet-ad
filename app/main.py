@@ -9,6 +9,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -1187,6 +1188,80 @@ def create_app(
         task.add_done_callback(app.state.tasks.discard)
         return state
 
+    @app.get(
+        "/api/conversations/{project_id}/generation-history",
+        dependencies=[Depends(require_auth)],
+    )
+    async def generation_history_read(project_id: str, request: Request):
+        store = _store(request)
+        state = _read_project(store, project_id)
+        return {
+            "versions": prompt_review_store.generation_history(
+                store.path(project_id), state,
+            ),
+        }
+
+    @app.post(
+        "/api/conversations/{project_id}/regenerate",
+        status_code=202,
+        dependencies=[Depends(require_auth)],
+    )
+    async def regenerate_with_edited_prompts(project_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise _error(400, "invalid_json", "请求体必须是 JSON 对象") from None
+        if not isinstance(body, dict) or set(body) != {"segments"}:
+            raise _error(
+                400,
+                "invalid_prompt_review_edit",
+                '请求体必须是 {"segments":[{"segment_index":N,"prompt":"..."}]}',
+            )
+        try:
+            with app.state.resume_lock:
+                state = _read_project(_store(request), project_id)
+                if state.get("status") != "succeeded":
+                    raise _error(
+                        409,
+                        "regenerate_not_succeeded",
+                        "只有已成功项目可以编辑提示词重新生成",
+                    )
+                app.state.pipeline.regenerate_with_edited_prompts(
+                    project_id, body["segments"],
+                )
+                state = _store(request).update(
+                    project_id,
+                    status="queued",
+                    has_video=False,
+                    project_progress={
+                        "status": "queued",
+                        "percent": 0,
+                        "stage": "picsart_resume_queued",
+                    },
+                    generation={
+                        "status": "queued",
+                        "stage": "picsart_resume_queued",
+                        "error": None,
+                    },
+                    error=None,
+                )
+        except PromptReviewError as exc:
+            status = 409 if exc.code in {
+                "regenerate_not_succeeded",
+                "prompt_review_unavailable",
+                "prompt_review_stale",
+                "regenerate_unavailable",
+            } else 422
+            raise _error(status, exc.code, exc.message) from None
+        except (FileNotFoundError, OSError):
+            raise _error(404, "conversation_not_found", "会话不存在") from None
+        task = asyncio.create_task(
+            asyncio.to_thread(pipeline_entry, project_id, "resume_r2v")
+        )
+        app.state.tasks.add(task)
+        task.add_done_callback(app.state.tasks.discard)
+        return state
+
     @app.get("/api/conversations/{project_id}/creation-input/replacement-image", dependencies=[Depends(require_auth)])
     async def replacement(project_id: str, request: Request):
         store = _store(request)
@@ -1216,10 +1291,20 @@ def create_app(
     @app.get("/api/conversations/{project_id}/files/{relative:path}", dependencies=[Depends(require_auth)])
     async def project_file(project_id: str, relative: str, request: Request):
         target = PUBLIC_PROJECT_FILES.get(relative)
-        if target is None:
-            raise _error(404, "file_not_found", "文件不存在")
         store = _store(request)
         state = _read_project(store, project_id)
+        if target is None:
+            # 历史版本成片：output/history/v{N}/generated.mp4，版本号必须在
+            # generation_history 里有正式记录才放行（不开放任意路径）。
+            match = re.fullmatch(r"history/v([1-9][0-9]*)/generated\.mp4", relative)
+            archived_versions = {
+                entry.get("version")
+                for entry in (state.get("generation_history") or [])
+                if isinstance(entry, dict)
+            } if isinstance(state.get("generation_history"), list) else set()
+            if match is None or int(match.group(1)) not in archived_versions:
+                raise _error(404, "file_not_found", "文件不存在")
+            target = (f"output/history/v{int(match.group(1))}/generated.mp4", "video/mp4")
         if relative == "source.mp4" and state.get("has_source") is not True:
             raise _error(404, "file_not_found", "文件不存在")
         if relative == "generated.mp4" and (
