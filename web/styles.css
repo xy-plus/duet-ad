@@ -407,7 +407,8 @@ input, textarea { font-family: inherit; }
 #menu-btn { display: none; }
 
 .main-title {
-  flex: 1;
+  /* 收缩到文字宽度，让重命名/收藏按钮紧跟标题右侧（间隔见 #rename-btn） */
+  flex: 0 1 auto;
   min-width: 0;
   margin: 0;
   font-size: 15px;
@@ -419,7 +420,7 @@ input, textarea { font-family: inherit; }
 
 /* 标题旁的重命名输入框与收藏按钮 */
 .main-title-input {
-  flex: 1;
+  flex: 0 1 420px;
   min-width: 0;
   height: 32px;
   padding: 0 10px;
@@ -431,8 +432,12 @@ input, textarea { font-family: inherit; }
   background: #FFFFFF;
 }
 .main-title-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(0, 113, 227, .15); }
+/* 重命名图标挨着项目名称，与标题间隔为 header 宽度的 5%；收藏按钮紧随其后 */
+#rename-btn { margin-left: 5%; }
 .fav-btn { flex-shrink: 0; color: rgba(0, 0, 0, .25); }
 .fav-btn.is-fav { color: #E8A200; }
+/* 资产库按钮保持在 header 最右 */
+#assets-btn { margin-left: auto; }
 
 /* ===== Persistent operation header ===== */
 .operation-status {
