@@ -1381,7 +1381,7 @@ function historyEntry(detail) {
       host.remove();
       return;
     }
-    const button = el("button", "btn btn-ghost history-button",
+    const button = el("button", "btn btn-primary history-button",
       "历史版本（" + archived.length + "）");
     button.type = "button";
     button.addEventListener("click", () => openHistoryModal(detail, versions));

@@ -458,14 +458,20 @@ def test_prompt_review_ui_states_are_wired():
 
 def test_generation_history_modal_is_wired():
     source = APP_JS.read_text(encoding="utf-8")
+    css = STYLES_CSS.read_text(encoding="utf-8")
     results = _function_source(source, "renderResults")
     assert "historyEntry(detail)" in results
     assert "generationHistorySection" not in results  # 旧内嵌面板已移除
     entry = _function_source(source, "historyEntry")
     assert '"/generation-history"' in entry
-    assert '"历史版本（" + archived.length + "）"' in entry  # 按钮带数量标记
+    # 主题色按钮（与"重新生成视频"同款 btn-primary），带数量标记。
+    assert '"btn btn-primary history-button"' in entry
+    assert '"历史版本（" + archived.length + "）"' in entry
     assert "host.remove()" in entry  # 无历史版本时按钮不显示
     assert "openHistoryModal(detail, versions)" in entry
+    # 靠右排列：flex 容器 + margin-left:auto。
+    assert _css_rule_bodies(css, ".history-button") == [" margin-left: auto; "]
+    assert "display: flex" in _css_rule_bodies(css, ".history-entry")[0]
     modal = _function_source(source, "openHistoryModal")
     assert '"modal-backdrop"' in modal
     assert 'dialog.setAttribute("role", "dialog")' in modal
@@ -477,7 +483,6 @@ def test_generation_history_modal_is_wired():
     assert "videoPlayer(detail, version.video_file)" in modal
     assert "textarea.readOnly = true" in modal  # 历史提示词只读
     assert '" · 当前"' in modal
-    css = STYLES_CSS.read_text(encoding="utf-8")
     assert ".modal-backdrop" in css
     assert ".modal-card" in css
     assert _css_rule_bodies(css, "body.modal-open") == [" overflow: hidden; "]

@@ -1412,7 +1412,9 @@ input, textarea { font-family: inherit; }
 .history-segment-label { font-size: 13px; font-weight: 600; }
 
 /* ===== 历史版本入口与弹窗 ===== */
-.history-entry { margin-top: 4px; }
+/* 按钮靠右排列（flex 容器 + margin-left:auto），主题色复用 btn-primary */
+.history-entry { display: flex; margin-top: 4px; }
+.history-button { margin-left: auto; }
 body.modal-open { overflow: hidden; }
 .modal-backdrop {
   position: fixed;
