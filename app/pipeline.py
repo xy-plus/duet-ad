@@ -61,7 +61,7 @@ from app.seedream import (
     _validated_image_media_type,
     reset_attempt as _seedream_reset_attempt,
 )
-from app.research_log import ResearchLog
+from app.research_log import ResearchLog, display_duration_seconds
 from app import prompt_review
 from app.prompt_review import PromptReviewError
 from app.store import ProjectStore, replacement_input_paths
@@ -2699,11 +2699,19 @@ class Pipeline:
         )
         self._replace_dialogue_audio_track(project, prepared, final, log)
         self._add_subtitles(project_id, project, final, request, log)
+        # 终态总耗时（前置节点 + 最后一次 H3 生成）随成功落盘，列表接口直接读，
+        # 避免每次列表刷新解析全部项目 trace；详情接口仍按 trace 实时推导。
+        display_duration = display_duration_seconds(project)
         self.store.update(
             project_id,
             status="succeeded",
             has_video=True,
             output_path="output/generated.mp4",
+            **(
+                {"display_duration_s": round(display_duration, 3)}
+                if display_duration is not None
+                else {}
+            ),
             project_progress={
                 "status": "succeeded",
                 "percent": 100,
@@ -4664,11 +4672,18 @@ class Pipeline:
             )
             self._replace_dialogue_audio_track(project, prepared, final, log)
             self._add_subtitles(project_id, project, final, request, log)
+            # 终态总耗时随成功落盘（供列表直接读），与主路径口径一致。
+            display_duration = display_duration_seconds(project)
             self.store.update(
                 project_id,
                 status="succeeded",
                 has_video=True,
                 output_path="output/generated.mp4",
+                **(
+                    {"display_duration_s": round(display_duration, 3)}
+                    if display_duration is not None
+                    else {}
+                ),
                 project_progress={
                     "status": "succeeded",
                     "percent": 100,
@@ -5232,11 +5247,18 @@ class Pipeline:
             )
             self._replace_dialogue_audio_track(project, prepared, final, log)
             self._add_subtitles(project_id, project, final, request, log)
+            # 终态总耗时随成功落盘（供列表直接读），与主路径口径一致。
+            display_duration = display_duration_seconds(project)
             self.store.update(
                 project_id,
                 status="succeeded",
                 has_video=True,
                 output_path="output/generated.mp4",
+                **(
+                    {"display_duration_s": round(display_duration, 3)}
+                    if display_duration is not None
+                    else {}
+                ),
                 project_progress={
                     "status": "succeeded",
                     "percent": 100,
