@@ -51,7 +51,8 @@ Object Replace Skill 要求 `replacement_set` 中每个人物、实体和场景�
 
 参见 `/home/xy/duet-ad1-h3-max-r2v/.env.example`。至少需要显式提供：
 
-- `ACCESS_TOKEN`：前端登录 Bearer token；禁止使用缺省或空值。
+- `ACCESS_TOKEN`：旧共享访问口令（兼容入口，映射为管理员身份）；禁止使用缺省或空值。
+- `INITIAL_ADMIN_EMAIL` / `INITIAL_ADMIN_PASSWORD`：首次启动且用户库为空时播种的管理员账号（fastapi-users，用户库在 `<DATA_DIR>/users.db`）；两者须同时配置。
 - `DEEPSEEK_API_KEY`、`PICSART_API_KEY`、`ARK_API_KEY`。DeepSeek 仍负责 video-maker、翻译、Object Replace 和可选 DeepSeek Fusion；Ark Seedream 负责项目级单张新形象图版。
 - `SEEDREAM_API_BASE`、`SEEDREAM_MODEL` 和 `SEEDREAM_TIMEOUT_S`：Seedream 同步生成端点、模型和请求超时；默认值见 `.env.example`。
 - `FUSION_AGENT`：内部逐段 Fusion 执行器，只能为 `codex` 或 `deepseek`，缺省值为 `deepseek`。客户端传入的同名字段会被忽略，服务端选择在创建时冻结；Object Replace 则固定为项目级 DeepSeek 节点，不受该配置影响。
@@ -70,7 +71,7 @@ python3 /home/xy/duet-ad1-h3-max-r2v/run.py
 
 ## API 与存储
 
-前端使用登录、能力声明、项目列表/创建/详情、项目媒体和替换图七组 API。成功项目在同一状态快照中返回 `project_progress.percent=100` 与 `has_video=true`；前端每两秒轮询，无 SSE/WebSocket。
+前端使用账号登录（邮箱+密码，自助注册，cookie+Bearer 双通道）、兼容口令登录、能力声明、项目列表/创建/详情/改名/收藏、项目媒体和替换图等 API。项目按 `owner_id` 归属隔离，superuser 可见全部。成功项目在同一状态快照中返回 `project_progress.percent=100` 与 `has_video=true`；前端每两秒轮询，无 SSE/WebSocket。
 
 ```text
 /home/xy/duet-ad1-h3-max-r2v/data/projects/{project_id}/
