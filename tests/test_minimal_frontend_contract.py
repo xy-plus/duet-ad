@@ -620,6 +620,8 @@ def test_active_upload_appends_only_the_minimal_multipart_contract():
         '"reference_url", url',
         '"client_request_id", requestId',
         "capability.request_field, JSON.stringify(generationRequest)",
+        # 素材库选图只传 sha 引用（与 replacement_image 上传可混合）
+        '"material_sha256", image.sha256',
         "capability.replacement_image_field, image, image.name",
     ]
     assert "if (file)" in upload

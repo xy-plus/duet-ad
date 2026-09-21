@@ -30,6 +30,9 @@ const state = {
   token: null,         // Bearer 凭据：账号登录的 JWT 或旧共享口令
   currentUser: null,   // /api/auth/me 返回的当前用户（id/email/is_superuser）
   favOnly: false,      // 侧栏「只看收藏」过滤开关
+  assetsView: false,   // 资产库视图开关（打开时隐藏 stream 与创建抽屉）
+  assetURLs: [],       // 资产库视图的 blob URL，离开/刷新时统一 revoke
+  materialSelection: [], // 素材选择弹窗里已勾选的 sha256（保持勾选顺序）
   authEpoch: 0,       // 同一口令重新登录也必须使旧异步请求失效
   conversations: [],
   currentId: null,
@@ -738,6 +741,13 @@ function showLogin(message) {
   state.currentId = null;
   state.detail = null;
   state.currentUser = null;
+  state.assetsView = false;
+  revokeAssetURLs();
+  $("assets-view").hidden = true;
+  $("stream").hidden = false;
+  const dock = document.querySelector(".composer-dock");
+  if (dock) dock.hidden = false;
+  closeMaterialModal();
   state.minimalCreationCapability = null;
   state.minimalCreationCapabilityLoaded = false;
   $("app-view").hidden = true;
@@ -1186,7 +1196,7 @@ function applyConversationUpdate(detail) {
 
 function syncHeaderTools() {
   const conv = state.conversations.find((c) => c.id === state.currentId);
-  const show = Boolean(state.currentId && conv);
+  const show = Boolean(state.currentId && conv && !state.assetsView);
   if (!show) cancelRename();
   $("rename-btn").hidden = !show;
   const favBtn = $("detail-fav-btn");
@@ -1253,6 +1263,256 @@ async function saveRename() {
   } catch (err) {
     if (handleAuthError(err)) return;
     setComposerError(err.message);
+  }
+}
+
+/* ===== 资产库（素材 + 成片只读聚合） ===== */
+function revokeAssetURLs() {
+  for (const url of state.assetURLs) URL.revokeObjectURL(url);
+  state.assetURLs = [];
+}
+
+function trackAssetURL(url) {
+  state.assetURLs.push(url);
+  return url;
+}
+
+async function openAssetsView() {
+  if (state.uploading) return;
+  state.assetsView = true;
+  stopPolling();
+  hideOperationHeader();
+  $("stream").hidden = true;
+  document.querySelector(".composer-dock").hidden = true;
+  $("assets-view").hidden = false;
+  $("main-title").textContent = "资产库";
+  syncHeaderTools();
+  await loadAssets();
+}
+
+function closeAssetsView() {
+  if (!state.assetsView) return;
+  state.assetsView = false;
+  revokeAssetURLs();
+  $("assets-view").hidden = true;
+  $("stream").hidden = false;
+  document.querySelector(".composer-dock").hidden = false;
+  const conv = state.conversations.find((c) => c.id === state.currentId);
+  $("main-title").textContent = state.currentId
+    ? (conv && conv.title) || "会话"
+    : "视频工作室";
+  syncHeaderTools();
+}
+
+async function loadAssets() {
+  const errEl = $("assets-error");
+  errEl.hidden = true;
+  revokeAssetURLs();
+  $("assets-materials").textContent = "";
+  $("assets-videos").textContent = "";
+  try {
+    renderAssets(await apiJSON("/api/assets"));
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    errEl.textContent = "资产库加载失败：" + err.message;
+    errEl.hidden = false;
+  }
+}
+
+function renderAssets(assets) {
+  const materials = assets && Array.isArray(assets.materials) ? assets.materials : [];
+  const videos = assets && Array.isArray(assets.videos) ? assets.videos : [];
+  const materialsEl = $("assets-materials");
+  const videosEl = $("assets-videos");
+  materialsEl.textContent = "";
+  videosEl.textContent = "";
+  if (materials.length === 0) {
+    materialsEl.appendChild(el("p", "assets-empty",
+      "素材库还是空的：创建项目时上传的替换参考图会自动汇总到这里"));
+  }
+  for (const material of materials) {
+    materialsEl.appendChild(materialCard(material, null));
+  }
+  if (videos.length === 0) {
+    videosEl.appendChild(el("p", "assets-empty",
+      "还没有成片：项目生成成功的视频（含历史版本）会出现在这里"));
+  }
+  for (const video of videos) {
+    videosEl.appendChild(videoCard(video));
+  }
+}
+
+/* 素材卡片：onPick 非空时为选择模式（弹窗），点击切换勾选。 */
+function materialCard(material, onPick) {
+  const cell = el("button", "material-cell");
+  cell.type = "button";
+  const thumb = el("span", "material-thumb");
+  thumb.appendChild(icon("i-attach"));
+  cell.appendChild(thumb);
+  const meta = el("span", "material-meta");
+  meta.appendChild(el("span", "material-name", material.filename || "参考图"));
+  meta.appendChild(el("span", "material-uses", "使用 " + (material.use_count || 1) + " 次"));
+  cell.appendChild(meta);
+  void apiBlobURL(material.preview_url).then((url) => {
+    thumb.textContent = "";
+    const image = el("img");
+    image.src = url;
+    image.alt = material.filename || "素材预览";
+    thumb.appendChild(image);
+  }).catch((err) => { if (handleAuthError(err)) return; });
+  if (onPick) {
+    cell.setAttribute("aria-pressed", "false");
+    cell.addEventListener("click", () => onPick(material, cell));
+  } else {
+    cell.disabled = true;
+  }
+  return cell;
+}
+
+/* 成片卡片：视频 blob 较大，点击播放按钮时才拉取（auth 走 api()）。 */
+function videoCard(video) {
+  const card = el("div", "video-card");
+  const stage = el("div", "video-stage");
+  const playBtn = el("button", "video-play");
+  playBtn.type = "button";
+  playBtn.setAttribute("aria-label", "播放 " + (video.title || "成片"));
+  playBtn.appendChild(icon("i-film"));
+  stage.appendChild(playBtn);
+  card.appendChild(stage);
+  playBtn.addEventListener("click", async () => {
+    playBtn.disabled = true;
+    try {
+      const url = trackAssetURL(await apiBlobURL(video.file_url));
+      const player = document.createElement("video");
+      player.src = url;
+      player.controls = true;
+      player.autoplay = true;
+      player.className = "video-player";
+      stage.textContent = "";
+      stage.appendChild(player);
+    } catch (err) {
+      playBtn.disabled = false;
+      if (handleAuthError(err)) return;
+    }
+  });
+  const meta = el("div", "video-meta");
+  const versionLabel = video.version === null || video.version === undefined
+    ? "当前版" : "历史 v" + video.version;
+  meta.appendChild(el("span", "video-title",
+    (video.title || "未命名项目") + " · " + versionLabel));
+  const facts = [];
+  if (video.completed_at) facts.push(fmtTime(video.completed_at));
+  if (Number.isFinite(video.duration_s) && video.duration_s > 0) {
+    facts.push(formatDuration(video.duration_s));
+  }
+  meta.appendChild(el("span", "video-facts", facts.join(" · ")));
+  card.appendChild(meta);
+  const download = el("button", "btn btn-ghost video-download", "下载");
+  download.type = "button";
+  download.addEventListener("click", async () => {
+    download.disabled = true;
+    try {
+      const url = trackAssetURL(await apiBlobURL(video.file_url));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = (video.title || "video") + (video.version ? "-v" + video.version : "") + ".mp4";
+      link.click();
+    } catch (err) {
+      if (handleAuthError(err)) return;
+    } finally {
+      download.disabled = false;
+    }
+  });
+  card.appendChild(download);
+  return card;
+}
+
+/* ===== 素材选择弹窗 ===== */
+function openMaterialModal() {
+  if (state.viewingSubmittedConfig || state.uploading) return;
+  state.materialSelection = [];
+  $("material-modal").hidden = false;
+  document.body.classList.add("modal-open");
+  $("material-modal-confirm").disabled = true;
+  $("material-modal-confirm").textContent = "添加所选";
+  const grid = $("material-modal-grid");
+  grid.textContent = "";
+  $("material-modal-empty").hidden = true;
+  void apiJSON("/api/assets").then((assets) => {
+    const materials = assets && Array.isArray(assets.materials) ? assets.materials : [];
+    if (materials.length === 0) {
+      $("material-modal-empty").hidden = false;
+      return;
+    }
+    for (const material of materials) {
+      grid.appendChild(materialCard(material, toggleMaterialSelection));
+    }
+  }).catch((err) => {
+    if (handleAuthError(err)) return;
+    closeMaterialModal();
+    setComposerError("素材库加载失败：" + err.message);
+  });
+}
+
+function closeMaterialModal() {
+  $("material-modal").hidden = true;
+  document.body.classList.remove("modal-open");
+  state.materialSelection = [];
+}
+
+function toggleMaterialSelection(material, cell) {
+  const maxImages = state.minimalCreationCapability
+    ? state.minimalCreationCapability.replacement.max_images : 4;
+  const at = state.materialSelection.indexOf(material.sha256);
+  if (at >= 0) {
+    state.materialSelection.splice(at, 1);
+    cell.classList.remove("selected");
+    cell.setAttribute("aria-pressed", "false");
+  } else {
+    // 已选参考图（上传+库）+ 本次勾选合计不能超过上限
+    if (state.replacementImages.length + state.materialSelection.length >= maxImages) return;
+    state.materialSelection.push(material.sha256);
+    cell.classList.add("selected");
+    cell.setAttribute("aria-pressed", "true");
+  }
+  const confirm = $("material-modal-confirm");
+  confirm.disabled = state.materialSelection.length === 0;
+  confirm.textContent = state.materialSelection.length
+    ? "添加所选（" + state.materialSelection.length + "）" : "添加所选";
+}
+
+async function confirmMaterialSelection() {
+  const maxImages = state.minimalCreationCapability
+    ? state.minimalCreationCapability.replacement.max_images : 4;
+  try {
+    const assetsData = await apiJSON("/api/assets");
+    const materials = assetsData && Array.isArray(assetsData.materials) ? assetsData.materials : [];
+    const bySha = new Map(materials.map((m) => [m.sha256, m]));
+    for (const sha of state.materialSelection) {
+      const material = bySha.get(sha);
+      if (!material) continue;
+      if (state.replacementImages.some((image) => image.kind === "library" && image.sha256 === sha)) continue;
+      if (state.replacementImages.length >= maxImages) break;
+      const previewUrl = await apiBlobURL(material.preview_url);
+      state.replacementImages.push({
+        kind: "library",
+        sha256: sha,
+        name: material.filename || "素材",
+        size: material.bytes,
+        type: material.media_type,
+      });
+      state.replacementPreviewURLs.push(previewUrl);
+    }
+    state.submittedReplacements = [];
+    state.replacementPreviewOwnerId = null;
+    state.clientRequestId = newRequestId();
+    closeMaterialModal();
+    renderReplacementImages();
+    updateReplacementHint();
+    updateSendBtn();
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    setComposerError("素材加载失败：" + err.message);
   }
 }
 
@@ -1843,6 +2103,7 @@ function shouldPollDetail(detail) {
 
 async function selectConversation(id) {
   if (state.uploading) return; // 上传中不切换，避免打断
+  closeAssetsView();
   const switchingProject = state.currentId !== id;
   state.currentId = id;
   if (switchingProject) {
@@ -2114,7 +2375,8 @@ function renderReplacementImages() {
       chip.appendChild(preview);
     }
     const filename = String(image.filename || image.name || "参考图");
-    chip.appendChild(el("span", null, "参考图 " + (index + 1) + " · " + filename));
+    const sourceTag = image.kind === "library" ? " · 素材库" : "";
+    chip.appendChild(el("span", null, "参考图 " + (index + 1) + " · " + filename + sourceTag));
     if (!submitted) {
       const remove = el("button", "icon-btn icon-btn-sm");
       remove.type = "button";
@@ -2127,11 +2389,14 @@ function renderReplacementImages() {
   });
   const maxImages = state.minimalCreationCapability
     ? state.minimalCreationCapability.replacement.max_images : 4;
+  const pickerDisabled = state.uploading || state.viewingSubmittedConfig
+    || images.length >= maxImages;
   $("replacement-select").hidden = submitted;
   $("replacement-select").textContent = images.length
     ? "添加参考图（" + images.length + "/" + maxImages + "）" : "上传参考图（最多 " + maxImages + " 张）";
-  $("replacement-select").disabled = state.uploading || state.viewingSubmittedConfig
-    || images.length >= maxImages;
+  $("replacement-select").disabled = pickerDisabled;
+  $("material-pick-btn").hidden = submitted;
+  $("material-pick-btn").disabled = pickerDisabled;
 }
 
 function resetReplacementImageDisplay() {
@@ -2461,7 +2726,12 @@ function uploadConversation({
     const images = Array.isArray(replacementImages)
       ? replacementImages : replacementImage ? [replacementImage] : [];
     images.forEach((image) => {
-      fd.append(capability.replacement_image_field, image, image.name);
+      // 素材库选图：只传 sha 引用，后端从既有项目里复用文件
+      if (image && image.kind === "library") {
+        fd.append("material_sha256", image.sha256);
+      } else {
+        fd.append(capability.replacement_image_field, image, image.name);
+      }
     });
     xhr.send(fd);
   });
@@ -2643,6 +2913,20 @@ function bindEvents() {
     if (conv) void toggleFavorite(conv.id, conv.favorite !== true);
   });
 
+  $("assets-btn").addEventListener("click", () => {
+    if (state.assetsView) closeAssetsView();
+    else void openAssetsView();
+  });
+  $("material-pick-btn").addEventListener("click", openMaterialModal);
+  $("material-modal-close").addEventListener("click", closeMaterialModal);
+  $("material-modal").addEventListener("click", (e) => {
+    if (e.target === $("material-modal")) closeMaterialModal();
+  });
+  $("material-modal-confirm").addEventListener("click", () => void confirmMaterialSelection());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("material-modal").hidden) closeMaterialModal();
+  });
+
   $("menu-btn").addEventListener("click", openDrawer);
   $("drawer-backdrop").addEventListener("click", closeDrawer);
   $("composer-toggle").addEventListener("click", () => {
@@ -2651,6 +2935,7 @@ function bindEvents() {
 
   $("new-chat-btn").addEventListener("click", async () => {
     if (state.uploading) return;
+    closeAssetsView();
     state.currentId = null;
     state.detail = null;
     resetComposerForNewProject();

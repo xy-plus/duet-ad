@@ -22,6 +22,8 @@
   <symbol id="i-sparkle" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5 14 8.6l6.1 2-6.1 2L12 18.7 10 12.6l-6.1-2 6.1-2L12 2.5Z"/></symbol>
   <symbol id="i-star" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.4l-5.8 3.1 1.1-6.5L2.6 9.4l6.5-.9L12 2.6z"/></symbol>
   <symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 20h16"/></symbol>
 </svg>
 
 <div id="login-view" class="login-view" hidden>
@@ -94,7 +96,22 @@
       <button id="detail-fav-btn" class="icon-btn fav-btn" type="button" hidden aria-label="收藏项目" title="收藏">
         <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-star"></use></svg></span>
       </button>
+      <button id="assets-btn" class="icon-btn" type="button" aria-label="打开资产库" title="资产库">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-grid"></use></svg></span>
+      </button>
     </header>
+
+    <section id="assets-view" class="assets-view" hidden aria-label="资产库">
+      <div class="assets-inner">
+        <p id="assets-error" class="inline-error" role="alert" hidden></p>
+        <h2 class="assets-section-title">素材</h2>
+        <p class="assets-section-sub">创建项目时上传过的替换参考图，按内容去重；创建新项目时可直接从库里选图</p>
+        <div id="assets-materials" class="assets-materials" aria-live="polite"></div>
+        <h2 class="assets-section-title">成片</h2>
+        <p class="assets-section-sub">各项目生成的视频（含历史版本），可播放、可下载</p>
+        <div id="assets-videos" class="assets-videos" aria-live="polite"></div>
+      </div>
+    </section>
 
     <section id="operation-status" class="operation-status" aria-label="项目运行状态" aria-live="polite" hidden></section>
 
@@ -236,7 +253,10 @@
               </div>
             </div>
             <div class="replacement-inputs">
-              <button type="button" id="replacement-select" class="reference-image-button">上传参考图（最多 4 张）</button>
+              <div class="replacement-buttons">
+                <button type="button" id="replacement-select" class="reference-image-button">上传参考图（最多 4 张）</button>
+                <button type="button" id="material-pick-btn" class="reference-image-button">从素材库选择</button>
+              </div>
               <div id="replacement-image-list" class="reference-image-list" aria-live="polite" hidden></div>
               <label class="sr-only" for="replacement-instruction">替换说明</label>
               <textarea id="replacement-instruction" class="setup-textarea" rows="3" maxlength="1000"
@@ -259,6 +279,22 @@
 
   <input type="file" id="file-input" accept="video/*" hidden>
   <input type="file" id="replacement-image-input" accept="image/jpeg,image/png,image/webp" multiple hidden>
+</div>
+
+<div id="material-modal" class="modal-backdrop" hidden>
+  <div class="modal-card material-modal" role="dialog" aria-modal="true" aria-labelledby="material-modal-title">
+    <div class="modal-header">
+      <h3 id="material-modal-title" class="res-h3">从素材库选择</h3>
+      <button id="material-modal-close" class="icon-btn icon-btn-sm modal-close" type="button" aria-label="关闭">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"></use></svg></span>
+      </button>
+    </div>
+    <p id="material-modal-empty" class="assets-empty" hidden>素材库还是空的：先在项目里上传参考图，之后就能直接复用</p>
+    <div id="material-modal-grid" class="assets-materials modal-grid"></div>
+    <div class="modal-foot">
+      <button id="material-modal-confirm" class="btn btn-primary" type="button" disabled>添加所选</button>
+    </div>
+  </div>
 </div>
 
 <script src="app.js"></script>
