@@ -1204,6 +1204,8 @@ function startRename() {
 function cancelRename() {
   $("rename-input").hidden = true;
   $("main-title").hidden = false;
+  // 恢复铅笔入口（startRename 藏了它）；无项目时 syncHeaderTools 会随即再藏掉
+  $("rename-btn").hidden = false;
 }
 
 async function saveRename() {
