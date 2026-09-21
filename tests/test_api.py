@@ -1371,6 +1371,24 @@ def test_files_endpoint_exposes_only_two_fixed_aliases_even_if_state_is_poisoned
         assert (project / "logs" / "trace.jsonl").is_file()
 
 
+def test_web_static_assets_require_revalidation_api_paths_unchanged(tmp_path: Path):
+    """web 静态资源必须 no-cache（每次加载 revalidate）；/api 与 /internal 不变。"""
+    app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
+    with TestClient(app) as client:
+        for path in ("/", "/index.html", "/app.js", "/styles.css"):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert response.headers["Cache-Control"] == "private, no-cache"
+        api_response = client.get("/api/conversations", headers=AUTH)
+        assert api_response.status_code == 200
+        assert "Cache-Control" not in api_response.headers
+        internal_response = client.get(
+            "/internal/provider-assets/" + "0" * 32 + "/asset?token=wrong"
+        )
+        assert internal_response.status_code == 404
+        assert internal_response.headers["Cache-Control"] == "private, no-store"
+
+
 def test_provider_asset_signature_binds_project_asset_id_token_and_real_path(tmp_path: Path):
     app = create_app(settings(tmp_path), pipeline_factory=successful_factory)
     with TestClient(app) as client:

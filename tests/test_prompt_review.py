@@ -733,7 +733,9 @@ class _PromptReviewPipeline:
         self.resumed: list[str] = []
 
     def run(self, project_id: str) -> None:
-        self.release.wait(timeout=10)
+        # 超时只是防挂死的兜底：-n auto 高负载下事件循环/线程池排队可能
+        # 超过 10s，超时误触发会把项目标 failed 造成偶发失败。
+        self.release.wait(timeout=60)
 
     def confirm_prompt_review(self, project_id: str, segments) -> None:
         state = self.store.read(project_id)

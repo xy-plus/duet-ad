@@ -1305,10 +1305,18 @@ def create_app(
     async def disable_static_browser_cache(request: Request, call_next):
         # Static assets are served straight from the working tree, so a stale
         # browser copy can pair a new frontend with an old backend (or the
-        # reverse after a downgrade). Never let browsers cache them.
+        # reverse after a downgrade). Web responses must revalidate on every
+        # load (no-cache): StaticFiles already sends ETag/Last-Modified, so a
+        # fresh deploy answers 304 cheaply while a changed file is picked up
+        # immediately. /api 与 /internal 保持原语义（后者仍是 no-store）。
         response = await call_next(request)
-        if not request.url.path.startswith("/api"):
+        path = request.url.path
+        if path.startswith("/api"):
+            return response
+        if path.startswith("/internal"):
             response.headers["Cache-Control"] = "private, no-store"
+        else:
+            response.headers["Cache-Control"] = "private, no-cache"
         return response
 
     app.mount("/", StaticFiles(directory=web, html=True), name="web")
