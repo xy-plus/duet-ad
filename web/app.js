@@ -1221,10 +1221,11 @@ function videoPlayer(detail, file) {
   return wrap;
 }
 
-function videoSection(detail, file, title, sub) {
+function videoSection(detail, file, title, sub, action = null) {
   const sec = el("section", "res-section");
   const h = el("h3", "res-h3", title);
   if (sub) h.appendChild(el("span", "res-count", sub));
+  if (action) h.appendChild(action);
   sec.appendChild(h);
   sec.appendChild(videoPlayer(detail, file));
   return sec;
@@ -1373,7 +1374,7 @@ function promptReviewSection(detail, mode) {
 /* 历史版本：主页只显示带数量标记的入口按钮（无历史版本时不显示），点击
    打开弹窗；版本切换、视频播放、只读冻结提示词查看都在弹窗内。 */
 function historyEntry(detail) {
-  const host = el("div", "history-entry");
+  const host = el("span", "history-entry");
   apiJSON("/api/conversations/" + detail.id + "/generation-history").then((data) => {
     const versions = data && Array.isArray(data.versions) ? data.versions : [];
     const archived = versions.filter((version) => !version.current);
@@ -1382,7 +1383,7 @@ function historyEntry(detail) {
       return;
     }
     const button = el("button", "btn btn-primary history-button",
-      "历史版本（" + archived.length + "）");
+      "历史版本 (" + archived.length + ")");
     button.type = "button";
     button.addEventListener("click", () => openHistoryModal(detail, versions));
     host.appendChild(button);
@@ -1466,8 +1467,9 @@ function renderResults(detail) {
   const frag = document.createDocumentFragment();
   if (detail.has_video === true) {
     frag.appendChild(promptReviewSection(detail, "regenerate"));
-    frag.appendChild(videoSection(detail, "generated.mp4", "新视频", "已完成"));
-    frag.appendChild(historyEntry(detail));
+    frag.appendChild(videoSection(
+      detail, "generated.mp4", "新视频", "已完成", historyEntry(detail),
+    ));
   }
   return frag;
 }

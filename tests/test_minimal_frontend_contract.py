@@ -464,14 +464,17 @@ def test_generation_history_modal_is_wired():
     assert "generationHistorySection" not in results  # 旧内嵌面板已移除
     entry = _function_source(source, "historyEntry")
     assert '"/generation-history"' in entry
-    # 主题色按钮（与"重新生成视频"同款 btn-primary），带数量标记。
+    # 主题色按钮（与"重新生成视频"同款 btn-primary），半角括号带空格的数量标记。
     assert '"btn btn-primary history-button"' in entry
-    assert '"历史版本（" + archived.length + "）"' in entry
+    assert '"历史版本 (" + archived.length + ")"' in entry
     assert "host.remove()" in entry  # 无历史版本时按钮不显示
     assert "openHistoryModal(detail, versions)" in entry
-    # 靠右排列：flex 容器 + margin-left:auto。
-    assert _css_rule_bodies(css, ".history-button") == [" margin-left: auto; "]
-    assert "display: flex" in _css_rule_bodies(css, ".history-entry")[0]
+    # 按钮进成片区块标题行右侧：videoSection 标题行接收 action 并挂进 res-h3。
+    section = _function_source(source, "videoSection")
+    assert "if (action) h.appendChild(action)" in section
+    # 蓝底黑字：仅覆盖文字色为现有深色变量；res-h3 是 flex，靠右用 margin-left:auto。
+    assert _css_rule_bodies(css, ".history-button") == [" color: var(--text); "]
+    assert _css_rule_bodies(css, ".history-entry") == [" margin-left: auto; "]
     modal = _function_source(source, "openHistoryModal")
     assert '"modal-backdrop"' in modal
     assert 'dialog.setAttribute("role", "dialog")' in modal
@@ -791,11 +794,11 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
     mounted_results = re.findall(
         r"frag\.appendChild\((.*?)\);", results_renderer, flags=re.DOTALL
     )
-    # 冻结提示词（可编辑重新生成）在成片上方，历史版本入口按钮在成片下方。
+    # 冻结提示词（可编辑重新生成）在成片上方；历史版本入口按钮在成片
+    # 区块标题行内（videoSection 的 action 参数），不再单独成行。
     assert mounted_results == [
         'promptReviewSection(detail, "regenerate")',
-        'videoSection(detail, "generated.mp4", "新视频", "已完成")',
-        "historyEntry(detail)",
+        'videoSection(\n      detail, "generated.mp4", "新视频", "已完成", historyEntry(detail),\n    )',
     ]
     assert results_renderer.count("videoSection(") == 1
 
