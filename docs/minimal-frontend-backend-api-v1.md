@@ -243,6 +243,12 @@
 - 确认成功返回 `202`：后端重建 `prefix + 编辑后主体 + suffix` 写回各段冻结提示词、重算冻结清单回执，项目回到 `queued` 并走 resume-picsart 等价路径继续生成。
 - 不确认就永远不会发生付费提交；放弃项目无需任何操作。
 
+### 成功后编辑提示词重新生成（regenerate）与版本历史
+
+`succeeded` 项目可用 `POST /api/conversations/{id}/regenerate` 重新生成：body 与 confirm 同构（`{"segments":[{"segment_index":N,"prompt":"..."}]}`，`prompt` 仍只是可编辑部分）。后端先把当前版本归档到 `output/history/v{N}/`（成片、分段成片、各段冻结提示词全文、submit 证据日志）并记入 `generation_history`，再按同一四段公式重建提示词、清零 Picsart 账本后全新提交 H3；分段、检测、灰块视频、音频等前置产物全部复用。仅 `succeeded` 且存在冻结审核记录时可用，否则 `409 regenerate_not_succeeded` / `prompt_review_unavailable`。
+
+`GET /api/conversations/{id}/generation-history` 返回 `{"versions":[...]}`：每版含 `version`、`completed_at`、`current`（当前版本为 true）、`video_file`（`/api/conversations/{id}/files/` 的相对键，历史版本为 `history/v{N}/generated.mp4`）、`segments`（该版各段冻结提示词的可编辑部分与时间区间）。从未重新生成过时只有当前版本一项。
+
 ## 5. 最小错误合同
 
 错误结构固定为 `{"detail":{"code","message","field"}}`。前端需要以下稳定机器码：
