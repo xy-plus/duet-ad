@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import Depends
 from fastapi_users import BaseUserManager, FastAPIUsers, UUIDIDMixin, schemas
@@ -76,6 +77,15 @@ class ResolvedUser:
     id: str
     email: str
     is_superuser: bool
+
+
+def can_access_project(state: dict[str, Any], user: ResolvedUser) -> bool:
+    """superuser 可见全部；普通用户只看到自己的项目。无 owner_id 的存量
+    项目（迁移尚未运行，即用户库还没有 superuser）只对 superuser 可见。"""
+    if user.is_superuser:
+        return True
+    owner = state.get("owner_id")
+    return isinstance(owner, str) and owner == user.id
 
 
 class UserAuth:

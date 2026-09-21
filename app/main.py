@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import threading
 import time
@@ -27,12 +28,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2Pas
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
+from app.assets import collect_assets, find_material
 from app.pipeline import SAME_AS_SOURCE_LANGUAGE, Pipeline
 from app import prompt_review as prompt_review_store
 from app.prompt_review import PromptReviewError
 from app.research_log import ResearchLog, display_duration_seconds
 from app.safe_download import ReferenceDownloadError, Resolver, download_reference_url, resolve_addresses
 from app.store import (
+    SHA256_RE,
     ClientRequestIdConflict,
     IdempotencyIndexUnavailable,
     ProjectStateError,
@@ -47,6 +50,7 @@ from app.users import (
     ResolvedUser,
     User,
     UserAuth,
+    can_access_project,
 )
 
 
@@ -69,6 +73,8 @@ CREATION_FORM_FIELDS = frozenset({
     "client_request_id",
     "generation_request",
     "replacement_image",
+    # 从资产库选图（可重复，与 replacement_image 上传可混合，合计 ≤4）
+    "material_sha256",
 })
 PROVIDER_ASSET_SUFFIXES = {
     "video/mp4": ".mp4",
@@ -133,15 +139,6 @@ def _error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code, detail={"code": code, "message": message})
 
 
-def _can_access_project(state: dict[str, Any], user: ResolvedUser) -> bool:
-    """superuser 可见全部；普通用户只看到自己的项目。无 owner_id 的存量
-    项目（迁移尚未运行，即用户库还没有 superuser）只对 superuser 可见。"""
-    if user.is_superuser:
-        return True
-    owner = state.get("owner_id")
-    return isinstance(owner, str) and owner == user.id
-
-
 def _read_project(store: ProjectStore, project_id: str) -> dict[str, Any]:
     try:
         return store.read(project_id)
@@ -156,7 +153,7 @@ def _owned_project(
 ) -> dict[str, Any]:
     """读项目并做归属鉴权；无权访问与不存在一样是 404（不泄漏存在性）。"""
     state = _read_project(store, project_id)
-    if not _can_access_project(state, user):
+    if not can_access_project(state, user):
         raise _error(404, "project_not_found", "项目不存在")
     return state
 
@@ -255,7 +252,7 @@ async def _validate_creation_form(request: Request) -> None:
         if field not in CREATION_FORM_FIELDS:
             raise _error(422, "invalid_creation_form", f"不支持的创建字段: {field}")
         counts[field] = counts.get(field, 0) + 1
-        if counts[field] > (REPLACEMENT_MAX_IMAGES if field == "replacement_image" else 1):
+        if counts[field] > (REPLACEMENT_MAX_IMAGES if field in {"replacement_image", "material_sha256"} else 1):
             raise _error(422, "invalid_creation_form", f"创建字段不能重复: {field}")
 
 
@@ -758,11 +755,17 @@ def create_app(
         rows = [
             state
             for state in _store(request).list()
-            if _can_access_project(state, user)
+            if can_access_project(state, user)
         ]
         # 收藏优先；组内保持 store.list 的 created_at 倒序（稳定排序）。
         rows.sort(key=lambda state: state.get("favorite") is not True)
         return rows
+
+    @app.get("/api/assets")
+    async def assets(request: Request, user: ResolvedUser = Depends(require_user)):
+        # 资产库只读聚合：素材按 sha256 去重 + 成片（当前版与历史版），
+        # 每次请求现算（项目数 <200，无缓存层）。
+        return collect_assets(_store(request), user)
 
     def start_pipeline(project_id: str, operation: str = "run") -> None:
         task = asyncio.create_task(asyncio.to_thread(pipeline_entry, project_id, operation))
@@ -849,11 +852,15 @@ def create_app(
         generation_request: str | None,
         replacement_image: UploadFile | None,
         replacement_images: list[UploadFile] | None = None,
+        material_sha256s: list[str] | None = None,
+        user: ResolvedUser | None = None,
     ):
         """Validate and stage a creation request, yielding commit inputs.
 
         Shared by the internal /api/conversations endpoint and the public v1
         API so both enforce the exact same input rules and idempotency store.
+        material_sha256s（资产库选图，按 sha 复用当前用户项目里的参考图文件）
+        只有内部端点会传；对外 v1 不传则行为完全不变。
         """
 
         normalized_client_request_id = _normalize_client_request_id(client_request_id)
@@ -869,11 +876,23 @@ def create_app(
                 "file 与 reference_url 必须且只能提供一个",
             )
         images = replacement_images if replacement_images is not None else ([replacement_image] if replacement_image is not None else [])
-        if len(images) > REPLACEMENT_MAX_IMAGES:
+        materials = material_sha256s or []
+        for sha in materials:
+            if not isinstance(sha, str) or SHA256_RE.fullmatch(sha) is None:
+                raise _error(
+                    422,
+                    "invalid_material",
+                    "material_sha256 必须是 64 位十六进制 sha256",
+                )
+        if materials and user is None:
+            raise _error(422, "invalid_material", "material_sha256 仅内部 API 支持")
+        if len(images) + len(materials) > REPLACEMENT_MAX_IMAGES:
             raise _error(422, "invalid_creation_form", "最多提供 4 张参考图")
+        # 混合创建时固定排序：上传图在前、库选图在后，首图投影取上传图。
+        has_any_image = bool(images) or bool(materials)
         replacement_image = images[0] if images else None
         has_replacement_guidance = effective_request["replacement_guidance"] is not None
-        if (replacement_image is not None) != has_replacement_guidance:
+        if has_any_image != has_replacement_guidance:
             raise _error(
                 422,
                 "replacement_pair_required",
@@ -932,8 +951,6 @@ def create_app(
                 else {"kind": "url", "url": normalized_reference_url}
             )
 
-            replacement_snapshot = None
-            replacement_receipt = None
             replacement_snapshots = []
             image_receipts = []
             staged_replacements = []
@@ -958,8 +975,26 @@ def create_app(
                     "bytes": replacement_bytes,
                 })
                 staged_replacements.append(image_path)
-            replacement_snapshot = replacement_snapshots[0] if images else None
-            replacement_receipt = image_receipts[0] if images else None
+            # 资产库选图：按 sha 在当前用户项目里定位并复制进暂存区，落盘结构
+            # 与上传完全一致（inputs/replacement-image[-N]）。
+            for sha in materials:
+                found = find_material(app.state.store, sha, user)
+                if found is None or found[1]["bytes"] > REPLACEMENT_MAX_BYTES:
+                    raise _error(
+                        422,
+                        "material_not_found",
+                        "素材不存在或不属于当前账号",
+                    )
+                material_path, material_snapshot = found
+                index = len(staged_replacements) + 1
+                image_path = staging / ("replacement-image" if index == 1 else f"replacement-image-{index}")
+                await asyncio.to_thread(shutil.copyfile, material_path, image_path)
+                os.chmod(image_path, 0o600)
+                replacement_snapshots.append(material_snapshot)
+                image_receipts.append({"sha256": sha, "bytes": material_snapshot["bytes"]})
+                staged_replacements.append(image_path)
+            replacement_snapshot = replacement_snapshots[0] if staged_replacements else None
+            replacement_receipt = image_receipts[0] if staged_replacements else None
 
             generation_request_sha256 = hash_generation_request(effective_request)
             input_receipt = {
@@ -972,7 +1007,7 @@ def create_app(
                 },
                 "replacement_image": replacement_receipt,
             }
-            if len(images) > 1:
+            if len(staged_replacements) > 1:
                 input_receipt.update(version=2, replacement_images=image_receipts)
             request_digest = creation_request_digest(
                 generation_request_sha256,
@@ -990,10 +1025,10 @@ def create_app(
                 "replacement_snapshots": replacement_snapshots,
                 "staged_replacements": staged_replacements,
                 "staged_replacement": (
-                    staged_replacement if replacement_image is not None else None
+                    staged_replacement if staged_replacements else None
                 ),
                 "source_identity": source_identity,
-                "replacement_identity": image_receipts if len(images) > 1 else replacement_receipt,
+                "replacement_identity": image_receipts if len(staged_replacements) > 1 else replacement_receipt,
             }
 
     @app.post("/api/conversations", status_code=201)
@@ -1008,8 +1043,10 @@ def create_app(
         user: ResolvedUser = Depends(require_user),
     ):
         await _validate_creation_form(request)
-        replacement_images = (await request.form()).getlist("replacement_image")
+        form = await request.form()
+        replacement_images = form.getlist("replacement_image")
         replacement_image = replacement_images[0] if replacement_images else None
+        material_sha256s = form.getlist("material_sha256")
         try:
             async with staged_creation(
                 file=file,
@@ -1018,6 +1055,8 @@ def create_app(
                 generation_request=generation_request,
                 replacement_image=replacement_image,
                 replacement_images=replacement_images,
+                material_sha256s=material_sha256s,
+                user=user,
             ) as staged:
                 project_id, project, state, created = app.state.store.create_from_staging(
                     staged["effective_request"],
@@ -1060,7 +1099,7 @@ def create_app(
         response.status_code = 201 if created else 200
         if not created:
             # 幂等命中：项目属于谁就只能由谁看到重放结果。
-            if not _can_access_project(state, user):
+            if not can_access_project(state, user):
                 raise _error(404, "project_not_found", "项目不存在")
             return state
 
