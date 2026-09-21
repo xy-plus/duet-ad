@@ -173,6 +173,13 @@ input, textarea { font-family: inherit; }
 
 #login-form .btn-block { margin-top: 16px; }
 
+/* 登录页：账号/注册/旧口令三个表单叠放，切换显隐 */
+#register-form .btn-block,
+#legacy-form .btn-block { margin-top: 16px; }
+.login-card form .text-input + .text-input { margin-top: 10px; }
+.login-alt { margin-top: 14px; display: flex; flex-direction: column; gap: 4px; }
+.login-alt .btn-ghost { width: 100%; font-size: 13px; min-height: 34px; }
+
 /* ===== App layout ===== */
 .app {
   display: flex;
@@ -218,6 +225,11 @@ input, textarea { font-family: inherit; }
 .brand-dot svg { width: 14px; height: 14px; }
 
 .btn-new { width: 100%; margin-top: 14px; }
+
+/* 只看收藏过滤开关 */
+.fav-filter { width: 100%; margin-top: 8px; font-size: 13px; min-height: 34px; justify-content: flex-start; gap: 6px; }
+.fav-filter .ic svg { width: 14px; height: 14px; }
+.fav-filter.is-on { color: #E8A200; background: rgba(232, 162, 0, .1); }
 
 .conv-list {
   flex: 1;
@@ -269,6 +281,22 @@ input, textarea { font-family: inherit; }
 .conv-heading { min-width: 0; display: flex; align-items: center; gap: 6px; }
 .conv-heading .conv-title { flex: 1; min-width: 0; }
 .conv-heading .badge { flex-shrink: 0; }
+
+/* 列表项星标：默认浅灰，hover/已收藏变琥珀色 */
+.conv-fav {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  color: rgba(0, 0, 0, .18);
+  transition: color .15s ease, background .15s ease;
+}
+.conv-fav .ic svg { width: 14px; height: 14px; }
+.conv-fav:hover { color: #E8A200; background: rgba(232, 162, 0, .12); }
+.conv-fav.is-fav { color: #E8A200; }
 
 .conv-identity,
 .conv-footer {
@@ -343,6 +371,17 @@ input, textarea { font-family: inherit; }
 
 .sidebar-foot .btn-ghost { width: 100%; }
 
+/* 当前登录用户标识 */
+.current-user {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .main {
   flex: 1;
   min-width: 0;
@@ -365,6 +404,8 @@ input, textarea { font-family: inherit; }
 #menu-btn { display: none; }
 
 .main-title {
+  flex: 1;
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
@@ -372,6 +413,23 @@ input, textarea { font-family: inherit; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 标题旁的重命名输入框与收藏按钮 */
+.main-title-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  background: #FFFFFF;
+}
+.main-title-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(0, 113, 227, .15); }
+.fav-btn { flex-shrink: 0; color: rgba(0, 0, 0, .25); }
+.fav-btn.is-fav { color: #E8A200; }
 
 /* ===== Persistent operation header ===== */
 .operation-status {

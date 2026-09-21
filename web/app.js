@@ -1,5 +1,6 @@
 /* 视频工作室 — ChatGPT 式单页前端
- * 同源 API：/api/*，共享口令 Bearer 鉴权；文件直链也需鉴权，故一律 fetch(blob) → ObjectURL。
+ * 同源 API：/api/*，账号密码登录（fastapi-users，cookie+Bearer 双通道）；
+ * 兼容旧共享口令登录。文件直链也需鉴权，故一律 fetch(blob) → ObjectURL。
  */
 "use strict";
 
@@ -26,7 +27,9 @@ const DIALOGUE_MODES = Object.freeze(["auto_rewrite", "generate"]);
 const STATUS_TEXT = { queued: "排队中", processing: "处理中", done: "已完成", failed: "失败" };
 
 const state = {
-  token: null,
+  token: null,         // Bearer 凭据：账号登录的 JWT 或旧共享口令
+  currentUser: null,   // /api/auth/me 返回的当前用户（id/email/is_superuser）
+  favOnly: false,      // 侧栏「只看收藏」过滤开关
   authEpoch: 0,       // 同一口令重新登录也必须使旧异步请求失效
   conversations: [],
   currentId: null,
@@ -676,11 +679,12 @@ async function api(path, options = {}) {
   if (state.token) headers["Authorization"] = "Bearer " + state.token;
   let res;
   try {
-    res = await fetch(path, Object.assign({}, options, { headers }));
+    // credentials: same-origin 带上登录 cookie（双通道之一）；Bearer 头为主。
+    res = await fetch(path, Object.assign({}, options, { headers, credentials: "same-origin" }));
   } catch (e) {
     throw new Error("无法连接服务器，请检查网络后重试");
   }
-  if (res.status === 401) throw new AuthError("口令已失效");
+  if (res.status === 401) throw new AuthError("登录状态已失效");
   return res;
 }
 
@@ -715,16 +719,30 @@ function handleAuthError(err) {
 }
 
 /* ===== 登录 / 会话鉴权 ===== */
+/* 登录页三种模式：login（账号密码，主入口）、register（自助注册）、
+   legacy（旧访问口令，兼容入口）。 */
+function setLoginMode(mode) {
+  $("login-form").hidden = mode !== "login";
+  $("register-form").hidden = mode !== "register";
+  $("legacy-form").hidden = mode !== "legacy";
+  $("login-switch").textContent = mode === "register" ? "返回登录" : "注册账号";
+  $("legacy-switch").textContent = mode === "legacy" ? "返回登录" : "使用旧访问口令（兼容）";
+  const focusId = mode === "register" ? "register-email" : mode === "legacy" ? "login-token" : "login-email";
+  setTimeout(() => $(focusId).focus(), 0);
+}
+
 function showLogin(message) {
   stopPolling();
   hideOperationHeader();
   releaseHistoryThumbnails();
   state.currentId = null;
   state.detail = null;
+  state.currentUser = null;
   state.minimalCreationCapability = null;
   state.minimalCreationCapabilityLoaded = false;
   $("app-view").hidden = true;
   $("login-view").hidden = false;
+  setLoginMode("login");
   const errEl = $("login-error");
   if (message) {
     errEl.textContent = message;
@@ -732,8 +750,7 @@ function showLogin(message) {
   } else {
     errEl.hidden = true;
   }
-  $("login-token").value = "";
-  setTimeout(() => $("login-token").focus(), 0);
+  $("login-password").value = "";
 }
 
 function sessionExpired() {
@@ -743,12 +760,13 @@ function sessionExpired() {
   clearComposerSnapshots();
   resetComposerForNewProject();
   clearStream();
-  showLogin("登录状态已失效，请重新输入口令");
+  showLogin("登录状态已失效，请重新登录");
 }
 
+/* 旧访问口令登录（兼容入口）：口令本身即 Bearer 凭据，服务端映射为管理员。 */
 async function doLogin(token) {
-  const btn = $("login-btn");
-  const errEl = $("login-error");
+  const btn = $("legacy-btn");
+  const errEl = $("legacy-error");
   btn.disabled = true;
   btn.textContent = "验证中…";
   errEl.hidden = true;
@@ -756,6 +774,7 @@ async function doLogin(token) {
     const res = await fetch("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ token }),
     });
     if (res.status === 401) {
@@ -781,6 +800,97 @@ async function doLogin(token) {
   }
 }
 
+/* 账号密码登录：成功同时拿到 bearer token（存入 localStorage）与 HttpOnly cookie。 */
+async function doAccountLogin(email, password) {
+  const btn = $("login-btn");
+  const errEl = $("login-error");
+  btn.disabled = true;
+  btn.textContent = "验证中…";
+  errEl.hidden = true;
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ email, password }),
+    });
+    if (res.status === 401) {
+      errEl.textContent = "邮箱或密码不正确";
+      errEl.hidden = false;
+      return;
+    }
+    if (!res.ok) {
+      errEl.textContent = "登录失败（" + res.status + "），请稍后重试";
+      errEl.hidden = false;
+      return;
+    }
+    const data = await res.json();
+    state.authEpoch += 1;
+    state.token = data.access_token;
+    localStorage.setItem(TOKEN_KEY, data.access_token);
+    enterApp();
+  } catch (e) {
+    errEl.textContent = "无法连接服务器，请检查网络后重试";
+    errEl.hidden = false;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "登录";
+  }
+}
+
+async function doRegister(email, password) {
+  const btn = $("register-btn");
+  const errEl = $("register-error");
+  btn.disabled = true;
+  errEl.hidden = true;
+  try {
+    const res = await fetch("/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ email, password }),
+    });
+    if (!res.ok) {
+      let message = "注册失败（" + res.status + "），请稍后重试";
+      if (res.status === 400) {
+        try {
+          const data = await res.json();
+          if (data && data.detail === "REGISTER_USER_ALREADY_EXISTS") {
+            message = "该邮箱已注册，请直接登录";
+          }
+        } catch (e) { /* 保留默认提示 */ }
+      }
+      errEl.textContent = message;
+      errEl.hidden = false;
+      return;
+    }
+    await doAccountLogin(email, password);
+  } catch (e) {
+    errEl.textContent = "无法连接服务器，请检查网络后重试";
+    errEl.hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function loadCurrentUser() {
+  try {
+    const me = await apiJSON("/api/auth/me");
+    state.currentUser = me;
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    state.currentUser = null;
+  }
+  renderCurrentUser();
+}
+
+function renderCurrentUser() {
+  const label = state.currentUser && state.currentUser.email
+    ? state.currentUser.email + (state.currentUser.is_superuser ? "（管理员）" : "")
+    : "";
+  $("current-user").textContent = label;
+}
+
 function enterApp() {
   $("login-view").hidden = true;
   $("app-view").hidden = false;
@@ -788,18 +898,28 @@ function enterApp() {
   state.detail = null;
   resetComposerForNewProject();
   renderEmptyHero();
+  syncHeaderTools();
+  void loadCurrentUser();
   void loadMinimalCreationCapability();
   refreshList(false);
 }
 
 /* ===== 侧栏会话列表 ===== */
+/* 与服务端一致的展示顺序：收藏优先，其余按 created_at 倒序。 */
+function sortConversations(list) {
+  return list.slice().sort((a, b) => {
+    if ((a.favorite === true) !== (b.favorite === true)) return a.favorite === true ? -1 : 1;
+    return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+  });
+}
+
 async function refreshList() {
   try {
     const list = await apiJSON("/api/conversations");
-    state.conversations = mergeConversationList(
+    state.conversations = sortConversations(mergeConversationList(
       Array.isArray(list) ? list : [],
       state.conversations,
-    );
+    ));
     releaseHistoryThumbnails(new Set(state.conversations.map((item) => item.id)));
     renderList();
     void hydrateConversationSummaries();
@@ -905,11 +1025,16 @@ async function hydrateConversationSummaries() {
 function renderList() {
   const nav = $("conv-list");
   nav.textContent = "";
-  if (state.conversations.length === 0) {
-    nav.appendChild(el("div", "conv-empty", "还没有会话\n在下方选择一段视频，开始第一次生成"));
+  const items = state.favOnly
+    ? state.conversations.filter((c) => c.favorite === true)
+    : state.conversations;
+  if (items.length === 0) {
+    nav.appendChild(el("div", "conv-empty", state.favOnly
+      ? "还没有收藏的项目\n点击列表项右侧的星标收藏"
+      : "还没有会话\n在下方选择一段视频，开始第一次生成"));
     return;
   }
-  for (const c of state.conversations) {
+  for (const c of items) {
     const item = el("button", "conv-item" + (c.id === state.currentId ? " selected" : ""));
     item.type = "button";
     const thumb = el("span", "conv-thumb");
@@ -929,6 +1054,17 @@ function renderList() {
     const badgeState = conversationBadge(c);
     const badge = el("span", "badge " + badgeState.className, badgeState.text);
     heading.appendChild(badge);
+    const star = el("button", "conv-fav" + (c.favorite === true ? " is-fav" : ""));
+    star.type = "button";
+    star.title = c.favorite === true ? "取消收藏" : "收藏";
+    star.setAttribute("aria-label", star.title);
+    star.setAttribute("aria-pressed", String(c.favorite === true));
+    star.appendChild(icon("i-star"));
+    star.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void toggleFavorite(c.id, c.favorite !== true);
+    });
+    heading.appendChild(star);
     content.appendChild(heading);
     const identity = el("span", "conv-identity");
     identity.appendChild(el("span", null, formatDuration(c.duration_s)));
@@ -1024,6 +1160,100 @@ function renderListError(msg) {
   retry.addEventListener("click", () => refreshList(false));
   box.appendChild(retry);
   nav.appendChild(box);
+}
+
+/* ===== 收藏 / 重命名 / 头部工具 ===== */
+/* 服务端写回后用返回的完整 state 同步本地列表与详情头部。 */
+function applyConversationUpdate(detail) {
+  if (!detail || !detail.id) return;
+  const summary = state.conversations.find((item) => item.id === detail.id);
+  if (summary) {
+    summary.title = detail.title;
+    summary.favorite = detail.favorite === true;
+    summary.updated_at = detail.updated_at;
+    state.conversations = sortConversations(state.conversations);
+  }
+  if (state.currentId === detail.id) {
+    if (state.detail) {
+      state.detail.title = detail.title;
+      state.detail.favorite = detail.favorite === true;
+    }
+    $("main-title").textContent = detail.title || "会话";
+  }
+  renderList();
+  syncHeaderTools();
+}
+
+function syncHeaderTools() {
+  const conv = state.conversations.find((c) => c.id === state.currentId);
+  const show = Boolean(state.currentId && conv);
+  if (!show) cancelRename();
+  $("rename-btn").hidden = !show;
+  const favBtn = $("detail-fav-btn");
+  favBtn.hidden = !show;
+  if (show) {
+    const fav = conv.favorite === true;
+    favBtn.classList.toggle("is-fav", fav);
+    favBtn.title = fav ? "取消收藏" : "收藏";
+    favBtn.setAttribute("aria-pressed", String(fav));
+  }
+}
+
+async function toggleFavorite(id, favorite) {
+  try {
+    const detail = await apiJSON(
+      "/api/conversations/" + encodeURIComponent(id) + "/favorite",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ favorite }),
+      },
+    );
+    applyConversationUpdate(detail);
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    setComposerError(err.message);
+  }
+}
+
+function startRename() {
+  const conv = state.conversations.find((c) => c.id === state.currentId);
+  if (!conv) return;
+  const input = $("rename-input");
+  input.value = conv.title || "";
+  $("main-title").hidden = true;
+  $("rename-btn").hidden = true;
+  input.hidden = false;
+  input.focus();
+  input.select();
+}
+
+function cancelRename() {
+  $("rename-input").hidden = true;
+  $("main-title").hidden = false;
+}
+
+async function saveRename() {
+  const id = state.currentId;
+  const input = $("rename-input");
+  const title = input.value.trim();
+  const conv = state.conversations.find((c) => c.id === id);
+  cancelRename();
+  if (!id || !conv || !title || title === (conv.title || "")) return;
+  try {
+    const detail = await apiJSON(
+      "/api/conversations/" + encodeURIComponent(id) + "/rename",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      },
+    );
+    applyConversationUpdate(detail);
+  } catch (err) {
+    if (handleAuthError(err)) return;
+    setComposerError(err.message);
+  }
 }
 
 /* ===== 抽屉（移动端） ===== */
@@ -1621,6 +1851,7 @@ async function selectConversation(id) {
   }
   const conv = state.conversations.find((c) => c.id === id);
   $("main-title").textContent = (conv && conv.title) || "会话";
+  syncHeaderTools();
   renderList();
   loadDetail(id, false);
 }
@@ -2201,7 +2432,7 @@ function uploadConversation({
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", capability.endpoint);
-    xhr.setRequestHeader("Authorization", "Bearer " + state.token);
+    if (state.token) xhr.setRequestHeader("Authorization", "Bearer " + state.token);
     xhr.responseType = "json";
     xhr.upload.addEventListener("progress", (e) => {
       if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total);
@@ -2211,7 +2442,7 @@ function uploadConversation({
       if (xhr.status === 200 || xhr.status === 201) {
         resolve(xhr.response);
       } else if (xhr.status === 401) {
-        reject(new AuthError("口令已失效"));
+        reject(new AuthError("登录状态已失效"));
       } else {
         const data = xhr.response;
         reject(apiErrorFromPayload(
@@ -2337,16 +2568,49 @@ async function handleSend(event) {
 function bindEvents() {
   $("login-form").addEventListener("submit", (e) => {
     e.preventDefault();
+    const email = $("login-email").value.trim();
+    const password = $("login-password").value;
+    if (!email || !password) {
+      $("login-error").textContent = "请输入邮箱和密码";
+      $("login-error").hidden = false;
+      return;
+    }
+    doAccountLogin(email, password);
+  });
+
+  $("register-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const email = $("register-email").value.trim();
+    const password = $("register-password").value;
+    if (!email || !password) {
+      $("register-error").textContent = "请输入邮箱和密码";
+      $("register-error").hidden = false;
+      return;
+    }
+    doRegister(email, password);
+  });
+
+  $("legacy-form").addEventListener("submit", (e) => {
+    e.preventDefault();
     const token = $("login-token").value.trim();
     if (!token) {
-      $("login-error").textContent = "请输入访问口令";
-      $("login-error").hidden = false;
+      $("legacy-error").textContent = "请输入旧访问口令";
+      $("legacy-error").hidden = false;
       return;
     }
     doLogin(token);
   });
 
+  $("login-switch").addEventListener("click", () => {
+    setLoginMode($("register-form").hidden ? "register" : "login");
+  });
+  $("legacy-switch").addEventListener("click", () => {
+    setLoginMode($("legacy-form").hidden ? "legacy" : "login");
+  });
+
   $("logout-btn").addEventListener("click", async () => {
+    // 清服务端 cookie 通道（bearer token 随 localStorage 一起丢弃）。
+    void fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
     state.authEpoch += 1;
     state.token = null;
     localStorage.removeItem(TOKEN_KEY);
@@ -2354,6 +2618,29 @@ function bindEvents() {
     resetComposerForNewProject();
     clearStream();
     showLogin(null);
+  });
+
+  $("fav-filter-btn").addEventListener("click", () => {
+    state.favOnly = !state.favOnly;
+    $("fav-filter-btn").setAttribute("aria-pressed", String(state.favOnly));
+    $("fav-filter-btn").classList.toggle("is-on", state.favOnly);
+    renderList();
+  });
+
+  $("rename-btn").addEventListener("click", startRename);
+  $("rename-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void saveRename();
+    } else if (e.key === "Escape") {
+      cancelRename();
+      syncHeaderTools();
+    }
+  });
+  $("rename-input").addEventListener("blur", () => void saveRename());
+  $("detail-fav-btn").addEventListener("click", () => {
+    const conv = state.conversations.find((c) => c.id === state.currentId);
+    if (conv) void toggleFavorite(conv.id, conv.favorite !== true);
   });
 
   $("menu-btn").addEventListener("click", openDrawer);

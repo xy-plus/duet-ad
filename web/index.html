@@ -20,19 +20,41 @@
   <symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
   <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5.5 11.5 6.5-6.5 6.5 6.5"/></symbol>
   <symbol id="i-sparkle" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5 14 8.6l6.1 2-6.1 2L12 18.7 10 12.6l-6.1-2 6.1-2L12 2.5Z"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.4l-5.8 3.1 1.1-6.5L2.6 9.4l6.5-.9L12 2.6z"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></symbol>
 </svg>
 
 <div id="login-view" class="login-view" hidden>
   <div class="login-card">
     <div class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sparkle"></use></svg></div>
     <h1 class="login-title">视频工作室</h1>
-    <p class="login-sub">输入访问口令以继续</p>
+    <p class="login-sub">使用账号登录</p>
     <form id="login-form" novalidate>
-      <label class="sr-only" for="login-token">访问口令</label>
-      <input id="login-token" class="text-input" type="password" placeholder="访问口令" autocomplete="current-password">
+      <label class="sr-only" for="login-email">邮箱</label>
+      <input id="login-email" class="text-input" type="email" placeholder="邮箱" autocomplete="username">
+      <label class="sr-only" for="login-password">密码</label>
+      <input id="login-password" class="text-input" type="password" placeholder="密码" autocomplete="current-password">
       <p id="login-error" class="form-error" role="alert" hidden></p>
-      <button id="login-btn" class="btn btn-primary btn-block" type="submit">进入</button>
+      <button id="login-btn" class="btn btn-primary btn-block" type="submit">登录</button>
     </form>
+    <form id="register-form" novalidate hidden>
+      <label class="sr-only" for="register-email">邮箱</label>
+      <input id="register-email" class="text-input" type="email" placeholder="邮箱" autocomplete="username">
+      <label class="sr-only" for="register-password">密码</label>
+      <input id="register-password" class="text-input" type="password" placeholder="密码" autocomplete="new-password">
+      <p id="register-error" class="form-error" role="alert" hidden></p>
+      <button id="register-btn" class="btn btn-primary btn-block" type="submit">注册并登录</button>
+    </form>
+    <form id="legacy-form" novalidate hidden>
+      <label class="sr-only" for="login-token">旧访问口令</label>
+      <input id="login-token" class="text-input" type="password" placeholder="旧访问口令（兼容）" autocomplete="current-password">
+      <p id="legacy-error" class="form-error" role="alert" hidden></p>
+      <button id="legacy-btn" class="btn btn-primary btn-block" type="submit">进入</button>
+    </form>
+    <div class="login-alt">
+      <button id="login-switch" class="btn btn-ghost btn-block" type="button">注册账号</button>
+      <button id="legacy-switch" class="btn btn-ghost btn-block" type="button">使用旧访问口令（兼容）</button>
+    </div>
   </div>
 </div>
 
@@ -48,9 +70,13 @@
       <button id="new-chat-btn" class="btn btn-primary btn-new" type="button">
         <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"></use></svg></span>新建会话
       </button>
+      <button id="fav-filter-btn" class="btn btn-ghost fav-filter" type="button" aria-pressed="false">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-star"></use></svg></span>只看收藏
+      </button>
     </div>
     <nav id="conv-list" class="conv-list" aria-label="会话列表"></nav>
     <div class="sidebar-foot">
+      <span id="current-user" class="current-user"></span>
       <button id="logout-btn" class="btn btn-ghost" type="button">退出登录</button>
     </div>
   </aside>
@@ -61,6 +87,13 @@
         <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-menu"></use></svg></span>
       </button>
       <h1 id="main-title" class="main-title">视频工作室</h1>
+      <input id="rename-input" class="main-title-input" type="text" maxlength="100" hidden aria-label="项目名称">
+      <button id="rename-btn" class="icon-btn" type="button" hidden aria-label="重命名项目" title="重命名项目">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-pencil"></use></svg></span>
+      </button>
+      <button id="detail-fav-btn" class="icon-btn fav-btn" type="button" hidden aria-label="收藏项目" title="收藏">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-star"></use></svg></span>
+      </button>
     </header>
 
     <section id="operation-status" class="operation-status" aria-label="项目运行状态" aria-live="polite" hidden></section>
