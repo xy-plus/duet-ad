@@ -168,3 +168,78 @@ class ResearchLog:
                 "traceback": "".join(traceback.format_exception(exc)),
             },
         )
+
+
+# 展示耗时的提交批次节点名：首批 "picsart-submit"，续跑/重生成批次
+# "picsart-resume-submit"、"picsart-resume-02-submit"…（见 pipeline
+# ._next_resume_identity）。seedream-reference-submit 不属于 H3 批次。
+_SUBMIT_BATCH_NODE_RE = re.compile(r"^picsart(?:-resume(?:-\d+)?)?-submit$")
+
+_NODE_TERMINAL_EVENTS = frozenset(
+    {"node_succeeded", "node_failed", "node_skipped"}
+)
+
+
+def display_duration_seconds(project_dir: Path) -> float | None:
+    """展示用总耗时：前置节点耗时 + 最后一次 H3 生成耗时（trace.jsonl 推导）。
+
+    口径（确定性，只按结构化节点事件计算）：
+    - 前置节点耗时：首次运行中从项目开始到第一次 picsart 提交批次开始之
+      前——每个 (node, scope) 取最早一次在该时刻前完成的执行，累加其
+      started→terminal 时长（续跑重做的节点不重复计）。
+    - 最后一次生成耗时：最后一次 picsart 提交批次（regenerate 项目即重生成
+      那次，否则首次那次）的首个 node_started，到其后最后一个节点终止事
+      件（成片及后续字幕/音轨落盘完成）。
+    审核暂停、两次生成之间的间隔、用户等待没有任何节点事件，天然不计入。
+    trace 缺失/损坏/没有任何提交批次 → None（调用方回退墙钟）。
+    """
+    trace = project_dir / "logs" / "trace.jsonl"
+    try:
+        lines = trace.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    started: dict[tuple[str, str, int], datetime] = {}
+    # (node, scope) -> (ended_at, duration_s)，保留最早完成的一次执行
+    completed: dict[tuple[str, str], tuple[datetime, float]] = {}
+    batch_starts: dict[str, datetime] = {}
+    last_terminal_at: datetime | None = None
+    for line in lines:
+        try:
+            row = json.loads(line)
+            at = datetime.fromisoformat(row["at"])
+            node = row["node"]
+            scope = row["scope"]
+            event = row["event"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if event == "node_started":
+            key = (node, scope, row.get("attempt"))
+            if isinstance(key[2], int) and not isinstance(key[2], bool):
+                started[key] = at
+            if _SUBMIT_BATCH_NODE_RE.match(node):
+                if node not in batch_starts or at < batch_starts[node]:
+                    batch_starts[node] = at
+        elif event in _NODE_TERMINAL_EVENTS:
+            if last_terminal_at is None or at > last_terminal_at:
+                last_terminal_at = at
+            key = (node, scope, row.get("attempt"))
+            begin = started.get(key)
+            if begin is None or at < begin:
+                continue
+            slot = (node, scope)
+            duration = (at - begin).total_seconds()
+            if slot not in completed or at < completed[slot][0]:
+                completed[slot] = (at, duration)
+    if not batch_starts or last_terminal_at is None:
+        return None
+    first_batch_start = min(batch_starts.values())
+    last_batch_start = max(batch_starts.values())
+    pre_seconds = sum(
+        duration
+        for ended_at, duration in completed.values()
+        if ended_at <= first_batch_start
+    )
+    if last_terminal_at < last_batch_start:
+        return None
+    generation_seconds = (last_terminal_at - last_batch_start).total_seconds()
+    return pre_seconds + generation_seconds

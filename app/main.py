@@ -30,7 +30,7 @@ from app.config import Settings, get_settings
 from app.pipeline import SAME_AS_SOURCE_LANGUAGE, Pipeline
 from app import prompt_review as prompt_review_store
 from app.prompt_review import PromptReviewError
-from app.research_log import ResearchLog
+from app.research_log import ResearchLog, display_duration_seconds
 from app.safe_download import ReferenceDownloadError, Resolver, download_reference_url, resolve_addresses
 from app.store import (
     ClientRequestIdConflict,
@@ -957,7 +957,14 @@ def create_app(
 
     @app.get("/api/conversations/{project_id}", dependencies=[Depends(require_auth)])
     async def conversation(project_id: str, request: Request):
-        return _read_project(_store(request), project_id)
+        state = _read_project(_store(request), project_id)
+        # 终态项目的"总耗时"用 trace 推导（前置节点 + 最后一次 H3 生成，
+        # 审核暂停/等待不计入）；记录不全的老项目缺省该字段，前端回退墙钟。
+        if state.get("status") in {"succeeded", "failed"}:
+            display = display_duration_seconds(_store(request).path(project_id))
+            if display is not None:
+                state = {**state, "display_duration_s": round(display, 3)}
+        return state
 
     @app.post(
         "/api/conversations/{project_id}/resume-pre-picsart",

@@ -476,18 +476,22 @@ function formatDuration(value) {
   return minutes + " 分 " + String(tail).padStart(2, "0") + " 秒";
 }
 
+function formatDurationClock(totalSeconds) {
+  const total = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours}时 ${String(minutes).padStart(2, "0")}分`;
+  if (minutes > 0) return `${minutes}分 ${String(seconds).padStart(2, "0")}秒`;
+  return `${seconds}秒`;
+}
+
 function formatElapsed(createdAt, endAt, nowMs = Date.now()) {
   const start = new Date(createdAt).getTime();
   const terminal = endAt ? new Date(endAt).getTime() : Number.NaN;
   if (!Number.isFinite(start)) return "已耗时未知";
   const end = Number.isFinite(terminal) ? Math.min(nowMs, Math.max(start, terminal)) : nowMs;
-  const total = Math.max(0, Math.floor((end - start) / 1000));
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const seconds = total % 60;
-  if (hours > 0) return `已耗时 ${hours}时 ${String(minutes).padStart(2, "0")}分`;
-  if (minutes > 0) return `已耗时 ${minutes}分 ${String(seconds).padStart(2, "0")}秒`;
-  return `已耗时 ${seconds}秒`;
+  return "已耗时 " + formatDurationClock((end - start) / 1000);
 }
 
 function formatProjectTimestamp(iso) {
@@ -577,10 +581,20 @@ function projectProgressModel(detail, nowMs = Date.now()) {
 
   const terminal = ["succeeded", "failed"].includes(progress.state);
   const waiting = progress.state === "awaiting_prompt_review";
-  const elapsed = terminal && !value.updated_at
-    ? "未知"
-    : formatElapsed(value.created_at, terminal ? value.updated_at : null, nowMs)
-      .replace(/^已耗时\s*/, "");
+  // 终态总耗时优先用后端从 trace 推导的值（前置节点 + 最后一次 H3 生成，
+  // 审核暂停与等待不计入）；老项目没有该字段时回退创建→完成的墙钟。
+  const displaySeconds = terminal
+    && typeof value.display_duration_s === "number"
+    && Number.isFinite(value.display_duration_s)
+    && value.display_duration_s >= 0
+    ? value.display_duration_s
+    : null;
+  const elapsed = displaySeconds !== null
+    ? formatDurationClock(displaySeconds)
+    : terminal && !value.updated_at
+      ? "未知"
+      : formatElapsed(value.created_at, terminal ? value.updated_at : null, nowMs)
+        .replace(/^已耗时\s*/, "");
   return {
     ...progress,
     startedAt: formatProjectTimestamp(value.created_at),

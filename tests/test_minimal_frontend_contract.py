@@ -521,6 +521,26 @@ def test_detail_signature_changes_when_regeneration_flips_state():
     assert result[0] == result[2]  # 同名状态签名稳定，轮询不重渲
 
 
+def test_display_duration_prefers_backend_trace_value_with_wall_clock_fallback():
+    result = _run_contract(
+        "(()=>{const base={title:'t',created_at:'2026-09-20T00:00:00Z',"
+        "updated_at:'2026-09-21T03:00:00Z',project_progress:{status:'succeeded',percent:100}};"
+        "return {"
+        "trace:contract.projectProgressModel({...base,display_duration_s:11400}).elapsed,"
+        "fallback:contract.projectProgressModel(base).elapsed,"
+        "running:contract.projectProgressModel({...base,display_duration_s:11400,"
+        "project_progress:{status:'running',percent:50}},"
+        "new Date('2026-09-21T01:00:00Z').getTime()).elapsed"
+        "};})()"
+    )
+    # 后端 trace 推导值优先（11400s = 3时10分）
+    assert result["trace"] == "3时 10分"
+    # 老项目无字段：回退创建→完成墙钟（27 小时）
+    assert result["fallback"] == "27时 00分"
+    # 非终态不看该字段（运行中显示当前墙钟耗时）
+    assert result["running"] == "25时 00分"
+
+
 def test_prompt_review_segment_option_shows_source_time_range():
     result = _run_contract(
         "[{segment_index:1,start_s:0,end_s:8},{segment_index:2,start_s:8.5,end_s:16},"
