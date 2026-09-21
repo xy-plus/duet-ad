@@ -432,8 +432,8 @@ input, textarea { font-family: inherit; }
   background: #FFFFFF;
 }
 .main-title-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(0, 113, 227, .15); }
-/* 重命名图标挨着项目名称，与标题间隔为 header 宽度的 5%；收藏按钮紧随其后 */
-#rename-btn { margin-left: 5%; }
+/* 重命名图标挨着项目名称，与标题间隔为 header 宽度的 1%；收藏按钮紧随其后 */
+#rename-btn { margin-left: 1%; }
 .fav-btn { flex-shrink: 0; color: rgba(0, 0, 0, .25); }
 .fav-btn.is-fav { color: #E8A200; }
 /* 资产库按钮保持在 header 最右 */
