@@ -25,7 +25,7 @@
 
 提示词审核状态 `awaiting_prompt_review`（创建时 `prompt_review=true` 的项目在 H3 冻结后暂停）不参与 auto-resume：重启后原样保留，只能由 `POST /api/conversations/{id}/prompt-review/confirm`（对外 v1 为 `/api/v1/video-generations/{id}/prompt-review/confirm`）确认后继续，确认等价走 resume-picsart 路径。
 
-succeeded 项目编辑冻结提示词重跑用 `POST /api/conversations/{id}/regenerate`（body `{"segments":[{"segment_index":N,"prompt":"..."}]}`，仅 succeeded 且存在 prompt-review.json 时可用）：先把当前版本（成片、分段成片、各段冻结提示词、submit 证据日志）归档到 `output/history/v{N}/` 并记入 state 的 `generation_history`，再重建提示词、清零 Picsart 账本（已过 fail-closed 审计）后走 resume-picsart 等价路径全新提交；不 redo 分段/检测/灰块等任何前置产物。历史版本成片经 `GET /api/conversations/{id}/files/history/v{N}/generated.mp4` 读取。对外 v1 API 无此功能。
+succeeded 项目编辑冻结提示词重跑用 `POST /api/conversations/{id}/regenerate`（body `{"segments":[{"segment_index":N,"prompt":"..."}]}`，仅 succeeded 且存在 prompt-review.json 时可用）：先把当前版本（成片、分段成片、各段冻结提示词、submit 证据日志）归档到 `output/history/v{N}/` 并记入 state 的 `generation_history`，再重建提示词、清零 Picsart 账本（已过 fail-closed 审计）后走 resume-picsart 等价路径全新提交；不 redo 分段/检测/灰块等任何前置产物。状态迁移原子且先于文件操作（先 queued+has_video=false 再归档），归档失败整体回滚并把项目标 failed（`regenerate_failed`）。历史版本成片经 `GET /api/conversations/{id}/files/history/v{N}/generated.mp4` 读取。对外 v1 API 无此功能。
 
 ## 部署
 

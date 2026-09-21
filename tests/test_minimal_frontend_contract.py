@@ -456,18 +456,55 @@ def test_prompt_review_ui_states_are_wired():
     assert ".prompt-review-switcher" in css
 
 
-def test_generation_history_panel_is_wired():
+def test_generation_history_modal_is_wired():
     source = APP_JS.read_text(encoding="utf-8")
     results = _function_source(source, "renderResults")
-    assert "generationHistorySection(detail)" in results
-    history = _function_source(source, "generationHistorySection")
-    assert '"/generation-history"' in history
-    assert "历史版本" in history
-    assert "videoPlayer(detail, version.video_file)" in history
-    assert 'el("select", "prompt-review-switcher history-version-switcher")' in history
-    assert '" · 当前"' in history
-    assert "versions.length < 2" in history  # 从未重新生成时整块不显示
-    assert "textarea.readOnly = true" in history  # 历史提示词只读
+    assert "historyEntry(detail)" in results
+    assert "generationHistorySection" not in results  # 旧内嵌面板已移除
+    entry = _function_source(source, "historyEntry")
+    assert '"/generation-history"' in entry
+    assert '"历史版本（" + archived.length + "）"' in entry  # 按钮带数量标记
+    assert "host.remove()" in entry  # 无历史版本时按钮不显示
+    assert "openHistoryModal(detail, versions)" in entry
+    modal = _function_source(source, "openHistoryModal")
+    assert '"modal-backdrop"' in modal
+    assert 'dialog.setAttribute("role", "dialog")' in modal
+    assert '"icon-btn icon-btn-sm modal-close"' in modal  # 右上 X
+    assert "event.target === backdrop" in modal  # 点遮罩关闭
+    assert 'event.key === "Escape"' in modal  # Esc 关闭
+    assert 'document.body.classList.add("modal-open")' in modal  # 背景不滚动
+    assert 'document.body.classList.remove("modal-open")' in modal
+    assert "videoPlayer(detail, version.video_file)" in modal
+    assert "textarea.readOnly = true" in modal  # 历史提示词只读
+    assert '" · 当前"' in modal
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".modal-backdrop" in css
+    assert ".modal-card" in css
+    assert _css_rule_bodies(css, "body.modal-open") == [" overflow: hidden; "]
+
+
+def test_video_player_clears_stale_frame_on_load_failure():
+    # regenerate 窗口期 generated.mp4 404：必须清空旧画面而不是保留旧 blob。
+    player = _function_source(APP_JS.read_text(encoding="utf-8"), "videoPlayer")
+    assert 'video.removeAttribute("src")' in player
+    assert "video.load()" in player
+    assert "视频加载失败" in player
+
+
+def test_detail_signature_changes_when_regeneration_flips_state():
+    # regenerate 把 succeeded+has_video 翻成 queued+无视频：签名必须变化以
+    # 触发全量重渲，新片完成后再次变化重新加载视频。
+    result = _run_contract(
+        "[contract.detailSignature({id:'p',title:'t',note:null,error:null,"
+        "project_progress:{status:'succeeded'},has_source:true,has_video:true}).stable,"
+        "contract.detailSignature({id:'p',title:'t',note:null,error:null,"
+        "project_progress:{status:'queued'},has_source:true,has_video:false}).stable,"
+        "contract.detailSignature({id:'p',title:'t',note:null,error:null,"
+        "project_progress:{status:'succeeded'},has_source:true,has_video:true}).stable]"
+    )
+    assert result[0] != result[1]
+    assert result[1] != result[2]
+    assert result[0] == result[2]  # 同名状态签名稳定，轮询不重渲
 
 
 def test_prompt_review_segment_option_shows_source_time_range():
@@ -749,11 +786,11 @@ def test_progress_and_results_renderers_do_not_mount_technical_views():
     mounted_results = re.findall(
         r"frag\.appendChild\((.*?)\);", results_renderer, flags=re.DOTALL
     )
-    # 冻结提示词（可编辑重新生成）在成片上方，历史版本区在成片下方。
+    # 冻结提示词（可编辑重新生成）在成片上方，历史版本入口按钮在成片下方。
     assert mounted_results == [
         'promptReviewSection(detail, "regenerate")',
         'videoSection(detail, "generated.mp4", "新视频", "已完成")',
-        "generationHistorySection(detail)",
+        "historyEntry(detail)",
     ]
     assert results_renderer.count("videoSection(") == 1
 

@@ -1411,6 +1411,37 @@ input, textarea { font-family: inherit; }
 .history-version-stage { display: grid; gap: 14px; }
 .history-segment-label { font-size: 13px; font-weight: 600; }
 
+/* ===== 历史版本入口与弹窗 ===== */
+.history-entry { margin-top: 4px; }
+body.modal-open { overflow: hidden; }
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .24);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.modal-card {
+  background: var(--card);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  width: 100%;
+  max-width: 640px;
+  max-height: 85vh;
+  overflow-y: auto;
+  padding: 18px 20px;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.modal-header .res-h3 { margin: 0; }
+
 /* ===== Reduced motion ===== */
 @media (prefers-reduced-motion: reduce) {
   *,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -1338,6 +1339,7 @@ def test_regenerate_archives_current_version_and_resubmits(tmp_path, monkeypatch
     assert updated["segments"][0]["editable"] == "regenerated body one"
 
     # 等价 resume-picsart 入口重提：全新提交（旧账本已清、旧成片已归档）。
+    # 状态序列：翻转后 queued + has_video=false（窗口期看不到旧成功态）。
     store.update(
         project_id,
         status="queued",
@@ -1350,9 +1352,13 @@ def test_regenerate_archives_current_version_and_resubmits(tmp_path, monkeypatch
         },
         error=None,
     )
+    window_state = store.read(project_id)
+    assert window_state["status"] == "queued"
+    assert window_state["has_video"] is False
     pipeline.resume_r2v(project_id)
     state = store.read(project_id)
     assert state["status"] == "succeeded"
+    assert state["has_video"] is True
     assert len(picsart.submits) == 4  # 首次 2 段 + 重新生成 2 段
     assert any(
         "regenerated body one" in submit["prompt"] for submit in picsart.submits[2:]
@@ -1510,13 +1516,16 @@ class _RegeneratePipeline(_PromptReviewPipeline):
         super().__init__(store)
         self.regenerated: list[tuple[str, list]] = []
 
-    def regenerate_with_edited_prompts(self, project_id: str, segments) -> None:
+    def prepare_regenerate_prompts(self, project_id: str, segments):
         state = self.store.read(project_id)
         if state.get("status") != "succeeded":
             raise PromptReviewError(
                 "regenerate_not_succeeded", "只有已成功项目可以编辑提示词重新生成"
             )
-        self.regenerated.append((project_id, segments))
+        return {"segments": segments}
+
+    def execute_regenerate(self, project_id: str, prepared) -> None:
+        self.regenerated.append((project_id, prepared["segments"]))
 
 
 def _regenerate_factory(_settings, store, _register_asset):
@@ -1682,3 +1691,163 @@ def test_internal_generation_history_endpoint_and_files_route(tmp_path):
             ).status_code == 404
     finally:
         app.state.pipeline.release.set()
+
+
+# ---------- regenerate 状态窗口（原子翻转）与归档回滚 ----------
+
+
+class _BlockingRegeneratePipeline(_RegeneratePipeline):
+    """execute 时断言状态已原子翻转（同步端点里阻塞会卡死事件循环，所以
+    在 execute 内部读 store 验证时序，而不是从并发 HTTP 请求观察）。"""
+
+    def __init__(self, store: ProjectStore) -> None:
+        super().__init__(store)
+        self.window_states: list[tuple[str, bool]] = []
+
+    def execute_regenerate(self, project_id: str, prepared) -> None:
+        state = self.store.read(project_id)
+        self.window_states.append((state["status"], state["has_video"]))
+        super().execute_regenerate(project_id, prepared)
+
+
+def _blocking_regenerate_factory(_settings, store, _register_asset):
+    return _BlockingRegeneratePipeline(store)
+
+
+def test_regenerate_state_flip_precedes_archive_window(tmp_path):
+    """状态迁移原子且先于归档：execute 执行时读到的已是 queued+无视频。"""
+    app = create_app(
+        _endpoint_settings(tmp_path), pipeline_factory=_blocking_regenerate_factory,
+    )
+    try:
+        with TestClient(app) as client:
+            project_id = _create_project(app)
+            _mark_succeeded(app, project_id, [(1, "body one", 0.0, 8.0)])
+            # 翻转前：succeeded + 旧片可读。
+            assert client.get(
+                f"/api/conversations/{project_id}/files/generated.mp4",
+                headers=AUTH,
+            ).status_code == 200
+            response = client.post(
+                f"/api/conversations/{project_id}/regenerate",
+                headers=AUTH,
+                json={"segments": [{"segment_index": 1, "prompt": "edited"}]},
+            )
+            assert response.status_code == 202
+            # execute（归档/重写）执行期间观察到的一定是翻转后的状态。
+            assert app.state.pipeline.window_states == [("queued", False)]
+
+            # 翻转后的窗口态：旧片即使文件还在盘上也不可读（404）。
+            project_id2 = _create_project(app)
+            _mark_succeeded(app, project_id2, [(1, "body", 0.0, 8.0)])
+            app.state.store.update(
+                project_id2,
+                status="queued",
+                has_video=False,
+                project_progress={
+                    "status": "queued", "percent": 0,
+                    "stage": "picsart_resume_queued",
+                },
+            )
+            served = client.get(
+                f"/api/conversations/{project_id2}/files/generated.mp4",
+                headers=AUTH,
+            )
+            assert served.status_code == 404
+    finally:
+        app.state.pipeline.release.set()
+
+
+class _FailingRegeneratePipeline(_RegeneratePipeline):
+    def execute_regenerate(self, project_id: str, prepared) -> None:
+        raise OSError("simulated disk full")
+
+
+def _failing_regenerate_factory(_settings, store, _register_asset):
+    return _FailingRegeneratePipeline(store)
+
+
+def test_regenerate_archive_failure_marks_failed_not_fake_success(tmp_path):
+    """归档失败：项目标 failed（带明确 error），不得停在假成功态。"""
+    app = create_app(
+        _endpoint_settings(tmp_path), pipeline_factory=_failing_regenerate_factory,
+    )
+    try:
+        with TestClient(app) as client:
+            project_id = _create_project(app)
+            _mark_succeeded(app, project_id, [(1, "body one", 0.0, 8.0)])
+            response = client.post(
+                f"/api/conversations/{project_id}/regenerate",
+                headers=AUTH,
+                json={"segments": [{"segment_index": 1, "prompt": "edited"}]},
+            )
+            assert response.status_code == 500
+            assert response.json()["detail"]["code"] == "regenerate_failed"
+            state = app.state.store.read(project_id)
+            assert state["status"] == "failed"
+            assert state["error"]["code"] == "regenerate_failed"
+            assert state["has_video"] is False
+    finally:
+        app.state.pipeline.release.set()
+
+
+def test_regenerate_archive_failure_rolls_back_files(tmp_path, monkeypatch):
+    """归档中途失败：已移动的分段成片搬回原位，半成品归档目录删除。"""
+    store, pipeline, project_id, project, _picsart = _create_review_project(
+        tmp_path, monkeypatch, review=False,
+    )
+    pipeline.run(project_id)
+    assert store.read(project_id)["status"] == "succeeded"
+    review = _read_review(project)
+    edits = [
+        {"segment_index": s["segment_index"], "prompt": s["editable"]}
+        for s in review["segments"]
+    ]
+    segment_outputs = [
+        project / "work" / "segments" / f"{index:04d}" / "generated.mp4"
+        for index in (1, 2)
+    ]
+    assert all(path.is_file() for path in segment_outputs)
+
+    # 第一阶段：复制即失败，什么都没移动。
+    def boom_copy2(*_args, **_kwargs):
+        raise OSError("simulated ENOSPC")
+
+    with monkeypatch.context() as m:
+        m.setattr(shutil, "copy2", boom_copy2)
+        with pytest.raises(OSError, match="ENOSPC"):
+            pipeline.regenerate_with_edited_prompts(project_id, edits)
+    assert not (project / "output" / "history").exists()
+    assert all(path.is_file() for path in segment_outputs)
+
+    # 第二阶段：第二次移动失败，第一次移动必须回滚。
+    original_replace = os.replace
+    moved: list = []
+    failed = {"done": False}
+
+    def flaky_replace(source, destination):
+        if moved and not failed["done"]:
+            failed["done"] = True
+            raise OSError("simulated ENOSPC")
+        moved.append((source, destination))
+        return original_replace(source, destination)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "replace", flaky_replace)
+        with pytest.raises(OSError, match="ENOSPC"):
+            pipeline.regenerate_with_edited_prompts(project_id, edits)
+    assert not (project / "output" / "history" / "v1").exists()
+    assert all(path.is_file() for path in segment_outputs)
+
+    state = store.read(project_id)
+    # 两次失败都不留痕迹：无历史记录、账本未清、清单回执仍指向原提示词。
+    assert "generation_history" not in state
+    assert state["picsart_submission_receipts"] is not None
+    assert state["status"] == "succeeded"
+
+    # 回滚干净后可以正常 regenerate（不挡重试）。
+    pipeline.regenerate_with_edited_prompts(project_id, edits)
+    assert (
+        project / "output" / "history" / "v1" / "generated.mp4"
+    ).is_file()
+    assert len(store.read(project_id)["generation_history"]) == 1

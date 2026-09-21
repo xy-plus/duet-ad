@@ -1226,9 +1226,11 @@ def create_app(
                         "regenerate_not_succeeded",
                         "只有已成功项目可以编辑提示词重新生成",
                     )
-                app.state.pipeline.regenerate_with_edited_prompts(
+                prepared = app.state.pipeline.prepare_regenerate_prompts(
                     project_id, body["segments"],
                 )
+                # 状态迁移原子且先于文件操作：归档窗口内任何轮询都不得看到
+                # succeeded + has_video=true（旧视频）的组合。
                 state = _store(request).update(
                     project_id,
                     status="queued",
@@ -1245,6 +1247,22 @@ def create_app(
                     },
                     error=None,
                 )
+                try:
+                    app.state.pipeline.execute_regenerate(project_id, prepared)
+                except Exception:
+                    LOGGER.exception(
+                        "regenerate archive/apply failed for project %s",
+                        project_id,
+                    )
+                    _store(request).mark_failed(
+                        project_id,
+                        code="regenerate_failed",
+                        message="重新生成的归档/重写失败，请重试；已归档的历史版本不受影响",
+                        stage="regenerate_failed",
+                    )
+                    raise _error(
+                        500, "regenerate_failed", "重新生成准备失败，请重试"
+                    ) from None
         except PromptReviewError as exc:
             status = 409 if exc.code in {
                 "regenerate_not_succeeded",

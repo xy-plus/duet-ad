@@ -4745,14 +4745,23 @@ class Pipeline:
     def regenerate_with_edited_prompts(
         self, project_id: str, edits: list[dict[str, Any]],
     ) -> None:
-        """succeeded 项目编辑冻结提示词重提 H3：先归档当前版本，再重建提示词。
+        """组合入口：prepare + execute，不含状态翻转。
 
-        与 confirm 共用同一份编辑校验与四段重建公式；额外先把当前版本
-        （成片、分段成片、各段冻结提示词、submit 证据日志）归档到
-        output/history/v{N}/ 并记入 state.generation_history，然后清空
-        Picsart 回执（已过 _audit_h3_prep_submission_reset 的 fail-closed
-        审计），使 resume-picsart 等价入口以全新提交重放新提示词。只校验
-        与落盘，不写状态；状态迁移与调度由调用方完成。
+        端点用拆分形式：prepare（只读校验）→ 原子翻转 queued+has_video=False
+        → execute（落盘），保证归档窗口内任何轮询都看不到"成功+旧视频"。
+        """
+        prepared = self.prepare_regenerate_prompts(project_id, edits)
+        self.execute_regenerate(project_id, prepared)
+
+    def prepare_regenerate_prompts(
+        self, project_id: str, edits: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """regenerate 只读阶段：门禁/编辑校验/stale 重建/账本审计/归档规划。
+
+        succeeded 项目编辑冻结提示词重提 H3。与 confirm 共用同一份编辑校验
+        与四段重建公式；Picsart 旧账本先过 _audit_h3_prep_submission_reset
+        的 fail-closed 审计（execute 阶段才清零），使 resume-picsart 等价入
+        口以全新提交重放新提示词。本阶段不改动任何文件与状态。
         """
         project = self.store.path(project_id)
         state = self.store.read(project_id)
@@ -4764,22 +4773,42 @@ class Pipeline:
         frozen = self._prompt_review_frozen_segments(project)
         normalized = self._validated_prompt_review_edits(frozen, edits)
         manifest = self._prompt_review_manifest(state, frozen)
-        history_entry = self._archive_current_generation(
-            project, state, frozen,
-        )
         rebuilt = self._rebuild_frozen_prompts(project, frozen, normalized)
         raw_segments = self._validated_stored_segments(
             state, missing_message="project has no reusable segments",
         )
         # 审计旧账本（绑定清单且无 fail-closed 回执）后才允许清零重提。
         self._audit_h3_prep_submission_reset(project, state, raw_segments)
+        archive = self._plan_current_generation_archive(project, state, frozen)
+        return {
+            "frozen": frozen,
+            "normalized": normalized,
+            "manifest": manifest,
+            "rebuilt": rebuilt,
+            "archive": archive,
+        }
+
+    def execute_regenerate(
+        self, project_id: str, prepared: dict[str, Any],
+    ) -> None:
+        """regenerate 落盘阶段：归档当前版本（失败整体回滚）→ 重建提示词。
+
+        调用方必须在执行前已把项目原子翻转成 queued + has_video=False，并
+        在本方法抛错时把项目标 failed（不得停在"无视频但标成功"的假态）。
+        """
+        project = self.store.path(project_id)
+        state = self.store.read(project_id)
+        frozen = prepared["frozen"]
+        normalized = prepared["normalized"]
+        rebuilt = prepared["rebuilt"]
+        history_entry = self._apply_archive_plan(project, prepared["archive"])
         self._apply_rebuilt_prompts(
-            project, manifest, frozen, rebuilt, normalized,
+            project, prepared["manifest"], frozen, rebuilt, normalized,
         )
         history = state.get("generation_history") or []
         self.store.update(
             project_id,
-            h3_prepared_artifacts=manifest,
+            h3_prepared_artifacts=prepared["manifest"],
             picsart_submission_receipts=None,
             generation_history=[*history, history_entry],
         )
@@ -4947,18 +4976,16 @@ class Pipeline:
             ],
         )
 
-    def _archive_current_generation(
+    def _plan_current_generation_archive(
         self,
         project: Path,
         state: dict[str, Any],
         frozen: dict[int, dict[str, Any]],
     ) -> dict[str, Any]:
-        """把当前成功版本归档到 output/history/v{N}/ 并返回历史条目。
+        """归档规划（只读）：全部 fail-closed 校验在本阶段完成。
 
-        先归档再重跑：成片与分段成片移动/复制进归档目录，各段冻结提示词
-        全文存 prompts/segment-XXXX.txt，旧 submit 证据日志随之迁入（回执
-        账本随后清零，resume 门禁要求无账本时不得遗留 submit 痕迹；证据不
-        删除、只随版本归档）。归档目录已存在或产物缺失都 fail closed。
+        分段成片位置、冻结提示词内容、归档目录名冲突、成片缺失都在这里
+        判掉；_apply_archive_plan 只剩纯文件操作（带整体回滚）。
         """
         raw_history = state.get("generation_history")
         if raw_history is not None and (
@@ -5031,33 +5058,70 @@ class Pipeline:
             for path in sorted((project / "logs").glob("picsart*-submit"))
             if path.is_dir()
         ]
-        (archive_root / "prompts").mkdir(parents=True, mode=0o700)
-        (archive_root / "segments").mkdir(mode=0o700)
-        shutil.copy2(final_video, archive_root / "generated.mp4")
-        for index in sorted(frozen):
-            segment_dir = project / "work" / "segments" / f"{index:04d}"
-            shutil.copy2(
-                segment_dir / "h3_prompt.txt",
-                archive_root / "prompts" / f"segment-{index:04d}.txt",
-            )
-        for source, destination in segment_moves:
-            # 分段成片移走（不是复制）：resume 路径发现旧成片会直接复用而
-            # 不重提，移入归档既保历史又强制新版本全新提交。
-            os.replace(source, destination)
-        if submit_logs:
-            logs_archive = archive_root / "submit-logs"
-            logs_archive.mkdir(mode=0o700)
-            for directory in submit_logs:
-                os.rename(directory, logs_archive / directory.name)
         return {
             "version": version,
             "completed_at": state.get("updated_at"),
+            "archive_root": archive_root,
+            "final_video": final_video,
+            "segments": archive_segments,
+            "segment_moves": segment_moves,
+            "submit_logs": submit_logs,
+        }
+
+    def _apply_archive_plan(
+        self, project: Path, plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """执行归档落盘并返回历史条目；任何一步失败整体回滚。
+
+        分段成片与旧 submit 证据日志是移动（不是复制）：resume 路径发现旧
+        成片会直接复用而不重提，而清零账本后门禁要求不得遗留 submit 痕迹；
+        证据不删除、随版本归档。回滚把已移动的搬回原位并删除半成品目录，
+        不留残骸挡住重试。
+        """
+        archive_root = plan["archive_root"]
+        version = plan["version"]
+        (archive_root / "prompts").mkdir(parents=True, mode=0o700)
+        (archive_root / "segments").mkdir(mode=0o700)
+        moved: list[tuple[Path, Path]] = []
+        try:
+            shutil.copy2(plan["final_video"], archive_root / "generated.mp4")
+            for segment in plan["segments"]:
+                index = segment["segment_index"]
+                shutil.copy2(
+                    project / "work" / "segments" / f"{index:04d}" / "h3_prompt.txt",
+                    project / segment["prompt_path"],
+                )
+            for source, destination in plan["segment_moves"]:
+                os.replace(source, destination)
+                moved.append((destination, source))
+            if plan["submit_logs"]:
+                logs_archive = archive_root / "submit-logs"
+                logs_archive.mkdir(mode=0o700)
+                for directory in plan["submit_logs"]:
+                    target = logs_archive / directory.name
+                    os.rename(directory, target)
+                    moved.append((target, directory))
+        except Exception:
+            for destination, source in reversed(moved):
+                try:
+                    os.replace(destination, source)
+                except OSError:
+                    pass
+            shutil.rmtree(archive_root, ignore_errors=True)
+            try:
+                archive_root.parent.rmdir()  # 空父目录一并清掉，不挡重试
+            except OSError:
+                pass
+            raise
+        return {
+            "version": version,
+            "completed_at": plan["completed_at"],
             "video": self._project_artifact_receipt(
                 project,
                 archive_root / "generated.mp4",
                 f"output/history/v{version}/generated.mp4",
             ),
-            "segments": archive_segments,
+            "segments": plan["segments"],
         }
 
     def validate_r2v_resume(self, project_id: str) -> None:

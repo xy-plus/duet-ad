@@ -1197,7 +1197,8 @@ function renderFail(detail) {
 /* 视频区块：原始 / 最终成片共用同一加载骨架，靠标题与副标题区分 */
 function videoPlayer(detail, file) {
   const wrap = el("div", "video-wrap");
-  wrap.appendChild(el("div", "video-shimmer shimmer", "正在加载视频…"));
+  const shimmer = el("div", "video-shimmer shimmer", "正在加载视频…");
+  wrap.appendChild(shimmer);
   const video = el("video");
   video.controls = true;
   video.playsInline = true;
@@ -1209,7 +1210,14 @@ function videoPlayer(detail, file) {
       video.addEventListener("loadeddata", () => wrap.classList.add("is-ready"), { once: true });
       video.addEventListener("error", () => wrap.classList.add("is-error"), { once: true });
     })
-    .catch(() => wrap.classList.add("is-error"));
+    .catch(() => {
+      // 加载失败（如 regenerate 窗口期 generated.mp4 404）必须清空旧画面，
+      // 不能静默保留上一个 blob 让用户误以为已生成成功。
+      video.removeAttribute("src");
+      video.load();
+      shimmer.textContent = "视频加载失败，请稍后刷新重试";
+      wrap.classList.add("is-error");
+    });
   return wrap;
 }
 
@@ -1362,62 +1370,96 @@ function promptReviewSection(detail, mode) {
   return host;
 }
 
-/* 历史版本面板：列出版本号 + 完成时间，选中某版播放该版视频并查看该版
-   冻结提示词（只读）；当前版本在列表末尾（标记"当前"）。从未重新生成过
-   （只有当前版本）时整块不显示。 */
-function generationHistorySection(detail) {
-  const host = el("section", "res-section prompt-review-panel history-panel");
-  const h = el("h3", "res-h3", "历史版本");
-  host.appendChild(h);
-  const body = el("div", "prompt-review-body");
-  body.appendChild(el("p", "prompt-review-tip", "正在加载历史版本…"));
-  host.appendChild(body);
+/* 历史版本：主页只显示带数量标记的入口按钮（无历史版本时不显示），点击
+   打开弹窗；版本切换、视频播放、只读冻结提示词查看都在弹窗内。 */
+function historyEntry(detail) {
+  const host = el("div", "history-entry");
   apiJSON("/api/conversations/" + detail.id + "/generation-history").then((data) => {
     const versions = data && Array.isArray(data.versions) ? data.versions : [];
-    if (versions.length < 2) {
+    const archived = versions.filter((version) => !version.current);
+    if (!archived.length) {
       host.remove();
       return;
     }
-    body.textContent = "";
-    const switcher = el("select", "prompt-review-switcher history-version-switcher");
-    switcher.setAttribute("aria-label", "选择版本");
-    for (const version of versions) {
-      const label = "v" + version.version
-        + "（" + formatProjectTimestamp(version.completed_at) + "）"
-        + (version.current ? " · 当前" : "");
-      const option = el("option", null, label);
-      option.value = String(version.version);
-      switcher.appendChild(option);
-    }
-    body.appendChild(switcher);
-    const stage = el("div", "history-version-stage");
-    body.appendChild(stage);
-    const renderVersion = (version) => {
-      stage.textContent = "";
-      stage.appendChild(videoPlayer(detail, version.video_file));
-      for (const segment of version.segments) {
-        const block = el("div", "history-segment");
-        block.appendChild(el("div", "history-segment-label", segmentOptionLabel(segment)));
-        const textarea = el("textarea", "setup-textarea prompt-review-textarea");
-        textarea.readOnly = true;
-        textarea.rows = 6;
-        textarea.spellcheck = false;
-        textarea.value = String(segment.prompt || "");
-        block.appendChild(textarea);
-        stage.appendChild(block);
-      }
-    };
-    const latest = versions[versions.length - 1];
-    switcher.value = String(latest.version);
-    renderVersion(latest);
-    switcher.addEventListener("change", () => {
-      const selected = versions.find(
-        (version) => version.version === Number(switcher.value)
-      );
-      if (selected) renderVersion(selected);
-    });
+    const button = el("button", "btn btn-ghost history-button",
+      "历史版本（" + archived.length + "）");
+    button.type = "button";
+    button.addEventListener("click", () => openHistoryModal(detail, versions));
+    host.appendChild(button);
   }).catch(() => host.remove());
   return host;
+}
+
+function openHistoryModal(detail, versions) {
+  const backdrop = el("div", "modal-backdrop");
+  const dialog = el("div", "modal-card history-modal");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-label", "历史版本");
+  const header = el("div", "modal-header");
+  header.appendChild(el("h3", "res-h3", "历史版本"));
+  const close = el("button", "icon-btn icon-btn-sm modal-close");
+  close.type = "button";
+  close.setAttribute("aria-label", "关闭历史版本");
+  close.appendChild(icon("i-close"));
+  header.appendChild(close);
+  dialog.appendChild(header);
+  const body = el("div", "prompt-review-body");
+  dialog.appendChild(body);
+  backdrop.appendChild(dialog);
+  const onKeydown = (event) => {
+    if (event.key === "Escape") closeModal();
+  };
+  function closeModal() {
+    document.removeEventListener("keydown", onKeydown);
+    backdrop.remove();
+    document.body.classList.remove("modal-open");
+  }
+  close.addEventListener("click", closeModal);
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) closeModal();
+  });
+  document.addEventListener("keydown", onKeydown);
+
+  const switcher = el("select", "prompt-review-switcher history-version-switcher");
+  switcher.setAttribute("aria-label", "选择版本");
+  for (const version of versions) {
+    const label = "v" + version.version
+      + "（" + formatProjectTimestamp(version.completed_at) + "）"
+      + (version.current ? " · 当前" : "");
+    const option = el("option", null, label);
+    option.value = String(version.version);
+    switcher.appendChild(option);
+  }
+  body.appendChild(switcher);
+  const stage = el("div", "history-version-stage");
+  body.appendChild(stage);
+  const renderVersion = (version) => {
+    stage.textContent = "";
+    stage.appendChild(videoPlayer(detail, version.video_file));
+    for (const segment of version.segments) {
+      const block = el("div", "history-segment");
+      block.appendChild(el("div", "history-segment-label", segmentOptionLabel(segment)));
+      const textarea = el("textarea", "setup-textarea prompt-review-textarea");
+      textarea.readOnly = true;
+      textarea.rows = 6;
+      textarea.spellcheck = false;
+      textarea.value = String(segment.prompt || "");
+      block.appendChild(textarea);
+      stage.appendChild(block);
+    }
+  };
+  const latest = versions[versions.length - 1];
+  switcher.value = String(latest.version);
+  renderVersion(latest);
+  switcher.addEventListener("change", () => {
+    const selected = versions.find(
+      (version) => version.version === Number(switcher.value)
+    );
+    if (selected) renderVersion(selected);
+  });
+  document.body.appendChild(backdrop);
+  document.body.classList.add("modal-open");
 }
 
 function renderResults(detail) {
@@ -1425,7 +1467,7 @@ function renderResults(detail) {
   if (detail.has_video === true) {
     frag.appendChild(promptReviewSection(detail, "regenerate"));
     frag.appendChild(videoSection(detail, "generated.mp4", "新视频", "已完成"));
-    frag.appendChild(generationHistorySection(detail));
+    frag.appendChild(historyEntry(detail));
   }
   return frag;
 }
