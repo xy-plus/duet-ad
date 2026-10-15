@@ -1,0 +1,30 @@
+{
+  "name": "@hypit/timeline-author",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/speech": "workspace:*",
+    "@hypit/timeline": "workspace:*",
+    "@hypit/markup": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/temporal": "workspace:*",
+    "@hypit/temporal-markup": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/core": "workspace:*",
+    "@hypit/script": "workspace:*",
+    "@hypit/text": "workspace:*",
+    "@hypit/validation": "workspace:*"
+  }
+}

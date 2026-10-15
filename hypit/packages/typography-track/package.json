@@ -1,0 +1,34 @@
+{
+  "name": "@hypit/typography-track",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/composition": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/media": "workspace:*",
+    "@hypit/narrative": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/timeline": "workspace:*",
+    "@hypit/spatial": "workspace:*",
+    "@hypit/svs": "workspace:*",
+    "@hypit/temporal": "workspace:*",
+    "@hypit/temporal-markup": "workspace:*",
+    "@hypit/text": "workspace:*",
+    "@hypit/visual-ir": "workspace:*",
+    "@hypit/markup": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/core": "workspace:*",
+    "@hypit/validation": "workspace:*"
+  }
+}

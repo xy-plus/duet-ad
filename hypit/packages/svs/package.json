@@ -1,0 +1,21 @@
+{
+  "name": "@hypit/svs",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/core": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/markup": "workspace:*"
+  }
+}

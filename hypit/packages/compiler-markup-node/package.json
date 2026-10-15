@@ -1,0 +1,22 @@
+{
+  "name": "@hypit/compiler-markup-node",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hypit/compiler-node": "workspace:*",
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/workspace": "workspace:*",
+    "@hypit/package-loader-node": "workspace:*",
+    "@hypit/markup": "workspace:*",
+    "@hypit/validation": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/workspace-fs-node": "workspace:*"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@hypit/text",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/core": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/markup": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/svs": "workspace:*"
+  }
+}

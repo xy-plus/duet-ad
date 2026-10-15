@@ -1,0 +1,21 @@
+{
+  "name": "@hypit/performance-studio",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/performance": "workspace:*",
+    "@hypit/timeline": "workspace:*",
+    "@hypit/temporal": "workspace:*",
+    "@hypit/composition": "workspace:*",
+    "@hypit/studio-adapter": "workspace:*",
+    "@hypit/media-track-studio": "workspace:*"
+  }
+}

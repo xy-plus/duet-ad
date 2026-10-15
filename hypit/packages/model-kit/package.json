@@ -1,0 +1,19 @@
+{
+  "name": "@hypit/model-kit",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hypit/artifact": "workspace:*",
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/generation": "workspace:*",
+    "@hypit/host": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/text": "workspace:*"
+  }
+}

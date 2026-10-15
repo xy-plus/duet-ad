@@ -1,0 +1,17 @@
+{
+  "name": "@hypit/narrative",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/protocol": "workspace:*"
+  }
+}

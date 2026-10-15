@@ -1,0 +1,16 @@
+{
+  "name": "@hypit/node-journal",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run tests/"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}

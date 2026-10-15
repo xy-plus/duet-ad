@@ -1,0 +1,9 @@
+import { generationComponent, generationManifest } from "./index.js";
+
+export const hypitPackage = {
+  format: "hypit.node-package@1" as const,
+  modules: [{ manifest: generationManifest }],
+  components: [generationComponent],
+};
+
+export default hypitPackage;

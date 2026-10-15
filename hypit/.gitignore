@@ -1,0 +1,83 @@
+node_modules/
+dist/
+coverage/
+# Local architecture notes and repository-specific working instructions.
+/design/
+/.agents/development/
+/AGENTS.md
+.nyc_output/
+.DS_Store
+*.log
+*.tmp
+*.temp
+*.lock.editing
+
+# Ignore local editor state while distributing repository skill-discovery links.
+# The skill itself is a repository source at skills/hypit; what lives here is only the
+# per-agent link that points at it.
+.claude/*
+!.claude/skills
+.codex/*
+!.codex/skills
+.idea/
+.vscode/
+
+# Runtime credentials belong to the selected credential store, never Git.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*credentials*.json
+*service-account*.json
+
+# Local databases and test-run reports are deployment state.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+playwright-report/
+test-results/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+*.tsbuildinfo
+.svml-cache/
+.hypit/
+examples/**/assets/
+examples/**/reused/*.mp4
+examples/**/build/
+examples/**/output/
+examples/**/.svml/
+examples/**/evidence/generated/
+services/whisperx/.venv/
+services/whisperx/build/
+services/whisperx/**/__pycache__/
+services/whisperx/src/*.egg-info/
+services/image-opencv/.venv/
+services/image-opencv/**/__pycache__/
+services/media-lambda/build/
+
+# Local one-off preview documents are not repository sources.
+/launch-video-script-*.html
+
+# macOS Finder metadata
+.DS_Store
+examples/**/.svml/
+
+# Reverse-engineering scratch projects: real output, but not the repository
+/examples/*-reverse/
+/examples/reference-reconstruction/
+
+# Project workspaces: track authored sources (svml/svs/svrun/md/runtime.json),
+# never execution state, exports or reference media.
+/projects/*
+!/projects/*/
+/projects/*/.hypit/
+/projects/*/references/
+/projects/*/final.mp4
+/projects/*/final-*.mp4
+examples/ark-demo/reused/
+examples/ark-demo/final.mp4
+examples/ark-demo/.hypit/

@@ -1,0 +1,20 @@
+{
+  "name": "@hypit/runtime-host-node",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hypit/build-result": "workspace:*",
+    "@hypit/build-result-kit": "workspace:*",
+    "@hypit/driver-node": "workspace:*",
+    "@hypit/package-loader-node": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/runtime": "workspace:*",
+    "@hypit/runtime-kit": "workspace:*",
+    "@hypit/workspace": "workspace:*"
+  }
+}

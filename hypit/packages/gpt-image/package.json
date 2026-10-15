@@ -1,0 +1,34 @@
+{
+  "name": "@hypit/gpt-image",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/artifact": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/generation": "workspace:*",
+    "@hypit/image-transform": "workspace:*",
+    "@hypit/markup": "workspace:*",
+    "@hypit/model-kit": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/text": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/core": "workspace:*",
+    "@hypit/media": "workspace:*",
+    "@hypit/narrative": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/raster": "workspace:*",
+    "@hypit/run": "workspace:*",
+    "@hypit/seedance": "workspace:*",
+    "@hypit/spatial": "workspace:*",
+    "@hypit/speech": "workspace:*"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@hypit/hyperframes",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./project": "./src/project.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/composition": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/media": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/visual-ir": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/caption": "workspace:*",
+    "@hypit/caption-fine": "workspace:*",
+    "@hypit/deck-track": "workspace:*",
+    "@hypit/fonts-open": "workspace:*",
+    "@hypit/media-track": "workspace:*",
+    "@hypit/ranking": "workspace:*",
+    "@hypit/screen-overlay": "workspace:*",
+    "@hypit/script": "workspace:*",
+    "@hypit/spatial": "workspace:*",
+    "@hypit/svs": "workspace:*",
+    "@hypit/typography-track": "workspace:*"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "@hypit/film",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/composition": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/timeline": "workspace:*",
+    "@hypit/spatial": "workspace:*",
+    "@hypit/svs": "workspace:*",
+    "@hypit/markup": "workspace:*",
+    "@hypit/temporal-markup": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/core": "workspace:*",
+    "@hypit/driver-node": "workspace:*",
+    "@hypit/hyperframes": "workspace:*",
+    "@hypit/media": "workspace:*",
+    "@hypit/text": "workspace:*",
+    "@hypit/typography-track": "workspace:*",
+    "@hypit/validation": "workspace:*"
+  }
+}

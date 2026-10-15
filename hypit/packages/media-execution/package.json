@@ -1,0 +1,17 @@
+{
+  "name": "@hypit/media-execution",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hypit/media": "workspace:*",
+    "@hypit/media-pipeline": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/speech": "workspace:*"
+  }
+}

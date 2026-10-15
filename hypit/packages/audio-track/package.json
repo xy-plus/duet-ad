@@ -1,0 +1,36 @@
+{
+  "name": "@hypit/audio-track",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/composition": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/media": "workspace:*",
+    "@hypit/narrative": "workspace:*",
+    "@hypit/program-space": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/timeline": "workspace:*",
+    "@hypit/temporal": "workspace:*",
+    "@hypit/temporal-markup": "workspace:*",
+    "@hypit/markup": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/artifact": "workspace:*",
+    "@hypit/core": "workspace:*",
+    "@hypit/media-pipeline": "workspace:*",
+    "@hypit/spatial": "workspace:*",
+    "@hypit/speech": "workspace:*",
+    "@hypit/speech-evidence": "workspace:*",
+    "@hypit/validation": "workspace:*",
+    "@hypit/visual-ir": "workspace:*"
+  }
+}

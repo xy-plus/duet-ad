@@ -1,0 +1,28 @@
+{
+  "name": "@hypit/whisperx",
+  "version": "0.0.0-dev",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "hypit": {
+    "activation": "./src/activation.ts"
+  },
+  "dependencies": {
+    "@hypit/component-kit": "workspace:*",
+    "@hypit/elaborator": "workspace:*",
+    "@hypit/media-pipeline": "workspace:*",
+    "@hypit/media": "workspace:*",
+    "@hypit/narrative": "workspace:*",
+    "@hypit/protocol": "workspace:*",
+    "@hypit/speech": "workspace:*",
+    "@hypit/speech-alignment": "workspace:*",
+    "@hypit/speech-evidence": "workspace:*",
+    "@hypit/markup": "workspace:*"
+  },
+  "devDependencies": {
+    "@hypit/program-space": "workspace:*"
+  }
+}
