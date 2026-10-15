@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import pytest
+
+from app.config import Settings, get_settings
+
+
+def _settings(
+    *,
+    picsart_proxy: str | None = None,
+    object_mask_block_opacity: float = 1.0,
+    object_mask_block_blur: int = 31,
+    object_mask_enabled: bool = True,
+    object_mask_person_block_opacity: float = 1.0,
+) -> Settings:
+    return Settings(
+        access_token="test",
+        public_base_url="https://settings.test",
+        picsart_proxy=picsart_proxy,
+        object_mask_block_opacity=object_mask_block_opacity,
+        object_mask_block_blur=object_mask_block_blur,
+        object_mask_enabled=object_mask_enabled,
+        object_mask_person_block_opacity=object_mask_person_block_opacity,
+    )
+
+
+def test_settings_defaults_picsart_proxy_to_direct() -> None:
+    assert _settings(picsart_proxy=None).picsart_proxy is None
+
+
+def test_settings_defaults_to_deepseek_flash() -> None:
+    assert _settings().deepseek_model == "deepseek-flash"
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    ["http://127.0.0.1:7897", "https://proxy.example:443", "socks5://127.0.0.1:1080"],
+)
+def test_settings_accepts_picsart_proxy_schemes(proxy: str) -> None:
+    assert _settings(picsart_proxy=proxy).picsart_proxy == proxy
+
+
+@pytest.mark.parametrize("proxy", ["", "  ", "ftp://proxy.example", "not a url"])
+def test_settings_rejects_invalid_picsart_proxy(proxy: str) -> None:
+    with pytest.raises(ValueError, match="PICSART_PROXY"):
+        _settings(picsart_proxy=proxy)
+
+
+def test_get_settings_reads_picsart_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://settings.test")
+    monkeypatch.setenv("PICSART_PROXY", "  http://127.0.0.1:7897  ")
+
+    assert get_settings().picsart_proxy == "http://127.0.0.1:7897"
+
+
+def test_settings_defaults_object_mask_block_opacity_to_solid() -> None:
+    assert _settings().object_mask_block_opacity == 1.0
+
+
+def test_settings_defaults_object_mask_block_blur() -> None:
+    assert _settings().object_mask_block_blur == 31
+
+
+@pytest.mark.parametrize("blur", [1, 3, 31])
+def test_settings_accepts_positive_odd_object_mask_block_blur(blur: int) -> None:
+    assert _settings(object_mask_block_blur=blur).object_mask_block_blur == blur
+
+
+@pytest.mark.parametrize("blur", [0, -1, 2, 32, True])
+def test_settings_rejects_invalid_object_mask_block_blur(blur: int) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_BLOCK_BLUR"):
+        _settings(object_mask_block_blur=blur)
+
+
+@pytest.mark.parametrize("opacity", [0.05, 0.9, 0.95, 1, 1.0])
+def test_settings_accepts_object_mask_block_opacity(opacity: float) -> None:
+    assert _settings(object_mask_block_opacity=opacity).object_mask_block_opacity == float(
+        opacity
+    )
+
+
+@pytest.mark.parametrize("opacity", [0, -0.1, 1.1, float("inf"), float("nan"), True])
+def test_settings_rejects_invalid_object_mask_block_opacity(opacity: float) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_BLOCK_OPACITY"):
+        _settings(object_mask_block_opacity=opacity)
+
+
+def test_get_settings_reads_object_mask_block_opacity_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_BLOCK_OPACITY", "0.95")
+
+    assert get_settings().object_mask_block_opacity == pytest.approx(0.95)
+
+
+def test_get_settings_reads_object_mask_block_blur_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_BLOCK_BLUR", "15")
+
+    assert get_settings().object_mask_block_blur == 15
+
+
+def test_settings_defaults_object_mask_enabled() -> None:
+    assert _settings().object_mask_enabled is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_settings_accepts_object_mask_enabled(enabled: bool) -> None:
+    assert _settings(object_mask_enabled=enabled).object_mask_enabled is enabled
+
+
+@pytest.mark.parametrize("enabled", [0, 1, "true", "false", None])
+def test_settings_rejects_non_bool_object_mask_enabled(enabled: object) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_ENABLED"):
+        _settings(object_mask_enabled=enabled)
+
+
+def test_get_settings_defaults_object_mask_enabled_to_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+
+    assert get_settings().object_mask_enabled is True
+
+
+def test_get_settings_reads_object_mask_enabled_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_ENABLED", "false")
+
+    assert get_settings().object_mask_enabled is False
+
+
+def test_settings_defaults_person_block_opacity_to_solid() -> None:
+    assert _settings().object_mask_person_block_opacity == 1.0
+
+
+@pytest.mark.parametrize("opacity", [0.05, 0.99, 1.0])
+def test_settings_accepts_person_block_opacity(opacity: float) -> None:
+    assert _settings(
+        object_mask_person_block_opacity=opacity
+    ).object_mask_person_block_opacity == float(opacity)
+
+
+@pytest.mark.parametrize("opacity", [0, -0.1, 1.1, float("inf"), float("nan"), True])
+def test_settings_rejects_invalid_person_block_opacity(opacity: float) -> None:
+    with pytest.raises(ValueError, match="OBJECT_MASK_PERSON_BLOCK_OPACITY"):
+        _settings(object_mask_person_block_opacity=opacity)
+
+
+def test_get_settings_reads_person_block_opacity_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACCESS_TOKEN", "test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+    monkeypatch.setenv("OBJECT_MASK_PERSON_BLOCK_OPACITY", "0.98")
+
+    assert get_settings().object_mask_person_block_opacity == pytest.approx(0.98)

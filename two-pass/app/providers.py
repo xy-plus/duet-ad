@@ -1,0 +1,1237 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import mimetypes
+import os
+import re
+import signal
+import shutil
+import ssl
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any, Callable, Generic, Mapping, TypeVar
+from urllib.parse import urlsplit
+
+import httpx
+
+from app.config import Settings
+
+
+T = TypeVar("T")
+_MISSING = object()
+_LOGGER = logging.getLogger(__name__)
+# Bounded retry for ambiguous network failures: first attempt + 2 retries,
+# backing off 2s then 5s.  Only transport errors and gateway statuses are
+# retried; 4xx and other definite answers are final on the first attempt.
+RETRY_BACKOFF_S = (2.0, 5.0)
+# A TCP connection error proves that this attempt did not reach the provider,
+# so it is safe to wait out a short network outage without risking a duplicate
+# paid submission.  Do not use this schedule for errors after a connection has
+# been established: those may have transmitted the request.
+CONNECTION_RETRY_BACKOFF_S = (10.0, 30.0, 60.0, 120.0, 300.0)
+RETRYABLE_STATUSES = frozenset({502, 503, 504})
+# 429 限流单独处理（默认关闭，仅调用方按预算启用——检测类 provider 经
+# rate_limit_budget_s 启用，其余 provider 的 429 语义不变）：限流是"等
+# 窗口过去就能成"的暂时性失败，与 RETRYABLE_STATUSES 的秒级短重试不同，
+# 用分钟级退避。优先尊重响应 Retry-After 头（秒数或 HTTP-date，钳到
+# RATE_LIMIT_RETRY_AFTER_MAX_S；缺失/非法/非正值时退化为本指数序列）；
+# 累计等待超过调用方预算即停止重试、响应原样返回，由调用方
+# _ensure_success 维持 4xx 确定性致命（原降级语义），不新增门禁。
+RATE_LIMIT_BACKOFF_S = (30.0, 60.0, 120.0, 240.0, 480.0)
+RATE_LIMIT_RETRY_AFTER_MAX_S = 900.0
+_CONNECTION_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+)
+_RETRYABLE_TRANSPORT_ERRORS = (
+    *_CONNECTION_TRANSPORT_ERRORS,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    # SSL EOF/handshake failures usually surface wrapped as the httpx classes
+    # above; keep the raw class so an unwrapped one is still retried.
+    ssl.SSLError,
+)
+_SECRET_ENV_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
+_ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_CODEX_ACCOUNT_COMMAND = ("/home/xy/.local/bin/codex-acct", "acct2")
+_CODEX_MODEL = "gpt-5.6-sol"
+_CODEX_REASONING_EFFORT = "low"
+_CODEX_OUTPUT_MAX_BYTES = 64 * 1024
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(slots=True)
+class ProviderResult(Generic[T]):
+    value: T
+    record: dict[str, Any]
+    evidence_media: list[Path] = field(default_factory=list)
+
+
+class ProviderFailure(RuntimeError):
+    """A provider error that keeps all evidence collected before the failure."""
+
+    def __init__(
+        self,
+        record: dict[str, Any],
+        evidence_media: list[Path],
+        cause: Exception,
+    ) -> None:
+        self.record = record
+        self.evidence_media = list(evidence_media)
+        self.cause = cause
+        super().__init__(str(cause))
+
+
+def _headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def _content_type(headers: Mapping[str, str]) -> str:
+    return headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+
+def _binary_record(content: bytes, content_type: str) -> dict[str, Any]:
+    return {
+        "content_type": content_type or "application/octet-stream",
+        "length": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _media_type(path: Path, content: bytes) -> str:
+    """Prefer the actual image signature over a stale processing suffix."""
+
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+def _request_record(request: httpx.Request, body: Any = _MISSING) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "method": request.method,
+        "url": str(request.url),
+        "headers": dict(request.headers),
+    }
+    if body is not _MISSING:
+        record["body"] = body
+    elif request.content:
+        content_type = _content_type(request.headers)
+        if content_type == "application/json" or content_type.endswith("+json"):
+            try:
+                record["body"] = json.loads(request.content)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                record["body"] = request.content.decode("utf-8", errors="replace")
+        elif content_type.startswith("text/"):
+            record["body"] = request.content.decode("utf-8", errors="replace")
+        else:
+            record["body"] = _binary_record(request.content, content_type)
+    return record
+
+
+def response_record(response: httpx.Response, *, request_body: Any = _MISSING) -> dict[str, Any]:
+    """Record the actual HTTP exchange without decoding binary data as text."""
+
+    content_type = _content_type(response.headers)
+    if content_type == "application/json" or content_type.endswith("+json"):
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = response.content.decode("utf-8", errors="replace")
+    elif content_type.startswith("text/") or content_type in {
+        "application/xml",
+        "application/x-www-form-urlencoded",
+    }:
+        body = response.content.decode(response.encoding or "utf-8", errors="replace")
+    else:
+        body = _binary_record(response.content, content_type)
+    return {
+        "request": _request_record(response.request, request_body),
+        "response": {
+            "status_code": response.status_code,
+            "headers": dict(response.headers),
+            "body": body,
+        },
+    }
+
+
+def _transport_record(request: httpx.Request, request_body: Any = _MISSING) -> dict[str, Any]:
+    return {"request": _request_record(request, request_body), "response": None}
+
+
+def is_retryable_transport_error(exc: BaseException) -> bool:
+    return isinstance(exc, _RETRYABLE_TRANSPORT_ERRORS)
+
+
+def is_connection_transport_error(exc: BaseException) -> bool:
+    """Whether an HTTP attempt failed before a TCP connection was established."""
+
+    return isinstance(exc, _CONNECTION_TRANSPORT_ERRORS)
+
+
+def retry_sleep(seconds: float) -> None:
+    """Backoff seam between retries; tests replace it to avoid real sleeps."""
+
+    time.sleep(seconds)
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Retry-After 头（秒数或 HTTP-date）→ 等待秒数，钳到
+    RATE_LIMIT_RETRY_AFTER_MAX_S；缺失/非法/非正值返回 None（调用方退化为
+    RATE_LIMIT_BACKOFF_S 序列）。"""
+    header = response.headers.get("retry-after")
+    if header is None:
+        return None
+    header = header.strip()
+    if header.isdigit():
+        seconds = float(int(header))
+    else:
+        try:
+            parsed = parsedate_to_datetime(header)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+    if seconds <= 0:
+        return None
+    return min(seconds, RATE_LIMIT_RETRY_AFTER_MAX_S)
+
+
+def _send(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    json_body: Any = _MISSING,
+    content: bytes | None = None,
+    files: Mapping[str, Any] | None = None,
+    request_body: Any = _MISSING,
+    rate_limit_budget_s: float | None = None,
+) -> tuple[httpx.Response, dict[str, Any]]:
+    kwargs: dict[str, Any] = {"headers": headers}
+    if json_body is not _MISSING:
+        kwargs["json"] = json_body
+        if request_body is _MISSING:
+            request_body = json_body
+    if content is not None:
+        kwargs["content"] = content
+    if files is not None:
+        # multipart 上传（如 sandbase /v1/upload）；记录侧由
+        # _request_record 按非 JSON 二进制体落 sha256，不落明文。
+        kwargs["files"] = files
+    request = client.build_request(method, url, **kwargs)
+    attempts: list[dict[str, Any]] = []
+    attempt_number = 0
+    connection_phase = True
+    connection_retries = 0
+    ambiguous_retries = 0
+    rate_limit_retries = 0
+    rate_limit_waited_s = 0.0
+    while True:
+        attempt_number += 1
+        try:
+            response = client.send(request)
+        except _RETRYABLE_TRANSPORT_ERRORS as exc:
+            exchange = _transport_record(request, request_body)
+            exchange["attempt"] = attempt_number
+            exchange["error"] = {"type": type(exc).__name__, "message": str(exc)}
+            attempts.append(exchange)
+            if is_connection_transport_error(exc) and connection_phase:
+                backoff_s = CONNECTION_RETRY_BACKOFF_S
+                retry_index = connection_retries
+                connection_retries += 1
+            else:
+                # Once a request could have crossed the network, every later
+                # retry stays on the short, duplicate-safe schedule.
+                connection_phase = False
+                backoff_s = RETRY_BACKOFF_S
+                retry_index = ambiguous_retries
+                ambiguous_retries += 1
+            if retry_index < len(backoff_s):
+                max_attempts = attempt_number + len(backoff_s) - retry_index
+                _LOGGER.warning(
+                    "provider %s %s attempt %d/%d failed with %s: %s; retrying in %gs",
+                    method,
+                    url,
+                    attempt_number,
+                    max_attempts,
+                    type(exc).__name__,
+                    exc,
+                    backoff_s[retry_index],
+                )
+                retry_sleep(backoff_s[retry_index])
+                continue
+            failure = _transport_record(request, request_body)
+            failure["attempts"] = attempts
+            raise ProviderFailure(failure, [], exc) from exc
+        except httpx.HTTPError as exc:
+            exchange = _transport_record(request, request_body)
+            exchange["attempt"] = attempt_number
+            exchange["error"] = {"type": type(exc).__name__, "message": str(exc)}
+            attempts.append(exchange)
+            failure = _transport_record(request, request_body)
+            if len(attempts) > 1:
+                failure["attempts"] = attempts
+            raise ProviderFailure(failure, [], exc) from exc
+        exchange = response_record(response, request_body=request_body)
+        exchange["attempt"] = attempt_number
+        attempts.append(exchange)
+        if response.status_code == 429 and rate_limit_budget_s is not None:
+            # 429 限流：长退避等窗口（序列/钳制见 RATE_LIMIT_BACKOFF_S 段头
+            # 注释）。累计等待超预算即落下响应，由调用方维持 4xx 致命语义。
+            wait_s = _retry_after_seconds(response)
+            if wait_s is None:
+                wait_s = RATE_LIMIT_BACKOFF_S[
+                    min(rate_limit_retries, len(RATE_LIMIT_BACKOFF_S) - 1)
+                ]
+            if rate_limit_waited_s + wait_s <= rate_limit_budget_s:
+                rate_limit_retries += 1
+                rate_limit_waited_s += wait_s
+                _LOGGER.warning(
+                    "provider %s %s attempt %d returned HTTP 429; "
+                    "retrying in %gs (rate-limit wait %gs/%gs)",
+                    method,
+                    url,
+                    attempt_number,
+                    wait_s,
+                    rate_limit_waited_s,
+                    rate_limit_budget_s,
+                )
+                retry_sleep(wait_s)
+                continue
+        if response.status_code in RETRYABLE_STATUSES:
+            # A gateway response is an ambiguous, post-transport outcome;
+            # retain its historical two short retries even if preceding
+            # connection failures were harmless.
+            connection_phase = False
+            retry_index = ambiguous_retries
+            ambiguous_retries += 1
+            if retry_index < len(RETRY_BACKOFF_S):
+                max_attempts = attempt_number + len(RETRY_BACKOFF_S) - retry_index
+                _LOGGER.warning(
+                    "provider %s %s attempt %d/%d returned HTTP %d; retrying in %gs",
+                    method,
+                    url,
+                    attempt_number,
+                    max_attempts,
+                    response.status_code,
+                    RETRY_BACKOFF_S[retry_index],
+                )
+                retry_sleep(RETRY_BACKOFF_S[retry_index])
+                continue
+        if len(attempts) > 1:
+            return response, {**exchange, "attempts": attempts}
+        return response, exchange
+
+
+def _ensure_success(
+    response: httpx.Response,
+    record: dict[str, Any],
+    evidence_media: list[Path] | None = None,
+) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise ProviderFailure(record, evidence_media or [], exc) from exc
+
+
+def _json_body(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ValueError("provider response is not valid JSON") from exc
+
+
+def _deepseek_base(base: str) -> str:
+    canonical = base.rstrip("/")
+    if canonical.endswith("/beta"):
+        canonical = canonical[:-5]
+    return canonical
+
+
+def _deepseek_responses_url(base: str) -> str:
+    return _deepseek_base(base) + "/responses"
+
+
+def _structured_output_text(body: Any) -> str:
+    if not isinstance(body, dict):
+        raise TypeError("DeepSeek response must be an object")
+    status = body.get("status")
+    if status != "completed":
+        raise ValueError(f"DeepSeek structured response status is {status!r}")
+    output = body.get("output")
+    if not isinstance(output, list):
+        raise TypeError("DeepSeek structured response output must be a list")
+    messages = [
+        item for item in output
+        if isinstance(item, dict) and item.get("type") == "message"
+    ]
+    if len(messages) != 1:
+        raise ValueError("DeepSeek structured response must contain one message")
+    message = messages[0]
+    if message.get("status") != "completed" or message.get("role") != "assistant":
+        raise ValueError("DeepSeek structured response message is incomplete")
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise TypeError("DeepSeek structured response content must be a list")
+    text_parts = [
+        item for item in content
+        if isinstance(item, dict) and item.get("type") == "output_text"
+    ]
+    if len(text_parts) != 1 or not isinstance(text_parts[0].get("text"), str):
+        raise ValueError("DeepSeek structured response must contain one output_text")
+    return text_parts[0]["text"]
+
+
+def _parse_structured_json(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Models occasionally emit raw control characters inside string
+        # values even under a strict transport schema; accept them before
+        # asking the model to repair its output.
+        parsed = json.loads(text, strict=False)
+    if not isinstance(parsed, dict):
+        raise TypeError("DeepSeek structured output must decode to an object")
+    return parsed
+
+
+# A malformed or schema-invalid structured output is repaired in the same
+# conversation: the bad assistant output and a correction instruction are
+# appended, and the model re-answers.  After JSON_REPAIR_MAX_ATTEMPTS repairs
+# the original error is raised so the caller's node-level retry still applies.
+JSON_REPAIR_MAX_ATTEMPTS = 3
+
+
+def _json_repair_instruction(error: Exception) -> str:
+    return (
+        f"Your previous output failed JSON validation: {error}. "
+        "Output corrected JSON only, no markdown, no commentary."
+    )
+
+
+class DeepSeekClient:
+    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
+        self.settings = settings
+        self.transport = transport
+
+    @staticmethod
+    def _responses_content(payload: Any, images: list[Path]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": json.dumps(payload, ensure_ascii=False),
+            }
+        ]
+        for image in images:
+            image_bytes = image.read_bytes()
+            mime = _media_type(image, image_bytes)
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{encoded}",
+                }
+            )
+        return content
+
+    def complete_structured(
+        self,
+        instruction: str,
+        payload: Any,
+        schema: dict[str, Any],
+        images: list[Path] | None = None,
+        *,
+        validator: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> ProviderResult[dict[str, Any]]:
+        """Structured call with an in-conversation JSON repair loop.
+
+        When the model's output text fails to parse or the ``validator``
+        rejects it, the bad output and a correction instruction are appended
+        to the same conversation and the request is resent, up to
+        ``JSON_REPAIR_MAX_ATTEMPTS`` times.  Every repair exchange is kept in
+        the provider record under ``json_repairs``.  A persistent failure
+        raises the original error so node-level retry still applies.
+        """
+        media = list(images or [])
+        url = _deepseek_responses_url(self.settings.deepseek_api_base)
+        try:
+            content = self._responses_content(payload, media)
+        except Exception as exc:
+            record = {
+                "request": {
+                    "method": "POST",
+                    "url": url,
+                    "headers": _headers(self.settings.deepseek_api_key),
+                    "body": {"instruction": instruction, "payload": payload},
+                },
+                "response": None,
+            }
+            raise ProviderFailure(record, media, exc) from exc
+
+        conversation: list[dict[str, Any]] = [
+            {"role": "user", "content": content}
+        ]
+        record: dict[str, Any] | None = None
+        repairs: list[dict[str, Any]] = []
+        try:
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+            ) as client:
+                for repair_round in range(JSON_REPAIR_MAX_ATTEMPTS + 1):
+                    request: dict[str, Any] = {
+                        "model": self.settings.deepseek_model,
+                        "instructions": instruction,
+                        "input": conversation,
+                        "reasoning": {"effort": "high"},
+                        "text": {
+                            "format": {
+                                "type": "json_schema",
+                                "name": "duet_structured_result",
+                                "schema": schema,
+                            }
+                        },
+                    }
+                    response, record = _send(
+                        client,
+                        "POST",
+                        url,
+                        headers=_headers(self.settings.deepseek_api_key),
+                        json_body=request,
+                    )
+                    _ensure_success(response, record, media)
+                    text = _structured_output_text(_json_body(response))
+                    try:
+                        value = _parse_structured_json(text)
+                        if validator is not None:
+                            validator(value)
+                    except Exception as exc:
+                        if repair_round >= JSON_REPAIR_MAX_ATTEMPTS:
+                            raise
+                        repairs.append({
+                            "repair": repair_round + 1,
+                            "exchange": record,
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        })
+                        conversation = [
+                            *conversation,
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": text}
+                                ],
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": _json_repair_instruction(exc),
+                                    }
+                                ],
+                            },
+                        ]
+                        continue
+                    if repairs:
+                        record = {**record, "json_repairs": repairs}
+                    return ProviderResult(
+                        value=value, record=record, evidence_media=media,
+                    )
+                raise AssertionError("unreachable")
+        except ProviderFailure as exc:
+            if repairs and "json_repairs" not in exc.record:
+                exc.record = {**exc.record, "json_repairs": repairs}
+            if exc.evidence_media:
+                raise
+            raise ProviderFailure(exc.record, media, exc.cause) from exc.cause
+        except Exception as exc:
+            fallback = record or {
+                "request": {
+                    "method": "POST",
+                    "url": url,
+                    "headers": _headers(self.settings.deepseek_api_key),
+                    "body": conversation,
+                },
+                "response": None,
+            }
+            if repairs and "json_repairs" not in fallback:
+                fallback = {**fallback, "json_repairs": repairs}
+            raise ProviderFailure(fallback, media, exc) from exc
+
+
+class CodexProcessError(RuntimeError):
+    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(message)
+
+
+def _scrubbed_process_env() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not _SECRET_ENV_RE.search(key)
+    }
+    environment["PATH"] = "/home/xy/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    return environment
+
+
+def _clean_process_text(value: str, limit: int = 8192) -> str:
+    lines = [
+        line for line in value.splitlines()
+        if _ENV_LINE_RE.match(line.strip()) is None
+    ]
+    return "\n".join(lines).strip()[-limit:]
+
+
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            process.wait()
+            return
+        time.sleep(0.02)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def _read_regular_file(path: Path, limit: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 1 or info.st_size > limit:
+            raise ValueError("Codex structured output has an invalid size")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > limit:
+            raise ValueError("Codex structured output exceeds its limit")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def _copy_regular_file(source: Path, destination: Path, limit: int) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("Codex image input is not a bounded regular file")
+        output = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(output, remaining)
+                    remaining = remaining[written:]
+            os.fsync(output)
+        finally:
+            os.close(output)
+    finally:
+        os.close(descriptor)
+
+
+def _image_suffix(source: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        header = os.read(descriptor, 16)
+    finally:
+        os.close(descriptor)
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return ".webp"
+    raise ValueError("Codex image input format is unsupported")
+
+
+def _parse_codex_object(raw: bytes) -> dict[str, Any]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Codex structured output is not UTF-8") from None
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-JSON constant is forbidden: {value}")
+
+    decoder = json.JSONDecoder(parse_constant=reject_constant)
+    start = len(text) - len(text.lstrip())
+    fenced = False
+    if text.startswith("```", start):
+        header = re.match(r"```(?:json)?[ \t]*\r?\n", text[start:])
+        if header is None:
+            raise ValueError("Codex structured output has an invalid JSON fence")
+        fenced = True
+        start += header.end()
+        start += len(text[start:]) - len(text[start:].lstrip())
+    try:
+        value, end = decoder.raw_decode(text, start)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("Codex structured output is not one JSON value") from None
+    suffix_start = end
+    if fenced:
+        closing = end + len(text[end:]) - len(text[end:].lstrip())
+        if not text.startswith("```", closing):
+            raise ValueError("Codex structured output has an incomplete JSON fence")
+        suffix_start = closing + 3
+    # Any trailing text (including the "tokens used" telemetry footer) is
+    # ignored: the JSON value above is the complete structured output.
+    if not isinstance(value, dict):
+        raise TypeError("Codex structured output must be an object")
+    return value
+
+
+class CodexClient:
+    """Run one schema-constrained fusion call through ``codex-acct acct2``."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._gate = threading.BoundedSemaphore(settings.codex_concurrency)
+
+    @staticmethod
+    def _command(stage: Path, output: Path, images: list[Path]) -> list[str]:
+        inner = [
+            *_CODEX_ACCOUNT_COMMAND,
+            "exec",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "-C", str(stage),
+            "-s", "workspace-write",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color", "never",
+            "-o", str(output),
+            "-m", _CODEX_MODEL,
+            "--output-schema", str(stage / ".codex-output-schema.json"),
+            "-c", f'model_reasoning_effort="{_CODEX_REASONING_EFFORT}"',
+            "-c", "sandbox_workspace_write.network_access=false",
+            "-c", 'shell_environment_policy.inherit="core"',
+            "-c", 'shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',
+        ]
+        for image in images:
+            inner.extend(("--image", str(image)))
+        inner.append("--")
+        inner.append(
+            "严格执行当前目录 SKILL.md；只读取 input.json 和随消息附带的图片；"
+            "按注入的 JSON Schema 输出唯一完整结果，不执行其他任务。"
+        )
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise FileNotFoundError("bwrap executable not found")
+        bwrap_path = Path(bwrap).resolve(strict=True)
+        checkout = _SOURCE_ROOT.resolve(strict=True)
+        command = [
+            str(bwrap_path),
+            "--bind", "/", "/",
+            "--dev-bind", "/dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", str(checkout),
+            "--tmpfs", "/tmp",
+            "--bind", str(stage), str(stage),
+        ]
+        for candidate in sorted(stage.iterdir(), key=lambda path: path.name):
+            if candidate != output:
+                command.extend(("--ro-bind", str(candidate), str(candidate)))
+        command.extend(("--chdir", str(stage), *inner))
+        return command
+
+    def complete_structured(
+        self,
+        instruction: str,
+        payload: Any,
+        schema: dict[str, Any],
+        images: list[Path] | None = None,
+        *,
+        validator: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> ProviderResult[dict[str, Any]]:
+        # Codex runs as a one-shot subprocess, so there is no conversation to
+        # repair in: the validator rejects the output here and the caller's
+        # node-level retry reruns the whole process.
+        media = list(images or [])
+        request_record: dict[str, Any] = {
+            "provider": "codex",
+            "account": "acct2",
+            "model": _CODEX_MODEL,
+            "reasoning_effort": _CODEX_REASONING_EFFORT,
+            "input": payload,
+            "schema": schema,
+        }
+        response_record: dict[str, Any] | None = None
+        try:
+            if not isinstance(payload, dict) or not isinstance(schema, dict):
+                raise TypeError("Codex structured input and schema must be objects")
+            with tempfile.TemporaryDirectory(
+                prefix="duet-h3-fusion-", dir="/tmp",
+            ) as raw_stage:
+                stage = Path(raw_stage).resolve(strict=True)
+                skill_path = stage / "SKILL.md"
+                input_path = stage / "input.json"
+                schema_path = stage / ".codex-output-schema.json"
+                output_path = stage / ".codex-final-output.json"
+                skill_path.write_text(instruction, encoding="utf-8")
+                input_path.write_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    encoding="utf-8",
+                )
+                schema_path.write_text(
+                    json.dumps(
+                        schema,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    encoding="utf-8",
+                )
+                for path in (skill_path, input_path, schema_path):
+                    os.chmod(path, 0o600)
+                staged_images: list[Path] = []
+                for index, source in enumerate(media, 1):
+                    suffix = _image_suffix(source)
+                    target = stage / f"image-{index}{suffix}"
+                    _copy_regular_file(source, target, 64 * 1024 * 1024)
+                    staged_images.append(target)
+                descriptor = os.open(
+                    output_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                os.close(descriptor)
+                command = self._command(stage, output_path, staged_images)
+                request_record["command"] = [
+                    value if not value.startswith(str(stage)) else value.replace(str(stage), "<stage>", 1)
+                    for value in command[command.index(str(_CODEX_ACCOUNT_COMMAND[0])):]
+                ]
+                with self._gate, tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        env=_scrubbed_process_env(),
+                        start_new_session=True,
+                    )
+                    try:
+                        returncode = process.wait(timeout=self.settings.codex_timeout_s)
+                    except subprocess.TimeoutExpired:
+                        _terminate_process_group(process)
+                        stderr_file.seek(0)
+                        stderr = _clean_process_text(
+                            stderr_file.read().decode("utf-8", errors="replace")
+                        )
+                        raise CodexProcessError(
+                            f"codex timed out after {self.settings.codex_timeout_s:g}s",
+                            stderr=stderr,
+                        ) from None
+                    _terminate_process_group(process)
+                    stdout_file.seek(0)
+                    stderr_file.seek(0)
+                    stdout = _clean_process_text(
+                        stdout_file.read().decode("utf-8", errors="replace")
+                    )
+                    stderr = _clean_process_text(
+                        stderr_file.read().decode("utf-8", errors="replace")
+                    )
+                response_record = {
+                    "returncode": returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+                if returncode != 0:
+                    raise CodexProcessError(
+                        f"codex exit {returncode}: {stderr[-500:]}",
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                value = _parse_codex_object(
+                    _read_regular_file(output_path, _CODEX_OUTPUT_MAX_BYTES)
+                )
+                response_record["body"] = value
+                if validator is not None:
+                    validator(value)
+                return ProviderResult(
+                    value=value,
+                    record={"request": request_record, "response": response_record},
+                    evidence_media=media,
+                )
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(
+                {"request": request_record, "response": response_record},
+                media,
+                exc,
+            ) from exc
+
+
+_MEDIAKIT_TASK_PENDING_STATUSES = frozenset(
+    {"PENDING", "QUEUED", "RUNNING", "PROCESSING", "CREATED"}
+)
+
+
+def _mediakit_task_result(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict) or body.get("success") is not True:
+        raise ValueError("MediaKit task query was not successful")
+    result = body.get("result")
+    if not isinstance(result, dict):
+        raise TypeError("MediaKit task query result must be an object")
+    return result
+
+
+class MediaKitClient:
+    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
+        self.settings = settings
+        self.transport = transport
+
+    def _mediakit_headers(self) -> dict[str, str]:
+        token = self.settings.mediakit_api_key
+        if not token:
+            raise ValueError("VOLC_MEDIAKIT_API_KEY must be set to a non-empty value")
+        return _headers(token)
+
+    def submit_video_subtitle_erase(self, video_url: str) -> ProviderResult[str]:
+        if not isinstance(video_url, str) or not video_url.strip():
+            raise ValueError("MediaKit video URL is invalid")
+        video_url = video_url.strip()
+        mode = self.settings.mediakit_video_erase_mode
+        endpoint = (
+            "erase-video-subtitle-pro"
+            if mode == "pro"
+            else "erase-video-subtitle"
+        )
+        body: dict[str, Any] = {"video_url": video_url, "mode": "Subtitle"}
+        if mode == "pro":
+            # The pro tier pins v5: faster and optimized against subtitle
+            # flicker on AIGC video after erasure.
+            body["model_version"] = "v5"
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                response, record = _send(
+                    client,
+                    "POST",
+                    f"{self.settings.mediakit_api_base}/tools/{endpoint}",
+                    headers=self._mediakit_headers(),
+                    json_body=body,
+                )
+            _ensure_success(response, record)
+            # Submit returns a flat {"success": true, "task_id": ...}; only
+            # the poll response wraps its payload in "result".
+            submit_body = _json_body(response)
+            if not isinstance(submit_body, dict) or submit_body.get("success") is not True:
+                raise ValueError("MediaKit task submit was not successful")
+            task_id = submit_body.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("MediaKit task submit response has no task_id")
+            record["outcome"] = "accepted"
+            record["task_id"] = task_id
+            return ProviderResult(task_id, record)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+    def poll_task(self, task_id: str) -> ProviderResult[str]:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("MediaKit task id is invalid")
+        task_id = task_id.strip()
+        record: dict[str, Any] = {"task_id": task_id, "polls": []}
+        poll_url = f"{self.settings.mediakit_api_base}/tasks/{task_id}"
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        try:
+            with httpx.Client(timeout=self.settings.request_timeout_s, transport=self.transport) as client:
+                while True:
+                    try:
+                        response, exchange = _send(
+                            client,
+                            "GET",
+                            poll_url,
+                            headers=self._mediakit_headers(),
+                        )
+                    except ProviderFailure as exc:
+                        record["polls"].append(exc.record)
+                        raise ProviderFailure(record, [], exc.cause) from exc.cause
+                    record["polls"].append(exchange)
+                    _ensure_success(response, record)
+                    # Task query is flat: {"success": true, "status": ...} with
+                    # "result": {"video_url": ...} only present once completed.
+                    task_body = _json_body(response)
+                    if (
+                        not isinstance(task_body, dict)
+                        or task_body.get("success") is not True
+                    ):
+                        raise ValueError("MediaKit task query was not successful")
+                    status = str(task_body.get("status") or "").upper()
+                    if status == "COMPLETED":
+                        result = _mediakit_task_result(task_body)
+                        video_url = result.get("video_url")
+                        if not isinstance(video_url, str) or not video_url:
+                            raise ValueError(
+                                "MediaKit completed task has no video_url"
+                            )
+                        return ProviderResult(video_url, record)
+                    if status not in _MEDIAKIT_TASK_PENDING_STATUSES:
+                        raise RuntimeError(
+                            "MediaKit task failed: "
+                            + json.dumps(task_body, ensure_ascii=False)
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"MediaKit task {task_id} timed out")
+                    time.sleep(self.settings.provider_poll_interval_s)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        record: dict[str, Any] | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.Client(
+                timeout=self.settings.request_timeout_s,
+                transport=self.transport,
+                follow_redirects=True,
+            ) as client:
+                response, record = _send(client, "GET", url)
+            if response.history:
+                record["redirects"] = [response_record(item) for item in response.history]
+            _ensure_success(response, record)
+            destination.write_bytes(response.content)
+            return ProviderResult(destination, record, [destination])
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc
+
+
+class PicsartClient:
+    WORKFLOW = "minimax/h3-max/reference-to-video"
+    # These client errors establish that the request was not accepted. Timeout,
+    # conflict/early-data and rate-limit responses remain submission-unknown.
+    SAFE_REJECT_STATUS_CODES = frozenset(
+        code for code in range(400, 500)
+        if code not in {408, 409, 425, 429}
+    )
+
+    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None) -> None:
+        self.settings = settings
+        self.transport = transport
+
+    def _http_client_kwargs(self, **kwargs: Any) -> dict[str, Any]:
+        """Keep Picsart traffic isolated from ambient proxy environment."""
+        client_kwargs: dict[str, Any] = {
+            "timeout": self.settings.request_timeout_s,
+            "transport": self.transport,
+            "trust_env": False,
+            **kwargs,
+        }
+        if self.settings.picsart_proxy is not None:
+            client_kwargs["proxy"] = self.settings.picsart_proxy
+        return client_kwargs
+
+    def submit(
+        self,
+        *,
+        prompt: str,
+        video_url: str,
+        image_urls: list[str] | None,
+        audio_urls: list[str] | None = None,
+        duration: int,
+        resolution: str,
+        aspect_ratio: str,
+    ) -> ProviderResult[str]:
+        if image_urls is not None:
+            if not isinstance(image_urls, list):
+                raise ValueError("Picsart image_urls must be a list or None")
+            if len(image_urls) > 9:
+                raise ValueError("Picsart image_urls supports at most 9 URLs")
+            if any(
+                not isinstance(url, str) or not url.strip()
+                for url in image_urls
+            ):
+                raise ValueError(
+                    "Picsart image_urls must contain non-empty strings"
+                )
+            image_urls = [url.strip() for url in image_urls]
+
+        if audio_urls is not None:
+            if not isinstance(audio_urls, list):
+                raise ValueError("Picsart audio_urls must be a list or None")
+            if len(audio_urls) > 3:
+                raise ValueError("Picsart audio_urls supports at most 3 URLs")
+            if any(
+                not isinstance(url, str) or not url.strip()
+                for url in audio_urls
+            ):
+                raise ValueError(
+                    "Picsart audio_urls must contain non-empty strings"
+                )
+            audio_urls = [url.strip() for url in audio_urls]
+
+        params: dict[str, Any] = {
+            "prompt": prompt,
+            "reference_video_urls": [video_url],
+            "resolution": resolution.upper(),
+            "duration": duration,
+            "aspect_ratio": aspect_ratio,
+            "prompt_expansion_mode": "quality",
+        }
+        if image_urls:
+            params["reference_image_urls"] = image_urls
+        if audio_urls:
+            params["reference_audio_urls"] = audio_urls
+        body = {"params": params}
+        record: dict[str, Any] | None = None
+        try:
+            with httpx.Client(**self._http_client_kwargs()) as client:
+                try:
+                    response, record = _send(
+                        client,
+                        "POST",
+                        f"{self.settings.picsart_api_base}/workflows/{self.WORKFLOW}/submit",
+                        headers=_headers(self.settings.picsart_api_key),
+                        json_body=body,
+                    )
+                except ProviderFailure as exc:
+                    exc.record["outcome"] = "unknown"
+                    raise
+            if not response.is_success:
+                status_code = response.status_code
+                record["outcome"] = (
+                    "rejected"
+                    if status_code in self.SAFE_REJECT_STATUS_CODES
+                    else "unknown"
+                )
+                _ensure_success(response, record)
+            payload = _json_body(response)
+            envelope = payload.get("response") if isinstance(payload, dict) else None
+            task_id = envelope.get("id") if isinstance(envelope, dict) else None
+            if not isinstance(task_id, str) or not task_id:
+                record["outcome"] = "unknown"
+                raise ValueError("Picsart submit response has no task id")
+            record["outcome"] = "accepted"
+            record["task_id"] = task_id
+            return ProviderResult(task_id, record)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            failure_record = record or {}
+            failure_record.setdefault("outcome", "unknown")
+            raise ProviderFailure(failure_record, [], exc) from exc
+
+    def poll(self, task_id: str) -> ProviderResult[str]:
+        record: dict[str, Any] = {"task_id": task_id, "polls": []}
+        poll_url = (
+            f"{self.settings.picsart_api_base}/workflows/{self.WORKFLOW}/{task_id}/result"
+        )
+        deadline = time.monotonic() + self.settings.provider_poll_timeout_s
+        try:
+            with httpx.Client(**self._http_client_kwargs()) as client:
+                while True:
+                    try:
+                        response, exchange = _send(
+                            client,
+                            "GET",
+                            poll_url,
+                            headers=_headers(self.settings.picsart_api_key),
+                        )
+                    except ProviderFailure as exc:
+                        record["polls"].append(exc.record)
+                        raise ProviderFailure(record, [], exc.cause) from exc.cause
+                    record["polls"].append(exchange)
+                    _ensure_success(response, record)
+                    payload = _json_body(response)
+                    envelope = payload.get("response") if isinstance(payload, dict) else None
+                    if not isinstance(envelope, dict):
+                        raise TypeError("Picsart poll response envelope must be an object")
+                    status = str(envelope.get("status") or "").upper()
+                    if status == "COMPLETED":
+                        result = envelope.get("result")
+                        if not isinstance(result, dict):
+                            raise TypeError("Picsart completed result must be an object")
+                        video = result.get("video")
+                        if not isinstance(video, dict):
+                            raise TypeError("Picsart completed result must contain a video object")
+                        url = video.get("url")
+                        if not isinstance(url, str) or not url:
+                            raise ValueError("Picsart completed video has no URL")
+                        return ProviderResult(url, record)
+                    if status == "FAILED":
+                        raise RuntimeError("Picsart task failed: " + json.dumps(envelope, ensure_ascii=False))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Picsart task {task_id} timed out")
+                    time.sleep(self.settings.provider_poll_interval_s)
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record, [], exc) from exc
+
+    def download(self, url: str, destination: Path) -> ProviderResult[Path]:
+        record: dict[str, Any] | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.Client(
+                **self._http_client_kwargs(follow_redirects=True)
+            ) as client:
+                response, record = _send(client, "GET", url)
+            if response.history:
+                record["redirects"] = [response_record(item) for item in response.history]
+            _ensure_success(response, record)
+            destination.write_bytes(response.content)
+            return ProviderResult(destination, record, [destination])
+        except ProviderFailure:
+            raise
+        except Exception as exc:
+            raise ProviderFailure(record or {}, [], exc) from exc

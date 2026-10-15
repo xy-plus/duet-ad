@@ -1,0 +1,20 @@
+[Unit]
+Description=duet-ad1 H3 Max R2V release HTTPS frontend on 3211
+Wants=network-online.target
+After=network-online.target duet-ad1-h3-max-r2v-release.service
+Requires=duet-ad1-h3-max-r2v-release.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/duet/caddy run --config /home/xy/duet-ad1-h3-max-r2v-release/deploy/caddy-3211.json
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duet-ad1-h3-max-r2v-release-caddy
+
+[Install]
+WantedBy=default.target

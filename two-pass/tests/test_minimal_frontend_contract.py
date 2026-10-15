@@ -1,0 +1,1444 @@
+import json
+import re
+
+from test_web_h3_contract import APP_JS, _run_contract
+
+
+INDEX_HTML = APP_JS.parent / "index.html"
+STYLES_CSS = APP_JS.parent / "styles.css"
+
+
+def _capability(**overrides):
+    capability = {
+        "supported": True,
+        "version": 1,
+        "endpoint": "/api/conversations",
+        "encoding": "multipart/form-data",
+        "request_field": "generation_request",
+        "replacement_image_field": "replacement_image",
+        "aspect_ratios": ["16:9", "9:16"],
+        "resolutions": ["480p", "768p"],
+        "defaults": {
+            "add_subtitles": False,
+            "fit_mode": "auto",
+            "optimize_image": True,
+            "remove_subtitle": True,
+            "remove_logo": True,
+        },
+        "dialogue": {
+            "modes": ["auto_rewrite", "generate"],
+            "mode": "auto_rewrite",
+            "translation": True,
+            "max_brief_chars": 1000,
+            "optional": True,
+            "default": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
+        },
+        "replacement": {
+            "supported": True,
+            "accept": ["image/jpeg", "image/png", "image/webp"],
+            "max_bytes": 10 * 1024 * 1024,
+            "max_images": 4,
+            "max_instruction_chars": 1000,
+        },
+    }
+    capability.update(overrides)
+    return capability
+
+
+def _function_source(source, name):
+    marker = f"function {name}("
+    assert marker in source
+    return marker + source.split(marker, 1)[1].split("\nfunction ", 1)[0]
+
+
+def _tag_attrs(source, tag, element_id):
+    match = re.search(
+        rf'<{tag}\b(?P<before>[^>]*)\bid="{re.escape(element_id)}"(?P<after>[^>]*)>',
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group("before") + match.group("after")
+
+
+def _source_mode_attrs(source, value):
+    match = re.search(
+        rf'<input\b(?=[^>]*\bname="source-mode")(?=[^>]*\bvalue="{re.escape(value)}")(?P<attrs>[^>]*)>',
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group("attrs")
+
+
+def _target_language_mode_attrs(source, value):
+    match = re.search(
+        rf'<input\b(?=[^>]*\bname="target-language-mode")(?=[^>]*\bvalue="{re.escape(value)}")(?P<attrs>[^>]*)>',
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group("attrs")
+
+
+def _dialogue_write_mode_attrs(source, value):
+    match = re.search(
+        rf'<input\b(?=[^>]*\bname="dialogue-write-mode")(?=[^>]*\bvalue="{re.escape(value)}")(?P<attrs>[^>]*)>',
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group("attrs")
+
+
+def _css_rule_bodies(source, selector):
+    return re.findall(rf'{re.escape(selector)}\s*\{{(?P<body>[^}}]*)\}}', source)
+
+
+def test_creation_form_defaults_to_link_and_same_source_language():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    composer = html.split('<form id="composer"', 1)[1].split("</form>", 1)[0]
+    visible = composer
+    # 旧兼容控件与旧弹窗已从 DOM 移除，不再允许留在页面上。
+    for legacy_markup in (
+        'class="legacy-contract-controls"',
+        'name="voice-mode"',
+        'name="dialogue-mode"',
+        'id="note-input"',
+        'id="dialogue-review-fields"',
+        'dialogue-review-policy',
+        'id="generation-config"',
+        'id="pp-dialog"',
+        'id="draft-dialog"',
+    ):
+        assert legacy_markup not in html
+
+    source_section = visible.split(
+        '<section class="setup-section source-section"', 1
+    )[1].split("</section>", 1)[0]
+    upload_attrs = _source_mode_attrs(source_section, "upload")
+    link_attrs = _source_mode_attrs(source_section, "link")
+    assert re.search(r"\bchecked\b", upload_attrs) is None
+    assert re.search(r"\bchecked\b", link_attrs) is not None
+    assert "hidden" in _tag_attrs(source_section, "button", "attach-btn")
+    assert "hidden" not in _tag_attrs(source_section, "div", "url-row")
+    assert "required" in _tag_attrs(source_section, "input", "url-input")
+
+    assert '<h2 id="dialogue-title">改编台词</h2>' in visible
+    dialogue = visible.split('aria-labelledby="dialogue-title"', 1)[1].split(
+        "</section>", 1
+    )[0]
+    assert "自动改写原视频台词，或描述一段口播由 AI 直接生成" in dialogue
+    assert 'id="script-input"' not in html
+    assert "script-input" not in source
+    output_section = visible.split(
+        'aria-labelledby="output-title"', 1
+    )[1].split("</section>", 1)[0]
+    # 显示字幕合并在生成配置 section 内；指定替换是独立的第四个 setup-section。
+    assert 'id="add-subtitles"' in output_section
+    assert 'id="subtitle-hint"' in output_section
+    assert 'id="replacement-instruction"' not in output_section
+    assert (
+        '<section class="setup-section optional-section" '
+        'aria-labelledby="replacement-title">'
+    ) in visible
+    replacement_section = visible.split(
+        'aria-labelledby="replacement-title"', 1
+    )[1].split("</section>", 1)[0]
+    assert 'id="replacement-instruction"' in replacement_section
+    assert visible.index('aria-labelledby="dialogue-title"') < visible.index(
+        'aria-labelledby="replacement-title"'
+    )
+    assert re.findall(r'<textarea\b[^>]*\bid="([^"]+)"', visible) == [
+        "dialogue-brief",
+        "replacement-instruction",
+    ]
+    assert 'name="voice-mode"' not in visible
+    assert 'name="dialogue-mode"' not in visible
+    assert 'id="dialogue-review-fields"' not in visible
+    assert 'id="generation-config"' not in visible
+    assert "后处理" not in visible
+
+    assert "台词来源" in dialogue
+    rewrite_attrs = _dialogue_write_mode_attrs(dialogue, "auto_rewrite")
+    generate_attrs = _dialogue_write_mode_attrs(dialogue, "generate")
+    assert re.search(r"\bchecked\b", rewrite_attrs) is not None
+    assert re.search(r"\bchecked\b", generate_attrs) is None
+    brief_fields = re.search(
+        r'<div\b(?P<attrs>[^>]*)id="dialogue-brief-fields"(?P<tail>[^>]*)>',
+        visible,
+        flags=re.DOTALL,
+    )
+    assert brief_fields is not None
+    assert "hidden" in brief_fields.group("attrs") + brief_fields.group("tail")
+    brief_attrs = _tag_attrs(visible, "textarea", "dialogue-brief")
+    assert 'maxlength="1000"' in brief_attrs
+    assert "disabled" in brief_attrs
+    assert "required" not in brief_attrs
+
+    dialogue_write_mode = _function_source(source, "dialogueWriteMode")
+    assert 'input[name="dialogue-write-mode"]:checked' in dialogue_write_mode
+    assert 'return checked ? checked.value : "auto_rewrite"' in dialogue_write_mode
+    sync_dialogue_controls = _function_source(source, "syncDialogueModeControls")
+    assert 'dialogueWriteMode() === "generate"' in sync_dialogue_controls
+    assert '$("dialogue-brief-fields").hidden = !isGenerate' in sync_dialogue_controls
+    assert '$("dialogue-brief").required = isGenerate' in sync_dialogue_controls
+    assert (
+        '$("dialogue-brief").disabled = state.uploading || state.viewingSubmittedConfig || !isGenerate'
+        in sync_dialogue_controls
+    )
+
+    assert 'id="translation-toggle"' not in html
+    assert '<fieldset class="language-fieldset">' in dialogue
+    assert "最终视频语种" in dialogue
+    assert "与原视频相同" in dialogue
+    assert "其他" in dialogue
+    same_attrs = _target_language_mode_attrs(dialogue, "same")
+    other_attrs = _target_language_mode_attrs(dialogue, "other")
+    assert re.search(r"\bchecked\b", same_attrs) is not None
+    assert re.search(r"\bchecked\b", other_attrs) is None
+    assert 'aria-describedby="same-language-hint"' in same_attrs
+
+    hint = re.search(
+        r'<p\b(?P<attrs>[^>]*)id="same-language-hint"(?P<tail>[^>]*)>',
+        visible,
+        flags=re.DOTALL,
+    )
+    assert hint is not None
+    hint_attrs = hint.group("attrs") + hint.group("tail")
+    assert 'class="field-hint"' in hint_attrs
+    assert "hidden" not in hint_attrs
+    assert "拉丁字母语种" in dialogue
+    assert "英语" in dialogue
+
+    fields = re.search(
+        r'<div\b(?P<attrs>[^>]*)id="translation-fields"(?P<tail>[^>]*)>',
+        visible,
+        flags=re.DOTALL,
+    )
+    assert fields is not None
+    fields_attrs = fields.group("attrs") + fields.group("tail")
+    assert 'class="translation-fields"' in fields_attrs
+    assert "hidden" in fields_attrs
+    language_attrs = _tag_attrs(visible, "input", "lang-input")
+    assert 'maxlength="80"' in language_attrs
+    assert "disabled" in language_attrs
+    assert "required" not in language_attrs
+    assert "translationEnabled" not in source
+    assert "setTranslationEnabled" not in source
+    assert 'name="fusion-agent"' not in visible
+    assert "Codex" not in visible
+    assert "DeepSeek" not in visible
+
+    target_language_mode = _function_source(source, "targetLanguageMode")
+    assert 'input[name="target-language-mode"]:checked' in target_language_mode
+    assert 'return checked ? checked.value : "same"' in target_language_mode
+    sync_controls = _function_source(source, "syncTargetLanguageControls")
+    assert 'targetLanguageMode() === "other"' in sync_controls
+    assert '$("translation-fields").hidden = !isOther' in sync_controls
+    assert '$("same-language-hint").hidden = isOther' in sync_controls
+    assert '$("lang-input").required = isOther' in sync_controls
+    assert (
+        '$("lang-input").disabled = state.uploading || state.viewingSubmittedConfig || !isOther'
+        in sync_controls
+    )
+    bind_events = _function_source(source, "bindEvents")
+    assert 'input[name="target-language-mode"]' in bind_events
+    assert "syncTargetLanguageControls();" in bind_events
+    assert 'input[name="dialogue-write-mode"]' in bind_events
+    assert "syncDialogueModeControls();" in bind_events
+
+    source_mode = _function_source(source, "sourceMode")
+    assert 'return checked ? checked.value : "link"' in source_mode
+
+
+def test_minimal_creation_capability_is_exact_and_fails_closed():
+    good = _capability()
+    result = _run_contract(
+        "(()=>{const good="
+        + json.dumps(good)
+        + ";return {"
+        "good:contract.normalizeMinimalCreationCapability({minimal_creation:good}),"
+        "missing:contract.normalizeMinimalCreationCapability({}),"
+        "unsupported:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,supported:false}}),"
+        "wrongVersion:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,version:2}}),"
+        "wrongField:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,request_field:'other'}}),"
+        "defaultDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,defaults:{...good.defaults,remove_logo:false}}}),"
+        "extraDefault:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,defaults:{...good.defaults,extra:true}}}),"
+        "dialogueDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,translation:false}}}),"
+        "dialogueExtra:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,max_target_language_chars:80}}}),"
+        "dialogueModesDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,modes:['generate','auto_rewrite']}}}),"
+        "dialogueBriefLimitDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,max_brief_chars:0}}}),"
+        "dialogueOptionalDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,optional:false}}}),"
+        "dialogueDefaultDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,dialogue:{...good.dialogue,default:{mode:'auto_rewrite',target_language:'中文'}}}}),"
+        "replacementDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,accept:['image/png']}}}),"
+        "replacementCountDrift:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,max_images:3}}}),"
+        "replacementExtra:contract.normalizeMinimalCreationCapability({minimal_creation:{...good,replacement:{...good.replacement,extra:true}}})"
+        "}})()"
+    )
+
+    assert result["good"] == {
+        "endpoint": "/api/conversations",
+        "request_field": "generation_request",
+        "replacement_image_field": "replacement_image",
+        "aspect_ratios": ["16:9", "9:16"],
+        "resolutions": ["480p", "768p"],
+        "dialogue": {
+            "modes": ["auto_rewrite", "generate"],
+            "mode": "auto_rewrite",
+            "translation": True,
+            "max_brief_chars": 1000,
+            "optional": True,
+            "default": {
+                "mode": "auto_rewrite",
+                "target_language": "与原视频相同",
+            },
+        },
+        "replacement": {
+            "accept": ["image/jpeg", "image/png", "image/webp"],
+            "max_bytes": 10 * 1024 * 1024,
+            "max_images": 4,
+            "max_instruction_chars": 1000,
+        },
+    }
+    assert all(value is None for key, value in result.items() if key != "good")
+
+
+def test_minimal_request_has_exact_auto_rewrite_and_replacement_shapes():
+    capability = _capability()
+    result = _run_contract(
+        "(()=>{const capability="
+        + json.dumps(capability)
+        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        "targetLanguage:' 日语 ',hasReplacementImage:false,replacementInstruction:''};"
+        "return {same:contract.buildMinimalGenerationRequest({...base,"
+        "targetLanguage:contract.resolveTargetLanguage('same','不会提交')},capability),"
+        "resolved:{same:contract.resolveTargetLanguage('same','英语'),"
+        "other:contract.resolveTargetLanguage('other',' 日语 '),"
+        "unknown:contract.resolveTargetLanguage('unknown','日语')},"
+        "request:contract.buildMinimalGenerationRequest(base,capability),"
+        "injected:contract.buildMinimalGenerationRequest({...base,script:'用户注入台词'},capability),"
+        "replacement:contract.buildMinimalGenerationRequest({...base,aspectRatio:'16:9',resolution:'480p',"
+        "hasReplacementImage:true,replacementInstruction:' 替换成参考产品 '},capability)}})()"
+    )
+
+    request = {
+        "version": 1,
+        "output": {
+            "aspect_ratio": "9:16",
+            "resolution": "768p",
+            "fit_mode": "auto",
+        },
+        "processing": {
+            "optimize_image": True,
+            "remove_subtitle": True,
+            "remove_logo": True,
+        },
+        "dialogue": {
+            "mode": "auto_rewrite",
+            "target_language": "日语",
+        },
+        "replacement_guidance": None,
+        "add_subtitles": False,
+        "prompt_review": False,
+    }
+    same_request = json.loads(json.dumps(request))
+    same_request["dialogue"]["target_language"] = "与原视频相同"
+    assert result["same"] == same_request
+    assert result["resolved"] == {
+        "same": "与原视频相同",
+        "other": "日语",
+        "unknown": "",
+    }
+    assert result["request"] == request
+    assert result["injected"] == request
+
+    replacement = json.loads(json.dumps(request))
+    replacement["output"] = {
+        "aspect_ratio": "16:9",
+        "resolution": "480p",
+        "fit_mode": "auto",
+    }
+    replacement["replacement_guidance"] = {
+        "instruction": "替换成参考产品",
+        "image_field": "replacement_image",
+    }
+    assert result["replacement"] == replacement
+    assert "script" not in json.dumps(result)
+
+    request_builder = _function_source(
+        APP_JS.read_text(encoding="utf-8"), "buildMinimalGenerationRequest"
+    )
+    assert "script" not in request_builder.lower()
+
+
+def test_subtitle_toggle_is_sent_in_actual_multipart_and_restored():
+    source = APP_JS.read_text(encoding="utf-8")
+    upload = _function_source(source, "uploadConversation")
+    result = _run_contract(
+        "(async()=>{const capability=" + json.dumps(_capability()) + ";"
+        "const state={token:'test'};let sent;"
+        "class XMLHttpRequest {constructor(){this.upload={addEventListener(){}};this.status=201;}"
+        "open(){}setRequestHeader(){}addEventListener(name,fn){if(name==='load')this.loaded=fn;}"
+        "send(fd){sent=JSON.parse(fd.get('generation_request'));this.loaded();}};"
+        + upload + ";const base={aspectRatio:'9:16',resolution:'480p',targetLanguage:'日语'};"
+        "const values=[];for(const addSubtitles of [false,true,false]){"
+        "const request=contract.buildMinimalGenerationRequest({...base,addSubtitles},capability);"
+        "await uploadConversation({url:'https://example.com/v.mp4',requestId:'subtitle-test',"
+        "generationRequest:request,capability},()=>{});"
+        "values.push([sent.add_subtitles,contract.projectComposerModel({effective_request:sent},null).addSubtitles]);}"
+        "return values;})()"
+    )
+    assert result == [[False, False], [True, True], [False, False]]
+    attrs = _tag_attrs(INDEX_HTML.read_text(encoding="utf-8"), "input", "add-subtitles")
+    assert 'type="checkbox"' in attrs and "checked" not in attrs
+    assert 'addSubtitles: $("add-subtitles").checked' in source
+    assert '$("add-subtitles").checked = false' in _function_source(source, "resetComposerForNewProject")
+    assert '$("add-subtitles").checked' not in _function_source(source, "loadMinimalCreationCapability")
+
+
+def test_prompt_review_toggle_defaults_to_straight_through_and_maps_inverted():
+    source = APP_JS.read_text(encoding="utf-8")
+    result = _run_contract(
+        "(()=>{const capability=" + json.dumps(_capability()) + ";"
+        "const base={aspectRatio:'9:16',resolution:'480p',targetLanguage:'日语'};"
+        "return [false,true].map((promptReview)=>"
+        "contract.buildMinimalGenerationRequest({...base,promptReview},capability).prompt_review);})()"
+    )
+    assert result == [False, True]
+    attrs = _tag_attrs(INDEX_HTML.read_text(encoding="utf-8"), "input", "auto-continue")
+    # 开关默认打开 = 直通（prompt_review=false）；关闭 = 暂停审核。
+    assert 'type="checkbox"' in attrs and "checked" in attrs
+    assert 'promptReview: !$("auto-continue").checked' in source
+    assert '$("auto-continue").checked = true' in _function_source(source, "resetComposerForNewProject")
+    # 「显示字幕」与「自动继续生成」之间：间距 = 容器宽度的 5%（不写死 px）。
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    assert _css_rule_bodies(css, "#subtitle-hint + .subtitle-option") == [
+        " margin-top: 5%; ",
+    ]
+
+
+def test_prompt_review_ui_states_are_wired():
+    source = APP_JS.read_text(encoding="utf-8")
+    progress = _function_source(source, "projectProgressModel")
+    assert '"awaiting_prompt_review"' in progress
+    assert "等待你审核提示词" in progress
+    badge = _function_source(source, "conversationBadge")
+    assert "awaiting_prompt_review" in badge
+    stable = _function_source(source, "renderStable")
+    assert 'progress.state === "awaiting_prompt_review"' in stable
+    assert 'promptReviewSection(detail, "review")' in stable
+    results = _function_source(source, "renderResults")
+    assert 'promptReviewSection(detail, "regenerate")' in results
+    review = _function_source(source, "promptReviewSection")
+    assert '"/prompt-review"' in review
+    assert '"/prompt-review/confirm"' in review
+    assert '"/regenerate"' in review
+    panel = _function_source(source, "promptReviewPanel")
+    assert "确认并继续生成" in panel
+    assert "重新生成视频" in panel
+    # 面板 + 下拉切换分段 + 共用单编辑框，未确认编辑在内存暂存。
+    assert '"res-section prompt-review-panel"' in panel
+    assert 'el("select", "prompt-review-switcher")' in panel
+    assert "segmentOptionLabel(segment)" in panel
+    assert "edits.set(current, textarea.value)" in panel
+    assert "textarea.value = edits.get(current)" in panel
+    assert 'mode === "review" ? "提示词审核" : "冻结提示词"' in review
+    assert "prompt-review-segment" not in review  # 旧的逐段裸露编辑框已移除
+    # regenerate 有付费确认提示。
+    assert "会消耗生成额度" in review
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".prompt-review-panel" in css
+    assert ".prompt-review-switcher" in css
+
+
+def test_generation_history_modal_is_wired():
+    source = APP_JS.read_text(encoding="utf-8")
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    results = _function_source(source, "renderResults")
+    assert "historyEntry(detail)" in results
+    assert "generationHistorySection" not in results  # 旧内嵌面板已移除
+    entry = _function_source(source, "historyEntry")
+    assert '"/generation-history"' in entry
+    # 主题色按钮（与"重新生成视频"同款 btn-primary），半角括号带空格的数量标记。
+    assert '"btn btn-primary history-button"' in entry
+    assert '"历史版本 (" + archived.length + ")"' in entry
+    assert "host.remove()" in entry  # 无历史版本时按钮不显示
+    assert "openHistoryModal(detail, versions)" in entry
+    # 按钮进成片区块标题行右侧：videoSection 标题行接收 action 并挂进 res-h3。
+    section = _function_source(source, "videoSection")
+    assert "if (action) h.appendChild(action)" in section
+    # 浅蓝底黑字：背景复用色板既有浅蓝（badge.processing 同款 accent 12%
+    # alpha），文字为现有深色变量；res-h3 是 flex，靠右用 margin-left:auto。
+    assert _css_rule_bodies(css, ".history-button") == [
+        " background: rgba(0, 113, 227, .12); color: var(--text); ",
+    ]
+    assert _css_rule_bodies(css, ".history-button:hover:not(:disabled)") == [
+        " background: rgba(0, 113, 227, .2); ",
+    ]
+    assert _css_rule_bodies(css, ".history-entry") == [" margin-left: auto; "]
+    modal = _function_source(source, "openHistoryModal")
+    assert '"modal-backdrop"' in modal
+    assert 'dialog.setAttribute("role", "dialog")' in modal
+    assert '"icon-btn icon-btn-sm modal-close"' in modal  # 右上 X
+    assert "event.target === backdrop" in modal  # 点遮罩关闭
+    assert 'event.key === "Escape"' in modal  # Esc 关闭
+    assert 'document.body.classList.add("modal-open")' in modal  # 背景不滚动
+    assert 'document.body.classList.remove("modal-open")' in modal
+    assert "videoPlayer(detail, version.video_file)" in modal
+    assert "textarea.readOnly = true" in modal  # 历史提示词只读
+    assert '" · 当前"' in modal
+    assert ".modal-backdrop" in css
+    assert ".modal-card" in css
+    assert _css_rule_bodies(css, "body.modal-open") == [" overflow: hidden; "]
+
+
+def test_video_player_clears_stale_frame_on_load_failure():
+    # regenerate 窗口期 generated.mp4 404：必须清空旧画面而不是保留旧 blob。
+    player = _function_source(APP_JS.read_text(encoding="utf-8"), "videoPlayer")
+    assert 'video.removeAttribute("src")' in player
+    assert "video.load()" in player
+    assert "视频加载失败" in player
+
+
+def test_detail_signature_changes_when_regeneration_flips_state():
+    # regenerate 把 succeeded+has_video 翻成 queued+无视频：签名必须变化以
+    # 触发全量重渲，新片完成后再次变化重新加载视频。
+    result = _run_contract(
+        "[contract.detailSignature({id:'p',title:'t',note:null,error:null,"
+        "project_progress:{status:'succeeded'},has_source:true,has_video:true}).stable,"
+        "contract.detailSignature({id:'p',title:'t',note:null,error:null,"
+        "project_progress:{status:'queued'},has_source:true,has_video:false}).stable,"
+        "contract.detailSignature({id:'p',title:'t',note:null,error:null,"
+        "project_progress:{status:'succeeded'},has_source:true,has_video:true}).stable]"
+    )
+    assert result[0] != result[1]
+    assert result[1] != result[2]
+    assert result[0] == result[2]  # 同名状态签名稳定，轮询不重渲
+
+
+def test_display_duration_prefers_backend_trace_value_with_wall_clock_fallback():
+    result = _run_contract(
+        "(()=>{const base={title:'t',created_at:'2026-09-20T00:00:00Z',"
+        "updated_at:'2026-09-21T03:00:00Z',project_progress:{status:'succeeded',percent:100}};"
+        "return {"
+        "trace:contract.projectProgressModel({...base,display_duration_s:11400}).elapsed,"
+        "fallback:contract.projectProgressModel(base).elapsed,"
+        "running:contract.projectProgressModel({...base,display_duration_s:11400,"
+        "project_progress:{status:'running',percent:50}},"
+        "new Date('2026-09-21T01:00:00Z').getTime()).elapsed"
+        "};})()"
+    )
+    # 后端 trace 推导值优先（11400s = 3时10分）
+    assert result["trace"] == "3时 10分"
+    # 老项目无字段：回退创建→完成墙钟（27 小时）
+    assert result["fallback"] == "27时 00分"
+    # 非终态不看该字段（运行中显示当前墙钟耗时）
+    assert result["running"] == "25时 00分"
+
+
+def test_prompt_review_segment_option_shows_source_time_range():
+    result = _run_contract(
+        "[{segment_index:1,start_s:0,end_s:8},{segment_index:2,start_s:8.5,end_s:16},"
+        "{segment_index:3,start_s:null,end_s:null},{segment_index:4,start_s:'x',end_s:9},"
+        "{segment_index:5,end_s:9}]"
+        ".map(contract.segmentOptionLabel)"
+    )
+    assert result == [
+        "分段 1（0s ~ 8s）",
+        "分段 2（8.5s ~ 16s）",
+        "分段 3",
+        "分段 4",
+        "分段 5",
+    ]
+
+
+def test_minimal_request_rejects_missing_or_long_language_and_replacement_pair():
+    capability = _capability()
+    result = _run_contract(
+        "(()=>{const capability="
+        + json.dumps(capability)
+        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        "targetLanguage:'日语',hasReplacementImage:false,replacementInstruction:''};"
+        "const capture=(value)=>{try{contract.buildMinimalGenerationRequest(value,capability);return null}"
+        "catch(error){return error.message}};return {"
+        "language:capture({...base,targetLanguage:'  '}),"
+        "longLanguage:capture({...base,targetLanguage:'a'.repeat(81)}),"
+        "briefMissing:capture({...base,dialogueMode:'generate'}),"
+        "briefBlank:capture({...base,dialogueMode:'generate',dialogueBrief:'  '}),"
+        "briefLong:capture({...base,dialogueMode:'generate',dialogueBrief:'好'.repeat(1001)}),"
+        "imageOnly:capture({...base,hasReplacementImage:true}),"
+        "instructionOnly:capture({...base,replacementInstruction:'替换产品'}),"
+        "tooMany:capture({...base,replacementImageCount:5,replacementInstruction:'替换产品'})}})()"
+    )
+    assert result == {
+        "language": "请填写目标语言",
+        "longLanguage": "目标语言超过长度限制",
+        "briefMissing": "请填写口播描述",
+        "briefBlank": "请填写口播描述",
+        "briefLong": "口播描述超过长度限制",
+        "imageOnly": "参考图与替换说明需要一起提供",
+        "instructionOnly": "参考图与替换说明需要一起提供",
+        "tooMany": "参考图数量超出限制",
+    }
+
+
+def test_minimal_request_generate_mode_carries_exact_brief_shape():
+    capability = _capability()
+    result = _run_contract(
+        "(()=>{const capability="
+        + json.dumps(capability)
+        + ";const base={aspectRatio:'9:16',resolution:'768p',"
+        "targetLanguage:'日语',dialogueMode:'generate',"
+        "dialogueBrief:' 用轻松口吻介绍产品 ',hasReplacementImage:false,replacementInstruction:''};"
+        "return {generate:contract.buildMinimalGenerationRequest(base,capability),"
+        "rewrite:contract.buildMinimalGenerationRequest({...base,dialogueMode:'auto_rewrite'},capability)}})()"
+    )
+    assert result["generate"]["dialogue"] == {
+        "mode": "generate",
+        "target_language": "日语",
+        "brief": "用轻松口吻介绍产品",
+    }
+    assert result["rewrite"]["dialogue"] == {
+        "mode": "auto_rewrite",
+        "target_language": "日语",
+    }
+    assert "brief" not in result["rewrite"]["dialogue"]
+
+
+def test_active_upload_appends_only_the_minimal_multipart_contract():
+    source = APP_JS.read_text(encoding="utf-8")
+    upload = _function_source(source, "uploadConversation")
+    append_arguments = re.findall(r"fd\.append\((.+)\);", upload)
+
+    assert append_arguments == [
+        '"file", file, file.name',
+        '"reference_url", url',
+        '"client_request_id", requestId',
+        "capability.request_field, JSON.stringify(generationRequest)",
+        # 素材库选图只传 sha 引用（与 replacement_image 上传可混合）
+        '"material_sha256", image.sha256',
+        "capability.replacement_image_field, image, image.name",
+    ]
+    assert "if (file)" in upload
+    assert "else if (url)" in upload
+    assert "images.forEach" in upload
+    assert "replacementImages = null" in upload
+    assert "replacementImage = null" in upload  # 保留旧单图调用兼容。
+    assert upload.count('xhr.open("POST", capability.endpoint)') == 1
+    assert upload.count("xhr.send(fd)") == 1
+    for legacy_field in (
+        '"voice_mode"',
+        '"dialogue_mode"',
+        '"dialogue_review_policy"',
+        '"generation_config"',
+    ):
+        assert legacy_field not in upload
+
+    # Structured 429 errors use the same detail.code/detail.message parser as
+    # every other v1 create failure; they are not stringified as [object Object].
+    assert 'xhr.status === 429' not in upload
+    parsed = _run_contract(
+        "(()=>{const error=contract.apiErrorFromPayload("
+        "{detail:{code:'queue_full',message:'当前队列已满'}},'fallback');"
+        "return {code:error.code,message:error.message}})()"
+    )
+    assert parsed == {"code": "queue_full", "message": "当前队列已满"}
+
+    result = _run_contract(
+        "(async()=>{const capability=" + json.dumps(_capability()) + ";"
+        "const state={token:'test'};let sent=[];"
+        "class FormData {constructor(){this.items=[]}append(...args){this.items.push(args)}};"
+        "class XMLHttpRequest {constructor(){this.upload={addEventListener(){}};this.status=201;}"
+        "open(){}setRequestHeader(){}addEventListener(name,fn){if(name==='load')this.loaded=fn;}"
+        "send(fd){sent=fd.items.map((entry)=>[entry[0],entry[1].name||entry[1],entry[2]||null]);this.loaded();}};"
+        + upload
+        + ";await uploadConversation({url:'https://example.com/v.mp4',requestId:'r1',generationRequest:{},"
+        "replacementImages:[{name:'one.png'},{name:'two.webp'},{name:'three.jpg'}],capability},()=>{});"
+        "return sent;})()"
+    )
+    assert result == [
+        ["reference_url", "https://example.com/v.mp4", None],
+        ["client_request_id", "r1", None],
+        ["generation_request", "{}", None],
+        ["replacement_image", "one.png", "one.png"],
+        ["replacement_image", "two.webp", "two.webp"],
+        ["replacement_image", "three.jpg", "three.jpg"],
+    ]
+
+
+def test_creation_form_has_no_internal_vertical_scroll_or_height_cap():
+    styles = (APP_JS.parent / "styles.css").read_text(encoding="utf-8")
+    for selector in (".composer-dock", ".composer-inner", ".minimal-composer"):
+        rule_bodies = _css_rule_bodies(styles, selector)
+        assert rule_bodies, selector
+        for body in rule_bodies:
+            assert "max-height" not in body
+            assert re.search(r"\boverflow(?:-y)?\s*:", body) is None
+
+
+def test_project_progress_is_authoritative_for_polling_and_success_rendering():
+    result = _run_contract(
+        "(()=>({"
+        "queued:contract.shouldPollDetail({status:'done',project_progress:{percent:0,status:'queued'}}),"
+        "running:contract.shouldPollDetail({status:'failed',project_progress:{percent:47,status:'running'}}),"
+        "succeeded:contract.shouldPollDetail({status:'processing',has_video:true,project_progress:{percent:100,status:'succeeded'}}),"
+        "failed:contract.shouldPollDetail({status:'processing',project_progress:{percent:47,status:'failed'}}),"
+        "missing:contract.shouldPollDetail({status:'processing'})"
+        "}))()"
+    )
+    assert result == {
+        "queued": True,
+        "running": True,
+        "succeeded": False,
+        "failed": False,
+        "missing": False,
+    }
+
+    render_stable = _function_source(
+        APP_JS.read_text(encoding="utf-8"), "renderStable"
+    )
+    assert 'progress.state === "succeeded" && detail.has_video === true' in render_stable
+    assert 'detail.status === "done"' not in render_stable
+
+
+def test_source_video_stays_stable_while_progress_percent_changes():
+    result = _run_contract(
+        "(()=>{const base={id:'v1',title:'demo',status:'processing',has_source:true,has_video:false,"
+        "project_progress:{percent:12,status:'running'},error:null};"
+        "const original=contract.detailSignature(base).stable;return {"
+        "progressPercent:contract.detailSignature({...base,project_progress:{percent:13,status:'running'}}).stable!==original,"
+        "progressState:contract.detailSignature({...base,project_progress:{percent:12,status:'failed'}}).stable!==original,"
+        "source:contract.detailSignature({...base,has_source:false}).stable!==original,"
+        "error:contract.detailSignature({...base,error:{code:'project_failed',message:'生成失败'}}).stable!==original"
+        "}})()"
+    )
+    assert result == {
+        "progressPercent": False,
+        "progressState": True,
+        "source": True,
+        "error": True,
+    }
+
+
+def test_project_progress_model_exposes_only_product_level_fields():
+    result = _run_contract(
+        "(()=>{const runningNow=new Date('2026-09-03T08:05:06').getTime();"
+        "const terminalNow=new Date('2026-09-03T09:00:00').getTime();"
+        "const authoritative=contract.projectProgressModel({title:'夏日项目',"
+        "created_at:'2026-09-03T08:00:00',updated_at:'2026-09-03T08:04:00',"
+        "project_progress:{percent:63,status:'running',stage:'h3',segments:[1,2]},"
+        "generation:{stage:'h3',segments:[{status:'succeeded'}]}},runningNow);"
+        "const complete=contract.projectProgressModel({has_video:true,status:'done',"
+        "created_at:'2026-09-03T08:00:00',updated_at:'2026-09-03T08:12:34',"
+        "project_progress:{percent:100,status:'succeeded'},"
+        "generation:{stage:'stitch',segments:[{status:'succeeded'}]}},terminalNow);"
+        "const missingV1=contract.projectProgressModel({title:'合同缺失',"
+        "effective_request:{version:1},generation:{status:'running',stage:'h3'}},terminalNow);"
+        "return {authoritative,complete,missingV1}})()"
+    )
+    assert result == {
+        "authoritative": {
+            "title": "夏日项目", "percent": 63, "state": "running",
+            "startedAt": "2026-09-03 08:00:00",
+            "elapsedLabel": "当前耗时", "elapsed": "5分 06秒",
+            "phase": "AI 正在生成视频", "loading": True,
+        },
+        "complete": {
+            "title": "未命名项目", "percent": 100, "state": "succeeded",
+            "startedAt": "2026-09-03 08:00:00",
+            "elapsedLabel": "总耗时", "elapsed": "12分 34秒",
+            "phase": "视频生成完成", "loading": False,
+        },
+        "missingV1": {
+            "title": "合同缺失", "percent": 0, "state": "failed",
+            "startedAt": "未知", "elapsedLabel": "总耗时", "elapsed": "未知",
+            "phase": "视频生成未完成", "loading": False,
+        },
+    }
+    for model in result.values():
+        assert set(model) == {
+            "title", "percent", "state", "startedAt", "elapsedLabel", "elapsed",
+            "phase", "loading",
+        }
+        assert "stage" not in model
+        assert "segments" not in model
+
+
+def test_progress_and_results_renderers_do_not_mount_technical_views():
+    source = APP_JS.read_text(encoding="utf-8")
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    progress_renderer = _function_source(source, "renderOperationHeader")
+    assert "projectProgressModel(detail)" in progress_renderer
+    created_nodes = re.findall(
+        r'el\("([^"]+)",\s*"([^"]+)"', progress_renderer
+    )
+    assert created_nodes == [
+        ("div", "project-progress-header"),
+        ("div", "project-progress-fields"),
+        ("span", "project-progress-field project-progress-project"),
+        ("span", "project-progress-label"),
+        ("strong", "project-progress-title"),
+        ("span", "project-progress-field"),
+        ("span", "project-progress-label"),
+        ("span", "project-progress-time"),
+        ("span", "project-progress-field"),
+        ("span", "project-progress-label"),
+        ("span", "project-progress-time"),
+        ("div", "project-phase"),
+        ("span", "project-phase-spinner"),
+        ("span", "project-phase-label"),
+    ]
+    for label in ('"项目"', '"发起时间"', "model.elapsedLabel", "model.elapsed"):
+        assert label in progress_renderer
+    assert progress_renderer.count('setAttribute("role", "status")') == 1
+    assert '"project-progress-percent"' not in progress_renderer
+    assert '"project-progress-track"' not in progress_renderer
+    assert '"project-progress-fill"' not in progress_renderer
+    assert "operation-timeline" not in progress_renderer
+    assert "operationTimeline(" not in progress_renderer
+    assert "model.stages" not in progress_renderer
+    assert 'el("ol"' not in progress_renderer
+    assert 'el("li"' not in progress_renderer
+    assert "stage" not in progress_renderer.lower()
+    assert "segment" not in progress_renderer.lower()
+    for removed_progress_ui in (
+        ".project-progress-percent", ".project-progress-track", ".project-progress-fill"
+    ):
+        assert removed_progress_ui not in css
+    assert ".project-phase-spinner" in css
+    assert "animation: project-phase-spin" in css
+
+    user_bubble = _function_source(source, "renderUserBubble")
+    assert "detail.has_source === true" in user_bubble
+    assert 'videoPlayer(detail, "source.mp4")' in user_bubble
+    assert 'preview.setAttribute("aria-label", "原视频")' in user_bubble
+
+    results_renderer = _function_source(source, "renderResults")
+    mounted_results = re.findall(
+        r"frag\.appendChild\((.*?)\);", results_renderer, flags=re.DOTALL
+    )
+    # 冻结提示词（可编辑重新生成）在成片上方；历史版本入口按钮在成片
+    # 区块标题行内（videoSection 的 action 参数），不再单独成行。
+    assert mounted_results == [
+        'promptReviewSection(detail, "regenerate")',
+        'videoSection(\n      detail, "generated.mp4", "新视频", "已完成", historyEntry(detail),\n    )',
+    ]
+    assert results_renderer.count("videoSection(") == 1
+
+    result_renderers = "\n".join(
+        _function_source(source, name)
+        for name in (
+            "renderResults",
+            "renderStable",
+        )
+    )
+    for technical_view in (
+        "renderIntermediateStages(",
+        "renderPpAsk(",
+        "renderPpChat(",
+    ):
+        assert technical_view not in result_renderers
+
+
+def test_three_public_progress_phases_follow_project_progress_boundaries():
+    result = _run_contract(
+        "(()=>({"
+        "queued:contract.projectPhaseLabel({project_progress:{status:'queued',percent:0},"
+        "generation:{status:'queued',stage:'upstream'}}),"
+        "analysis:contract.projectPhaseLabel({project_progress:{status:'running',percent:23},"
+        "generation:{status:'running',stage:'scene-detection'}}),"
+        "videoMaker:contract.projectPhaseLabel({project_progress:{status:'running',percent:24},"
+        "generation:{status:'running',stage:'video-maker'}}),"
+        "projectIndex:contract.projectPhaseLabel({project_progress:{status:'running',percent:56},"
+        "generation:{status:'running',stage:'video-maker-project-index'}}),"
+        "h3:contract.projectPhaseLabel({project_progress:{status:'running',percent:57},"
+        "generation:{status:'running',stage:'h3-max-r2v'}}),"
+        "stitch:contract.projectPhaseLabel({project_progress:{status:'running',percent:95},"
+        "generation:{status:'running',stage:'stitch'}})"
+        "}))()"
+    )
+    assert result == {
+        "queued": "AI 正在理解视频",
+        "analysis": "AI 正在理解视频",
+        "videoMaker": "AI 正在思考创意",
+        "projectIndex": "AI 正在思考创意",
+        "h3": "AI 正在生成视频",
+        "stitch": "AI 正在生成视频",
+    }
+
+
+def test_project_configuration_model_restores_server_values_and_local_inputs():
+    result = _run_contract(
+        "(()=>{const request={version:1,output:{aspect_ratio:'16:9',resolution:'480p',fit_mode:'auto'},"
+        "processing:{optimize_image:true,remove_subtitle:true,remove_logo:true},"
+        "dialogue:{mode:'auto_rewrite',target_language:'日语'},"
+        "replacement_guidance:{instruction:'替换成参考产品',image_field:'replacement_image'}};"
+        "const local={request,input:contract.creationInputSnapshot({url:'https://media.example/source.mp4',"
+        "replacementImage:{name:'product.png',size:321,type:'image/png'}})};"
+        "const restored=contract.projectComposerModel({effective_request:request,"
+        "input_receipt:{replacement_image:{sha256:'a',bytes:321}}},local);"
+        "const same=contract.projectComposerModel({effective_request:{...request,"
+        "dialogue:{mode:'auto_rewrite',target_language:'与原视频相同'},replacement_guidance:null},"
+        "creation_input:{version:1,source:{mode:'upload',filename:'clip.mp4',bytes:456},replacement_image:null},"
+        "input_receipt:{replacement_image:null}},null);"
+        "const historical=contract.projectComposerModel({effective_request:{...request,replacement_guidance:null},"
+        "creation_input:null,input_receipt:{replacement_image:null}},local);"
+        "const generate=contract.projectComposerModel({effective_request:{...request,"
+        "dialogue:{mode:'generate',target_language:'日语',brief:'口播描述文本'},replacement_guidance:null},"
+        "creation_input:{version:1,source:{mode:'upload',filename:'clip.mp4',bytes:456},replacement_image:null},"
+        "input_receipt:{replacement_image:null}},null);"
+        "const invalid=contract.projectComposerModel({effective_request:{version:1,output:{aspect_ratio:'1:1'}}},local);"
+        "return {restored,same,historical,generate,invalid}})()"
+    )
+    assert result["restored"] == {
+        "addSubtitles": False,
+        "aspectRatio": "16:9",
+        "resolution": "480p",
+        "dialogueMode": "auto_rewrite",
+        "dialogueBrief": "",
+        "languageMode": "other",
+        "targetLanguage": "日语",
+        "replacementInstruction": "替换成参考产品",
+        "source": {"mode": "link", "reference_url": "https://media.example/source.mp4"},
+        "replacementImage": {
+            "filename": "product.png", "bytes": 321,
+            "media_type": "image/png", "preview_url": "",
+        },
+        "replacementImages": [{
+            "filename": "product.png", "bytes": 321,
+            "media_type": "image/png", "preview_url": "",
+        }],
+    }
+    assert result["same"] == {
+        "addSubtitles": False,
+        "aspectRatio": "16:9",
+        "resolution": "480p",
+        "dialogueMode": "auto_rewrite",
+        "dialogueBrief": "",
+        "languageMode": "same",
+        "targetLanguage": "",
+        "replacementInstruction": "",
+        "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
+        "replacementImage": None,
+        "replacementImages": [],
+    }
+    assert result["historical"] == {
+        "addSubtitles": False,
+        "aspectRatio": "16:9",
+        "resolution": "480p",
+        "dialogueMode": "auto_rewrite",
+        "dialogueBrief": "",
+        "languageMode": "other",
+        "targetLanguage": "日语",
+        "replacementInstruction": "",
+        "source": None,
+        "replacementImage": None,
+        "replacementImages": [],
+    }
+    assert result["generate"] == {
+        "addSubtitles": False,
+        "aspectRatio": "16:9",
+        "resolution": "480p",
+        "dialogueMode": "generate",
+        "dialogueBrief": "口播描述文本",
+        "languageMode": "other",
+        "targetLanguage": "日语",
+        "replacementInstruction": "",
+        "source": {"mode": "upload", "filename": "clip.mp4", "bytes": 456},
+        "replacementImage": None,
+        "replacementImages": [],
+    }
+    assert result["invalid"] is None
+
+
+def test_creation_input_server_presence_is_authoritative_and_link_null_is_preserved():
+    result = _run_contract(
+        "(()=>{const local=contract.creationInputSnapshot({url:'https://local.example/source.mp4'});"
+        "const omitted=contract.resolveCreationInputSnapshot({},local);"
+        "const explicitNull=contract.resolveCreationInputSnapshot({creation_input:null},local);"
+        "const future=contract.resolveCreationInputSnapshot({creation_input:{version:2,source:{mode:'link',"
+        "reference_url:'https://server.example/source.mp4'},replacement_image:null}},local);"
+        "const malformed=contract.resolveCreationInputSnapshot({creation_input:{version:1,"
+        "source:{mode:'upload',filename:'clip.mp4',bytes:12},replacement_image:{filename:'product.png',"
+        "bytes:3,media_type:'image/png'}}},local);"
+        "const redacted=contract.resolveCreationInputSnapshot({creation_input:{version:1,"
+        "source:{mode:'link',reference_url:null},replacement_image:null}},local);"
+        "return {omitted,explicitNull,future,malformed,redacted}})()"
+    )
+
+    assert result["omitted"]["source"] == {
+        "mode": "link", "reference_url": "https://local.example/source.mp4"
+    }
+    assert result["explicitNull"] is None
+    assert result["future"] is None
+    assert result["malformed"] is None
+    assert result["redacted"] == {
+        "version": 1,
+        "source": {"mode": "link", "reference_url": None},
+        "replacement_image": None,
+        "replacement_images": [],
+    }
+
+
+def test_multi_reference_snapshot_is_ordered_and_keeps_the_single_image_projection():
+    result = _run_contract(
+        "(()=>{const images=[{name:'first.png',size:3,type:'image/png'},"
+        "{name:'second.webp',size:5,type:'image/webp'},"
+        "{name:'third.jpg',size:7,type:'image/jpeg'}];"
+        "const local=contract.creationInputSnapshot({url:'https://media.example/source.mp4',replacementImages:images});"
+        "const base='/api/conversations/project-1/creation-input/';"
+        "const server={version:1,source:{mode:'link',reference_url:'https://media.example/source.mp4'},"
+        "replacement_image:{filename:'first.png',bytes:3,media_type:'image/png',preview_url:base+'replacement-image'},"
+        "replacement_images:[{filename:'first.png',bytes:3,media_type:'image/png',preview_url:base+'replacement-images/1'},"
+        "{filename:'second.webp',bytes:5,media_type:'image/webp',preview_url:base+'replacement-images/2'},"
+        "{filename:'third.jpg',bytes:7,media_type:'image/jpeg',preview_url:base+'replacement-images/3'}]};"
+        "const mismatch={...server,replacement_image:{...server.replacement_image,filename:'wrong.png'}};"
+        "const request={version:1,output:{aspect_ratio:'9:16',resolution:'768p',fit_mode:'auto'},"
+        "processing:{optimize_image:true,remove_subtitle:true,remove_logo:true},"
+        "dialogue:{mode:'auto_rewrite',target_language:'日语'},"
+        "replacement_guidance:{instruction:'替换成参考图',image_field:'replacement_image'},add_subtitles:false};"
+        "return {local,localNormalized:contract.normalizeCreationInputSnapshot(local,{allowLocalPreview:true}),"
+        "server:contract.normalizeCreationInputSnapshot(server),"
+        "model:contract.projectComposerModel({effective_request:request,creation_input:server},null),"
+        "mismatch:contract.normalizeCreationInputSnapshot(mismatch)};})()"
+    )
+    expected_images = [
+        {"filename": "first.png", "bytes": 3, "media_type": "image/png"},
+        {"filename": "second.webp", "bytes": 5, "media_type": "image/webp"},
+        {"filename": "third.jpg", "bytes": 7, "media_type": "image/jpeg"},
+    ]
+    assert result["local"]["replacement_images"] == expected_images
+    assert result["local"]["replacement_image"] == expected_images[0]
+    assert result["localNormalized"]["replacement_images"] == [
+        {**image, "preview_url": ""} for image in expected_images
+    ]
+    assert result["localNormalized"]["replacement_image"] == {
+        **expected_images[0], "preview_url": ""
+    }
+    assert [image["filename"] for image in result["server"]["replacement_images"]] == [
+        "first.png", "second.webp", "third.jpg"
+    ]
+    # 旧单图预览和列表第一个预览的安全路径不同，但元数据必须是首图投影。
+    assert result["server"]["replacement_image"]["preview_url"].endswith("replacement-image")
+    assert result["server"]["replacement_images"][0]["preview_url"].endswith("replacement-images/1")
+    assert [image["filename"] for image in result["model"]["replacementImages"]] == [
+        "first.png", "second.webp", "third.jpg"
+    ]
+    assert {
+        key: result["model"]["replacementImage"][key]
+        for key in ("filename", "bytes", "media_type")
+    } == {
+        key: result["model"]["replacementImages"][0][key]
+        for key in ("filename", "bytes", "media_type")
+    }
+    assert result["mismatch"] is None
+
+
+def test_creation_input_preview_path_is_exact_and_same_origin():
+    result = _run_contract(
+        "(()=>{const id='project-1';const origin='https://studio.example';"
+        "const path='/api/conversations/project-1/creation-input/replacement-image';"
+        "const indexed='/api/conversations/project-1/creation-input/replacement-images/2';"
+        "return {relative:contract.creationInputReplacementPreviewPath(id,path,origin),"
+        "absolute:contract.creationInputReplacementPreviewPath(id,origin+path,origin),"
+        "indexed:contract.creationInputReplacementPreviewPath(id,indexed,origin,2),"
+        "indexedAbsolute:contract.creationInputReplacementPreviewPath(id,origin+indexed,origin,2),"
+        "wrongIndex:contract.creationInputReplacementPreviewPath(id,indexed,origin,1),"
+        "zeroIndex:contract.creationInputReplacementPreviewPath(id,indexed,origin,0),"
+        "external:contract.creationInputReplacementPreviewPath(id,'https://evil.example'+path,origin),"
+        "otherProject:contract.creationInputReplacementPreviewPath(id,"
+        "'/api/conversations/project-2/creation-input/replacement-image',origin),"
+        "query:contract.creationInputReplacementPreviewPath(id,path+'?download=1',origin),"
+        "suffix:contract.creationInputReplacementPreviewPath(id,path+'/extra',origin)}})()"
+    )
+
+    expected = "/api/conversations/project-1/creation-input/replacement-image"
+    assert result == {
+        "relative": expected,
+        "absolute": expected,
+        "indexed": "/api/conversations/project-1/creation-input/replacement-images/2",
+        "indexedAbsolute": "/api/conversations/project-1/creation-input/replacement-images/2",
+        "wrongIndex": None,
+        "zeroIndex": None,
+        "external": None,
+        "otherProject": None,
+        "query": None,
+        "suffix": None,
+    }
+
+
+def test_configuration_is_reapplied_on_refresh_and_project_switch_not_polling():
+    source = APP_JS.read_text(encoding="utf-8")
+    load_detail = _function_source(source, "loadDetail")
+    submit = _function_source(source, "handleSend")
+    restore = _function_source(source, "applyProjectComposer")
+
+    assert "if (!silent) applyProjectComposer(detail);" in load_detail
+    assert "rememberSubmittedComposer(" in submit
+    assert submit.index("rememberSubmittedComposer(") < submit.index("selectConversation(created.id)")
+    for mapping in (
+        'input[name="aspect-ratio"]',
+        'input[name="resolution"]',
+        'input[name="target-language-mode"]',
+        '$("lang-input").value = model.targetLanguage',
+        '$("replacement-instruction").value = model.replacementInstruction',
+        'model.source.mode === "upload"',
+        "storedComposerDraft(detail.id)",
+    ):
+        assert mapping in restore
+
+    select = _function_source(source, "selectConversation")
+    loading = _function_source(source, "prepareComposerForProjectLoad")
+    assert select.index("prepareComposerForProjectLoad()") < select.index("loadDetail(id, false)")
+    assert "state.viewingSubmittedConfig = true" in loading
+    assert 'showUnavailableSource("正在加载项目配置…")' in loading
+
+
+def test_restored_project_configuration_is_view_only_and_releases_file_objects():
+    source = APP_JS.read_text(encoding="utf-8")
+    restore = _function_source(source, "applyProjectComposer")
+    reset = _function_source(source, "resetComposerForNewProject")
+    update_button = _function_source(source, "updateSendBtn")
+    remember = _function_source(source, "rememberSubmittedComposer")
+    cleanup = _function_source(source, "clearComposerSnapshots")
+    expired = _function_source(source, "sessionExpired")
+
+    assert "state.viewingSubmittedConfig = true" in restore
+    assert "state.viewingSubmittedConfig = false" in reset
+    assert "state.viewingSubmittedConfig" in update_button
+    assert "const record = { request, input };" in remember
+    assert "sourceFile" not in remember
+    assert "replacementImage:" not in remember
+    assert "sessionStorage.removeItem(COMPOSER_SNAPSHOTS_KEY)" in cleanup
+    assert "revokeReplacementPreviewURLs()" in cleanup
+    assert "clearComposerSnapshots()" in expired
+
+    enter = _function_source(source, "enterApp")
+    assert "resetComposerForNewProject()" in enter
+
+    preview = _function_source(source, "loadSubmittedReplacementPreview")
+    assert "creationInputReplacementPreviewPath(conversationId, previewUrl, null, index)" in preview
+    assert "api(safePath)" in preview
+    assert "api(previewUrl)" not in preview
+
+    assert 'showUnavailableSource("历史项目未保存来源信息")' in restore
+    assert '$("url-input").placeholder = "链接来源已提交"' in restore
+    assert "localPreviewAllowed" in restore
+
+
+def test_success_response_freezes_configuration_before_followup_requests():
+    source = APP_JS.read_text(encoding="utf-8")
+    submit = _function_source(source, "handleSend")
+    entry = submit.split("const mode = sourceMode()", 1)[0]
+    success = submit.split("const created = await uploadConversation", 1)[1].split(
+        "} catch (err)", 1
+    )[0]
+    before_refresh = success.split("await refreshList(false)", 1)[0]
+
+    assert "state.uploading || state.viewingSubmittedConfig" in entry
+    for immediate_freeze in (
+        "state.viewingSubmittedConfig = true",
+        "state.file = null",
+        "state.replacementImages = []",
+        '$("file-input").value = ""',
+        '$("replacement-image-input").value = ""',
+    ):
+        assert immediate_freeze in before_refresh
+    assert before_refresh.index("rememberSubmittedComposer(") < before_refresh.index(
+        "state.viewingSubmittedConfig = true"
+    )
+    assert before_refresh.index("state.viewingSubmittedConfig = true") < before_refresh.index(
+        "setUploading(false)"
+    )
+    assert success.index("await refreshList(false)") < success.index(
+        "selectConversation(created.id)"
+    )
+
+
+def test_view_only_configuration_blocks_hidden_file_and_drop_paths():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    set_uploading = _function_source(source, "setUploading")
+    pick_video = _function_source(source, "pickFile")
+    pick_replacement = _function_source(source, "pickReplacementImages")
+    bind_events = _function_source(source, "bindEvents")
+
+    for input_id in ("file-input", "replacement-image-input"):
+        assert "hidden" in _tag_attrs(html, "input", input_id)
+        assert f'$("{input_id}").disabled = controlsDisabled' in set_uploading
+    assert "if (state.viewingSubmittedConfig) return;" in pick_video
+    assert pick_video.index("state.viewingSubmittedConfig") < pick_video.index(
+        "setComposerError(null)"
+    )
+    assert "if (state.viewingSubmittedConfig) return;" in pick_replacement
+    assert pick_replacement.index("state.viewingSubmittedConfig") < pick_replacement.index(
+        "setComposerError(null)"
+    )
+    assert bind_events.count("!state.viewingSubmittedConfig") >= 2
+    assert (
+        "state.uploading || state.viewingSubmittedConfig || sourceMode() !== \"upload\""
+        in bind_events
+    )
+
+
+def test_reference_image_picker_rejects_unsupported_formats_before_submit():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = APP_JS.read_text(encoding="utf-8")
+    file_check = _function_source(source, "isReferenceImageFile")
+    picker = _function_source(source, "pickReplacementImages")
+    capability_loader = _function_source(source, "loadMinimalCreationCapability")
+
+    assert 'accept="image/jpeg,image/png,image/webp"' in _tag_attrs(
+        html, "input", "replacement-image-input"
+    )
+    assert "multiple" in _tag_attrs(html, "input", "replacement-image-input")
+    assert '$("replacement-image-input").accept = normalized.replacement.accept.join(",")' in capability_loader
+    assert "REPLACEMENT_IMAGE_TYPES.includes(file.type)" in file_check
+    assert "jpe?g|png|webp" in file_check
+    assert "images.some((image) => !isReferenceImageFile(image))" in picker
+    assert "参考图仅支持 JPG、PNG 或 WebP" in picker
+    assert "images.some((image) => image.size > capability.replacement.max_bytes)" in picker
+    assert "state.replacementImages.push(...images)" in picker
+    assert "state.replacementImages.length + images.length > maxImages" in picker
+    renderer = _function_source(source, "renderReplacementImages")
+    assert 'image.filename || image.name || "参考图"' in renderer
+
+
+def test_logout_and_401_scrub_composer_session_and_stream_urls():
+    source = APP_JS.read_text(encoding="utf-8")
+    auth_error = _function_source(source, "handleAuthError")
+    expired = _function_source(source, "sessionExpired")
+    cleanup = _function_source(source, "clearComposerSnapshots")
+    reset = _function_source(source, "resetComposerForNewProject")
+    clear_stream = _function_source(source, "clearStream")
+    bind_events = _function_source(source, "bindEvents")
+    logout = bind_events.split('$("logout-btn").addEventListener', 1)[1].split(
+        '$("menu-btn").addEventListener', 1
+    )[0]
+
+    assert "sessionExpired()" in auth_error
+    for action in (
+        "state.authEpoch += 1",
+        "state.token = null",
+        "localStorage.removeItem(TOKEN_KEY)",
+        "clearComposerSnapshots()",
+        "resetComposerForNewProject()",
+        "clearStream()",
+    ):
+        assert action in expired
+        assert action in logout
+    assert expired.index("clearComposerSnapshots()") < expired.index("showLogin(")
+    assert logout.index("clearComposerSnapshots()") < logout.index("showLogin(")
+
+    assert "sessionStorage.removeItem(COMPOSER_SNAPSHOTS_KEY)" in cleanup
+    assert "revokeReplacementPreviewURLs()" in cleanup
+    for cleared_control in (
+        '$("file-input").value = ""',
+        '$("url-input").value = ""',
+        "resetReplacementImageDisplay()",
+        '$("replacement-instruction").value = ""',
+        '$("lang-input").value = ""',
+    ):
+        assert cleared_control in reset
+    assert "revokeURLs()" in clear_stream
+    assert '$("stream").textContent = ""' in clear_stream
+
+
+def test_inflight_upload_continuations_are_scoped_to_the_auth_epoch():
+    source = APP_JS.read_text(encoding="utf-8")
+    submit = _function_source(source, "handleSend")
+    login = _function_source(source, "doLogin")
+    before_upload = submit.split("const created = await uploadConversation", 1)[0]
+    after_upload = submit.split("const created = await uploadConversation", 1)[1]
+    success, failure = after_upload.split("} catch (err)", 1)
+
+    assert "state.authEpoch += 1" in login
+    assert "const submitEpoch = state.authEpoch" in before_upload
+    assert before_upload.index("const submitEpoch = state.authEpoch") < before_upload.index(
+        "const progress"
+    )
+    assert "if (submitEpoch !== state.authEpoch) return;" in success
+    assert success.index("if (submitEpoch !== state.authEpoch) return;") < success.index(
+        "rememberSubmittedComposer("
+    )
+    assert "if (submitEpoch !== state.authEpoch) return;" in failure
+    assert failure.index("if (submitEpoch !== state.authEpoch) return;") < failure.index(
+        "setUploading(false)"
+    )
+
+
+def test_success_keeps_submitted_configuration_in_the_collapsible_composer():
+    source = APP_JS.read_text(encoding="utf-8")
+    submit = _function_source(source, "handleSend")
+    success = submit.split("const created = await uploadConversation", 1)[1].split(
+        "} catch (err)", 1
+    )[0]
+
+    assert "state.clientRequestId = newRequestId()" in success
+    assert "setUploading(false)" in success
+    assert "selectConversation(created.id)" in success
+    assert "created," in success
+    assert success.index("state.viewingSubmittedConfig = true") < success.index("setUploading(false)")
+    for destructive_reset in (
+        "clearFile()",
+        '$("url-input").value = ""',
+        '$("lang-input").value = ""',
+        '$("replacement-instruction").value = ""',
+        "clearReplacementImage()",
+    ):
+        assert destructive_reset not in success
+
+
+def test_sidebar_project_cards_restore_0903_information_density_and_manual_selection():
+    source = APP_JS.read_text(encoding="utf-8")
+    render_list = _function_source(source, "renderList")
+
+    for visible_project_field in (
+        'const badgeState = conversationBadge(c);',
+        'el("span", "badge " + badgeState.className, badgeState.text)',
+        'el("span", "conv-identity")',
+        "formatDuration(c.duration_s)",
+        'el("span", "conv-footer")',
+        "const progress = projectProgressModel(c);",
+        'el("span", null, progress.elapsed)',
+        "progress.loading ? c.created_at : (c.updated_at || c.created_at)",
+        'el("span", "conv-time", fmtTime(cardTime))',
+        'el("span", "conv-output " + (c.has_video === true ? "is-ready" : "is-waiting")',
+        'c.has_video === true ? "成片已提交" : "等待成片"',
+    ):
+        assert visible_project_field in render_list
+    assert 'el("span", "conv-id", "#" + shortId(c.id))' not in render_list
+    assert "segment_count" not in render_list
+    assert "operationTimeline" not in render_list
+    assert "timeline.current.label" not in render_list
+    assert "progress.elapsedLabel" not in render_list
+
+    assert 'c.id === state.currentId ? " selected" : ""' in render_list
+    click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]
+    assert click_handler.index("selectConversation(c.id);") < click_handler.index(
+        "closeDrawer();"
+    )
+
+
+def test_sidebar_refresh_uses_list_summaries_without_n_plus_one_detail_requests():
+    source = APP_JS.read_text(encoding="utf-8")
+    refresh = _function_source(source, "refreshList")
+    hydrate = _function_source(source, "hydrateConversationSummaries")
+    thumbnail = _function_source(source, "loadHistoryThumbnail")
+
+    assert refresh.count('apiJSON("/api/conversations")') == 1
+    assert 'apiJSON("/api/conversations/"' not in refresh
+    assert "hydrateConversationSummaries()" in refresh
+    assert 'apiJSON("/api/conversations/" + encodeURIComponent(summary.id))' not in source
+    assert "apiJSON(" not in hydrate
+    assert "loadDetail(" not in hydrate
+    assert "loadHistoryThumbnail(summary)" in hydrate
+
+    assert "summary.thumbnail_path" in thumbnail
+    assert '"/files/" + encodedMediaPath(summary.thumbnail_path)' in thumbnail
+    assert "apiJSON(" not in thumbnail
+    assert "loadDetail(" not in thumbnail
+
+
+def test_enter_app_stays_new_until_manual_or_created_project_selection():
+    source = APP_JS.read_text(encoding="utf-8")
+    enter = _function_source(source, "enterApp").split(
+        "/* ===== 侧栏会话列表 ===== */", 1
+    )[0]
+    refresh = _function_source(source, "refreshList")
+    select = _function_source(source, "selectConversation")
+    render_list = _function_source(source, "renderList")
+    bind = _function_source(source, "bindEvents")
+
+    for caller in ("doLogin", "boot"):
+        assert "enterApp();" in _function_source(source, caller)
+    for new_project_action in (
+        "state.currentId = null",
+        "state.detail = null",
+        "resetComposerForNewProject()",
+        "renderEmptyHero()",
+        "refreshList(false)",
+    ):
+        assert new_project_action in enter
+    assert "SELECTED_PROJECT_KEY" not in source
+    assert "storedSelectedProjectId" not in source
+    assert "state.pendingRestoreId" not in source
+    assert "rememberSelectedProjectId" not in source
+    assert "clearSelectedProjectId" not in source
+    assert "refreshList(true)" not in enter
+    assert "selectConversation(" not in enter
+    assert refresh.count('apiJSON("/api/conversations")') == 1
+    assert "selectConversation(" not in refresh
+
+    click_handler = render_list.split('item.addEventListener("click", () => {', 1)[1]
+    assert "selectConversation(c.id);" in click_handler
+    assert "loadDetail(id, false)" in select
+
+    new_project = bind.split('$("new-chat-btn").addEventListener', 1)[1].split(
+        '$("attach-btn").addEventListener', 1
+    )[0]
+    for reset_action in (
+        "state.currentId = null",
+        "state.detail = null",
+        "resetComposerForNewProject()",
+        "renderEmptyHero()",
+    ):
+        assert reset_action in new_project
+
+    submit = _function_source(source, "handleSend")
+    success = submit.split("const created = await uploadConversation", 1)[1].split(
+        "} catch (err)", 1
+    )[0]
+    assert success.index("await refreshList(false)") < success.index(
+        "selectConversation(created.id)"
+    )
+
+
+def test_initial_detail_failure_clears_selection_and_returns_to_new_project():
+    source = APP_JS.read_text(encoding="utf-8")
+    load_detail = _function_source(source, "loadDetail")
+    failure = load_detail.split("} catch (err) {", 1)[1]
+    silent_start = failure.index("if (silent) {")
+    initial_start = failure.index("state.currentId = null", silent_start)
+    silent_failure = failure[silent_start:initial_start]
+    initial_failure = failure[initial_start:]
+
+    assert "if (seq !== state.detailSeq || state.currentId !== id) return;" in failure
+    assert "if (silent) {" in silent_failure
+    assert 'renderStreamError("会话加载失败：" + err.message);' in silent_failure
+    assert "startPolling(id);" in silent_failure
+    for action in (
+        "state.currentId = null",
+        "state.detail = null",
+        "resetComposerForNewProject()",
+        "renderList()",
+        "renderEmptyHero()",
+        'setComposerError("项目加载失败，已回到新建项目：" + err.message)',
+    ):
+        assert action in initial_failure
+
+    ordered_actions = (
+        "state.currentId = null",
+        "state.detail = null",
+        "resetComposerForNewProject()",
+        "renderList()",
+        "renderEmptyHero()",
+    )
+    positions = [initial_failure.index(action) for action in ordered_actions]
+    assert positions == sorted(positions)
+
+
+def test_terminal_detail_updates_sidebar_locally_without_another_list_get():
+    source = APP_JS.read_text(encoding="utf-8")
+    load_detail = _function_source(source, "loadDetail")
+    poll_decision = load_detail.split("if (shouldPollDetail(detail)", 1)[1]
+
+    assert "syncConversationDetail(state.conversations, detail)" in load_detail
+    assert "renderList();" in load_detail
+    assert "stopPolling();" in poll_decision
+    assert "refreshList(" not in poll_decision

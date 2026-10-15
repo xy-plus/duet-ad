@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">H3 Max R2V 当前完整链路</title>
+  <desc id="desc">输入经过视频分析和项目级全局索引，由 Object Replace 与 Seedream 生成单张新形象图版，再由 Fusion 和 H3 生成并拼接成片。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#102744"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#365672" stroke-width="1" opacity=".2"/></pattern>
+    <filter id="shadow"><feDropShadow dy="7" stdDeviation="8" flood-color="#000814" flood-opacity=".45"/></filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5 0 10Z" fill="#48d8ff"/></marker>
+    <style>
+      .t{font-family:system-ui,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#eef8ff}.title{font-size:40px;font-weight:750}.sub{font-size:20px;fill:#9bc7e8}.h{font-size:24px;font-weight:750}.n{font-size:17px;font-weight:650}.s{font-size:15px;fill:#c8def0}.m{font:600 14px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#d9f5ff}.panel{fill:#102944;stroke:#356d91;stroke-width:2}.card{fill:#153653;stroke:#3b7da3;stroke-width:1.5}.gold{fill:#443719;stroke:#ffd166;stroke-width:3}.purple{fill:#292252;stroke:#8670dc;stroke-width:2}.green{fill:#123d3c;stroke:#2abe9e;stroke-width:2}.warn{fill:#401f2a;stroke:#ff6b7a;stroke-width:2}.flow{fill:none;stroke:#48d8ff;stroke-width:4;marker-end:url(#arrow)}.inner{fill:none;stroke:#6fb8dc;stroke-width:2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#bg)"/><rect width="1920" height="1080" fill="url(#grid)"/>
+  <text x="50" y="58" class="t title">H3 Max R2V 当前完整链路</text>
+  <text x="50" y="92" class="t sub">全局索引是唯一身份锚点 · 单项目一张 Seedream 新形象图版 · 所有分段复用同一映射</text>
+  <rect x="1515" y="33" width="350" height="54" rx="27" class="gold"/><text x="1690" y="67" text-anchor="middle" class="t n" fill="#ffe4a0">GLOBAL INDEX ANCHOR</text>
+
+  <!-- Five main phases -->
+  <g filter="url(#shadow)"><rect x="40" y="125" width="340" height="680" rx="20" class="panel"/><rect x="408" y="125" width="340" height="680" rx="20" class="panel"/><rect x="776" y="125" width="340" height="680" rx="20" class="purple"/><rect x="1144" y="125" width="340" height="680" rx="20" class="panel"/><rect x="1512" y="125" width="368" height="680" rx="20" class="green"/></g>
+  <path d="M380 450H408M748 450H776M1116 450H1144M1484 450H1512" class="flow"/>
+
+  <!-- Phase 1 -->
+  <text x="64" y="165" class="t h">1  输入与前处理</text>
+  <rect x="62" y="188" width="296" height="105" rx="12" class="card"/>
+  <text x="82" y="219" class="t n">创建输入</text><text x="82" y="246" class="t s">源视频 · generation_request</text><text x="82" y="271" class="t s">可选用户图 · 持久化创建幂等</text>
+  <path d="M210 293V319" class="inner"/>
+  <rect x="62" y="319" width="296" height="103" rx="12" class="card"/>
+  <text x="82" y="351" class="t n">音频与场景分析</text><text x="82" y="379" class="t s">Whisper / YAMNet · 场景检测</text><text x="82" y="404" class="t s">spoken-only 台词与时间轴</text>
+  <path d="M210 422V448" class="inner"/>
+  <rect x="62" y="448" width="296" height="112" rx="12" class="card"/>
+  <text x="82" y="480" class="t n">scene-first 分段</text><text x="82" y="508" class="t s">4–10 秒 · join_mode · 原视频 PTS</text><text x="82" y="535" class="t s">每段 exact-9 关键帧</text>
+  <path d="M210 560V586" class="inner"/>
+  <rect x="62" y="586" width="296" height="108" rx="12" class="card"/>
+  <text x="82" y="618" class="t n">MediaKit 清理</text><text x="82" y="646" class="t s">去字幕 / Logo</text><text x="82" y="672" class="t s">全尺寸处理 → 分析副本</text>
+  <rect x="62" y="718" width="296" height="62" rx="12" fill="#0d2338" stroke="#356887"/><text x="82" y="744" class="t n">冻结产物</text><text x="82" y="767" class="t m">segments + frames + voice_lines</text>
+
+  <!-- Phase 2 -->
+  <text x="432" y="165" class="t h">2  VideoMaker 与全局索引</text>
+  <rect x="430" y="188" width="296" height="100" rx="12" class="card"/><text x="450" y="220" class="t n">逐段 VideoMaker</text><text x="450" y="248" class="t s">九帧像素是唯一视觉事实源</text><text x="450" y="274" class="t m">segment.visual_prompt</text>
+  <path d="M578 288V322" class="inner"/>
+  <rect x="430" y="322" width="296" height="236" rx="16" class="gold"/>
+  <text x="578" y="358" text-anchor="middle" class="t h" fill="#ffe4a0">项目级 Project Index</text><text x="578" y="392" text-anchor="middle" class="t n" fill="#ffe4a0">唯一身份锚点</text>
+  <rect x="454" y="417" width="248" height="108" rx="10" fill="#282824" stroke="#ffd166"/>
+  <text x="475" y="446" class="t m">people: person-01</text><text x="475" y="472" class="t m">entities: entity-01..N</text><text x="475" y="498" class="t m">scenes / relations</text>
+  <text x="578" y="546" text-anchor="middle" class="t s" fill="#ffe4a0">stable key 跨图片、跨分段持续复用</text>
+  <path d="M578 558V587" class="inner"/>
+  <rect x="430" y="587" width="296" height="105" rx="12" class="card"/><text x="450" y="620" class="t n">项目级翻译 / 台词本地化</text><text x="450" y="648" class="t s">目标语种 · 分段时间窗口</text><text x="450" y="674" class="t s">冻结 translated dialogue</text>
+  <rect x="430" y="718" width="296" height="62" rx="12" fill="#0d2338" stroke="#356887"/><text x="450" y="744" class="t n">冻结原始索引</text><text x="450" y="767" class="t m">work/element_index.json</text>
+
+  <!-- Phase 3 -->
+  <text x="800" y="165" class="t h">3  Object Replace 与 Seedream</text>
+  <rect x="798" y="188" width="296" height="132" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="220" class="t n">Object Replace v3</text><text x="818" y="248" class="t s">确定性 replacement_set</text><text x="818" y="273" class="t s">全部人物 / 实体 / 场景 stable key</text><text x="818" y="298" class="t s">外观 / 交互语义分离 · 人物音色</text>
+  <path d="M946 320V346" class="inner"/>
+  <rect x="798" y="346" width="296" height="97" rx="12" fill="#332b68" stroke="#957eea"/><text x="818" y="378" class="t n">后端确定性映射</text><text x="818" y="407" class="t m">stable key → TILE_XX</text><text x="818" y="431" class="t s">sheet bundle v4 · spec v2</text>
+  <path d="M946 443V469" class="inner"/>
+  <rect x="798" y="469" width="296" height="220" rx="14" fill="#211d48" stroke="#aa92f3"/><text x="818" y="501" class="t n">Seedream · 每项目仅 1 次</text><text x="818" y="527" class="t s">Image 1 空白布局 · Image 2 可选用户图</text>
+  <g transform="translate(826 550)"><rect width="240" height="108" rx="8" fill="#f2f0e8" stroke="#e4cf87" stroke-width="2"/><rect x="7" y="7" width="110" height="44" fill="#b9d4e5"/><rect x="123" y="7" width="110" height="44" fill="#d2b8df"/><rect x="7" y="57" width="110" height="44" fill="#d9bf91"/><rect x="123" y="57" width="110" height="44" fill="#abcbb1"/><text x="15" y="34" class="t m" fill="#173044">TILE_01</text><text x="131" y="34" class="t m" fill="#35223d">TILE_02</text><text x="15" y="84" class="t m" fill="#3d2e19">TILE_03</text><text x="131" y="84" class="t m" fill="#213c27">TILE_04</text></g><text x="818" y="681" class="t s">人物面部特写 · 单体分格 · 场景空置</text>
+  <rect x="798" y="713" width="296" height="67" rx="12" fill="#392f70" stroke="#b09cf4"/><text x="818" y="741" class="t n">单张 2048×2048 新形象图版</text><text x="818" y="766" class="t s">固定标签、行列、文件 SHA</text>
+
+  <!-- Phase 4 -->
+  <text x="1168" y="165" class="t h">4  Fusion 与 H3</text>
+  <rect x="1166" y="188" width="296" height="112" rx="12" class="card"/><text x="1186" y="220" class="t n">逐段 Fusion</text><text x="1186" y="249" class="t m">stable key → TILE_XX → Image N</text><text x="1186" y="276" class="t s">图版取外观 · 增强索引取动作/关系</text>
+  <path d="M1314 300V326" class="inner"/>
+  <rect x="1166" y="326" width="296" height="178" rx="12" class="card"/><text x="1186" y="358" class="t n">H3 有序媒体输入</text><text x="1186" y="388" class="t s">Video 1：静音源片段</text><text x="1186" y="418" class="t s">Image 1 图版（固定主参考）</text><text x="1186" y="444" class="t s">有绑定：Image 2 用户图</text><text x="1186" y="471" class="t s">提示词首行强制换脸</text><text x="1186" y="496" class="t s">Audio 1..N：冻结音色</text>
+  <path d="M1314 504V530" class="inner"/>
+  <rect x="1166" y="530" width="296" height="105" rx="12" fill="#102f4b" stroke="#48d8ff" stroke-width="2"/><text x="1186" y="563" class="t n">H3 manifest v4</text><text x="1186" y="591" class="t s">prompt / 媒体顺序 / 路径 / SHA</text><text x="1186" y="617" class="t s">全段预检后才越过付费边界</text>
+  <path d="M1314 635V661" class="inner"/>
+  <rect x="1166" y="661" width="296" height="119" rx="12" fill="#173957" stroke="#55bee8"/><text x="1186" y="694" class="t n">Picsart H3 Max R2V</text><text x="1186" y="722" class="t s">逐段独立 task，共享图版锚点</text><text x="1186" y="750" class="t m">Segment 1 · 2 · ... · N</text>
+
+  <!-- Phase 5 -->
+  <text x="1536" y="165" class="t h">5  输出</text>
+  <rect x="1534" y="188" width="324" height="105" rx="12" fill="#174c48" stroke="#2fc4a3"/><text x="1554" y="221" class="t n">逐段供应商任务</text><text x="1554" y="251" class="t m">submit → poll → download</text><text x="1554" y="277" class="t s">task_id 与付费回执绑定</text>
+  <path d="M1696 293V324" class="inner"/>
+  <rect x="1534" y="324" width="324" height="103" rx="12" fill="#174c48" stroke="#2fc4a3"/><text x="1554" y="357" class="t n">逐段后处理</text><text x="1554" y="386" class="t s">24 fps · 裁回源片段时长</text><text x="1554" y="413" class="t s">验证媒体可解码</text>
+  <path d="M1696 427V458" class="inner"/>
+  <rect x="1534" y="458" width="324" height="103" rx="12" fill="#174c48" stroke="#2fc4a3"/><text x="1554" y="491" class="t n">最终拼接</text><text x="1554" y="520" class="t s">按 join_mode 顺序 concat</text><text x="1554" y="547" class="t s">保留目标台词与音轨</text>
+  <path d="M1696 561V592" class="inner"/>
+  <rect x="1534" y="592" width="324" height="124" rx="14" fill="#0e5a4b" stroke="#45e0b7" stroke-width="3"/><text x="1696" y="632" text-anchor="middle" class="t h">最终成片</text><text x="1696" y="667" text-anchor="middle" class="t n">H.264 + AAC</text><text x="1696" y="697" text-anchor="middle" class="t s">完整下载 · Range 206</text>
+  <rect x="1534" y="738" width="324" height="42" rx="12" fill="#123b37" stroke="#2fc4a3"/><text x="1696" y="765" text-anchor="middle" class="t s">succeeded / completed / 100%</text>
+
+  <!-- Safety lane -->
+  <rect x="40" y="836" width="1840" height="204" rx="22" fill="#091725" stroke="#4d708c" stroke-width="2"/>
+  <text x="66" y="878" class="t h">付费安全与恢复</text><path d="M270 869H1848" stroke="#284b66" stroke-width="2"/>
+  <rect x="66" y="902" width="330" height="108" rx="12" class="warn"/><text x="86" y="935" class="t n">Seedream receipt</text><text x="86" y="965" class="t s">POST 前 claim；每项目至多一次</text><text x="86" y="992" class="t s">unknown 禁止自动重投</text>
+  <rect x="416" y="902" width="330" height="108" rx="12" class="warn"/><text x="436" y="935" class="t n">Picsart ledger</text><text x="436" y="965" class="t s">先完整 submission_started，再 POST</text><text x="436" y="992" class="t s">已有 task_id：只 poll / download</text>
+  <rect x="766" y="902" width="350" height="108" rx="12" class="card"/><text x="786" y="935" class="t n">resume-pre-picsart</text><text x="786" y="965" class="t s">复用或本地 replay 图版 checkpoint</text><text x="786" y="992" class="t s">checkpoint 后不重跑全局索引 / OR</text>
+  <rect x="1136" y="902" width="350" height="108" rx="12" class="card"/><text x="1156" y="935" class="t n">resume-picsart</text><text x="1156" y="965" class="t s">只复用冻结 manifest v4 素材与提示词</text><text x="1156" y="992" class="t s">零提交 checkpoint 可安全首提</text>
+  <rect x="1506" y="902" width="348" height="108" rx="12" class="warn"/><text x="1526" y="935" class="t n">Fail Closed</text><text x="1526" y="965" class="t s">哈希 / 顺序 / 回执不一致即停止</text><text x="1526" y="992" class="t s">所有版本字段必须严格等值</text>
+</svg>

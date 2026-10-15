@@ -1,0 +1,20 @@
+[Unit]
+Description=duet-ad1 H3 Max R2V verify HTTPS frontend on 3221
+Wants=network-online.target
+After=network-online.target duet-ad1-h3-max-r2v-verify.service
+Requires=duet-ad1-h3-max-r2v-verify.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/duet/caddy run --config /home/xy/duet-ad1-h3-max-r2v-release/deploy/caddy-3221.json
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duet-ad1-h3-max-r2v-verify-caddy
+
+[Install]
+WantedBy=default.target
