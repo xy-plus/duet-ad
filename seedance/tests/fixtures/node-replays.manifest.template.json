@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "generated_at": "<ISO-8601 UTC timestamp of the harvest run>",
+  "projects_root": "<absolute path to data/projects the fixtures came from>",
+  "nodes": ["<every node id the suite covers, in pipeline order>"],
+  "entries": [
+    {
+      "subset": "replays | boundary",
+      "project": "<source project id>",
+      "node": "<node id, e.g. video-maker>",
+      "scope": "<scope id, e.g. project or segment-0001>",
+      "attempt": 1,
+      "input_sha256": "<sha256 of the historical input.json>",
+      "output_sha256": "<sha256 of the historical output.json, when present>",
+      "media": [
+        {"name": "001-source.mp4", "size_bytes": 0, "sha256": "<sha256>"}
+      ],
+      "skipped_media": [
+        {
+          "name": "002-ggml-small.bin",
+          "size_bytes": 0,
+          "sha256": "<sha256>",
+          "reason": "model_or_oversized"
+        }
+      ],
+      "extras": {
+        "prompt.txt": {
+          "sha256": "<sha256>",
+          "matches_logged_prompt_sha256": true
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=duet-ad1 H3 Max R2V Seedance 2.5 experiment HTTPS frontend on 3271
+Wants=network-online.target
+After=network-online.target duet-ad1-h3-max-r2v-seedance25-e2e-3272.service
+Requires=duet-ad1-h3-max-r2v-seedance25-e2e-3272.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/duet/caddy run --config /home/xy/duet-ad1-h3-max-r2v/.worktree/seedance25-r2v/deploy/caddy-3271.json
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duet-ad1-h3-max-r2v-seedance25-e2e-3271-caddy
+
+[Install]
+WantedBy=default.target

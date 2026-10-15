@@ -1,0 +1,26 @@
+[Unit]
+Description=duet-ad1 H3 Max R2V Seedance 2.5 experiment backend (3272, experiment/seedance25-r2v)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/xy/duet-ad1-h3-max-r2v/.worktree/seedance25-r2v
+Environment=HTTP_PROXY=http://127.0.0.1:7897
+Environment=HTTPS_PROXY=http://127.0.0.1:7897
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+ExecStart=/home/xy/duet-ad1-h3-max-r2v/.worktree/seedance25-r2v/deploy/run-backend-3272.sh
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+UMask=0077
+NoNewPrivileges=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duet-ad1-h3-max-r2v-seedance25-e2e-3272
+
+[Install]
+WantedBy=default.target
