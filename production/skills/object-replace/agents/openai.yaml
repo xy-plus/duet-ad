@@ -1,0 +1,4 @@
+interface:
+  display_name: "Object Replace"
+  short_description: "Plan global replacements and character voice references"
+  default_prompt: "Use $object-replace to plan stable object replacements and character voice references."

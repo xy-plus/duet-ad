@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.deps/
+.env
+data/
+data-dev/
+.venv-separation/
+models/UVR-MDX-NET-Inst_HQ_3.onnx
+
+tests/fixtures/node-replays/
+
+# Seedance2.5 侦察取回的 BytePlus 密钥材料，禁止入库
+data-verify/seedance25-recon-20260929/
+data-verify/seedance25-replay-c57d9d6c-20260929/
+data-verify/seedance25-e2e-eyelash-20260929/
+data-verify/seedance25-e2e-eyelash-v2-20261002/

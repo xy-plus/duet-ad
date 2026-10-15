@@ -1,0 +1,71 @@
+{
+  "admin": {"disabled": true},
+  "apps": {
+    "http": {
+      "servers": {
+        "srv3211": {
+          "listen": [":3211"],
+          "protocols": ["h1", "h2"],
+          "automatic_https": {"disable_redirects": true},
+          "routes": [
+            {
+              "match": [
+                {
+                  "not": [
+                    {
+                      "path": [
+                        "/api/conversations/*/files/*",
+                        "/api/conversations/*/creation-input/*",
+                        "/api/v1/video-generations/*/content",
+                        "/internal/provider-assets/*"
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "encode",
+                  "encodings": {"gzip": {}},
+                  "minimum_length": 512
+                },
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [{"dial": "127.0.0.1:3212"}]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [{"dial": "127.0.0.1:3212"}]
+                }
+              ],
+              "terminal": true
+            }
+          ],
+          "tls_connection_policies": [
+            {
+              "certificate_selection": {
+                "any_tag": ["duet-h3-r2v-cert"]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "certificates": {
+        "load_files": [
+          {
+            "certificate": "/home/xy/duet-video-v2/live/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/8.166.140.227/8.166.140.227.crt",
+            "key": "/home/xy/duet-video-v2/live/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/8.166.140.227/8.166.140.227.key",
+            "tags": ["duet-h3-r2v-cert"]
+          }
+        ]
+      }
+    }
+  }
+}
