@@ -10,3 +10,5 @@ This branch contains source snapshots of the versions running before service ret
 | Two-pass experiment (not running) | `two-pass/` | `duet-ad1-h3-max-r2v@929facd3476aa59b64c7245e2afc481491519fe5` | none |
 
 Captured on 2026-10-15 UTC. Only code, configuration templates, tests, and source documentation are included. Runtime data, verification media, model binaries, credentials, generated archives, Hypit examples and sample projects are excluded. The original source commit IDs are provenance references; this branch intentionally does not contain their Git history.
+
+`hypit/LICENSE` is copied verbatim from the Hypit source commit. This archive does not change its license terms.
